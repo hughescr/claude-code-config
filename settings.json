@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__calculator",
+      "mcp__documentation",
+      "mcp__search",
+      "mcp__time",
+      "mcp__web-fetch"
+    ],
+    "deny": []
+  },
+  "model": "opus",
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/craig/.claude/count_tokens.js"
+          }
+        ]
+      }
+    ]
+  },
+  "feedbackSurveyState": {
+    "lastShownTime": 1753992418601
+  }
+}

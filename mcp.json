@@ -1,0 +1,59 @@
+{
+    "mcpServers": {
+        "browser": {
+            "command": "bunx",
+            "args": [
+                "--bun",
+                "@playwright/mcp@latest",
+                "--browser",
+                "webkit",
+                "--user-agent",
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
+            ]
+        },
+        "web-fetch": {
+            "command": "bunx",
+            "args": [
+                "--bun",
+                "mcp-server-fetch-typescript@latest"
+            ]
+        },
+        "search": {
+            "command": "bunx",
+            "args": [
+                "--bun",
+                "mcp-omnisearch"
+            ],
+            "env": {
+                "BRAVE_API_KEY": "BSAD7ujTKN9VTzxPwfyoUhFb07l2Lf8",
+                "PERPLEXITY_API_KEY": "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"
+            }
+        },
+        "time": {
+            "command": "uvx",
+            "args": [
+                "mcp-server-time",
+                "--local-timezone=America/Los_Angeles"
+            ]
+        },
+        "documentation": {
+            "type": "stdio",
+            "command": "bunx",
+            "args": [
+                "--bun",
+                "@upstash/context7-mcp"
+            ],
+            "env": {}
+        },
+        "calculator": {
+            "command": "uvx",
+            "args": [
+                "--from",
+                "calculator-mcp-server@git+https://github.com/hughescr/calculator-mcp-server.git",
+                "--",
+                "calculator-mcp-server",
+                "--stdio"
+            ]
+        }
+    }
+}
