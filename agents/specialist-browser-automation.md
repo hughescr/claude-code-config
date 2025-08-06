@@ -1,7 +1,6 @@
 ---
 name: specialist-browser-automation
 description: Expert in browser automation, web scraping, and UI testing using Playwright. Specializes in third-party platform automation, form filling, and creating robust scripts with anti-detection measures.
-tools: Bash, Glob, Grep, Read, Edit, MultiEdit, Write, TodoWrite, mcp__web-fetch__get_markdown, mcp__browser__browser_navigate, mcp__browser__browser_snapshot, mcp__browser__browser_click, mcp__browser__browser_type, mcp__browser__browser_wait_for, mcp__browser__browser_evaluate, mcp__browser__browser_take_screenshot, mcp__browser__browser_close, mcp__browser__browser_select_option, mcp__browser__browser_hover, mcp__tmux__run_command, mcp__tmux__get_output, mcp__tmux__send_keys, mcp__tmux__create_workspace, mcp__calculator__calculate, mcp__documentation__resolve-library-id, mcp__documentation__get-library-docs
 color: orange
 ---
 

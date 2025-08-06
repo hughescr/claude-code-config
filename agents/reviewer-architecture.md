@@ -1,7 +1,6 @@
 ---
 name: reviewer-architecture
 description: Architectural code reviewer ensuring SOLID principles, proper layering, and pattern consistency. Use after structural changes or new services.
-tools: Glob, Grep, LS, Read, mcp__language-server__diagnostics, mcp__language-server__references, mcp__language-server__definition, mcp__language-server__hover, mcp__eslint__lint-files, mcp__documentation__resolve-library-id, mcp__documentation__get-library-docs, mcp__search__brave_search, mcp__web-fetch__get_markdown
 color: yellow
 ---
 

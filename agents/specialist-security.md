@@ -1,7 +1,6 @@
 ---
 name: security-specialist
 description: Defensive security expert for AWS/SST infrastructure, secure coding practices, and compliance. Specializes in threat modeling, vulnerability assessment, and securing multi-tenant web applications.
-tools: Task, Glob, Grep, LS, ExitPlanMode, Read, TodoWrite, Edit, MultiEdit, ListMcpResourcesTool, ReadMcpResourceTool, mcp__documentation__resolve-library-id, mcp__documentation__get-library-docs, mcp__language-server__diagnostics, mcp__language-server__hover, mcp__language-server__references, mcp__eslint__lint-files
 color: red
 ---
 

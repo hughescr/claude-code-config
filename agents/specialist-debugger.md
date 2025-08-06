@@ -1,7 +1,6 @@
 ---
 name: specialist-debugger
 description: Expert debugger for runtime errors, test failures, build issues, and unexpected behavior. Specializes in root cause analysis using systematic investigation. Use proactively when encountering any issues.
-tools: Bash, Glob, Grep, Read, Edit, MultiEdit, TodoWrite, mcp__search__perplexity_search, mcp__web-fetch__get_markdown, mcp__tmux__run_command, mcp__tmux__get_output, mcp__tmux__send_keys, mcp__tmux__create_workspace, mcp__documentation__resolve-library-id, mcp__documentation__get-library-docs, mcp__eslint__lint-files, mcp__language-server__definition, mcp__language-server__diagnostics, mcp__language-server__hover, mcp__language-server__references, mcp__calculator__calculate, mcp__browser__browser_navigate, mcp__browser__browser_snapshot
 color: red
 ---
 

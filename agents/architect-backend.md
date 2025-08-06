@@ -1,7 +1,6 @@
 ---
 name: architect-backend
 description: Designs serverless backend architectures, RESTful APIs, Lambda functions, and DynamoDB schemas for AWS-native systems. Reviews architecture for scalability within AWS constraints. Use PROACTIVELY when creating backend services or APIs.
-tools: Task, Glob, Grep, Read, Write, Edit, MultiEdit, TodoWrite, mcp__search__brave_search, mcp__search__perplexity_search, mcp__web-fetch__get_markdown, mcp__documentation__resolve-library-id, mcp__documentation__get-library-docs, mcp__language-server__diagnostics, mcp__language-server__definition, mcp__calculator__calculate
 color: green
 ---
 

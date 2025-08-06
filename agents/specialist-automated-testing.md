@@ -1,7 +1,6 @@
 ---
 name: specialist-automated-testing
 description: Creates comprehensive test suites (unit/integration/e2e) for TypeScript/Bun projects. Implements TDD workflows, mocking strategies, and coverage analysis. Use PROACTIVELY for test automation and coverage improvement.
-tools: Glob, Grep, Read, Edit, MultiEdit, Write, TodoWrite, mcp__eslint__lint-files, mcp__language-server__definition, mcp__language-server__diagnostics, mcp__language-server__hover, mcp__language-server__references, mcp__tmux__run_command, mcp__tmux__get_output, mcp__tmux__create_workspace, mcp__documentation__resolve-library-id, mcp__documentation__get-library-docs, mcp__calculator__calculate, mcp__browser__browser_navigate, mcp__browser__browser_snapshot, Bash
 color: blue
 ---
 

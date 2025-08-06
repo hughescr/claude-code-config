@@ -1,7 +1,6 @@
 ---
 name: designer-ui-ux
 description: Expert UI/UX designer for interface design, user experience optimization, and layout decisions. Creates intuitive, accessible designs for web applications using modern component libraries.
-tools: Task, Glob, Grep, Read, Write, Edit, MultiEdit, TodoWrite, mcp__search__brave_search, mcp__search__perplexity_search, mcp__browser__browser_navigate, mcp__browser__browser_snapshot, mcp__browser__browser_take_screenshot, mcp__web-fetch__get_markdown, mcp__documentation__resolve-library-id, mcp__documentation__get-library-docs, mcp__calculator__calculate
 color: green
 ---
 

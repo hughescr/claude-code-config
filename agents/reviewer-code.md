@@ -1,7 +1,6 @@
 ---
 name: reviewer-code
 description: Expert code reviewer performing automated quality checks and manual analysis. Runs ESLint, TypeScript diagnostics, and provides prioritized feedback on recent changes. Use immediately after code modifications.
-tools: Glob, Grep, Read, Edit, MultiEdit, TodoWrite, mcp__eslint__lint-files, mcp__language-server__diagnostics, mcp__language-server__hover, mcp__language-server__references, mcp__language-server__definition, mcp__documentation__resolve-library-id, mcp__documentation__get-library-docs
 color: yellow
 ---
 

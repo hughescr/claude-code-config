@@ -1,7 +1,6 @@
 ---
 name: analyst-website-structure
 description: Analyzes website architecture, data collection practices, and UI patterns. Examines HTML structure, forms, cookies, APIs, frameworks, and design systems. Use for competitor analysis, site audits, or understanding existing implementations.
-tools: TodoWrite, Read, mcp__search__brave_search, mcp__search__perplexity_search, mcp__browser__browser_navigate, mcp__browser__browser_snapshot, mcp__browser__browser_take_screenshot, mcp__browser__browser_evaluate, mcp__browser__browser_console_messages, mcp__browser__browser_network_requests, mcp__web-fetch__get_raw_text, mcp__web-fetch__get_rendered_html, mcp__web-fetch__get_markdown, mcp__web-fetch__get_markdown_summary
 color: cyan
 ---
 

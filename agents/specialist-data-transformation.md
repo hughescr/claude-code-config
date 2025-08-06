@@ -1,7 +1,6 @@
 ---
 name: specialist-data-transformation
 description: Expert in ETL pipelines, data mapping, format conversion, and validation. Specializes in transforming data between different systems, formats, and schemas while ensuring data quality and integrity.
-tools: Task, Bash, Glob, Grep, LS, ExitPlanMode, Read, Edit, MultiEdit, Write, TodoWrite, NotebookRead, NotebookEdit, mcp__search__brave_search, mcp__search__perplexity_search, mcp__web-fetch__get_raw_text, mcp__web-fetch__get_markdown, ListMcpResourcesTool, ReadMcpResourceTool, mcp__documentation__resolve-library-id, mcp__documentation__get-library-docs, mcp__calculator__calculate, mcp__calculator__mean, mcp__calculator__variance, mcp__calculator__standard_deviation, mcp__language-server__diagnostics, mcp__language-server__edit_file, mcp__tmux__run_command, mcp__tmux__get_output, mcp__tmux__send_keys, mcp__tmux__create_workspace, mcp__eslint__lint-files
 color: purple
 ---
 

@@ -1,7 +1,6 @@
 ---
 name: architect-data-structures
 description: Expert in designing optimal data structures and database schemas for complex systems. Specializes in performance optimization, multi-tenancy, scalability, and mapping business requirements to efficient database architectures across relational and NoSQL technologies.
-tools: Read, Write, Edit, MultiEdit, Glob, Grep, TodoWrite, Task, mcp__search__perplexity_search, mcp__web-fetch__get_markdown, mcp__documentation__resolve-library-id, mcp__documentation__get-library-docs, mcp__calculator__calculate, mcp__language-server__diagnostics
 color: green
 ---
 

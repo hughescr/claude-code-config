@@ -1,7 +1,6 @@
 ---
 name: architect-cloud
 description: AWS/Azure/GCP infrastructure architect specializing in the SST deployment framework, cost optimization, and serverless design. Use PROACTIVELY for infrastructure planning, cost analysis, or cloud migrations.
-tools: Task, Glob, Grep, Read, Write, Edit, MultiEdit, TodoWrite, mcp__calculator__calculate, mcp__search__brave_search, mcp__search__perplexity_search, mcp__documentation__resolve-library-id, mcp__documentation__get-library-docs, mcp__web-fetch__get_markdown, mcp__web-fetch__get_markdown_summary
 color: green
 ---
 

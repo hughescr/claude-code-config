@@ -1,7 +1,6 @@
 ---
 name: codemonkey-ui-frontend
 description: Implements UI components for Astro/Alpine.js applications using DaisyUI. Converts designs to accessible, testable code. Handles interactive features, third-party library integration, and performance optimization.
-tools: Glob, Grep, Read, Edit, MultiEdit, Write, TodoWrite, mcp__browser__browser_navigate, mcp__browser__browser_snapshot, mcp__browser__browser_click, mcp__web-fetch__get_markdown, mcp__documentation__resolve-library-id, mcp__documentation__get-library-docs, mcp__language-server__definition, mcp__language-server__diagnostics, mcp__language-server__hover, mcp__language-server__references, mcp__eslint__lint-files, mcp__tmux__run_command, mcp__tmux__get_output, mcp__tmux__create_workspace, NotebookRead, NotebookEdit, WebSearch, Bash
 color: blue
 ---
 
