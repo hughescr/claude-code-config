@@ -1,6 +1,7 @@
 ---
 name: reviewer-code
 description: Expert code reviewer performing automated quality checks and manual analysis. Runs ESLint, TypeScript diagnostics, and provides prioritized feedback on recent changes. Use immediately after code modifications.
+model: opus
 color: yellow
 ---
 

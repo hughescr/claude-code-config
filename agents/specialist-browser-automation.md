@@ -1,6 +1,7 @@
 ---
 name: specialist-browser-automation
 description: Expert in browser automation, web scraping, and UI testing using Playwright. Specializes in third-party platform automation, form filling, and creating robust scripts with anti-detection measures.
+model: opus
 color: orange
 ---
 

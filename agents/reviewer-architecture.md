@@ -1,6 +1,7 @@
 ---
 name: reviewer-architecture
 description: Architectural code reviewer ensuring SOLID principles, proper layering, and pattern consistency. Use after structural changes or new services.
+model: opus
 color: yellow
 ---
 

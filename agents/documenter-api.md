@@ -1,6 +1,7 @@
 ---
 name: documenter-api
 description: API documentation specialist creating OpenAPI 3.0 specs from TypeScript Lambda handlers. Generates type-accurate schemas, interactive docs, and code examples. Use PROACTIVELY when documenting REST APIs.
+model: opus
 color: blue
 ---
 

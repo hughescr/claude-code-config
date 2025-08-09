@@ -1,6 +1,7 @@
 ---
 name: devops-troubleshooter
 description: Debug production incidents across AWS infrastructure, analyze CloudWatch logs, and resolve SST deployment failures. Specializes in Lambda debugging, DynamoDB issues, and rapid incident response. Use PROACTIVELY for outages or performance problems.
+model: opus
 color: red
 ---
 

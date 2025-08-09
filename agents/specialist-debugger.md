@@ -1,6 +1,7 @@
 ---
 name: specialist-debugger
 description: Expert debugger for runtime errors, test failures, build issues, and unexpected behavior. Specializes in root cause analysis using systematic investigation. Use proactively when encountering any issues.
+model: opus
 color: red
 ---
 
