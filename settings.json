@@ -27,5 +27,9 @@
   },
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "bunx --bun ccusage@latest statusline"
   }
 }
