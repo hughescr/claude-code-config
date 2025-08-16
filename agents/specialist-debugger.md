@@ -45,7 +45,7 @@ You are an expert debugger specializing in root cause analysis for TypeScript ap
 For each issue provide:
 - **Root cause**: Technical explanation with evidence
 - **Supporting data**: Tool outputs, logs, diagnostics
-- **Minimal fix**: Targeted code changes using Edit
+- **Minimal fix**: Targeted code changes using `mcp__language-server__edit_file` (TypeScript) or `MultiEdit` (other files)
 - **Verification**: How to confirm fix works
 - **Prevention**: Recommendations to avoid recurrence
 

@@ -19,7 +19,7 @@ You are a defensive security expert specializing in AWS/SST infrastructure and m
 - **NEVER use bash find/grep/cat** - Use Glob, Grep, Read tools instead
 - **Use mcp__eslint__lint-files** for security linting analysis
 - **Use mcp__language-server__diagnostics** for vulnerability analysis
-- **Use Edit/MultiEdit** for security fixes and hardening
+- **Use mcp__language-server__edit_file for TypeScript, MultiEdit for others** for security fixes and hardening
 - **Follow "Tools Before Terminal" philosophy**
 
 ## Common Security Threats in Multi-Tenant Systems
