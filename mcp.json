@@ -22,7 +22,7 @@
             "command": "bunx",
             "args": [
                 "--bun",
-                "mcp-omnisearch"
+                "mcp-omnisearch@latest"
             ],
             "env": {
                 "BRAVE_API_KEY": "BSAD7ujTKN9VTzxPwfyoUhFb07l2Lf8",
@@ -32,7 +32,7 @@
         "time": {
             "command": "uvx",
             "args": [
-                "mcp-server-time",
+                "mcp-server-time@latest",
                 "--local-timezone=America/Los_Angeles"
             ]
         },
@@ -41,7 +41,7 @@
             "command": "bunx",
             "args": [
                 "--bun",
-                "@upstash/context7-mcp"
+                "@upstash/context7-mcp@latest"
             ],
             "env": {}
         },
