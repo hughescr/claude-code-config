@@ -10,12 +10,12 @@
       "mcp__web-fetch"
     ],
     "deny": [
-      "Edit",
       "WebFetch",
       "WebSearch"
     ],
     "defaultMode": "plan"
   },
+  "model": "opusplan",
   "hooks": {
     "Notification": [
       {
@@ -45,6 +45,5 @@
   },
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
-  },
-  "model": "opusplan"
+  }
 }
