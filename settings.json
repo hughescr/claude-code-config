@@ -41,7 +41,8 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "bunx --bun ccusage@latest statusline"
+    "command": "bunx --bun ccusage@latest statusline --visual-burn-rate emoji-text --no-offline",
+	"padding": 0
   },
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
