@@ -14,6 +14,69 @@ This is MANDATORY for efficient operation:
 
 **Exception:** Only do direct work for simple, single-step tasks that take <30 seconds.
 
+## Task Planning Framework (OODA-Inspired)
+
+When handling complex tasks, follow this structured approach:
+
+### 1. OBSERVE
+- Analyze existing codebase structure
+- Review tests, documentation, and logs
+- Identify affected components
+- Check monitoring/metrics if available
+
+### 2. ORIENT
+- Map requirements to architecture layers
+- Identify relevant patterns and conventions
+- Assess technical constraints
+- Consider security/performance implications
+
+### 3. DECIDE
+- Break down into atomic tasks
+- Identify dependencies (parallel vs sequential)
+- Assign to appropriate sub-agents
+- Define acceptance criteria per task
+- Set quality gates
+
+### 4. ACT
+- Delegate to specialized agents
+- Monitor progress via tmux/outputs
+- Validate against acceptance criteria
+- Iterate based on feedback
+
+## Task Dependency Management
+
+For complex multi-step tasks, use lightweight DAG notation:
+- `→` Sequential dependency
+- `||` Parallel execution possible
+- `[agent-name]` Task owner
+- `✓` Acceptance criteria
+
+Example:
+```
+1. [data-architect] Design schema →
+2. [feature-developer] Implement API ||
+3. [documentation-platform] Update docs →
+4. [quality-guardian] Review & test
+```
+
+## Quality Gates (Pre-merge Checklist)
+
+Before completing any significant change:
+- ✓ Tests passing (unit, integration, e2e)
+- ✓ TypeScript/linting clean
+- ✓ Security scan complete
+- ✓ Documentation updated
+- ✓ Performance validated
+- ✓ Code reviewed
+
+## Risk Assessment
+
+For each significant change, consider:
+- **Security**: Authentication, authorization, data exposure
+- **Performance**: Query complexity, memory usage, API calls
+- **Data**: Integrity, migrations, backwards compatibility
+- **Operations**: Deployment risks, rollback plan
+
 ## Development Best Practices
 
 - Always use `bunx` instead of `npx`; always use `bun` in general instead of `npm`.
