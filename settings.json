@@ -7,15 +7,15 @@
       "mcp__documentation",
       "mcp__search",
       "mcp__time",
-      "mcp__web-fetch"
-    ],
-    "deny": [
+      "mcp__web-fetch",
       "WebFetch",
       "WebSearch"
     ],
+    "deny": [
+    ],
     "defaultMode": "plan"
   },
-  "model": "opusplan",
+  "model": "opus",
   "hooks": {
     "Notification": [
       {
