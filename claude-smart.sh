@@ -61,7 +61,7 @@ if [[ ${#MCP_FILES[@]} -gt 0 ]] && command -v jq &>/dev/null; then
         # Later configs override earlier ones for the same server name
         MCP_TEMP=$(mktemp /tmp/claude-code-mcp.XXXXXXXX)
         trap "rm -f '$MCP_TEMP'" EXIT
-        jq -s 'reduce .[] as $item ({}; . * $item)' "${EXISTING_MCP[@]}" > "$MCP_TEMP"
+        jq -sc 'reduce .[] as $item ({}; . * $item)' "${EXISTING_MCP[@]}" > "$MCP_TEMP"
         CLAUDE_FLAGS+=(--mcp-config "$MCP_TEMP")
     fi
 fi
@@ -74,8 +74,8 @@ if [[ ${#AGENT_FILES[@]} -gt 0 ]] && command -v jq &>/dev/null; then
     done
 
     if [[ ${#EXISTING_AGENTS[@]} -gt 0 ]]; then
-        MERGED_AGENTS=$(jq -s 'reduce .[] as $item ({}; . * $item)' "${EXISTING_AGENTS[@]}")
-        [[ "$MERGED_AGENTS" != "{}" ]] && CLAUDE_FLAGS+=(--agents "$MERGED_AGENTS")
+        MERGED_JSON=$(jq -sc 'reduce .[] as $item ({}; . * $item)' "${EXISTING_AGENTS[@]}")
+        [[ "$MERGED_JSON" != "{}" ]] && CLAUDE_FLAGS+=(--agents "$MERGED_JSON")
     fi
 fi
 
