@@ -3,19 +3,12 @@
   "includeCoAuthoredBy": false,
   "permissions": {
     "allow": [
-      "mcp__calculator",
-      "mcp__documentation",
-      "mcp__search",
-      "mcp__time",
-      "mcp__web-fetch",
-      "WebFetch",
-      "WebSearch"
+      "WebSearch",
+      "WebFetch"
     ],
-    "deny": [
-    ],
+    "deny": [],
     "defaultMode": "plan"
   },
-  "model": "opus",
   "hooks": {
     "Notification": [
       {
@@ -42,7 +35,7 @@
   "statusLine": {
     "type": "command",
     "command": "bunx --bun ccusage@latest statusline --visual-burn-rate emoji-text --no-offline",
-	"padding": 0
+    "padding": 0
   },
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
