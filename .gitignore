@@ -1,0 +1,15 @@
+.encryption_key
+config
+count_tokens.js
+leaderboard.json
+leaderboard_submitted.json
+projects/
+shell-snapshots/
+statsig/
+todos/
+ide
+migration_v2_complete
+history.jsonl
+debug/
+file-history/
+.claude/
