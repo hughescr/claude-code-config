@@ -4,11 +4,13 @@
   "permissions": {
     "allow": [
       "WebSearch",
-      "WebFetch"
+      "WebFetch",
+      "Bash(bun -p 'crypto.randomUUID()')"
     ],
     "deny": [],
     "defaultMode": "plan"
   },
+  "model": "opusplan",
   "hooks": {
     "Notification": [
       {
@@ -37,6 +39,7 @@
     "command": "bunx --bun ccusage@latest statusline --visual-burn-rate emoji-text --no-offline",
     "padding": 0
   },
+  "alwaysThinkingEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
   }
