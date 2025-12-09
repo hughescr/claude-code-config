@@ -1,0 +1,8 @@
+{
+    "mcpServers": {
+        "DuckDB": {
+            "command": "uvx",
+            "args": ["mcp-server-motherduck@latest", "--db-path", "duck-database.db", "--max-rows", "1024", "--max-chars", "32768"]
+        }
+    }
+}
