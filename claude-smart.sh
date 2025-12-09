@@ -7,6 +7,7 @@
 #   2. .claude-mixins file in project root (one per line, # for comments)
 #
 # Priority: env var > marker file
+# Priority for mixin configs: ./.claude/ > ~/.claude/
 # Auto-detected: typescript (via tsconfig.json or package.json)
 
 set -euo pipefail
@@ -40,10 +41,21 @@ elif [[ -f ".claude-mixins" ]]; then
     done < .claude-mixins
 fi
 
-# Add mixin configs if they exist
+# Add mixin configs if they exist (local .claude/ takes priority over ~/.claude/)
 for mixin in "${MIXINS[@]}"; do
-    [[ -f ~/.claude/mcp-${mixin}.json ]] && MCP_FILES+=(~/.claude/mcp-${mixin}.json)
-    [[ -f ~/.claude/agents-${mixin}.json ]] && AGENT_FILES+=(~/.claude/agents-${mixin}.json)
+    # MCP config: local .claude/ takes priority over ~/.claude/
+    if [[ -f "./.claude/mcp-${mixin}.json" ]]; then
+        MCP_FILES+=("./.claude/mcp-${mixin}.json")
+    elif [[ -f ~/.claude/mcp-${mixin}.json ]]; then
+        MCP_FILES+=(~/.claude/mcp-${mixin}.json)
+    fi
+
+    # Agents config: local .claude/ takes priority over ~/.claude/
+    if [[ -f "./.claude/agents-${mixin}.json" ]]; then
+        AGENT_FILES+=("./.claude/agents-${mixin}.json")
+    elif [[ -f ~/.claude/agents-${mixin}.json ]]; then
+        AGENT_FILES+=(~/.claude/agents-${mixin}.json)
+    fi
 done
 
 # Prepare flags array
