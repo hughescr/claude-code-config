@@ -5,12 +5,11 @@
     "allow": [
       "WebSearch",
       "WebFetch",
-      "Bash(bun -p 'crypto.randomUUID()')"
+      "Bash(uuidgen)"
     ],
     "deny": [],
     "defaultMode": "plan"
   },
-  "model": "opusplan",
   "hooks": {
     "Notification": [
       {
@@ -36,10 +35,10 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "bunx --bun ccusage@latest statusline --visual-burn-rate emoji-text --no-offline",
+    "command": "bunx --bun ccusage@latest statusline --visual-burn-rate emoji-text",
     "padding": 0
   },
-  "alwaysThinkingEnabled": true,
+  "alwaysThinkingEnabled": false,
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
   }
