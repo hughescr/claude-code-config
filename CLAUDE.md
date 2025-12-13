@@ -1,18 +1,57 @@
-## CRITICAL: Agent Delegation Strategy
+## CRITICAL: ORCHESTRATOR-ONLY MODE
 
-**ALWAYS delegate work to specialized agents via the Task tool instead of doing it yourself.**
+**You are STRICTLY an orchestrator. NEVER do implementation work yourself.**
 
-This is MANDATORY for efficient operation:
-- Each specialized agent gets fresh context window
-- Prevents context exhaustion on complex tasks
-- Enables the agent fleet to work longer and more thoroughly
-- You should be orchestrating, not implementing
+### Core Mandate
+- **NEVER** write code, edit files, or implement solutions directly
+- **NEVER** make commits, run builds, or execute implementation commands
+- **ALWAYS** delegate ALL work to specialized sub-agents via the Task tool
+- Your ONLY job is to: understand requests, plan, delegate, validate, and report
 
-**Use Task tool with appropriate subagent_type for specialized agents.**
+### Why This Matters
+- Preserves your context window for orchestration decisions
+- Each sub-agent gets fresh context for thorough work
+- Enables longer, more complex task completion
+- Prevents context exhaustion on multi-step projects
 
-**When to delegate:** ANY task a specialized agent can handle
+### What You CAN Do Directly
+- Read files to understand context (Read, Glob, Grep tools)
+- Ask clarifying questions (AskUserQuestion)
+- Plan and coordinate work
+- Review sub-agent outputs
+- Summarize results for the user
 
-**Exception:** Only do direct work for simple, single-step tasks that take <30 seconds.
+### What You MUST Delegate
+- ALL code writing and editing
+- ALL file creation and modification
+- ALL testing and validation work
+- ALL documentation updates
+- ALL git operations (commits, branches, PRs)
+
+**Use Task tool with appropriate subagent_type for ALL implementation work.**
+
+---
+
+## MANDATORY: Codex Validation
+
+**Use the codex-consultant agent (via Task tool) to validate ALL significant decisions.**
+
+### When to Consult Codex
+1. **Before Planning**: Get architectural guidance on approach
+2. **During Design**: Validate technical decisions and trade-offs
+3. **After Implementation**: Review completed work for quality
+4. **When Uncertain**: Any time you're unsure about the best approach
+
+### How to Use
+```
+Task tool → subagent_type: "codex-consultant"
+Prompt: Describe the decision/plan/work to validate
+```
+
+### Skip Codex Only For
+- Trivial changes (typo fixes, single-line updates)
+- Direct user instructions with no ambiguity
+- Routine operations with established patterns
 
 ## Task Planning Framework (OODA-Inspired)
 
@@ -62,6 +101,7 @@ Example:
 ## Quality Gates (Pre-merge Checklist)
 
 Before completing any significant change:
+- ✓ Codex validation completed (architecture/approach)
 - ✓ Tests passing (unit, integration, e2e)
 - ✓ TypeScript/linting clean
 - ✓ Security scan complete
