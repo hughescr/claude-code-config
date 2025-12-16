@@ -43,9 +43,21 @@
 4. **When Uncertain**: Any time you're unsure about the best approach
 
 ### How to Use
+Use the Codex CLI directly via Bash:
+
+```bash
+# Single query
+codex "Describe the decision/plan/work to validate"
+
+# For back-and-forth conversations, use resume with chat ID
+codex resume <chat-id>
 ```
-Task tool → subagent_type: "codex-consultant"
-Prompt: Describe the decision/plan/work to validate
+
+**Note:** Always include the chat ID with `codex resume <chat-id>` to continue the correct conversation. This is essential in multi-user environments where multiple Codex sessions may be active.
+
+**Alias:** If `codex` is not available in the shell environment, use the full command:
+```bash
+/opt/homebrew/bin/bunx @openai/codex --search "your query"
 ```
 
 ### Skip Codex Only For

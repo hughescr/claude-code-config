@@ -14,3 +14,4 @@ debug/
 file-history/
 .claude/
 plans/
+stats-cache.json
