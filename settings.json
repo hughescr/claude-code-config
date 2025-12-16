@@ -5,9 +5,24 @@
     "allow": [
       "WebSearch",
       "WebFetch",
-      "Bash(uuidgen)"
+      "Bash(uuidgen)",
+      "mcp__DevTools",
+      "mcp__Tmux",
+      "mcp__Search",
+      "mcp__Codex",
+      "Bash(gh run list:*)",
+      "Bash(gh run view:*)",
+      "Bash(cat:*)",
+      "Bash(tree:*)",
+      "Bash(grep:*)",
+      "Bash(wc:*)",
+      "Bash(xargs ls:*)",
+      "Bash(find:*)",
+      "Bash(hugo:*)",
+      "Bash(curl:*)"
     ],
     "deny": [],
+    "ask": [],
     "defaultMode": "plan"
   },
   "hooks": {
@@ -38,7 +53,7 @@
     "command": "bunx --bun ccusage@latest statusline --visual-burn-rate emoji-text",
     "padding": 0
   },
-  "alwaysThinkingEnabled": false,
+  "alwaysThinkingEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
   }

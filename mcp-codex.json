@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "Codex": {
-      "command": "bunx",
-      "args": ["@openai/codex@latest", "--search", "mcp-server"]
-    }
-  }
-}
