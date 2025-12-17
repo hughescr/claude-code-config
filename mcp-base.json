@@ -1,8 +1,4 @@
 {
     "mcpServers": {
-        "Search": {
-            "command": "bunx",
-            "args": ["@hughescr/mcp-proxy-processor@latest", "serve", "Search"]
-        }
     }
 }
