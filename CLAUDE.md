@@ -32,39 +32,6 @@
 
 ---
 
-## MANDATORY: Codex Validation
-
-**Use the codex-consultant agent (via Task tool) to validate ALL significant decisions.**
-
-### When to Consult Codex
-1. **Before Planning**: Get architectural guidance on approach
-2. **During Design**: Validate technical decisions and trade-offs
-3. **After Implementation**: Review completed work for quality
-4. **When Uncertain**: Any time you're unsure about the best approach
-
-### How to Use
-Use the Codex CLI directly via Bash:
-
-```bash
-# Single query
-codex "Describe the decision/plan/work to validate"
-
-# For back-and-forth conversations, use resume with chat ID
-codex resume <chat-id>
-```
-
-**Note:** Always include the chat ID with `codex resume <chat-id>` to continue the correct conversation. This is essential in multi-user environments where multiple Codex sessions may be active.
-
-**Alias:** If `codex` is not available in the shell environment, use the full command:
-```bash
-/opt/homebrew/bin/bunx @openai/codex --search "your query"
-```
-
-### Skip Codex Only For
-- Trivial changes (typo fixes, single-line updates)
-- Direct user instructions with no ambiguity
-- Routine operations with established patterns
-
 ## Task Planning Framework (OODA-Inspired)
 
 When handling complex tasks, follow this structured approach:
