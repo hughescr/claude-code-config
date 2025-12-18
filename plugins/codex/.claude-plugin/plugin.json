@@ -1,5 +1,8 @@
 {
   "name": "codex",
-  "version": "1.0.0",
-  "description": "OpenAI Codex integration agent for architecture consultation"
+  "version": "1.1.0",
+  "description": "Transparent relay to OpenAI Codex CLI with helpful error handling",
+  "author": {
+    "name": "craig"
+  }
 }
