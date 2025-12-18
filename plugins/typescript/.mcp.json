@@ -1,0 +1,10 @@
+{
+    "Tmux": {
+        "command": "bunx",
+        "args": ["@hughescr/mcp-proxy-processor@latest", "serve", "Tmux"]
+    },
+    "DevTools": {
+        "command": "bunx",
+        "args": ["@hughescr/mcp-proxy-processor@latest", "serve", "DevTools"]
+    }
+}
