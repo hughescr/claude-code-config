@@ -11,6 +11,39 @@
         "gitCommitSha": "3960ee866e4e1053aa21cfa3a1d7c0b2323c0d5f",
         "isLocal": true
       }
+    ],
+    "commit-commands@claude-plugins-official": [
+      {
+        "scope": "user",
+        "installPath": "/Users/craig/.claude/plugins/cache/claude-plugins-official/commit-commands/ab2b6d0cad88",
+        "version": "ab2b6d0cad88",
+        "installedAt": "2025-12-18T09:14:14.622Z",
+        "lastUpdated": "2025-12-18T09:17:05.530Z",
+        "gitCommitSha": "cea69b7e7b8adeca57b3d4370c04ecf19d7c77e7",
+        "isLocal": true
+      }
+    ],
+    "feature-dev@claude-plugins-official": [
+      {
+        "scope": "user",
+        "installPath": "/Users/craig/.claude/plugins/cache/claude-plugins-official/feature-dev/ab2b6d0cad88",
+        "version": "ab2b6d0cad88",
+        "installedAt": "2025-12-18T09:14:27.729Z",
+        "lastUpdated": "2025-12-18T09:17:05.531Z",
+        "gitCommitSha": "cea69b7e7b8adeca57b3d4370c04ecf19d7c77e7",
+        "isLocal": true
+      }
+    ],
+    "frontend-design@claude-plugins-official": [
+      {
+        "scope": "user",
+        "installPath": "/Users/craig/.claude/plugins/cache/claude-plugins-official/frontend-design/ab2b6d0cad88",
+        "version": "ab2b6d0cad88",
+        "installedAt": "2025-12-18T09:14:56.434Z",
+        "lastUpdated": "2025-12-18T09:17:05.530Z",
+        "gitCommitSha": "cea69b7e7b8adeca57b3d4370c04ecf19d7c77e7",
+        "isLocal": true
+      }
     ]
   }
 }
