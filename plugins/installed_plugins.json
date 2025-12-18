@@ -1,4 +1,16 @@
 {
   "version": 2,
-  "plugins": {}
+  "plugins": {
+    "plugin-dev@claude-plugins-official": [
+      {
+        "scope": "user",
+        "installPath": "/Users/craig/.claude/plugins/cache/claude-plugins-official/plugin-dev/ab2b6d0cad88",
+        "version": "ab2b6d0cad88",
+        "installedAt": "2025-12-18T08:25:51.988Z",
+        "lastUpdated": "2025-12-18T08:27:16.960Z",
+        "gitCommitSha": "3960ee866e4e1053aa21cfa3a1d7c0b2323c0d5f",
+        "isLocal": true
+      }
+    ]
+  }
 }
