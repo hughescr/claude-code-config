@@ -12,8 +12,8 @@
 
 set -euo pipefail
 
-# Base plugin directories (always included)
-PLUGIN_DIRS=(~/.claude/plugins/base)
+# Build up a set of plugin directories to load
+PLUGIN_DIRS=()
 
 # Detect TypeScript project
 if [[ -f "tsconfig.json" ]] || \
