@@ -5,20 +5,13 @@
     "allow": [
       "WebSearch",
       "WebFetch",
-      "Bash(uuidgen)",
-      "mcp__DevTools",
-      "mcp__Tmux",
-      "mcp__Search",
-      "mcp__Codex",
       "Bash(gh run list:*)",
       "Bash(gh run view:*)",
       "Bash(cat:*)",
       "Bash(tree:*)",
       "Bash(grep:*)",
       "Bash(wc:*)",
-      "Bash(xargs ls:*)",
       "Bash(find:*)",
-      "Bash(hugo:*)",
       "Bash(curl:*)"
     ],
     "deny": [],
@@ -53,11 +46,11 @@
     "command": "bunx --bun ccusage@latest statusline --visual-burn-rate emoji-text",
     "padding": 0
   },
+  "enabledPlugins": {
+    "plugin-dev@claude-plugins-official": true
+  },
   "alwaysThinkingEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
-  },
-  "enabledPlugins": {
-    "plugin-dev@claude-plugins-official": true
   }
 }
