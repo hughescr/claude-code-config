@@ -16,3 +16,4 @@ file-history/
 plans/
 stats-cache.json
 plugins/marketplaces
+plugins/cache
