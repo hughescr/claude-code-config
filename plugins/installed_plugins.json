@@ -4,10 +4,10 @@
     "plugin-dev@claude-plugins-official": [
       {
         "scope": "user",
-        "installPath": "/Users/craig/.claude/plugins/cache/claude-plugins-official/plugin-dev/ab2b6d0cad88",
-        "version": "ab2b6d0cad88",
+        "installPath": "/Users/craig/.claude/plugins/cache/claude-plugins-official/plugin-dev/6d3752c000e2",
+        "version": "6d3752c000e2",
         "installedAt": "2025-12-18T08:25:51.988Z",
-        "lastUpdated": "2025-12-18T08:27:16.960Z",
+        "lastUpdated": "2025-12-19T18:20:09.540Z",
         "gitCommitSha": "3960ee866e4e1053aa21cfa3a1d7c0b2323c0d5f",
         "isLocal": true
       }
@@ -15,10 +15,10 @@
     "commit-commands@claude-plugins-official": [
       {
         "scope": "user",
-        "installPath": "/Users/craig/.claude/plugins/cache/claude-plugins-official/commit-commands/ab2b6d0cad88",
-        "version": "ab2b6d0cad88",
+        "installPath": "/Users/craig/.claude/plugins/cache/claude-plugins-official/commit-commands/6d3752c000e2",
+        "version": "6d3752c000e2",
         "installedAt": "2025-12-18T09:14:14.622Z",
-        "lastUpdated": "2025-12-18T09:17:05.530Z",
+        "lastUpdated": "2025-12-19T18:20:09.541Z",
         "gitCommitSha": "cea69b7e7b8adeca57b3d4370c04ecf19d7c77e7",
         "isLocal": true
       }
@@ -26,10 +26,10 @@
     "feature-dev@claude-plugins-official": [
       {
         "scope": "user",
-        "installPath": "/Users/craig/.claude/plugins/cache/claude-plugins-official/feature-dev/ab2b6d0cad88",
-        "version": "ab2b6d0cad88",
+        "installPath": "/Users/craig/.claude/plugins/cache/claude-plugins-official/feature-dev/6d3752c000e2",
+        "version": "6d3752c000e2",
         "installedAt": "2025-12-18T09:14:27.729Z",
-        "lastUpdated": "2025-12-18T09:17:05.531Z",
+        "lastUpdated": "2025-12-19T18:20:09.530Z",
         "gitCommitSha": "cea69b7e7b8adeca57b3d4370c04ecf19d7c77e7",
         "isLocal": true
       }
@@ -37,11 +37,22 @@
     "frontend-design@claude-plugins-official": [
       {
         "scope": "user",
-        "installPath": "/Users/craig/.claude/plugins/cache/claude-plugins-official/frontend-design/ab2b6d0cad88",
-        "version": "ab2b6d0cad88",
+        "installPath": "/Users/craig/.claude/plugins/cache/claude-plugins-official/frontend-design/6d3752c000e2",
+        "version": "6d3752c000e2",
         "installedAt": "2025-12-18T09:14:56.434Z",
-        "lastUpdated": "2025-12-18T09:17:05.530Z",
+        "lastUpdated": "2025-12-19T18:20:09.542Z",
         "gitCommitSha": "cea69b7e7b8adeca57b3d4370c04ecf19d7c77e7",
+        "isLocal": true
+      }
+    ],
+    "claude-code-wakatime@wakatime": [
+      {
+        "scope": "user",
+        "installPath": "/Users/craig/.claude/plugins/cache/wakatime/claude-code-wakatime/3.0.0",
+        "version": "3.0.0",
+        "installedAt": "2025-12-19T18:21:14.824Z",
+        "lastUpdated": "2025-12-19T18:21:14.824Z",
+        "gitCommitSha": "d8145e0e794daf839477aa5819d12f44107004f5",
         "isLocal": true
       }
     ]
