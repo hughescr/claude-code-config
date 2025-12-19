@@ -17,3 +17,5 @@ plans/
 stats-cache.json
 plugins/marketplaces
 plugins/cache
+chrome/
+plugins/install-counts-cache.json
