@@ -1,0 +1,5 @@
+{
+  "name": "tmux",
+  "version": "1.0.0",
+  "description": "Tmux MCP server integration for terminal multiplexer support"
+}
