@@ -77,16 +77,40 @@ Example:
 4. [quality-guardian] Review & test
 ```
 
-## Quality Gates (Pre-merge Checklist)
+## Task Tracking Guidelines
 
-Before completing any significant change:
-- ✓ Codex validation completed (architecture/approach)
-- ✓ Tests passing (unit, integration, e2e)
-- ✓ TypeScript/linting clean
-- ✓ Security scan complete
+### For Orchestrators
+- Use the **Plan agent** for complex multi-step orchestration
+- The Plan agent helps break down work and coordinate sub-agents
+- Orchestrators delegate implementation; Plan agent helps structure that delegation
+
+### For Sub-Agents
+When a sub-agent receives a delegated task and needs to track their own work:
+
+**DO:**
+- Use TodoWrite to create todos for each sub-task you identify
+- Mark in_progress as you begin each task
+- Mark completed when finished
+- Update the todo list as your understanding evolves
+
+**DO NOT:**
+- Write temporary planning files (`cat > /tmp/plan.md << EOF`)
+- Use bash heredocs or redirects to create tracking documents
+- Create markdown files for task organization
+
+TodoWrite is the proper mechanism for task breakdown tracking within a sub-agent's scope.
+
+## Quality Mindset
+
+Before completing any significant change, ensure:
+- ✓ Architecture/approach validated (use Codex skill for complex decisions)
+- ✓ Tests passing
+- ✓ Linting clean
+- ✓ Security considered
 - ✓ Documentation updated
-- ✓ Performance validated
 - ✓ Code reviewed
+
+*Domain-specific quality gates (TypeScript strict mode, framework rules, etc.) are defined in specialized agents.*
 
 ## Risk Assessment
 
@@ -95,10 +119,6 @@ For each significant change, consider:
 - **Performance**: Query complexity, memory usage, API calls
 - **Data**: Integrity, migrations, backwards compatibility
 - **Operations**: Deployment risks, rollback plan
-
-## Development Best Practices
-
-- Always use `bunx` instead of `npx`; always use `bun` in general instead of `npm`.
 
 ## Available CLI Tools
 
