@@ -32,6 +32,45 @@
 
 ---
 
+## CRITICAL: SUB-AGENT FILE RESTRICTIONS
+
+**This section applies to ALL sub-agents receiving delegated tasks.**
+
+### FORBIDDEN: Temporary Planning Files
+
+**NEVER use Bash to create planning, tracking, or organizational files.**
+
+These patterns are STRICTLY PROHIBITED:
+```bash
+# ALL OF THESE ARE FORBIDDEN:
+cat > /tmp/plan.md << EOF
+cat > /tmp/claude/task-breakdown.md << 'EOF'
+echo "## Plan" > /tmp/planning.md
+cat << EOF > /tmp/approach.md
+printf "..." > /tmp/notes.md
+```
+
+### Why This Rule Exists
+- Temporary files waste context on file I/O instead of actual work
+- TodoWrite provides structured, visible task tracking
+- Planning files get lost and create clutter
+- The orchestrator cannot see your temp files
+
+### The ONLY Correct Approach
+Use **TodoWrite** for ALL task tracking and planning:
+```
+TodoWrite([
+  {content: "Analyze existing code", status: "in_progress", activeForm: "Analyzing existing code"},
+  {content: "Implement feature X", status: "pending", activeForm: "Implementing feature X"},
+  ...
+])
+```
+
+### Enforcement
+If you find yourself about to write `cat >` or any heredoc for a .md/.txt planning file, STOP. Use TodoWrite instead.
+
+---
+
 ## Task Planning Framework (OODA-Inspired)
 
 When handling complex tasks, follow this structured approach:
@@ -85,20 +124,31 @@ Example:
 - Orchestrators delegate implementation; Plan agent helps structure that delegation
 
 ### For Sub-Agents
-When a sub-agent receives a delegated task and needs to track their own work:
 
-**DO:**
-- Use TodoWrite to create todos for each sub-task you identify
-- Mark in_progress as you begin each task
-- Mark completed when finished
+**⚠️ CRITICAL RULES - VIOLATIONS WILL CAUSE TASK FAILURE ⚠️**
+
+When a sub-agent receives a delegated task:
+
+**MANDATORY - Use TodoWrite:**
+- Create todos for each sub-task you identify
+- Mark `in_progress` as you begin each task
+- Mark `completed` when finished
 - Update the todo list as your understanding evolves
 
-**DO NOT:**
-- Write temporary planning files (`cat > /tmp/plan.md << EOF`)
-- Use bash heredocs or redirects to create tracking documents
-- Create markdown files for task organization
+**STRICTLY FORBIDDEN - Never Do These:**
+- ❌ `cat > /tmp/anything.md << EOF` - NEVER
+- ❌ `cat > /tmp/claude/plan.md << 'EOF'` - NEVER
+- ❌ Any heredoc redirecting to a file for planning - NEVER
+- ❌ `echo "..." > /tmp/notes.txt` - NEVER
+- ❌ Creating ANY markdown/text files for task organization - NEVER
 
-TodoWrite is the proper mechanism for task breakdown tracking within a sub-agent's scope.
+**Why This Matters:**
+1. Temp files waste tokens on file I/O
+2. The orchestrator cannot see your temp files
+3. TodoWrite is visible and structured
+4. Planning files create noise and get abandoned
+
+**If you're tempted to write a planning file, use TodoWrite instead. No exceptions.**
 
 ## Quality Mindset
 
