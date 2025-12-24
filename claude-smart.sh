@@ -1,6 +1,6 @@
 #!/usr/bin/env zsh
 # Smart Claude wrapper with project detection and mixin support
-# Loads plugin directories (MCP servers are now loaded via plugins)
+# Loads plugin directories and their .mcp.json configs
 #
 # Mixins can be specified via:
 #   1. CLAUDE_MIXINS env var (comma or space separated): CLAUDE_MIXINS="web,mobile"
@@ -55,6 +55,15 @@ CLAUDE_FLAGS=()
 for dir in "${PLUGIN_DIRS[@]}"; do
     [[ -d "$dir" ]] && CLAUDE_FLAGS+=(--plugin-dir "$dir")
 done
+
+# Collect MCP configs from plugin directories
+MCP_CONFIGS=()
+for dir in "${PLUGIN_DIRS[@]}"; do
+    [[ -f "$dir/.mcp.json" ]] && MCP_CONFIGS+=("$dir/.mcp.json")
+done
+
+# Add single --mcp-config with all paths (space-separated)
+(( ${#MCP_CONFIGS[@]} > 0 )) && CLAUDE_FLAGS+=(--mcp-config "${MCP_CONFIGS[@]}")
 
 # Execute via bunx (always fetch latest)
 # Don't use exec so trap cleanup can run
