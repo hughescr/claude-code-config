@@ -1,6 +1,8 @@
 {
-  "DevTools": {
-    "command": "bunx",
-    "args": ["@hughescr/mcp-proxy-processor@latest", "serve", "DevTools"]
+  "mcpServers": {
+    "DevTools": {
+      "command": "bunx",
+      "args": ["@hughescr/mcp-proxy-processor@latest", "serve", "DevTools"]
+    }
   }
 }

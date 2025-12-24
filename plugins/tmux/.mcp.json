@@ -1,6 +1,8 @@
 {
-  "Tmux": {
-    "command": "bunx",
-    "args": ["@hughescr/mcp-proxy-processor@latest", "serve", "Tmux"]
+  "mcpServers": {
+    "Tmux": {
+      "command": "bunx",
+      "args": ["@hughescr/mcp-proxy-processor@latest", "serve", "Tmux"]
+    }
   }
 }
