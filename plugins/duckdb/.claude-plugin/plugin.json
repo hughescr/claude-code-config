@@ -1,5 +1,6 @@
 {
   "name": "duckdb",
   "version": "1.0.0",
-  "description": "DuckDB MCP server for data analysis"
+  "description": "DuckDB MCP server for data analysis",
+  "mcpServers": ".mcp.json"
 }
