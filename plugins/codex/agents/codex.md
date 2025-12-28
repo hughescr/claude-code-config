@@ -60,20 +60,6 @@ codex exec --full-auto --json resume <SESSION_ID> "Follow-up prompt"
 
 When errors occur, provide clear, actionable guidance:
 
-### CLI Not Found
-**Symptom**: `command not found: codex` or similar
-
-**Response**:
-"The codex command is not available on this system. To install:
-```bash
-npm install -g @openai/codex
-```
-
-Alternatively, if you have it installed but need an alias, add to your shell config:
-```bash
-alias codex='/path/to/codex'
-```"
-
 ### Network or API Errors
 **Symptom**: Connection timeouts, API errors, authentication failures
 

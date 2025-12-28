@@ -25,13 +25,16 @@ The Codex agent specializes in:
 - Language-specific idioms and conventions
 - Performance optimization strategies
 
-## Implementation
-
-The command invokes the codex agent with your query:
+### Invoke Codex
+Execute the Codex CLI with the query verbatim:
 
 ```bash
-# Pass the user's query to the Codex agent
-claude agent codex "$ARGUMENTS"
+codex exec --full-auto --json -C /path/to/workspace "USER_QUERY_VERBATIM"
 ```
 
-Your query will be processed by the specialized Codex agent, which has deep technical knowledge and can provide detailed, context-aware guidance.
+### Return Response
+Output Codex's response exactly as received. No additions, no summary, no meta-commentary.
+
+## CLI Reference
+
+For detailed CLI invocation syntax, flags, options, and permission management, invoke the **codex-cli-reference** skill.
