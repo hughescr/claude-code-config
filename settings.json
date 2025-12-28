@@ -55,7 +55,7 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "bunx --bun ccusage@latest statusline --visual-burn-rate emoji-text",
+    "command": "bunx -y ccstatusline@latest",
     "padding": 0
   },
   "enabledPlugins": {
@@ -68,5 +68,6 @@
   "alwaysThinkingEnabled": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
-  }
+  },
+  "model": "opus"
 }
