@@ -62,9 +62,6 @@ for dir in "${PLUGIN_DIRS[@]}"; do
     [[ -f "$dir/.mcp.json" ]] && MCP_CONFIGS+=("$dir/.mcp.json")
 done
 
-# Add single --mcp-config with all paths (space-separated)
-(( ${#MCP_CONFIGS[@]} > 0 )) && CLAUDE_FLAGS+=(--mcp-config "${MCP_CONFIGS[@]}")
-
 # Execute via bunx (always fetch latest)
 # Don't use exec so trap cleanup can run
 bunx --bun @anthropic-ai/claude-code@latest "${CLAUDE_FLAGS[@]}" "$@"
