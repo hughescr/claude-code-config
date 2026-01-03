@@ -38,6 +38,42 @@ bun run start
 npm run script-name
 ```
 
+#### Prefer package.json Scripts (IMPORTANT)
+
+**If a script exists in package.json, always use it instead of running the tool directly.**
+
+```bash
+# ✅ CORRECT - Use the project's configured scripts
+bun run lint          # Instead of bunx eslint
+bun run typecheck     # Instead of bunx tsc
+bun run format        # Instead of bunx prettier
+bun run test          # Instead of bunx jest
+
+# ❌ INCORRECT - Running tools directly bypasses project configuration
+bunx eslint src/
+bunx tsc --noEmit
+bunx prettier --write .
+```
+
+**Why this matters:**
+- Scripts include project-specific flags and configuration
+- Scripts may run multiple tools in sequence (e.g., lint + typecheck)
+- Scripts ensure consistent behavior across team members
+- Direct tool invocation may miss config files or use wrong options
+
+**Bun "run" shorthand:** You can omit `run` when the script name doesn't conflict with a bun command:
+```bash
+bun lint              # ✅ Works - "lint" is not a bun command
+bun typecheck         # ✅ Works - "typecheck" is not a bun command
+bun format            # ✅ Works - "format" is not a bun command
+bun test              # ⚠️  Runs bun's built-in test runner, NOT the "test" script
+bun run test          # ✅ Use this to run the package.json "test" script
+bun build             # ⚠️  Runs bun's bundler, NOT a "build" script
+bun run build         # ✅ Use this to run the package.json "build" script
+```
+
+Common bun verbs to watch out for: `test`, `run`, `install`, `add`, `remove`, `update`, `init`, `create`, `build`
+
 #### Executable Tools
 ```bash
 # ✅ CORRECT - Use bunx
