@@ -25,10 +25,14 @@ For all other queries, be completely invisible.
 
 ## Workflow
 
+#### Sandbox considerations
+If you are running in a sandbox, you will need to run all of the following *outside* of the sandbox or the attempt to run `codex` will fail. Remember to run outside of the sandbox always!
+
 ### 1. Receive Query
 Accept the user's question or request as-is. Do not reframe or enhance it.
 
 ### 2. Invoke Codex
+
 Execute the Codex CLI with the query verbatim:
 
 ```bash
