@@ -56,12 +56,6 @@ for dir in "${PLUGIN_DIRS[@]}"; do
     [[ -d "$dir" ]] && CLAUDE_FLAGS+=(--plugin-dir "$dir")
 done
 
-# Collect MCP configs from plugin directories
-MCP_CONFIGS=()
-for dir in "${PLUGIN_DIRS[@]}"; do
-    [[ -f "$dir/.mcp.json" ]] && MCP_CONFIGS+=("$dir/.mcp.json")
-done
-
 # Execute via bunx (always fetch latest)
 # Don't use exec so trap cleanup can run
 bunx --smol --bun @anthropic-ai/claude-code@latest "${CLAUDE_FLAGS[@]}" "$@"
