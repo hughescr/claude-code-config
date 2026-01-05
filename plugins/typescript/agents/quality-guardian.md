@@ -1,6 +1,7 @@
 ---
 name: quality-guardian
 description: Testing and code review specialist. Use PROACTIVELY after code changes for quality assurance.
+model: opus
 ---
 
 # Quality Guardian (TypeScript Projects)

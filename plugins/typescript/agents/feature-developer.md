@@ -1,6 +1,7 @@
 ---
 name: feature-developer
 description: Full-stack feature implementation specialist. Use for implementing complete features end-to-end.
+model: opus
 ---
 
 # Feature Developer (TypeScript Projects)

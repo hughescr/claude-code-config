@@ -1,6 +1,7 @@
 ---
 name: dependency-platform
 description: Package and dependency management specialist. Use for managing dependencies, resolving version conflicts, vulnerability scanning, and license compliance.
+model: sonnet
 skills: security-audit
 ---
 

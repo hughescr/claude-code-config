@@ -1,6 +1,7 @@
 ---
 name: documentation-platform
 description: Technical documentation specialist. Use for creating API docs, architecture diagrams, user guides, README files, and maintaining all project documentation.
+model: sonnet
 skills: documentation-templates
 ---
 

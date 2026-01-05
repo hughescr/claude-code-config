@@ -1,6 +1,7 @@
 ---
 name: debugger-optimizer
 description: Problem solver for debugging and performance optimization. Use when encountering errors or performance issues.
+model: sonnet
 ---
 
 # Debugger-Optimizer (TypeScript Projects)
