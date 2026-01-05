@@ -64,4 +64,4 @@ done
 
 # Execute via bunx (always fetch latest)
 # Don't use exec so trap cleanup can run
-bunx --bun @anthropic-ai/claude-code@latest "${CLAUDE_FLAGS[@]}" "$@"
+bunx --smol --bun @anthropic-ai/claude-code@latest "${CLAUDE_FLAGS[@]}" "$@"
