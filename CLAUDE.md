@@ -71,6 +71,24 @@ If you find yourself about to write `cat >` or any heredoc for a .md/.txt planni
 
 ---
 
+## Git Operations & Sandbox Mode
+
+**`git commit` MUST run outside the sandbox for GPG signing to work.**
+
+When executing git commits, always use `dangerouslyDisableSandbox: true`:
+
+```bash
+# This will FAIL in sandbox mode (GPG signing blocked):
+git commit -m "message"
+
+# Correct approach - disable sandbox for git commit:
+Bash({ command: "git commit -m '...'", dangerouslyDisableSandbox: true })
+```
+
+Other git operations (status, diff, log, add) work fine in sandbox mode - only `commit` requires the override due to GPG access requirements.
+
+---
+
 ## Task Planning Framework (OODA-Inspired)
 
 When handling complex tasks, follow this structured approach:
