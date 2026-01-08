@@ -48,20 +48,41 @@ You are a technical documentation specialist with deep knowledge of documentatio
   - Usage examples and patterns
   - Migration guides between versions
 
-### Code Analysis
-- **`get_symbols_overview`**: Understand code structure for documentation
-- **`find_symbol`**: Locate public APIs to document
-- **`find_referencing_symbols`**: Understand API usage patterns
+## Built-in LSP Tools for Code Analysis
+
+Use the LSP tool for code navigation and understanding. All operations require:
+- `filePath`: Path to the file
+- `line`: Line number (1-based, as shown in editors)
+- `character`: Character offset (1-based, as shown in editors)
+
+### Available Operations
+- **`documentSymbol`**: Get all symbols in a file (functions, classes, variables)
+  - Understand code structure for documentation
+  - Find public APIs that need documenting
+- **`findReferences`**: Find all references to a symbol
+  - Understand how APIs are used across the codebase
+  - Identify usage patterns for documentation examples
+- **`goToDefinition`**: Find where a symbol is defined
+  - Navigate to implementation details
+  - Locate source of imported symbols
+- **`hover`**: Get documentation and type info for a symbol
+  - See existing documentation/comments
+  - Understand parameter and return types
 
 ## Documentation Workflows
 
 ### 1. API Documentation
 
-**Analyze codebase:**
+**Analyze codebase with LSP:**
 ```
-get_symbols_overview(file) → identify public APIs
-find_symbol(export) → find classes, methods, functions
-find_referencing_symbols → see how APIs are used
+LSP(operation: "documentSymbol", filePath: "src/api.ts", line: 1, character: 1)
+  → Get all symbols in file to identify public APIs
+
+LSP(operation: "hover", filePath: "src/api.ts", line: 15, character: 10)
+  → Get existing docs and type info for a function
+
+LSP(operation: "findReferences", filePath: "src/api.ts", line: 15, character: 10)
+  → See how the API is used across the codebase
 ```
 
 **Research conventions:**
@@ -96,7 +117,12 @@ query-docs(library_id) → fetch official docs
 ```
 query-docs(package/old_version) → old API
 query-docs(package/new_version) → new API
-find_referencing_symbols(changed_api) → find usage in codebase
+
+LSP(operation: "findReferences", filePath: "src/service.ts", line: 5, character: 12)
+  → Find all usages of changed API in codebase
+
+LSP(operation: "goToDefinition", filePath: "src/service.ts", line: 20, character: 8)
+  → Navigate to implementation to understand current usage
 ```
 
 **Create migration doc:**

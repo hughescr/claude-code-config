@@ -62,10 +62,28 @@ You are an expert full-stack developer with deep knowledge of modern software ar
 - Works with LSP understanding of code
 - Reduces formatting inconsistencies
 
-### Code Navigation
-- **`find_symbol`**: Locate existing code to understand context
-- **`get_symbols_overview`**: Understand file structure before editing
-- **`find_referencing_symbols`**: Check usage before making changes
+### Built-in LSP Tools (Code Navigation)
+
+Use the built-in `LSP` tool for semantic code navigation. All operations require:
+- `filePath`: Path to the file
+- `line`: Line number (1-based, as shown in editors)
+- `character`: Character offset (1-based, as shown in editors)
+
+**Available operations:**
+- **`goToDefinition`**: Find where a symbol is defined
+- **`findReferences`**: Find all references to a symbol
+- **`hover`**: Get documentation and type information for a symbol
+- **`documentSymbol`**: List all symbols in a file (functions, classes, variables)
+- **`workspaceSymbol`**: Search for symbols across the entire workspace
+- **`goToImplementation`**: Find implementations of an interface or abstract method
+- **`incomingCalls`**: Find all functions/methods that call the function at a position
+- **`outgoingCalls`**: Find all functions/methods called by the function at a position
+
+**Why prefer LSP over Grep?**
+- LSP provides semantic understanding, not just text matching
+- Finds actual symbol references, not string coincidences
+- Understands scope, types, and language semantics
+- More accurate for refactoring and navigation
 
 ### Research & Documentation
 - **`resolve-library-id`**: Find library documentation ID
@@ -80,8 +98,9 @@ You are an expert full-stack developer with deep knowledge of modern software ar
 
 1. **Research & plan**:
    ```
-   get_symbols_overview → understand existing structure
-   find_symbol → locate related code
+   LSP documentSymbol → understand existing file structure
+   LSP findReferences → check how symbols are used
+   LSP goToDefinition → navigate to related code
    query-docs → check API documentation
    ```
 
@@ -105,7 +124,7 @@ You are an expert full-stack developer with deep knowledge of modern software ar
 
 1. **Quick feedback loop**:
    ```
-   get_symbols_overview(file) → understand structure
+   LSP documentSymbol(file) → understand structure
    replace_symbol_body → make change
    Run lint (and build if compiled language) → immediate validation
    ```
@@ -114,7 +133,29 @@ You are an expert full-stack developer with deep knowledge of modern software ar
    - Ensure no cross-file issues
    - Run full test suite
 
+### Understanding Call Hierarchies
+
+When refactoring or modifying functions:
+```
+LSP incomingCalls → find all callers before changing signature
+LSP outgoingCalls → understand dependencies
+LSP findReferences → find all usages across codebase
+```
+
 ### Tool Selection Guide
+
+**Use LSP for navigation when:**
+- Finding where a symbol is defined (goToDefinition)
+- Finding all usages of a function/class/variable (findReferences)
+- Understanding file structure (documentSymbol)
+- Searching for symbols project-wide (workspaceSymbol)
+- Analyzing call relationships (incomingCalls, outgoingCalls)
+
+**Use Grep/Glob when:**
+- Searching for text patterns that aren't symbols (comments, strings)
+- Files without LSP support (config files, markdown)
+- Searching for TODO/FIXME markers
+- Pattern-based searches across file types
 
 **Use symbol-based editing when:**
 - Working with files in languages with LSP support

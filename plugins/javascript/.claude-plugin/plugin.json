@@ -1,7 +1,6 @@
 {
   "name": "javascript",
   "version": "1.0.0",
-  "description": "JavaScript/Node.js development tools - npm packages, Bun runtime, and LSP support",
-  "mcpServers": "./.mcp.json",
-  "lspServers": "./.lsp.json"
+  "description": "JavaScript/Node.js development tools - npm packages and Bun runtime",
+  "mcpServers": "./.mcp.json"
 }

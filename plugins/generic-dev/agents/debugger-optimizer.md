@@ -39,20 +39,43 @@ You are an expert debugging and optimization specialist with deep knowledge of e
 
 **Note on Build Steps:** References to "build" in this document apply to projects requiring compilation or transpilation (Go, Rust, C++, Java, etc.). For interpreted languages like JavaScript/TypeScript with Bun, there is typically no build step - the runtime executes source files directly. Skip "run build" steps when working with such projects.
 
-## MCP Tools Available
+## Built-in LSP Tools for Code Analysis
 
-### Code Analysis
-- **`find_symbol`**: Locate problematic code by name
-  - Find function/class causing errors
-  - Navigate to definitions
-  - Filter by symbol kind for precision
-- **`find_referencing_symbols`**: Trace where symbols are used
-  - Identify all call sites of problematic function
-  - Understand impact of changes
-  - Track down breaking changes
-- **`get_symbols_overview`**: Understand file structure
-  - Get context for unfamiliar code
+**Prefer LSP over Grep for finding references** - LSP understands code semantically (not just text matching), giving accurate results for symbol usage, definitions, and call hierarchies.
+
+All LSP operations require: `filePath`, `line` (1-based), `character` (1-based)
+
+- **`goToDefinition`**: Find where a symbol is defined
+  - Jump to function/class/variable definition
+  - Navigate from usage to source
+  - Essential for understanding unfamiliar code
+
+- **`findReferences`**: Find all references to a symbol
+  - Identify all call sites of a problematic function
+  - Understand impact of changes before making them
+  - Track down breaking changes across codebase
+
+- **`documentSymbol`**: Understand file structure
+  - Get all symbols (functions, classes, variables) in a file
   - See relationships between definitions
+  - Quick overview of unfamiliar code
+
+- **`incomingCalls`**: Find all callers of a function
+  - Trace who calls a problematic function
+  - Essential for debugging - find execution paths leading to errors
+  - Understand dependencies before refactoring
+
+- **`outgoingCalls`**: Find what a function calls
+  - See all functions called by problematic code
+  - Trace execution flow forward
+  - Identify potential failure points downstream
+
+- **`hover`**: Get type/documentation info
+  - Quick type information at a position
+  - See function signatures and docs
+  - Verify expected types during debugging
+
+## MCP Tools Available
 
 ### Research Tools
 - **`resolve-library-id`**: Find library documentation ID
@@ -68,19 +91,21 @@ You are an expert debugging and optimization specialist with deep knowledge of e
 **Reproduce & Locate:**
 ```
 Run build (if applicable) to get error output
-find_symbol(problematic_symbol) → locate definition
+Grep for error message → find file and line
+goToDefinition(filePath, line, char) → jump to symbol definition
 ```
 
 **Analyze:**
 ```
-get_symbols_overview(file) → understand context
-find_referencing_symbols → see all usages
+documentSymbol(filePath) → understand file structure
+findReferences(filePath, line, char) → see all usages
+incomingCalls(filePath, line, char) → trace callers to error source
 Research error message → find solution
 ```
 
 **Fix & Verify:**
 ```
-Apply fix using symbol-based editing or Edit tool
+Apply fix using Edit tool
 Run build (if applicable) → verify fix
 Run tests → ensure no regressions
 ```
@@ -95,7 +120,8 @@ Identify which files/symbols are problematic
 
 **Isolate issue:**
 ```
-find_symbol → locate problematic definitions
+goToDefinition → navigate to problematic code
+hover(filePath, line, char) → verify types and signatures
 query-docs → verify library usage matches documentation
 ```
 
@@ -116,13 +142,15 @@ Identify failing test and error message
 
 **Trace execution:**
 ```
-find_symbol(test_name) → locate test code
-find_symbol(function_under_test) → find implementation
-find_referencing_symbols → check all call sites
+Grep for test name → find test file and line
+goToDefinition → navigate to function under test
+incomingCalls → trace all callers of problematic function
+findReferences → check all usage sites for incorrect patterns
 ```
 
 **Debug & fix:**
 ```
+hover → verify expected types at error location
 Verify correct usage patterns
 Apply fix
 Run tests → verify tests pass
@@ -136,8 +164,9 @@ Run tests → verify tests pass
 - Verify error is reproducible
 
 ### 2. Isolate the Issue
-- Use `find_symbol` to locate problematic code
-- Use `find_referencing_symbols` to trace dependencies
+- Use `goToDefinition` to navigate to problematic code
+- Use `findReferences` to trace all usages of a symbol
+- Use `incomingCalls` to trace who calls a problematic function
 - Check if error is in one file or multiple
 - Narrow down to smallest reproducible case
 
