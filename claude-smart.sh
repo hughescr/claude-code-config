@@ -8,7 +8,8 @@
 #
 # Priority: env var > marker file
 # Priority for mixin plugins: ./.claude/ > ~/.claude/
-# Auto-detected: javascript (via package.json), typescript (via tsconfig.json or package.json)
+# Auto-detected: javascript (via package.json), typescript (via tsconfig.json or package.json),
+#                hugo (via hugo.toml or config.toml with Hugo directories)
 
 set -euo pipefail
 
@@ -28,9 +29,23 @@ elif [[ "$has_package_json" == "true" ]] && command -v jq &>/dev/null; then
     fi
 fi
 
-# Load plugins based on detection (order matters: generic → js → ts)
+# Check for Hugo project
+has_hugo_config="false"
+if [[ -f "hugo.toml" ]] || [[ -f "hugo/hugo.toml" ]] || [[ -f "config/_default/hugo.toml" ]]; then
+    has_hugo_config="true"
+fi
+
+# Load plugins based on detection (order matters: generic → hugo → js → ts)
 if [[ "$has_package_json" == "true" ]]; then
     [[ -d ~/.claude/plugins/generic-dev ]] && PLUGIN_DIRS+=(~/.claude/plugins/generic-dev)
+fi
+
+# Load Hugo plugin if Hugo config detected
+if [[ "$has_hugo_config" == "true" ]]; then
+    [[ -d ~/.claude/plugins/hugo ]] && PLUGIN_DIRS+=(~/.claude/plugins/hugo)
+fi
+
+if [[ "$has_package_json" == "true" ]]; then
     [[ -d ~/.claude/plugins/javascript ]] && PLUGIN_DIRS+=(~/.claude/plugins/javascript)
 
     if [[ "$is_typescript" == "true" ]]; then

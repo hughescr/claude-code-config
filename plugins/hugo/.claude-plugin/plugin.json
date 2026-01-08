@@ -1,0 +1,5 @@
+{
+  "name": "hugo",
+  "version": "1.0.0",
+  "description": "Hugo static site development plugin with agents for template development, content management, asset pipeline, and AWS deployment"
+}
