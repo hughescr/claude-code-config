@@ -22,3 +22,5 @@ plugins/install-counts-cache.json
 plugins/installed_plugins.json
 plugins/known_marketplaces.json
 telemetry
+cache
+.serena
