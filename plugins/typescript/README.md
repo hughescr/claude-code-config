@@ -1,44 +1,26 @@
 # TypeScript Plugin
 
-TypeScript-specific agent overrides with MCP tool integrations for Claude Code.
-
-## Agents
-
-| Agent | Model | Description |
-|-------|-------|-------------|
-| **debugger-optimizer** | sonnet | Problem solver for debugging and performance optimization |
-| **dependency-platform** | sonnet | Package and dependency management specialist |
-| **documentation-platform** | sonnet | Technical documentation specialist |
-| **feature-developer** | opus | Full-stack feature implementation specialist |
-| **quality-guardian** | opus | Testing and code review specialist |
+TypeScript-specific development tools for Claude Code.
 
 ## Skills
 
-### typescript-standards
+- **typescript-quality**: TypeScript-specific quality standards (type checking, strict mode, TSDoc)
 
-Core TypeScript/JavaScript runtime standards enforcing a **Bun-first approach**:
+## Hooks
 
-- Use `bun` instead of `node` for execution
-- Use `bun install/add/remove` instead of `npm/yarn/pnpm`
-- Use `bunx` instead of `npx`
-- Prefer `package.json` scripts over direct tool invocation
+- **block-tsc-with-files**: Prevents running `tsc` with individual file arguments (TypeScript needs full project context)
 
-## Integrations
+## Usage
 
-### MCP Server
+This plugin is automatically loaded for TypeScript projects (detected via `tsconfig.json` or typescript in package.json). It builds on:
+- **generic-dev**: Symbol editing, documentation tools
+- **javascript**: npm packages, Bun runtime, LSP
 
-**DevTools** via `@hughescr/mcp-proxy-processor`
+The typescript-language-server (provided by javascript plugin) handles TypeScript files.
 
-Provides symbol-based editing, TypeScript diagnostics, and code navigation tools to agents.
+## Plugin Stack
 
-### LSP Server
-
-**typescript-language-server** for TypeScript/JavaScript files.
-
-Supported extensions: `.ts`, `.tsx`, `.js`, `.jsx`, `.mts`, `.cts`, `.mjs`, `.cjs`
-
-### Hooks
-
-**PreToolUse: block-tsc-with-files**
-
-Blocks `tsc` invocations with direct file arguments. TypeScript should process the entire project for proper type-checking. Use `tsc --noEmit` or `bun run typecheck` instead.
+For TypeScript projects, plugins are loaded in order:
+1. `generic-dev` - DevTools MCP (symbol editing, docs, security)
+2. `javascript` - nodejs-packages MCP, LSP, Bun runtime skill
+3. `typescript` - TypeScript quality skill, tsc hooks

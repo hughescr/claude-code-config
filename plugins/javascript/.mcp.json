@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "nodejs-packages": {
+      "command": "bunx",
+      "args": ["@hughescr/mcp-proxy-processor@latest", "serve", "nodejs-packages"]
+    }
+  }
+}

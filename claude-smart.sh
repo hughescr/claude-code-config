@@ -8,19 +8,34 @@
 #
 # Priority: env var > marker file
 # Priority for mixin plugins: ./.claude/ > ~/.claude/
-# Auto-detected: typescript (via tsconfig.json or package.json)
+# Auto-detected: javascript (via package.json), typescript (via tsconfig.json or package.json)
 
 set -euo pipefail
 
 # Build up a set of plugin directories to load
 PLUGIN_DIRS=()
 
-# Detect TypeScript project
-if [[ -f "tsconfig.json" ]] || \
-   { [[ -f "package.json" ]] && command -v jq &>/dev/null && \
-     jq -e '.devDependencies.typescript // .dependencies.typescript' package.json &>/dev/null 2>&1; }; then
+# Detect project type
+has_package_json=false
+[[ -f "package.json" ]] && has_package_json=true
 
-    [[ -d ~/.claude/plugins/typescript ]] && PLUGIN_DIRS+=(~/.claude/plugins/typescript)
+is_typescript=false
+if [[ -f "tsconfig.json" ]]; then
+    is_typescript=true
+elif [[ "$has_package_json" == "true" ]] && command -v jq &>/dev/null; then
+    if jq -e '.devDependencies.typescript // .dependencies.typescript' package.json &>/dev/null 2>&1; then
+        is_typescript=true
+    fi
+fi
+
+# Load plugins based on detection (order matters: generic → js → ts)
+if [[ "$has_package_json" == "true" ]]; then
+    [[ -d ~/.claude/plugins/generic-dev ]] && PLUGIN_DIRS+=(~/.claude/plugins/generic-dev)
+    [[ -d ~/.claude/plugins/javascript ]] && PLUGIN_DIRS+=(~/.claude/plugins/javascript)
+
+    if [[ "$is_typescript" == "true" ]]; then
+        [[ -d ~/.claude/plugins/typescript ]] && PLUGIN_DIRS+=(~/.claude/plugins/typescript)
+    fi
 fi
 
 # Detect and apply mixins (env var takes priority over marker file)

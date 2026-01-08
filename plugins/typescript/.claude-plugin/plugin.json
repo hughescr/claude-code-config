@@ -1,7 +1,5 @@
 {
   "name": "typescript",
   "version": "1.0.0",
-  "description": "TypeScript-specific agent overrides with MCP tool integrations",
-  "lspServers": "./.lsp.json",
-  "mcpServers": "./.mcp.json"
+  "description": "TypeScript-specific development tools - type checking, strict mode, and TSDoc"
 }
