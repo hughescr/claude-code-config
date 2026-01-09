@@ -24,3 +24,4 @@ plugins/known_marketplaces.json
 telemetry
 cache
 .serena
+paste-cache
