@@ -89,34 +89,56 @@ Other git operations (status, diff, log, add) work fine in sandbox mode - only `
 
 ---
 
-## Task Planning Framework (OODA-Inspired)
+## Task Framework: Consensus-OODA (Grove-Inspired)
 
-When handling complex tasks, follow this structured approach:
+**Core Principle**: The orchestrator ratifies good decisions from paired sub-agents—never decides alone.
 
-### 1. OBSERVE
-- Analyze existing codebase structure
-- Review tests, documentation, and logs
-- Identify affected components
-- Check monitoring/metrics if available
+### Consensus Pattern
 
-### 2. ORIENT
-- Map requirements to architecture layers
-- Identify relevant patterns and conventions
-- Assess technical constraints
-- Consider security/performance implications
+```
+┌─────────────────────────────────────────────────────────────┐
+│  ORCHESTRATOR (Grove-style Executive)                       │
+│  - Defines values/criteria for the phase                    │
+│  - Delegates to agent pair                                  │
+│  - Facilitates message-passing between agents               │
+│  - Ratifies consensus (or sends back for more iteration)    │
+└─────────────────────────────────────────────────────────────┘
+         │                                    │
+         ▼                                    ▼
+┌─────────────────────┐         ┌─────────────────────┐
+│  AGENT A            │ ◄─────► │  AGENT B            │
+│  (Primary focus)    │         │  (Complementary)    │
+└─────────────────────┘         └─────────────────────┘
+         │                                    │
+         └────────── CONSENSUS ───────────────┘
+                         │
+                         ▼
+              [Orchestrator Ratifies]
+```
 
-### 3. DECIDE
-- Break down into atomic tasks
-- Identify dependencies (parallel vs sequential)
-- Assign to appropriate sub-agents
-- Define acceptance criteria per task
-- Set quality gates
+### Generic Orchestrator Script (All Phases)
 
-### 4. ACT
-- Delegate to specialized agents
-- Monitor progress via tmux/outputs
-- Validate against acceptance criteria
-- Iterate based on feedback
+1. **Delegate**: Launch 2 agents with complementary focus areas
+2. **Facilitate**: Share A's output with B: "Do you agree? What would you add?"
+3. **Iterate**: Share B's feedback with A: "Address this. Consensus reached?"
+4. **Ratify**: When both explicitly agree, validate against project values
+5. **Enforce**: If inadequate, send agents back to iterate
+
+### OODA Phase Definitions
+
+| Phase | Agent A Focus | Agent B Focus |
+|-------|---------------|---------------|
+| **OBSERVE** | Direct investigation (files, functions, flows) | Broad patterns (conventions, related systems) |
+| **ORIENT** | Propose primary approach | Challenge, validate, propose alternatives |
+| **DECIDE** | Task breakdown with acceptance criteria | Validate completeness, identify gaps |
+| **ACT** | Implement the task | Review against criteria, suggest corrections |
+
+### Consensus Signals
+Agents state: "Consensus reached—I endorse this" or "Not yet—need resolution on [X]"
+
+### Fast Path (Single-Agent)
+Use single-agent for: trivial tasks, pure info gathering, user requests speed.
+Use pairs for: design decisions, committed code, multi-file changes, security/performance.
 
 ## Task Dependency Management
 
