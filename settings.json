@@ -36,8 +36,19 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/Users/craig/.claude/hooks/block-temp-planning-files.sh",
+            "command": "${HOME}/.claude/hooks/block-temp-planning-files.sh",
             "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/cleanup-old-files.sh",
+            "timeout": 30
           }
         ]
       }
