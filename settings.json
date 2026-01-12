@@ -40,6 +40,16 @@
             "timeout": 5000
           }
         ]
+      },
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/approve-plugin-skills.sh",
+            "timeout": 5000
+          }
+        ]
       }
     ],
     "SessionEnd": [
