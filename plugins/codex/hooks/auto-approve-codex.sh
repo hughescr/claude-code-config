@@ -22,8 +22,8 @@ if [[ "$command" =~ ^codex[[:space:]]+exec[[:space:]] ]]; then
      [[ "$command" =~ --json ]] && \
      [[ "$command" =~ -C[[:space:]] ]]; then
     # Auto-approve codex exec commands with the expected flags
-    echo '{"hookSpecificOutput": {"permissionDecision": "allow"}}' >&2
-    exit 2
+    echo '{"hookSpecificOutput": {"permissionDecision": "allow"}}'
+    exit 0
   fi
 fi
 

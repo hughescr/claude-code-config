@@ -7,10 +7,10 @@ command=$(echo "$input" | jq -r '.tool_input.command // empty')
 [ -z "$command" ] && exit 0
 
 deny_heredoc() {
-  cat >&2 << 'ERRMSG'
+  cat << 'ERRMSG'
 {"hookSpecificOutput": {"permissionDecision": "deny"}, "systemMessage": "BLOCKED: Creating files via heredoc is forbidden. Use TodoWrite for task tracking, or use the Write tool for legitimate file creation. See CLAUDE.md."}
 ERRMSG
-  exit 2
+  exit 0
 }
 
 # Check for heredoc marker (case-insensitive delimiter)

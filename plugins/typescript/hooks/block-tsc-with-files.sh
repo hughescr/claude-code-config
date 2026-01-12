@@ -7,10 +7,10 @@ command=$(echo "$input" | jq -r '.tool_input.command // empty')
 [ -z "$command" ] && exit 0
 
 deny_tsc_files() {
-  cat >&2 << 'ERRMSG'
+  cat << 'ERRMSG'
 {"hookSpecificOutput": {"permissionDecision": "deny"}, "systemMessage": "BLOCKED: tsc should not be run with individual file arguments. TypeScript needs to process the entire project for proper type-checking. Remove the file arguments and run 'tsc --noEmit' instead."}
 ERRMSG
-  exit 2
+  exit 0
 }
 
 # Extract the tsc command portion (handles direct tsc, npx tsc, pnpm tsc, yarn tsc)
