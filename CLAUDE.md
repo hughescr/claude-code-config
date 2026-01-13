@@ -71,6 +71,54 @@ If you find yourself about to write `cat >` or any heredoc for a .md/.txt planni
 
 ---
 
+## CRITICAL: Sub-Agent Skill Restrictions
+
+**Sub-agents MUST NEVER use the Skill tool. Invoking non-existent skills CRASHES Claude Code.**
+
+### Why This Is Critical
+- Sub-agents do NOT inherit CLAUDE.md instructions
+- Sub-agents only receive what the orchestrator passes in the `prompt` parameter
+- Without explicit instruction, sub-agents may guess at skill names and crash the session
+- The crash occurs when the tool_call is issued — hooks cannot prevent it
+
+### STRICTLY FORBIDDEN for Sub-Agents
+- ❌ Invoking ANY skill without explicit orchestrator instruction
+- ❌ Guessing skill names that "should" exist
+- ❌ Assuming a skill exists based on context or naming patterns
+- ❌ Using Skill tool to invoke built-in CLI commands (/help, /clear, etc.)
+
+### If You Think a Skill Would Help
+Do NOT invoke it. Instead, complete your task and note in your response:
+"Consider invoking skill [name] for [reason]"
+The orchestrator will decide whether to invoke it.
+
+---
+
+## CRITICAL: Sub-Agent Prompt Requirements
+
+**Every Task tool invocation MUST include the critical restrictions preamble.**
+
+### Standard Preamble (MANDATORY)
+Include this at the start of every sub-agent prompt:
+
+```
+CRITICAL RESTRICTIONS:
+- NEVER use the Skill tool. Invoking non-existent skills crashes Claude Code.
+- Use TodoWrite for task tracking, never temp files.
+- For git commit, use dangerouslyDisableSandbox: true for GPG signing.
+
+YOUR TASK:
+[actual task details here]
+```
+
+### Why This Is Mandatory
+- Sub-agents do NOT inherit CLAUDE.md instructions
+- Sub-agents get only what you pass in the `prompt` parameter
+- Without explicit instruction, sub-agents may violate critical rules
+- This preamble prevents crashes and enforces consistency
+
+---
+
 ## Git Operations & Sandbox Mode
 
 **`git commit` MUST run outside the sandbox for GPG signing to work.**
