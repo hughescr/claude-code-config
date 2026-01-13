@@ -1,4 +1,24 @@
 #!/bin/bash
+# ============================================================================
+# PreToolUse Hook Return Semantics
+# Docs: https://docs.anthropic.com/en/docs/claude-code/hooks
+# ============================================================================
+#
+# Exit Code | Stream  | Behavior
+# ----------|---------|----------------------------------------------------------
+# 0         | stdout  | Success - tool proceeds. If stdout contains JSON with
+#           |         | {"hookSpecificOutput": {"permissionDecision": "allow"}},
+#           |         | the tool runs without user permission prompt.
+#           |         | Empty stdout = no opinion, normal permission flow.
+# ----------|---------|----------------------------------------------------------
+# 2         | stderr  | Decision provided - Claude reads stderr for JSON:
+#           |         | {"hookSpecificOutput": {"permissionDecision": "deny|ask"},
+#           |         |  "systemMessage": "explanation for Claude"}
+#           |         | "deny" = block the tool, "ask" = prompt user
+# ----------|---------|----------------------------------------------------------
+# other     | stderr  | Error - shown to user only, Claude unaware, tool proceeds
+# ============================================================================
+
 # Auto-approve bash commands that run the expected codex CLI pattern
 
 input=$(cat)

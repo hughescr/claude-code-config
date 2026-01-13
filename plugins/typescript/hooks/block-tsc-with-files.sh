@@ -1,4 +1,24 @@
 #!/bin/bash
+# ============================================================================
+# PreToolUse Hook Return Semantics
+# Docs: https://docs.anthropic.com/en/docs/claude-code/hooks
+# ============================================================================
+#
+# Exit Code | Stream  | Behavior
+# ----------|---------|----------------------------------------------------------
+# 0         | stdout  | Success - tool proceeds. If stdout contains JSON with
+#           |         | {"hookSpecificOutput": {"permissionDecision": "allow"}},
+#           |         | the tool runs without user permission prompt.
+#           |         | Empty stdout = no opinion, normal permission flow.
+# ----------|---------|----------------------------------------------------------
+# 2         | stderr  | Decision provided - Claude reads stderr for JSON:
+#           |         | {"hookSpecificOutput": {"permissionDecision": "deny|ask"},
+#           |         |  "systemMessage": "explanation for Claude"}
+#           |         | "deny" = block the tool, "ask" = prompt user
+# ----------|---------|----------------------------------------------------------
+# other     | stderr  | Error - shown to user only, Claude unaware, tool proceeds
+# ============================================================================
+
 set -euo pipefail
 
 input=$(cat)
@@ -7,10 +27,10 @@ command=$(echo "$input" | jq -r '.tool_input.command // empty')
 [ -z "$command" ] && exit 0
 
 deny_tsc_files() {
-  cat << 'ERRMSG'
+  cat << 'ERRMSG' >&2
 {"hookSpecificOutput": {"permissionDecision": "deny"}, "systemMessage": "BLOCKED: tsc should not be run with individual file arguments. TypeScript needs to process the entire project for proper type-checking. Remove the file arguments and run 'tsc --noEmit' instead."}
 ERRMSG
-  exit 0
+  exit 2
 }
 
 # Extract the tsc command portion (handles direct tsc, npx tsc, pnpm tsc, yarn tsc)
