@@ -63,7 +63,7 @@ if [ "$found" = false ]; then
 fi
 
 if [ "$found" = true ]; then
-  echo '{"decision": "approve"}'
+  echo '{"hookSpecificOutput": {"permissionDecision": "allow"}}'
   exit 0
 else
   # Unknown plugin, passthrough to normal permission system
