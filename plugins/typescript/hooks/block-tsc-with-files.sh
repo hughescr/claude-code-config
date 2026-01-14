@@ -28,7 +28,7 @@ command=$(echo "$input" | jq -r '.tool_input.command // empty')
 
 deny_tsc_files() {
   cat << 'ERRMSG' >&2
-{"hookSpecificOutput": {"permissionDecision": "deny"}, "systemMessage": "BLOCKED: tsc should not be run with individual file arguments. TypeScript needs to process the entire project for proper type-checking. Remove the file arguments and run 'tsc --noEmit' instead."}
+{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny"}, "systemMessage": "BLOCKED: tsc should not be run with individual file arguments. TypeScript needs to process the entire project for proper type-checking. Remove the file arguments and run 'tsc --noEmit' instead."}
 ERRMSG
   exit 2
 }

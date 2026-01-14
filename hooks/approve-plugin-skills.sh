@@ -63,7 +63,7 @@ if [ "$found" = false ]; then
 fi
 
 if [ "$found" = true ]; then
-  echo '{"hookSpecificOutput": {"permissionDecision": "allow"}}'
+  echo '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}'
   exit 0
 else
   # Unknown plugin, passthrough to normal permission system
