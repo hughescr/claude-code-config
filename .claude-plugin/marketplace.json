@@ -1,0 +1,24 @@
+{
+  "$schema": "https://raw.githubusercontent.com/anthropics/claude-code/main/schemas/marketplace.schema.json",
+  "name": "craigs-claude-plugins",
+  "owner": {
+    "name": "Craig Hughes",
+    "email": "craig.github@rungie.com"
+  },
+  "metadata": {
+    "description": "Craig's Claude plugins"
+  },
+  "plugins": [
+    {
+      "name": "hugo",
+      "source": "./plugins/hugo",
+      "description": "Hugo static site development plugin",
+      "version": "1.0.0",
+      "category": "development",
+      "author": {
+        "name": "Craig Hughes",
+        "email": "craig.github@rungie.com"
+      }
+    }
+  ]
+}
