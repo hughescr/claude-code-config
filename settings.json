@@ -58,7 +58,7 @@
           {
             "type": "command",
             "command": "${HOME}/.claude/hooks/cleanup-old-files.sh",
-            "timeout": 30
+            "timeout": 30000
           }
         ]
       }
