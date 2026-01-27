@@ -137,6 +137,45 @@ Other git operations (status, diff, log, add) work fine in sandbox mode - only `
 
 ---
 
+## Git Submodule Management
+
+**Some plugins in ~/.claude are managed as git submodules pointing to external repositories.**
+
+### What This Means
+- Submodules are external git repos embedded within this repo
+- They track specific commits from upstream sources
+- Updates must be pulled explicitly (they don't auto-update)
+- More submodules may be added over time as the plugin ecosystem grows
+
+### Maintenance Cadence
+Claude should periodically check if submodules are out of date:
+- **Weekly**: When starting a new session, consider checking for updates
+- **On plugin work**: Always check before modifying or debugging plugin-related code
+- **After major releases**: Upstream plugins may have important updates
+
+### Commands
+
+```bash
+# Check for available updates (fetch without applying)
+cd ~/.claude
+git submodule update --remote --dry-run
+
+# Actually update all submodules to latest
+git submodule update --remote
+
+# Commit the submodule updates
+git add -A
+git commit -m "Update submodules to latest"
+```
+
+### Notes
+- The `--dry-run` flag shows what would change without modifying anything
+- After updating, review the changes before committing
+- Submodule updates may introduce breaking changes - test after updating
+- If a submodule update causes issues, you can revert with `git checkout -- <submodule-path>`
+
+---
+
 ## Task Framework: Consensus-OODA (Grove-Inspired)
 
 **Core Principle**: The orchestrator ratifies good decisions from paired sub-agents—never decides alone.
