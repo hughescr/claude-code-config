@@ -81,6 +81,7 @@ When modifying a function in a file:
 
 ### After Making Changes
 1. Run appropriate linting tools for the language
+   - **Tip:** For ESLint projects, use `bun lint --fix` or `eslint --fix` to automatically fix many formatting issues
 2. Run the project's test suite
 3. Verify no new errors introduced
 4. Follow project's code style conventions

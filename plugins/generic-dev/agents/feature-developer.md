@@ -117,7 +117,7 @@ Use the built-in `LSP` tool for semantic code navigation. All operations require
 
 4. **Iterate until clean**:
    - Fix all compilation errors
-   - Fix all linting errors and warnings
+   - Fix linting errors—use `bun lint --fix` or `eslint --fix` to auto-fix formatting issues
    - Ensure all tests pass
 
 ### Single-File Iteration

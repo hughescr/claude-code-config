@@ -76,3 +76,13 @@ Before completing TypeScript work:
 4. TSDoc comments on exported functions, classes, and types
 5. Strict mode compliance (null safety, no @ts-ignore abuse)
 6. @types packages added for dependencies without bundled types
+
+## ESLint Auto-Fix
+
+For formatting and stylistic issues, use auto-fix to save time:
+```bash
+bun lint --fix     # If project uses bun scripts
+eslint --fix .     # Direct eslint command
+```
+
+Auto-fix handles: trailing commas, semicolons, quotes, spacing, import order, and many other formatting rules. Always review changes after running auto-fix.

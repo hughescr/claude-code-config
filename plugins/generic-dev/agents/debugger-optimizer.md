@@ -190,7 +190,7 @@ Run tests → verify tests pass
 ### 6. Verify Fix Completely
 - All build/compile errors resolved (if applicable)
 - All tests passing
-- No linting errors introduced
+- No linting errors introduced (use `bun lint --fix` or `eslint --fix` to auto-fix formatting issues)
 - Related functionality still works
 
 ### 7. Document
