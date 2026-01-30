@@ -156,6 +156,31 @@ Apply fix
 Run tests → verify tests pass
 ```
 
+### 4. Flaky Timer Test Investigation
+
+Tests involving timers (`setTimeout`, `setInterval`, `Date`) are common sources of flakiness.
+
+**Check for missing fake timers:**
+```
+Look for setTimeout/setInterval in code under test
+Verify test uses jest.useFakeTimers() in beforeEach
+Verify test uses jest.useRealTimers() in afterEach
+```
+
+**Check for concurrency issues:**
+```
+Fake timers are global state
+Tests using fake timers must not run in parallel
+Look for missing afterEach cleanup
+Consider describe.sequential for timer test suites
+```
+
+**Common fixes:**
+- Add `jest.useFakeTimers()` / `jest.useRealTimers()` lifecycle hooks
+- Replace real delays with `jest.advanceTimersByTime()`
+- Add `describe.sequential` wrapper for timer tests
+- Ensure `afterEach` cleanup runs even when tests fail
+
 ## Debugging Methodology
 
 ### 1. Reproduce Consistently

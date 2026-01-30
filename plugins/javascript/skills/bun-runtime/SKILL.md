@@ -108,6 +108,27 @@ npm test
 npm run jest
 ```
 
+#### Fake Timers (MANDATORY for timer tests)
+
+When testing code with `setTimeout`, `setInterval`, or `Date`, **always use fake timers**:
+
+```javascript
+import { jest } from 'bun:test';
+
+beforeEach(() => { jest.useFakeTimers(); });
+afterEach(() => { jest.useRealTimers(); });
+
+jest.advanceTimersByTime(1000);  // Advance fake time
+jest.runAllTimers();             // Run all pending timers
+jest.setSystemTime(new Date()); // Mock Date.now()
+```
+
+**Never rely on real timers in tests** - they cause slow, flaky, non-deterministic results.
+
+**Concurrency warning**: Fake timers are global state. Tests using fake timers should not run in parallel. Use `describe.sequential` or ensure proper cleanup in `afterEach`.
+
+See the **testing-standards** skill for comprehensive patterns and examples.
+
 ## No Build Step Required
 
 Unlike traditional JavaScript/TypeScript workflows, Bun runs source files directly:

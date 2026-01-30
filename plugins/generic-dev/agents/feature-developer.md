@@ -180,6 +180,9 @@ Load appropriate quality skill for your project language. This agent provides ge
 - **Async**: Proper async/await handling where applicable
 - **Error handling**: Consistent error handling patterns
 - **Testing**: Write tests for new functionality
+  - **MANDATORY**: Use fake timers for any timer-dependent code (`setTimeout`, `setInterval`, `Date`)
+  - Never rely on real timers - they cause slow, flaky tests
+  - Always clean up fake timers in `afterEach` to prevent test pollution
 
 ## Collaboration
 
