@@ -162,15 +162,14 @@ Claude should periodically check if submodules are out of date:
 
 ```bash
 # Check for available updates (fetch without applying)
-cd ~/.claude
-git submodule update --remote --dry-run
+git -C ~/.claude submodule update --remote --dry-run
 
 # Actually update all submodules to latest
-git submodule update --remote
+git -C ~/.claude submodule update --remote
 
 # Commit the submodule updates
-git add -A
-git commit -m "Update submodules to latest"
+git -C ~/.claude add -A
+git -C ~/.claude commit -m "Update submodules to latest"
 ```
 
 ### Notes
@@ -251,7 +250,7 @@ Example:
 ## Task Tracking Guidelines
 
 ### For Orchestrators
-- Use the **Plan agent** for complex multi-step orchestration
+- Use the **Plan agent** (`subagent_type: Plan`) for complex multi-step orchestration
 - The Plan agent helps break down work and coordinate sub-agents
 - Orchestrators delegate implementation; Plan agent helps structure that delegation
 
@@ -285,7 +284,7 @@ When a sub-agent receives a delegated task:
 ## Quality Mindset
 
 Before completing any significant change, ensure:
-- ✓ Architecture/approach validated (use Codex skill for complex decisions)
+- ✓ Architecture/approach validated (use Codex skill from `plugins/codex` for complex decisions)
 - ✓ Tests passing
 - ✓ Linting clean
 - ✓ Security considered
