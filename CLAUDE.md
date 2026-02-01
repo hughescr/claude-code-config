@@ -52,22 +52,27 @@ printf "..." > /tmp/notes.md
 
 ### Why This Rule Exists
 - Temporary files waste context on file I/O instead of actual work
-- TodoWrite provides structured, visible task tracking
+- Task management tools (TaskCreate/TaskList/TaskUpdate) provide structured, visible task tracking
 - Planning files get lost and create clutter
 - The orchestrator cannot see your temp files
 
 ### The ONLY Correct Approach
-Use **TodoWrite** for ALL task tracking and planning:
+Use **Task Management Tools** for ALL task tracking and planning:
 ```
-TodoWrite([
-  {content: "Analyze existing code", status: "in_progress", activeForm: "Analyzing existing code"},
-  {content: "Implement feature X", status: "pending", activeForm: "Implementing feature X"},
-  ...
-])
+TaskCreate({
+  subject: "Analyze existing code",
+  description: "Review the codebase structure",
+  activeForm: "Analyzing existing code"
+})
+
+TaskUpdate({
+  taskId: "1",
+  status: "in_progress"
+})
 ```
 
 ### Enforcement
-If you find yourself about to write `cat >` or any heredoc for a .md/.txt planning file, STOP. Use TodoWrite instead.
+If you find yourself about to write `cat >` or any heredoc for a .md/.txt planning file, STOP. Use TaskCreate instead.
 
 ---
 
@@ -104,7 +109,7 @@ Include this at the start of every sub-agent prompt:
 ```
 CRITICAL RESTRICTIONS:
 - NEVER use the Skill tool. Invoking non-existent skills crashes Claude Code.
-- Use TodoWrite for task tracking, never temp files.
+- Use TaskCreate/TaskUpdate for task tracking, never temp files.
 - For git commit, use dangerouslyDisableSandbox: true for GPG signing.
 
 YOUR TASK:
@@ -256,7 +261,7 @@ Example:
 
 When a sub-agent receives a delegated task:
 
-**MANDATORY - Use TodoWrite:**
+**MANDATORY - Use Task Management Tools (TaskCreate/TaskList/TaskUpdate):**
 - Create todos for each sub-task you identify
 - Mark `in_progress` as you begin each task
 - Mark `completed` when finished
@@ -272,10 +277,10 @@ When a sub-agent receives a delegated task:
 **Why This Matters:**
 1. Temp files waste tokens on file I/O
 2. The orchestrator cannot see your temp files
-3. TodoWrite is visible and structured
+3. Task tools are visible and structured
 4. Planning files create noise and get abandoned
 
-**If you're tempted to write a planning file, use TodoWrite instead. No exceptions.**
+**If you're tempted to write a planning file, use TaskCreate instead. No exceptions.**
 
 ## Quality Mindset
 
