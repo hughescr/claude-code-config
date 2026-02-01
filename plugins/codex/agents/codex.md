@@ -72,8 +72,29 @@ This returns a `task_id`. Save this ID for the next step.
 
 ### 3. Wait for Completion
 
-Call TaskOutput repeatedly until the task completes:
+**⚠️ CRITICAL: Use TaskOutput ONLY - Never Read Output Files Directly**
 
+When you run Bash with `run_in_background: true`, it returns:
+- `task_id` - Use this with TaskOutput
+- `output_file` - **IGNORE THIS COMPLETELY**
+
+**FORBIDDEN PATTERNS** (never do any of these):
+```bash
+# ❌ WRONG - Reading output file with Read tool
+Read({ file_path: "/tmp/claude/.../output.txt" })
+
+# ❌ WRONG - Reading output file with tail
+Bash({ command: "tail -f /tmp/claude/.../output.txt" })
+
+# ❌ WRONG - Reading output file with cat
+Bash({ command: "cat /tmp/claude/.../output.txt" })
+
+# ❌ WRONG - Any other Bash file-reading command
+Bash({ command: "head /tmp/claude/..." })
+Bash({ command: "less /tmp/claude/..." })
+```
+
+**CORRECT** (always do this):
 ```
 TaskOutput({
   task_id: "<the task_id from step 2>",
@@ -81,6 +102,10 @@ TaskOutput({
   timeout: 600000
 })
 ```
+
+The `output_file` path exists but you must **never** use it. TaskOutput is the only valid way to get background task output.
+
+Call TaskOutput repeatedly until the task completes.
 
 **How this works:**
 - `block: true` means TaskOutput returns **immediately** when the task completes
