@@ -17,6 +17,7 @@
       "Write(/tmp/claude/codex-query.*)",
       "Bash(~/.claude/plugins/codex/scripts/codex-start.sh *)",
       "Bash(~/.claude/plugins/codex/scripts/codex-wait.sh *)",
+      "Bash(~/.claude/plugins/codex/scripts/codex-get-session-id.sh *)",
       "Read(/tmp/claude/codex*/*)"
     ],
     "deny": [],
