@@ -13,12 +13,12 @@
       "Bash(wc:*)",
       "Bash(find:*)",
       "Bash(curl:*)",
+      "Read(/tmp/claude/**)",
+      "Write(/tmp/claude/**)",
       "Bash(mktemp /tmp/claude/codex-query.XXXXXX)",
-      "Write(/tmp/claude/codex-query.*)",
       "Bash(~/.claude/plugins/codex/scripts/codex-start.sh *)",
       "Bash(~/.claude/plugins/codex/scripts/codex-wait.sh *)",
-      "Bash(~/.claude/plugins/codex/scripts/codex-get-session-id.sh *)",
-      "Read(/tmp/claude/codex*/*)"
+      "Bash(~/.claude/plugins/codex/scripts/codex-get-session-id.sh *)"
     ],
     "deny": [],
     "ask": [],
