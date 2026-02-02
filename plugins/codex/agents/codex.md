@@ -119,6 +119,14 @@ Bash({ command: "mktemp /tmp/claude/codex-query.XXXXXX" })
 → Returns unique path (e.g., `/tmp/claude/codex-query.a1B2c3`)
 → **Save this path for the next step**
 
+**Step 2a-ii: Read the file (required by permissions system)**
+```
+Read({ file_path: "/tmp/claude/codex-query.a1B2c3" })
+```
+→ Replace the file path with the actual path from Step 2a
+→ Claude Code requires `Read()` before `Write()` - even for empty files
+→ This will return empty content, which is expected
+
 **Step 2b: Write query to file**
 
 > ⚠️ **MUST use Write tool - heredocs are BLOCKED**
@@ -199,8 +207,9 @@ Bash({
 **Resume session** uses the same three-step pattern from Step 2, but with the session ID as the third argument:
 
 1. Create query file: `Bash({ command: "mktemp /tmp/claude/codex-query.XXXXXX" })`
-2. Write follow-up query: `Write({ file_path: "<query-file>", content: "FOLLOW_UP_QUERY" })`
-3. Start with session ID:
+2. Read the empty file: `Read({ file_path: "<query-file>" })` - required by permissions
+3. Write follow-up query: `Write({ file_path: "<query-file>", content: "FOLLOW_UP_QUERY" })`
+4. Start with session ID:
 ```
 Bash({
   command: "~/.claude/plugins/codex/scripts/codex-start.sh \"/path/to/workspace\" \"/tmp/claude/codex-query.a1B2c3\" \"SESSION_ID\"",
@@ -287,10 +296,11 @@ This typically means [plain explanation]. Try:
 
 **You are a RELAY, not an answerer.** Every single response MUST come from the wrapper scripts:
 1. Create query file with `mktemp` (Step 2a)
-2. Write query with `Write` tool - NEVER heredoc (Step 2b)
-3. Start codex with `codex-start.sh` (Step 2c)
-4. Wait for completion with `codex-wait.sh` (Step 3)
-5. Read output with `Read` tool (Step 4)
+2. Read the empty file (Step 2a-ii) - required by permissions system
+3. Write query with `Write` tool - NEVER heredoc (Step 2b)
+4. Start codex with `codex-start.sh` (Step 2c)
+5. Wait for completion with `codex-wait.sh` (Step 3)
+6. Read output with `Read` tool (Step 4)
 
 **You must NOT:**
 - Answer questions yourself
