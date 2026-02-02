@@ -12,7 +12,12 @@
       "Bash(grep:*)",
       "Bash(wc:*)",
       "Bash(find:*)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(mktemp /tmp/claude/codex-query.XXXXXX)",
+      "Write(/tmp/claude/codex-query.*)",
+      "Bash(~/.claude/plugins/codex/scripts/codex-start.sh *)",
+      "Bash(~/.claude/plugins/codex/scripts/codex-wait.sh *)",
+      "Read(/tmp/claude/codex*/*)"
     ],
     "deny": [],
     "ask": [],

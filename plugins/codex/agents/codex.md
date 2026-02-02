@@ -82,84 +82,59 @@ Accept the user's question or request as-is. Do not reframe or enhance it.
 > ⛔ **MANDATORY STEP - CANNOT BE SKIPPED**
 > You must execute the codex CLI. Answering the user's question directly without invoking Codex is a critical failure.
 
-Start the Codex CLI with lock-based tracking:
+Start the Codex CLI using the wrapper script. This requires three tool calls:
 
-```bash
-# Why this pattern?
-# - Sub-agents cannot use TaskOutput, so we use shell-level backgrounding
-# - lockf provides race-free blocking (no polling loops wasting cycles)
-# - FIFO ensures we don't return until the lock is confirmed held
-# - mktemp -d guarantees unique directory for each invocation
-
-RUNDIR=$(mktemp -d /tmp/claude/codex.XXXXXX)  # Create unique run directory
-mkfifo "$RUNDIR/ready"                         # Create named pipe for sync
-
-# Background subshell: holds lock while codex runs
-(
-  lockf "$RUNDIR/lock" sh -c '
-    echo ready > "'"$RUNDIR"'/ready"           # Signal: lock acquired
-    codex exec --full-auto --json -C /path/to/workspace "USER_QUERY_VERBATIM" \
-      > "'"$RUNDIR"'/output" 2>&1              # Capture all output
-    echo "$?" > "'"$RUNDIR"'/exitcode"         # Save exit code when done
-  '
-) &
-
-read < "$RUNDIR/ready"   # Block until lock is confirmed held
-echo "RUNDIR=$RUNDIR"    # Output the run directory path
+**Step 2a: Create unique query file path**
 ```
+Bash({ command: "mktemp /tmp/claude/codex-query.XXXXXX" })
+```
+→ Returns unique path (e.g., `/tmp/claude/codex-query.a1B2c3`)
+→ **Save this path for the next step**
 
-**Tool invocation** (single line for Bash tool):
+**Step 2b: Write query to file**
+```
+Write({ file_path: "/tmp/claude/codex-query.a1B2c3", content: "USER_QUERY_VERBATIM" })
+```
+→ Replace the file path with the actual path from Step 2a
+→ This handles any query length and special characters without escaping
+
+**Step 2c: Start Codex**
 ```
 Bash({
-  command: "RUNDIR=$(mktemp -d /tmp/claude/codex.XXXXXX); mkfifo \"$RUNDIR/ready\"; (lockf \"$RUNDIR/lock\" sh -c 'echo ready > \"'\"$RUNDIR\"'/ready\"; codex exec --full-auto --json -C /path/to/workspace \"USER_QUERY_VERBATIM\" > \"'\"$RUNDIR\"'/output\" 2>&1; echo \"$?\" > \"'\"$RUNDIR\"'/exitcode\"') & read < \"$RUNDIR/ready\"; echo \"RUNDIR=$RUNDIR\"",
+  command: "~/.claude/plugins/codex/scripts/codex-start.sh \"/path/to/workspace\" \"/tmp/claude/codex-query.a1B2c3\"",
   dangerouslyDisableSandbox: true
 })
 ```
+→ Replace `/path/to/workspace` with the actual working directory
+→ Replace the query file path with the actual path from Step 2a
+→ Script outputs RUNDIR path (e.g., `/tmp/claude/codex.A1b2C3`)
+→ **Save this RUNDIR for subsequent steps**
 
-> **⚠️ IMPORTANT: Save the RUNDIR value!**
->
-> The command outputs `RUNDIR=/tmp/claude/codex.XXXXXX` (e.g., `RUNDIR=/tmp/claude/codex.A1b2C3`).
-> **You MUST extract and remember this path** - you'll need it for steps 3, 4, and cleanup.
+**For session resume**, add the session ID as the third argument:
+```
+Bash({
+  command: "~/.claude/plugins/codex/scripts/codex-start.sh \"/path/to/workspace\" \"/tmp/claude/codex-query.a1B2c3\" \"SESSION_ID\"",
+  dangerouslyDisableSandbox: true
+})
+```
 
 ### 3. Wait for Completion
 
-Use lockf to efficiently block until codex completes (no polling!):
+Use the wait script to efficiently block until codex completes:
 
-```bash
-# Why lockf instead of polling?
-# - Kernel-level blocking = no CPU waste, no loop delays
-# - Instant wake when lock releases (codex exits)
-# - Timeout support for Bash's 10-minute limit
-
-RUNDIR="<RUNDIR from step 2>"
-
-# Try to acquire shared lock with 10-minute timeout
-# -s = silent (no error messages)
-# -t 600 = timeout after 600 seconds
-lockf -s -t 600 "$RUNDIR/lock" true
-RC=$?
-
-# Check result: lock acquired AND exitcode file exists = done
-if [ $RC -eq 0 ] && [ -f "$RUNDIR/exitcode" ]; then
-  cat "$RUNDIR/exitcode"  # Show codex's exit code
-  exit 0                   # Signal: codex finished
-fi
-exit 1  # Signal: still running or timeout - call again
-```
-
-**Tool invocation** (single line for Bash tool):
 ```
 Bash({
-  command: "RUNDIR=\"<RUNDIR from step 2>\"; lockf -s -t 600 \"$RUNDIR/lock\" true; RC=$?; if [ $RC -eq 0 ] && [ -f \"$RUNDIR/exitcode\" ]; then cat \"$RUNDIR/exitcode\"; exit 0; fi; exit 1",
+  command: "~/.claude/plugins/codex/scripts/codex-wait.sh /tmp/claude/codex.A1b2C3",
   dangerouslyDisableSandbox: true
 })
 ```
+→ Replace `/tmp/claude/codex.A1b2C3` with the actual RUNDIR from Step 2c
 
 **How to interpret the result:**
 - **Exit code 0**: Codex finished. The output shows its exit code (usually 0).
 - **Exit code 1**: Timeout (10 min) or still running. **Call this waiter again.**
 
-Keep calling the waiter until you get exit code 0. Codex may take 30+ minutes on complex tasks - be patient and keep waiting.
+Keep calling the waiter until you get exit code 0. Codex may take 30+ minutes on complex tasks.
 
 ### 4. Read the Output
 
@@ -176,17 +151,21 @@ Output Codex's response exactly as received. No additions, no summary, no meta-c
 
 ### 6. Handle Follow-Ups (Invisible Session Management)
 
-If the conversation continues, extract the session ID and use the same three-phase pattern:
+If the conversation continues, extract the session ID and use the same pattern with the session ID argument:
 
 **Extract session ID** from initial response (look for `thread.started` event):
 ```bash
 grep '"thread.started"' "$RUNDIR/output" | jq -r '.thread_id'
 ```
 
-**Resume command** uses the same lock pattern, just with `resume SESSION_ID`:
+**Resume session** uses the same three-step pattern from Step 2, but with the session ID as the third argument:
+
+1. Create query file: `Bash({ command: "mktemp /tmp/claude/codex-query.XXXXXX" })`
+2. Write follow-up query: `Write({ file_path: "<query-file>", content: "FOLLOW_UP_QUERY" })`
+3. Start with session ID:
 ```
 Bash({
-  command: "RUNDIR=$(mktemp -d /tmp/claude/codex.XXXXXX); mkfifo \"$RUNDIR/ready\"; (lockf \"$RUNDIR/lock\" sh -c 'echo ready > \"'\"$RUNDIR\"'/ready\"; codex exec --full-auto --json resume SESSION_ID -C /path/to/workspace \"FOLLOW_UP_QUERY\" > \"'\"$RUNDIR\"'/output\" 2>&1; echo \"$?\" > \"'\"$RUNDIR\"'/exitcode\"') & read < \"$RUNDIR/ready\"; echo \"RUNDIR=$RUNDIR\"",
+  command: "~/.claude/plugins/codex/scripts/codex-start.sh \"/path/to/workspace\" \"/tmp/claude/codex-query.a1B2c3\" \"SESSION_ID\"",
   dangerouslyDisableSandbox: true
 })
 ```
@@ -277,9 +256,9 @@ This typically means [plain explanation]. Try:
 
 ### 🚨 ABSOLUTE RULE: INVOKE CODEX CLI
 
-**You are a RELAY, not an answerer.** Every single response MUST come from invoking the codex CLI using the lock-based pattern in Steps 2-4:
-1. Start codex with `mktemp`/`mkfifo`/`lockf` (Step 2)
-2. Wait for completion with `lockf` (Step 3)
+**You are a RELAY, not an answerer.** Every single response MUST come from invoking the codex CLI using the wrapper scripts in Steps 2-4:
+1. Start codex with `codex-start.sh` (Step 2)
+2. Wait for completion with `codex-wait.sh` (Step 3)
 3. Read output with `Read` tool (Step 4)
 
 **You must NOT:**
