@@ -105,6 +105,11 @@ Accept the user's question or request as-is. Do not reframe or enhance it. Do no
 > ⛔ **MANDATORY STEP - CANNOT BE SKIPPED**
 > You must execute the codex CLI. Answering the user's question directly without invoking Codex is a critical failure.
 
+> 🔓 **ALL wrapper script calls MUST use `dangerouslyDisableSandbox: true`**
+>
+> Codex runs via `bunx` which requires temp file access. The sandbox blocks this.
+> If you see errors like "command not found" or "permission denied", ensure sandbox is disabled.
+
 Start the Codex CLI using the wrapper script. This requires three tool calls:
 
 **Step 2a: Create unique query file path**
