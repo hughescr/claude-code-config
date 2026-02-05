@@ -10,15 +10,15 @@ hooks:
     - matcher: "Read"
       hooks:
         - type: command
-          command: "${CLAUDE_PLUGIN_ROOT}/hooks/validate-read.sh"
+          command: "/Users/craig/.claude/hooks/codex/validate-read.sh"
     - matcher: "Write"
       hooks:
         - type: command
-          command: "${CLAUDE_PLUGIN_ROOT}/hooks/validate-write.sh"
+          command: "/Users/craig/.claude/hooks/codex/validate-write.sh"
     - matcher: "Bash"
       hooks:
         - type: command
-          command: "${CLAUDE_PLUGIN_ROOT}/hooks/validate-bash.sh"
+          command: "/Users/craig/.claude/hooks/codex/validate-bash.sh"
 ---
 
 # ⛔ ABSOLUTE PROHIBITIONS ⛔
@@ -119,7 +119,7 @@ Codex runs via `bunx` which requires temp file and network access. All wrapper s
 ## Step 4: Start Codex
 ```
 Bash({
-  command: "~/.claude/plugins/codex/scripts/codex-start.sh /path/to/workspace /tmp/claude/codex-query.a1B2c3",
+  command: "~/.claude/scripts/codex/codex-start.sh /path/to/workspace /tmp/claude/codex-query.a1B2c3",
   dangerouslyDisableSandbox: true
 })
 ```
@@ -132,7 +132,7 @@ Save the returned RUNDIR path (e.g., `/tmp/claude/codex.X1y2Z3`)
 For follow-ups with session ID, add it as third argument:
 ```
 Bash({
-  command: "~/.claude/plugins/codex/scripts/codex-start.sh /path/to/workspace /tmp/claude/codex-query.a1B2c3 thread_abc123",
+  command: "~/.claude/scripts/codex/codex-start.sh /path/to/workspace /tmp/claude/codex-query.a1B2c3 thread_abc123",
   dangerouslyDisableSandbox: true
 })
 ```
@@ -140,7 +140,7 @@ Bash({
 ## Step 5: Wait for completion
 ```
 Bash({
-  command: "~/.claude/plugins/codex/scripts/codex-wait.sh /tmp/claude/codex.X1y2Z3",
+  command: "~/.claude/scripts/codex/codex-wait.sh /tmp/claude/codex.X1y2Z3",
   dangerouslyDisableSandbox: true
 })
 ```
@@ -161,7 +161,7 @@ Output Codex's response **exactly**. No additions, no summary, no commentary.
 Extract session ID:
 ```
 Bash({
-  command: "~/.claude/plugins/codex/scripts/codex-get-session-id.sh /tmp/claude/codex.X1y2Z3",
+  command: "~/.claude/scripts/codex/codex-get-session-id.sh /tmp/claude/codex.X1y2Z3",
   dangerouslyDisableSandbox: true
 })
 ```

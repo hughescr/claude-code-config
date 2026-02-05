@@ -31,11 +31,11 @@ Invoking Codex requires these steps:
 
 Starts Codex in the background with lock-based completion tracking.
 
-**Location**: `~/.claude/plugins/codex/scripts/codex-start.sh`
+**Location**: `~/.claude/scripts/codex/codex-start.sh`
 
 **Usage**:
 ```bash
-~/.claude/plugins/codex/scripts/codex-start.sh <working-dir> <query-file> [session-id]
+~/.claude/scripts/codex/codex-start.sh <working-dir> <query-file> [session-id]
 ```
 
 **Parameters**:
@@ -58,11 +58,11 @@ Starts Codex in the background with lock-based completion tracking.
 
 Waits for Codex to complete using lock-based detection.
 
-**Location**: `~/.claude/plugins/codex/scripts/codex-wait.sh`
+**Location**: `~/.claude/scripts/codex/codex-wait.sh`
 
 **Usage**:
 ```bash
-~/.claude/plugins/codex/scripts/codex-wait.sh <rundir>
+~/.claude/scripts/codex/codex-wait.sh <rundir>
 ```
 
 **Parameters**:
@@ -81,11 +81,11 @@ Waits for Codex to complete using lock-based detection.
 
 Extracts the session ID from Codex output for session resume.
 
-**Location**: `~/.claude/plugins/codex/scripts/codex-get-session-id.sh`
+**Location**: `~/.claude/scripts/codex/codex-get-session-id.sh`
 
 **Usage**:
 ```bash
-~/.claude/plugins/codex/scripts/codex-get-session-id.sh <rundir>
+~/.claude/scripts/codex/codex-get-session-id.sh <rundir>
 ```
 
 **Parameters**:
@@ -129,7 +129,7 @@ Bash({ command: "mktemp /tmp/claude/codex-query.XXXXXX" })
 Write({ file_path: "/tmp/claude/codex-query.a1B2c3", content: "Analyze the codebase" })
 
 Bash({
-  command: "~/.claude/plugins/codex/scripts/codex-start.sh /path/to/workspace /tmp/claude/codex-query.a1B2c3",
+  command: "~/.claude/scripts/codex/codex-start.sh /path/to/workspace /tmp/claude/codex-query.a1B2c3",
   dangerouslyDisableSandbox: true
 })
 # → /tmp/claude/codex.X1y2Z3
@@ -141,7 +141,7 @@ After Codex completes, extract the session ID using the helper script:
 
 ```
 Bash({
-  command: "~/.claude/plugins/codex/scripts/codex-get-session-id.sh /tmp/claude/codex.X1y2Z3",
+  command: "~/.claude/scripts/codex/codex-get-session-id.sh /tmp/claude/codex.X1y2Z3",
   dangerouslyDisableSandbox: true
 })
 # → thread_abc123
@@ -153,7 +153,7 @@ Pass the session ID as the third argument:
 
 ```
 Bash({
-  command: "~/.claude/plugins/codex/scripts/codex-start.sh /path/to/workspace /tmp/claude/codex-query.b2C3d4 thread_abc123",
+  command: "~/.claude/scripts/codex/codex-start.sh /path/to/workspace /tmp/claude/codex-query.b2C3d4 thread_abc123",
   dangerouslyDisableSandbox: true
 })
 ```

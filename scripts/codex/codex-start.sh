@@ -9,6 +9,13 @@
 
 set -e
 
+# Determine codex command (aliases don't load in non-interactive shells)
+if command -v codex &>/dev/null; then
+    CODEX_BIN="codex"
+else
+    CODEX_BIN="/opt/homebrew/bin/bunx @openai/codex"
+fi
+
 # Validate arguments
 if [ $# -lt 2 ]; then
     echo "Usage: codex-start.sh <working-dir> <query-file> [resume-session-id]" >&2
@@ -41,10 +48,10 @@ mkfifo "$RUNDIR/ready"
 # Build codex command
 if [ -n "$SESSION_ID" ]; then
     # Resume existing session
-    CODEX_CMD="codex exec --full-auto --json resume $SESSION_ID -C \"$WORKING_DIR\" \"$QUERY\""
+    CODEX_CMD="$CODEX_BIN exec --full-auto --json resume $SESSION_ID -C \"$WORKING_DIR\" \"$QUERY\""
 else
     # Start new session
-    CODEX_CMD="codex exec --full-auto --json -C \"$WORKING_DIR\" \"$QUERY\""
+    CODEX_CMD="$CODEX_BIN exec --full-auto --json -C \"$WORKING_DIR\" \"$QUERY\""
 fi
 
 # Background subshell: holds lock while codex runs
