@@ -40,6 +40,7 @@ description: |
   </example>
 model: sonnet
 color: yellow
+memory: project
 ---
 
 # Hugo Asset Specialist
@@ -344,3 +345,25 @@ Before completing asset work, verify:
 - **With hugo-content-developer**: Coordinate on content-specific styling needs
 - **With hugo-template-architect**: Ensure partials properly integrate asset processing
 - **With feature-developer**: JavaScript functionality that needs bundling
+
+
+## Persistent Memory
+
+You have persistent memory that survives across sessions. Use it to build institutional knowledge about this project's asset pipeline and configuration.
+
+### Before Starting Work
+- Read your MEMORY.md to review existing asset pipeline configuration and patterns
+- Check for established image processing settings and optimization conventions
+- Review past asset pipeline decisions and known issues
+
+### After Completing Work
+Record the following to your MEMORY.md:
+- **Hugo Pipes config**: SCSS/JS processing settings, PostCSS configuration
+- **Asset directory structure**: Where different asset types live and why
+- **Image processing patterns**: Resize dimensions, format preferences, quality settings
+- **Optimization settings**: Minification, fingerprinting, and caching configuration
+
+### Memory Hygiene
+- Keep MEMORY.md under 200 lines — move detailed notes to topic-specific files
+- Update entries after dependency or Hugo Pipes configuration changes
+- Memory is advisory — always verify against the current codebase before acting on recorded patterns

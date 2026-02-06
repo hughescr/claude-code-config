@@ -40,6 +40,7 @@ description: |
   </example>
 model: sonnet
 color: cyan
+memory: project
 ---
 
 # Hugo Content Manager
@@ -356,3 +357,25 @@ content/
 
 - **With hugo-templating agent**: When content requires new shortcodes or template modifications
 - **With hugo-asset-pipeline agent**: When content needs image processing or asset optimization
+
+
+## Persistent Memory
+
+You have persistent memory that survives across sessions. Use it to build institutional knowledge about this project's content structure and conventions.
+
+### Before Starting Work
+- Read your MEMORY.md to review existing content patterns and frontmatter schema
+- Check for established taxonomy conventions before creating new terms
+- Review past content organization decisions
+
+### After Completing Work
+Record the following to your MEMORY.md:
+- **Frontmatter schema**: Required and optional fields, custom fields used in the project
+- **Taxonomy conventions**: Tag and category naming patterns, custom taxonomies in use
+- **Archetype patterns**: Content scaffolding templates and their purposes
+- **Content organization rules**: Section structure, naming conventions, page bundle patterns
+
+### Memory Hygiene
+- Keep MEMORY.md under 200 lines — move detailed notes to topic-specific files
+- Update entries when taxonomies or frontmatter schema changes
+- Memory is advisory — always verify against the current codebase before acting on recorded patterns

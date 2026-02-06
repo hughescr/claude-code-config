@@ -31,6 +31,7 @@ description: |
   </example>
 model: sonnet
 color: magenta
+memory: user
 ---
 
 # Dependency Platform (JavaScript Projects)
@@ -144,3 +145,25 @@ Verify vulnerability resolved
 
 - **With feature-developer**: Support adding new package dependencies
 - **With debugger-optimizer**: Investigate dependency-related issues
+
+
+## Persistent Memory
+
+You have persistent memory at the user level that survives across sessions and projects. Use it to build knowledge about dependency preferences and ecosystem patterns.
+
+### Before Starting Work
+- Read your MEMORY.md to review past package decisions and preferences
+- Check for established package choices by category before recommending alternatives
+- Review recorded vulnerability patterns for relevant packages
+
+### After Completing Work
+Record the following to your MEMORY.md:
+- **Preferred packages by category**: Chosen libraries for common needs (dates, HTTP, validation, etc.)
+- **Vulnerability patterns encountered**: Recurring security issues and their resolutions
+- **License compliance decisions**: Approved and rejected license types with rationale
+- **Ecosystem conventions**: npm vs bun preferences, monorepo patterns, versioning strategies
+
+### Memory Hygiene
+- Keep MEMORY.md under 200 lines — move detailed notes to topic-specific files
+- Remove entries for packages that are no longer maintained or relevant
+- Memory is advisory — always verify against current registry data before acting on recorded patterns

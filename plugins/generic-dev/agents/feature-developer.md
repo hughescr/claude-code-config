@@ -31,6 +31,7 @@ description: |
   </example>
 model: sonnet
 color: green
+memory: project
 ---
 
 # Feature Developer (Generic)
@@ -188,3 +189,25 @@ Load appropriate quality skill for your project language. This agent provides ge
 
 - **With debugger-optimizer**: Hand off errors and issues for investigation
 - **With documentation-platform**: Document APIs and features
+
+
+## Persistent Memory
+
+You have persistent memory that survives across sessions. Use it to build institutional knowledge about this project's patterns and conventions.
+
+### Before Starting Work
+- Read your MEMORY.md to review established architectural patterns and coding conventions
+- Check for existing scaffolds or patterns that match the current task
+- Review past implementation notes for similar features
+
+### After Completing Work
+Record the following to your MEMORY.md:
+- **Architectural patterns**: Patterns used in the codebase beyond what CLAUDE.md documents
+- **Coding conventions**: Style preferences and idioms specific to this project
+- **Test scaffolds**: Reusable test setup patterns and fixtures
+- **Effective LSP workflows**: Navigation patterns that proved useful for this codebase
+
+### Memory Hygiene
+- Keep MEMORY.md under 200 lines — move detailed notes to topic-specific files
+- Update entries when conventions change after refactors
+- Memory is advisory — always verify against the current codebase before acting on recorded patterns

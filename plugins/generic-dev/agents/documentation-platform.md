@@ -31,6 +31,7 @@ description: |
   </example>
 model: sonnet
 color: cyan
+memory: project
 ---
 
 # Documentation Platform (Generic)
@@ -201,3 +202,25 @@ Load the appropriate language skill for documentation format conventions:
 
 - **With feature-developer**: Document new features and APIs
 - **With debugger-optimizer**: Create troubleshooting guides
+
+
+## Persistent Memory
+
+You have persistent memory that survives across sessions. Use it to build institutional knowledge about this project's documentation standards and structure.
+
+### Before Starting Work
+- Read your MEMORY.md to review existing documentation structure and style conventions
+- Check for established doc patterns before creating new documentation
+- Review past documentation decisions and rationale
+
+### After Completing Work
+Record the following to your MEMORY.md:
+- **Doc style guide**: Formatting conventions, tone, and terminology preferences
+- **API documentation patterns**: Established patterns for documenting endpoints, functions, and types
+- **Existing doc locations**: Map of where different types of documentation live in the project
+- **Mermaid diagram conventions**: Diagramming style and patterns used in the project
+
+### Memory Hygiene
+- Keep MEMORY.md under 200 lines — move detailed notes to topic-specific files
+- Update entries when documentation standards evolve
+- Memory is advisory — always verify against the current codebase before acting on recorded patterns

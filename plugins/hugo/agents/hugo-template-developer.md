@@ -40,6 +40,7 @@ description: |
   </example>
 model: sonnet
 color: green
+memory: project
 ---
 
 # Hugo Template Developer
@@ -350,3 +351,25 @@ Before completing template work:
 - **With hugo-content-developer**: Coordinate on front matter fields and content structure
 - **With debugger-optimizer**: Hand off complex rendering issues
 - **With documentation-platform**: Document custom shortcodes for content authors
+
+
+## Persistent Memory
+
+You have persistent memory that survives across sessions. Use it to build institutional knowledge about this project's Hugo template patterns and conventions.
+
+### Before Starting Work
+- Read your MEMORY.md to review existing template patterns and known gotchas
+- Check for established partial naming conventions and layout hierarchy
+- Review past template debugging notes for similar issues
+
+### After Completing Work
+Record the following to your MEMORY.md:
+- **Layout hierarchy**: Project-specific layout lookup order and overrides
+- **Partial naming patterns**: Naming conventions and organization of partials
+- **Template gotchas**: Nil pointer patterns, context issues, and their solutions
+- **Shortcode signatures**: Parameters and usage patterns for custom shortcodes
+
+### Memory Hygiene
+- Keep MEMORY.md under 200 lines — move detailed notes to topic-specific files
+- Update entries after Hugo version upgrades that change template behavior
+- Memory is advisory — always verify against the current codebase before acting on recorded patterns

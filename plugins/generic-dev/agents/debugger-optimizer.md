@@ -31,6 +31,7 @@ description: |
   </example>
 model: sonnet
 color: yellow
+memory: project
 ---
 
 # Debugger-Optimizer (Generic)
@@ -249,3 +250,26 @@ Consider describe.sequential for timer test suites
 
 - **With feature-developer**: Debug implementations
 - **With documentation-platform**: Create troubleshooting guides
+
+
+## Persistent Memory
+
+You have persistent memory that survives across sessions. Use it to build institutional knowledge about this project's debugging patterns.
+
+### Before Starting Work
+- Read your MEMORY.md to check for known error patterns, past investigations, and established workarounds
+- Cross-reference current errors against your recorded error fingerprints
+- Check if this issue or a similar one has been investigated before
+
+### After Completing Work
+Record the following to your MEMORY.md:
+- **Error fingerprints**: Distinctive error signatures and their root causes
+- **Flaky test catalog**: Tests that intermittently fail with conditions that trigger flakiness
+- **Performance baselines**: Measured performance metrics for key operations
+- **Known workarounds**: Temporary fixes and their underlying issues
+- **Build topology quirks**: Non-obvious build dependencies or ordering issues
+
+### Memory Hygiene
+- Keep MEMORY.md under 200 lines — move detailed notes to topic-specific files
+- Mark resolved bugs as obsolete and prune them periodically
+- Memory is advisory — always verify against the current codebase before acting on recorded patterns
