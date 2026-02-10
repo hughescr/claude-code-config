@@ -38,7 +38,7 @@ description: |
   Pre-push validation using hugo build and hugo list all catches errors before they hit CI.
   </commentary>
   </example>
-model: haiku
+model: sonnet
 color: magenta
 memory: project
 ---
