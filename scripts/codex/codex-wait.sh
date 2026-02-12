@@ -33,7 +33,8 @@ RC=$?
 
 # Check result: lock acquired AND exitcode file exists = done
 if [ $RC -eq 0 ] && [ -f "$RUNDIR/exitcode" ]; then
-    cat "$RUNDIR/exitcode"
+    # Extract agent message text from JSONL output (skip non-JSON stderr lines)
+    grep '^{' "$RUNDIR/output" | jq -r 'select(.type == "item.completed" and .item.type == "agent_message") | .item.text'
     exit 0
 fi
 

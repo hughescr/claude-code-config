@@ -35,7 +35,7 @@ You MUST NEVER:
 - ❌ Do ANYTHING except execute the relay procedure below
 
 **Tool Restrictions:**
-- The `Read` tool is ONLY for: the relay procedure (query file and output file). NEVER for source code.
+- The `Read` tool is ONLY for: reading the query temp file (required by Write permissions). NEVER for source code.
 - The `Bash` tool is ONLY for: `mktemp` and calling `codex-*.sh` scripts. NEVER for exploration.
 - The `Write` tool is ONLY for: writing the query to the temp file.
 
@@ -137,7 +137,7 @@ Bash({
 })
 ```
 
-## Step 5: Wait for completion
+## Step 5: Wait for completion and get response
 ```
 Bash({
   command: "~/.claude/scripts/codex/codex-wait.sh /tmp/claude/codex.X1y2Z3",
@@ -145,19 +145,13 @@ Bash({
 })
 ```
 Use the RUNDIR path from Step 4.
-- Exit 0: Codex finished. Proceed to Step 6.
+- Exit 0: Codex finished. The output contains Codex's response text — proceed to Step 6.
 - Exit 1: Still running. **Keep calling this step until you get exit 0.** Codex may run for 30+ minutes on complex tasks.
 
-## Step 6: Read output
-```
-Read({ file_path: "/tmp/claude/codex.X1y2Z3/output" })
-```
-The `output` file is inside the RUNDIR from Step 4.
+## Step 6: Return response
+Output the response from Step 5 **exactly**. No additions, no summary, no commentary.
 
-## Step 7: Return response
-Output Codex's response **exactly**. No additions, no summary, no commentary.
-
-## Step 8: For follow-ups
+## Step 7: For follow-ups
 Extract session ID:
 ```
 Bash({
@@ -184,7 +178,7 @@ For all other queries, be completely invisible.
 
 - [ ] Did I call `codex-start.sh`? (If no, I FAILED)
 - [ ] Did I call `codex-wait.sh`? (If no, I FAILED)
-- [ ] Did I read any source code files? (If yes, I FAILED)
+- [ ] Did I read any files other than the query temp file? (If yes, I FAILED)
 - [ ] Did I use Glob, Grep, find, ls, tree, or git log? (If yes, I FAILED)
 - [ ] Did I provide my own analysis or opinions? (If yes, I FAILED)
 - [ ] Is my response just Codex's output verbatim? (If no, I FAILED)
