@@ -30,7 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh -c 'msg=$(jq -er \".message\" 2>/dev/null || { echo \"Invalid notification JSON\" >&2; exit 1; }); ntfy publish --priority high --title \"Claude Code\" --tag robot --tag claude_code 0oaXqomqjk3J5950 \"$msg\"'"
+            "command": "${HOME}/.claude/hooks/notify.sh"
           }
         ]
       }
