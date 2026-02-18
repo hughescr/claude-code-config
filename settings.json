@@ -24,7 +24,6 @@
     "ask": [],
     "defaultMode": "plan"
   },
-  "model": "opus",
   "hooks": {
     "Notification": [
       {
