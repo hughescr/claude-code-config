@@ -21,6 +21,7 @@ stats-cache.json
 /plugins/install-counts-cache.json
 /plugins/installed_plugins.json
 /plugins/known_marketplaces.json
+/plugins/blocklist.json
 /telemetry
 /cache
 .serena
