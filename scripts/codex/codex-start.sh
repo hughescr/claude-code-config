@@ -9,11 +9,11 @@
 
 set -e
 
-# Determine codex command (aliases don't load in non-interactive shells)
+# Determine codex binary as array (handles the space in bunx path)
 if command -v codex &>/dev/null; then
-    CODEX_BIN="codex"
+    CODEX_BIN_ARRAY=(codex)
 else
-    CODEX_BIN="/opt/homebrew/bin/bunx @openai/codex"
+    CODEX_BIN_ARRAY=(/opt/homebrew/bin/bunx "@openai/codex")
 fi
 
 # Validate arguments
@@ -45,23 +45,24 @@ QUERY=$(cat "$QUERY_FILE")
 RUNDIR=$(mktemp -d /tmp/claude/codex.XXXXXX)
 mkfifo "$RUNDIR/ready"
 
-# Build codex command
-if [ -n "$SESSION_ID" ]; then
-    # Resume existing session
-    CODEX_CMD="$CODEX_BIN exec --full-auto --json resume $SESSION_ID -C \"$WORKING_DIR\" \"$QUERY\""
-else
-    # Start new session
-    CODEX_CMD="$CODEX_BIN exec --full-auto --json -C \"$WORKING_DIR\" \"$QUERY\""
-fi
+# Build full command as array
+CODEX_ARGS=("${CODEX_BIN_ARRAY[@]}" exec --full-auto --json)
+[ -n "$SESSION_ID" ] && CODEX_ARGS+=(resume "$SESSION_ID")
+CODEX_ARGS+=(-C "$WORKING_DIR" "$QUERY")
+
+# Write a bash runner script with properly-quoted arguments
+# Using printf '%q' ensures all special chars in query/paths are safely escaped
+{
+    printf '#!/bin/bash\n'
+    printf 'echo ready > %q\n' "$RUNDIR/ready"
+    printf '%q ' "${CODEX_ARGS[@]}"
+    printf '> %q 2>&1\n' "$RUNDIR/output"
+    printf 'echo $? > %q\n' "$RUNDIR/exitcode"
+} > "$RUNDIR/run.sh"
+chmod +x "$RUNDIR/run.sh"
 
 # Background subshell: holds lock while codex runs
-(
-    lockf "$RUNDIR/lock" sh -c "
-        echo ready > \"$RUNDIR/ready\"
-        $CODEX_CMD > \"$RUNDIR/output\" 2>&1
-        echo \"\$?\" > \"$RUNDIR/exitcode\"
-    "
-) &
+(lockf "$RUNDIR/lock" "$RUNDIR/run.sh") &
 
 # Block until lock is confirmed held
 read < "$RUNDIR/ready"
