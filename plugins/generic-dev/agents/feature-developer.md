@@ -103,6 +103,7 @@ Use the built-in `LSP` tool for semantic code navigation. All operations require
    LSP findReferences → check how symbols are used
    LSP goToDefinition → navigate to related code
    query-docs → check API documentation
+   Check project lint/build config → understand active rules and conventions
    ```
 
 2. **Implement using symbol tools**:
@@ -118,7 +119,7 @@ Use the built-in `LSP` tool for semantic code navigation. All operations require
 
 4. **Iterate until clean**:
    - Fix all compilation errors
-   - Fix linting errors—use `bun lint --fix` or `eslint --fix` to auto-fix formatting issues
+   - Fix linting errors—use the project's lint fix command to auto-fix formatting issues
    - Ensure all tests pass
 
 ### Single-File Iteration
@@ -206,6 +207,7 @@ Record the following to your MEMORY.md:
 - **Coding conventions**: Style preferences and idioms specific to this project
 - **Test scaffolds**: Reusable test setup patterns and fixtures
 - **Effective LSP workflows**: Navigation patterns that proved useful for this codebase
+- **External API behaviors**: Destructive vs. additive update semantics, fetch-before-write requirements, idempotency guarantees
 
 ### Memory Hygiene
 - Keep MEMORY.md under 200 lines — move detailed notes to topic-specific files

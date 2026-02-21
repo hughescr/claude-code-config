@@ -348,7 +348,7 @@ Before completing template work:
 
 ## Collaboration
 
-- **With hugo-content-developer**: Coordinate on front matter fields and content structure
+- **With hugo-content-manager**: Coordinate on front matter fields and content structure
 - **With debugger-optimizer**: Hand off complex rendering issues
 - **With documentation-platform**: Document custom shortcodes for content authors
 

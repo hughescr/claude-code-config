@@ -216,7 +216,7 @@ Consider describe.sequential for timer test suites
 ### 6. Verify Fix Completely
 - All build/compile errors resolved (if applicable)
 - All tests passing
-- No linting errors introduced (use `bun lint --fix` or `eslint --fix` to auto-fix formatting issues)
+- No linting errors introduced (use the project's lint fix command to auto-fix formatting issues)
 - Related functionality still works
 
 ### 7. Document
