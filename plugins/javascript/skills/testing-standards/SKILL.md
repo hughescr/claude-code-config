@@ -1,6 +1,6 @@
 ---
 name: testing-standards
-description: This skill should be used when the user mentions "write tests", "unit test", "fake timers", "mock timers", "test setTimeout", "test setInterval", "flaky tests", "test timing", "test concurrency", or any testing of JavaScript/TypeScript code. Provides mandatory standards for testing time-dependent code.
+description: This skill should be used when the user mentions "write tests", "unit test", "fake timers", "mock timers", "test setTimeout", "test setInterval", "flaky tests", "test timing", "test concurrency", "mutation testing quality gate", "test quality", or any testing of JavaScript/TypeScript code. Provides mandatory standards for testing time-dependent code and mutation testing as a secondary quality gate.
 ---
 
 # JavaScript/TypeScript Testing Standards
@@ -156,3 +156,21 @@ describe('Auto-hiding notification', () => {
   });
 });
 ```
+
+## Mutation Testing as Quality Gate
+
+Mutation testing verifies that your tests actually catch bugs, not just execute code. A test suite can have 100% code coverage yet fail to detect real defects if assertions are weak or missing.
+
+### When to Run
+
+If the project has a `mutate` script in `package.json`, run `bun run mutate` after all tests pass. Mutation testing is a secondary quality gate — tests must pass first.
+
+### What It Catches
+
+- Tests that execute code but don't assert on results
+- Assertions that are too loose (e.g., checking truthiness instead of exact values)
+- Missing edge case coverage that lets mutants survive
+
+### Stryker-Specific Patterns
+
+For projects using Stryker, load the `stryker-mutation-testing` skill for comprehensive guidance on disable comments, NoCoverage patterns, survived mutant strategies, and incremental cache management.

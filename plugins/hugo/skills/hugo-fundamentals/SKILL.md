@@ -1,6 +1,6 @@
 ---
 name: hugo-fundamentals
-description: This skill should be used when the user mentions "hugo basics", "hugo config", "hugo commands", "project structure", "hugo setup", "hugo.toml", "config.toml", "hugo serve", "hugo build", "content directory", "layouts directory", "static directory", "assets directory", "hugo configuration", "module mounts", "hugo environment", or any general Hugo static site generator questions. Provides foundational Hugo knowledge including project structure, configuration patterns, and essential commands.
+description: This skill should be used when the user mentions "hugo basics", "hugo config", "hugo commands", "project structure", "hugo setup", "hugo.toml", "config.toml", "hugo serve", "hugo build", "content directory", "layouts directory", "static directory", "assets directory", "hugo configuration", "module mounts", "hugo environment", ".Site.Author", "author config", "site params", or any general Hugo static site generator questions. Provides foundational Hugo knowledge including project structure, configuration patterns, essential commands, and migration guidance for deprecated features.
 ---
 
 # Hugo Fundamentals
@@ -340,7 +340,10 @@ paginatePath = "page"             # URL path: /blog/page/2/
 ```toml
 [params]
   description = "Site description for SEO"
-  author = "Author Name"
+
+  [params.author]
+    name = "Author Name"
+    email = "author@example.com"
 
   [params.social]
     twitter = "@handle"
@@ -352,6 +355,21 @@ paginatePath = "page"             # URL path: /blog/page/2/
 ```
 
 Access in templates: `{{ .Site.Params.description }}`, `{{ .Site.Params.social.twitter }}`
+
+### .Site.Author Deprecation (Hugo v0.156.0+)
+
+`.Site.Author` was removed in Hugo v0.156.0. Migrate author data to `[params.author]`:
+
+```toml
+# Old (removed)
+[author]
+  name = "Author Name"
+
+# New — see [params.author] in Params Section above
+```
+
+- **Site-level**: `{{ .Site.Params.author.name }}` — from `hugo.toml` `[params.author]`
+- **Page-level**: `{{ .Params.author }}` — from page frontmatter `author` field
 
 ## Environment Detection
 

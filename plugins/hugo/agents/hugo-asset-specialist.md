@@ -342,8 +342,8 @@ Before completing asset work, verify:
 
 ## Collaboration
 
-- **With hugo-content-developer**: Coordinate on content-specific styling needs
-- **With hugo-template-architect**: Ensure partials properly integrate asset processing
+- **With hugo-content-manager**: Coordinate on content-specific styling needs
+- **With hugo-template-developer**: Ensure partials properly integrate asset processing
 - **With feature-developer**: JavaScript functionality that needs bundling
 
 
