@@ -77,7 +77,8 @@
   "enabledPlugins": {
     "commit-commands@claude-plugins-official": true,
     "claude-code-wakatime@wakatime": true,
-    "typescript-lsp@claude-plugins-official": true
+    "typescript-lsp@claude-plugins-official": true,
+    "swift-lsp@claude-plugins-official": true
   },
   "alwaysThinkingEnabled": true,
   "skipDangerousModePermissionPrompt": true,
