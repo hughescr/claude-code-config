@@ -31,3 +31,4 @@ stats-cache.json
 /usage-data
 /backups
 /sessions
+mcp-needs-auth-cache.json
