@@ -86,7 +86,7 @@ Include this at the start of every sub-agent prompt:
 ```
 CRITICAL RESTRICTIONS:
 - Use TaskCreate/TaskUpdate for task tracking, never temp files.
-- For git commit, use dangerouslyDisableSandbox: true for GPG signing.
+- For `bun mutate`, use dangerouslyDisableSandbox: true (stryker-incremental.json is sandbox-protected).
 
 YOUR TASK:
 [actual task details here]
@@ -97,24 +97,6 @@ YOUR TASK:
 - Sub-agents get only what you pass in the `prompt` parameter
 - Without explicit instruction, sub-agents may violate critical rules
 - This preamble enforces consistency
-
----
-
-## Git Operations & Sandbox Mode
-
-**`git commit` MUST run outside the sandbox for GPG signing to work.**
-
-When executing git commits, always use `dangerouslyDisableSandbox: true`:
-
-```bash
-# This will FAIL in sandbox mode (GPG signing blocked):
-git commit -m "message"
-
-# Correct approach - disable sandbox for git commit:
-Bash({ command: "git commit -m '...'", dangerouslyDisableSandbox: true })
-```
-
-Other git operations (status, diff, log, add) work fine in sandbox mode - only `commit` requires the override due to GPG access requirements.
 
 ---
 

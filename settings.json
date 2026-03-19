@@ -84,5 +84,13 @@
   "skipDangerousModePermissionPrompt": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
+  },
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true,
+    "network": {
+      "allowAllUnixSockets": true,
+      "allowLocalBinding": true
+    }
   }
 }
