@@ -22,7 +22,7 @@
     ],
     "deny": [],
     "ask": [],
-    "defaultMode": "plan"
+    "defaultMode": "auto"
   },
   "hooks": {
     "Notification": [
@@ -100,5 +100,6 @@
   "skipDangerousModePermissionPrompt": true,
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
-  }
+  },
+  "skipAutoPermissionPrompt": true
 }
