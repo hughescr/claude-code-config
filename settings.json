@@ -76,14 +76,16 @@
   },
   "enabledPlugins": {
     "commit-commands@claude-plugins-official": true,
-    "claude-code-wakatime@wakatime": true,
     "typescript-lsp@claude-plugins-official": true,
     "swift-lsp@claude-plugins-official": true
   },
-  "alwaysThinkingEnabled": true,
-  "skipDangerousModePermissionPrompt": true,
-  "feedbackSurveyState": {
-    "lastShownTime": 1754119602031
+  "extraKnownMarketplaces": {
+    "wakatime": {
+      "source": {
+        "source": "github",
+        "repo": "wakatime/claude-code-wakatime"
+      }
+    }
   },
   "sandbox": {
     "enabled": true,
@@ -92,5 +94,11 @@
       "allowAllUnixSockets": true,
       "allowLocalBinding": true
     }
+  },
+  "alwaysThinkingEnabled": true,
+  "voiceEnabled": false,
+  "skipDangerousModePermissionPrompt": true,
+  "feedbackSurveyState": {
+    "lastShownTime": 1754119602031
   }
 }
