@@ -41,6 +41,7 @@
         "hooks": [
           {
             "type": "command",
+            "if": "Bash(*<<*)",
             "command": "${HOME}/.claude/hooks/block-temp-planning-files.sh",
             "timeout": 5000
           }
@@ -51,6 +52,7 @@
         "hooks": [
           {
             "type": "command",
+            "if": "Skill(*:*)",
             "command": "${HOME}/.claude/hooks/approve-plugin-skills.sh",
             "timeout": 5000
           }
