@@ -52,7 +52,6 @@
         "hooks": [
           {
             "type": "command",
-            "if": "Skill(*:*)",
             "command": "${HOME}/.claude/hooks/approve-plugin-skills.sh",
             "timeout": 5000
           }
