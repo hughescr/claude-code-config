@@ -22,7 +22,7 @@
     ],
     "deny": [],
     "ask": [],
-    "defaultMode": "plan"
+    "defaultMode": "auto"
   },
   "hooks": {
     "Notification": [
@@ -41,8 +41,8 @@
         "hooks": [
           {
             "type": "command",
-            "if": "Bash(*<<*)",
             "command": "${HOME}/.claude/hooks/block-temp-planning-files.sh",
+            "if": "Bash(*<<*)",
             "timeout": 5000
           }
         ]
@@ -78,7 +78,8 @@
   "enabledPlugins": {
     "commit-commands@claude-plugins-official": true,
     "typescript-lsp@claude-plugins-official": true,
-    "swift-lsp@claude-plugins-official": true
+    "swift-lsp@claude-plugins-official": true,
+    "claude-code-wakatime@wakatime": true
   },
   "extraKnownMarketplaces": {
     "wakatime": {
@@ -97,10 +98,11 @@
     }
   },
   "alwaysThinkingEnabled": true,
-  "voiceEnabled": false,
+  "effortLevel": "low",
   "skipDangerousModePermissionPrompt": true,
+  "skipAutoPermissionPrompt": true,
+  "voiceEnabled": false,
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
-  },
-  "skipAutoPermissionPrompt": true
+  }
 }

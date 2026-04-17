@@ -1,0 +1,26 @@
+{
+  "pluginId": "claude-code-wakatime@wakatime",
+  "createdAt": "2026-04-15T12:59:09.019Z",
+  "files": {
+    ".claude-plugin/marketplace.json": "91940768c31f77dcd3a117750a8c8aed6a0eda16e29bb2bd6a6099194d1cadb7",
+    ".claude-plugin/plugin.json": "8ddd1dbc09de95e629871da712858d65199041768c88cd2b36c0ca59441a9022",
+    ".gitignore": "338c5c88a4813fadd091ab2b94da085a0ff6395bb8561752bc39fe1c1cb74808",
+    "LICENSE": "e271afc52cb2f0b4cd225ef8e618c450fc3e75c7a779db6a45db933dfda17628",
+    "README.md": "54602b956103a70b169d00c6c3c1408effa975eb0562d80e4fc9d27f8a0f7c3d",
+    "dist/index.js": "574058ef710db791d73ad2366914803a7d4c7cc91381b09fbff6139abfd5cc32",
+    "hooks/hooks.json": "fedbef2e4056fbb9e6c44709e5a2bb6085a12e1bd0409f714ea4d4650d780269",
+    "package-lock.json": "340d7287c726e5ca58b6685875724186b9b2f73309ec0487224c8927c00e0fe1",
+    "package.json": "7b6288c6a766001b4b818fab843e021fad34cef11f515923ef4eed2023d5c267",
+    "prettier.config.cjs": "b3705e203107e9c998fc2fff0602cffc264ed92c20a741e4a50d2067dffa738d",
+    "scripts/generate-version.js": "bd2d0f969d4992cdc19a04044539667c56e45a50e35dcd263d60a2184146bbe6",
+    "scripts/run": "92ab34d68efb7344afe2b14576f03f3d5ba3e389161406cb938ac2fb62b2d1b8",
+    "scripts/run.cmd": "9213c4d46b50537564514aa103d3cbd2b452e29d1edffca3530061a90c08459c",
+    "src/dependencies.ts": "777321c5b5223a327acb36ab76101ca10784632b7f7fbb2aea62601f0f6acf48",
+    "src/index.ts": "f3d3330660ab704a0acbc366f0bf8c1d9d586eedaa18853934c1c4c655682df5",
+    "src/logger.ts": "65a33413208919a31b7283767e256d49292961a7956458ddd610f9b6a95aef4e",
+    "src/options.ts": "6d1af006bdc15c32a2c6d9333e0180fe5fdb8156a5069b23cdd37f22fa14a42c",
+    "src/types.ts": "e84694391da31dd2f12a03ec1f1f1f2275d90e9e9c7be4609e01cd2dc148eea2",
+    "src/utils.ts": "e78ddba147ac0c61aa899149f5a34026efd89d53669042fa3986bb404a9ca47f",
+    "tsconfig.json": "2fb8eb85586ae59d9a4810e0248f4117c09f83ba6de49f5063e8ed32d9341fd9"
+  }
+}
