@@ -88,4 +88,4 @@ done
 
 # Execute via bunx (always fetch latest)
 # Don't use exec so trap cleanup can run
-bunx -p @anthropic-ai/claude-code-darwin-arm64 claude "${CLAUDE_FLAGS[@]}" "$@"
+bunx --force -p @anthropic-ai/claude-code-darwin-arm64 claude "${CLAUDE_FLAGS[@]}" "$@"
