@@ -22,7 +22,7 @@
     ],
     "deny": [],
     "ask": [],
-    "defaultMode": "default"
+    "defaultMode": "auto"
   },
   "hooks": {
     "Notification": [
