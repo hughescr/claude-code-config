@@ -99,12 +99,14 @@
   },
   "alwaysThinkingEnabled": true,
   "effortLevel": "high",
+  "awaySummaryEnabled": false,
   "skipDangerousModePermissionPrompt": true,
+  "remoteControlAtStartup": true,
   "agentPushNotifEnabled": true,
   "skipAutoPermissionPrompt": true,
+  "useAutoModeDuringPlan": true,
   "voiceEnabled": false,
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
-  },
-  "remoteControlAtStartup": true
+  }
 }
