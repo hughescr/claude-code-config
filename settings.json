@@ -1,8 +1,177 @@
 {
-  "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "includeCoAuthoredBy": false,
-  "permissions": {
-    "allow": [
+  "$schema" : "https:\/\/json.schemastore.org\/claude-code-settings.json",
+  "agentPushNotifEnabled" : true,
+  "alwaysThinkingEnabled" : true,
+  "awaySummaryEnabled" : false,
+  "enabledPlugins" : {
+    "ast-grep@ast-grep-marketplace" : true,
+    "clangd-lsp@claude-plugins-official" : true,
+    "claude-code-setup@claude-plugins-official" : true,
+    "claude-code-wakatime@wakatime" : true,
+    "claude-md-management@claude-plugins-official" : true,
+    "code-simplifier@claude-plugins-official" : true,
+    "commit-commands@claude-plugins-official" : true,
+    "gopls-lsp@claude-plugins-official" : true,
+    "pyright-lsp@claude-plugins-official" : true,
+    "rust-analyzer-lsp@claude-plugins-official" : true,
+    "swift-lsp@claude-plugins-official" : true,
+    "typescript-lsp@claude-plugins-official" : true
+  },
+  "env" : {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" : "1"
+  },
+  "extraKnownMarketplaces" : {
+    "ast-grep-marketplace" : {
+      "autoUpdate" : true,
+      "source" : {
+        "repo" : "ast-grep\/agent-skill",
+        "source" : "github"
+      }
+    },
+    "wakatime" : {
+      "source" : {
+        "repo" : "wakatime\/claude-code-wakatime",
+        "source" : "github"
+      }
+    }
+  },
+  "feedbackSurveyState" : {
+    "lastShownTime" : 1754119602031
+  },
+  "hooks" : {
+    "Notification" : [
+      {
+        "hooks" : [
+          {
+            "command" : "${HOME}\/.claude\/hooks\/notify.sh",
+            "type" : "command"
+          }
+        ]
+      },
+      {
+        "hooks" : [
+          {
+            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
+            "type" : "command"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest" : [
+      {
+        "hooks" : [
+          {
+            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
+            "type" : "command"
+          }
+        ]
+      }
+    ],
+    "PostToolUse" : [
+      {
+        "hooks" : [
+          {
+            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
+            "type" : "command"
+          }
+        ]
+      }
+    ],
+    "PreToolUse" : [
+      {
+        "hooks" : [
+          {
+            "command" : "${HOME}\/.claude\/hooks\/block-temp-planning-files.sh",
+            "if" : "Bash(*<<*)",
+            "timeout" : 5000,
+            "type" : "command"
+          }
+        ],
+        "matcher" : "Bash"
+      },
+      {
+        "hooks" : [
+          {
+            "command" : "${HOME}\/.claude\/hooks\/approve-plugin-skills.sh",
+            "timeout" : 5000,
+            "type" : "command"
+          }
+        ],
+        "matcher" : "Skill"
+      },
+      {
+        "hooks" : [
+          {
+            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
+            "type" : "command"
+          }
+        ]
+      }
+    ],
+    "SessionEnd" : [
+      {
+        "hooks" : [
+          {
+            "command" : "${HOME}\/.claude\/hooks\/cleanup-old-files.sh",
+            "timeout" : 30000,
+            "type" : "command"
+          }
+        ]
+      },
+      {
+        "hooks" : [
+          {
+            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
+            "type" : "command"
+          }
+        ]
+      }
+    ],
+    "SessionStart" : [
+      {
+        "hooks" : [
+          {
+            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
+            "type" : "command"
+          }
+        ]
+      }
+    ],
+    "Stop" : [
+      {
+        "hooks" : [
+          {
+            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
+            "type" : "command"
+          }
+        ]
+      }
+    ],
+    "StopFailure" : [
+      {
+        "hooks" : [
+          {
+            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
+            "type" : "command"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit" : [
+      {
+        "hooks" : [
+          {
+            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
+            "type" : "command"
+          }
+        ]
+      }
+    ]
+  },
+  "includeCoAuthoredBy" : false,
+  "inputNeededNotifEnabled" : true,
+  "permissions" : {
+    "allow" : [
       "WebSearch",
       "WebFetch",
       "Bash(gh run list:*)",
@@ -13,118 +182,37 @@
       "Bash(wc:*)",
       "Bash(find:*)",
       "Bash(curl:*)",
-      "Read(//tmp/claude/**)",
-      "Edit(//tmp/claude/**)",
-      "Bash(mktemp /tmp/claude/codex-query.XXXXXX)",
-      "Bash(~/.claude/scripts/codex/codex-start.sh *)",
-      "Bash(~/.claude/scripts/codex/codex-wait.sh *)",
-      "Bash(~/.claude/scripts/codex/codex-get-session-id.sh *)"
+      "Read(\/\/tmp\/claude\/**)",
+      "Edit(\/\/tmp\/claude\/**)",
+      "Bash(mktemp \/tmp\/claude\/codex-query.XXXXXX)",
+      "Bash(~\/.claude\/scripts\/codex\/codex-start.sh *)",
+      "Bash(~\/.claude\/scripts\/codex\/codex-wait.sh *)",
+      "Bash(~\/.claude\/scripts\/codex\/codex-get-session-id.sh *)"
     ],
-    "deny": [],
-    "ask": [],
-    "defaultMode": "auto"
-  },
-  "hooks": {
-    "Notification": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/hooks/notify.sh"
-          }
-        ]
-      }
+    "ask" : [
+
     ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/hooks/block-temp-planning-files.sh",
-            "if": "Bash(*<<*)",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": "Skill",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/hooks/approve-plugin-skills.sh",
-            "timeout": 5000
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/hooks/cleanup-old-files.sh",
-            "timeout": 30000
-          }
-        ]
-      }
+    "defaultMode" : "auto",
+    "deny" : [
+
     ]
   },
-  "statusLine": {
-    "type": "command",
-    "command": "bunx -y ccstatusline@latest",
-    "padding": 0
-  },
-  "enabledPlugins": {
-    "commit-commands@claude-plugins-official": true,
-    "typescript-lsp@claude-plugins-official": true,
-    "swift-lsp@claude-plugins-official": true,
-    "claude-code-wakatime@wakatime": true,
-    "ast-grep@ast-grep-marketplace": true,
-    "code-simplifier@claude-plugins-official": true,
-    "claude-md-management@claude-plugins-official": true,
-    "claude-code-setup@claude-plugins-official": true,
-    "clangd-lsp@claude-plugins-official": true,
-    "gopls-lsp@claude-plugins-official": true,
-    "pyright-lsp@claude-plugins-official": true,
-    "rust-analyzer-lsp@claude-plugins-official": true
-  },
-  "extraKnownMarketplaces": {
-    "wakatime": {
-      "source": {
-        "source": "github",
-        "repo": "wakatime/claude-code-wakatime"
-      }
-    },
-    "ast-grep-marketplace": {
-      "source": {
-        "source": "github",
-        "repo": "ast-grep/agent-skill"
-      },
-      "autoUpdate": true
+  "remoteControlAtStartup" : true,
+  "sandbox" : {
+    "autoAllowBashIfSandboxed" : true,
+    "enabled" : true,
+    "network" : {
+      "allowAllUnixSockets" : true,
+      "allowLocalBinding" : true
     }
   },
-  "sandbox": {
-    "enabled": true,
-    "autoAllowBashIfSandboxed": true,
-    "network": {
-      "allowAllUnixSockets": true,
-      "allowLocalBinding": true
-    }
+  "skipAutoPermissionPrompt" : true,
+  "skipDangerousModePermissionPrompt" : true,
+  "statusLine" : {
+    "command" : "bunx -y ccstatusline@latest",
+    "padding" : 0,
+    "type" : "command"
   },
-  "alwaysThinkingEnabled": true,
-  "awaySummaryEnabled": false,
-  "skipDangerousModePermissionPrompt": true,
-  "remoteControlAtStartup": true,
-  "inputNeededNotifEnabled": true,
-  "agentPushNotifEnabled": true,
-  "skipAutoPermissionPrompt": true,
-  "useAutoModeDuringPlan": true,
-  "voiceEnabled": false,
-  "feedbackSurveyState": {
-    "lastShownTime": 1754119602031
-  },
-  "env": {
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
-  }
+  "useAutoModeDuringPlan" : true,
+  "voiceEnabled" : false
 }
