@@ -47,34 +47,6 @@
             "type" : "command"
           }
         ]
-      },
-      {
-        "hooks" : [
-          {
-            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
-            "type" : "command"
-          }
-        ]
-      }
-    ],
-    "PermissionRequest" : [
-      {
-        "hooks" : [
-          {
-            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
-            "type" : "command"
-          }
-        ]
-      }
-    ],
-    "PostToolUse" : [
-      {
-        "hooks" : [
-          {
-            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
-            "type" : "command"
-          }
-        ]
       }
     ],
     "PreToolUse" : [
@@ -98,14 +70,6 @@
           }
         ],
         "matcher" : "Skill"
-      },
-      {
-        "hooks" : [
-          {
-            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
-            "type" : "command"
-          }
-        ]
       }
     ],
     "SessionEnd" : [
@@ -114,54 +78,6 @@
           {
             "command" : "${HOME}\/.claude\/hooks\/cleanup-old-files.sh",
             "timeout" : 30000,
-            "type" : "command"
-          }
-        ]
-      },
-      {
-        "hooks" : [
-          {
-            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
-            "type" : "command"
-          }
-        ]
-      }
-    ],
-    "SessionStart" : [
-      {
-        "hooks" : [
-          {
-            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
-            "type" : "command"
-          }
-        ]
-      }
-    ],
-    "Stop" : [
-      {
-        "hooks" : [
-          {
-            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
-            "type" : "command"
-          }
-        ]
-      }
-    ],
-    "StopFailure" : [
-      {
-        "hooks" : [
-          {
-            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
-            "type" : "command"
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit" : [
-      {
-        "hooks" : [
-          {
-            "command" : "\/Users\/craig\/.config\/iterm2\/cc-status",
             "type" : "command"
           }
         ]
