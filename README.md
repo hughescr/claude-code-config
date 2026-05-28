@@ -5,7 +5,7 @@ Personal Claude Code configuration with plugin-based architecture, custom hooks,
 ## Features
 
 - **Plugin System**: Modular plugins containing agents, skills, hooks, and commands
-- **Orchestrator Mode**: CLAUDE.md configures Claude as a delegating orchestrator that spawns sub-agents for implementation work
+- **Orchestrator Mode**: CLAUDE.md configures Claude as a delegating orchestrator that spawns sub-agents for all implementation work — launched **async** (in the background, so you stay interactive while they work), with a **Workflow engine** for large, opted-in, programmatically-enforced fan-out
 - **Custom Hooks**: PreToolUse, SessionEnd, and Notification hooks for workflow automation
 - **Marketplace Integration**: Install plugins from configured marketplaces
 - **Submodule Support**: Some plugins are managed as git submodules from external repos
@@ -56,7 +56,7 @@ git submodule update --remote
 
 ## Contents
 
-- `CLAUDE.md` - Global instructions (orchestrator mode, sub-agent restrictions, git operations)
+- `CLAUDE.md` - Global instructions (orchestrator mode, async-first delegation & question routing, workflow orchestration, sub-agent restrictions, git operations)
 - `settings.json` - Permissions, hooks, model preferences, enabled marketplace plugins
 - `plugins/` - Plugin directory with agents, skills, hooks, and commands
 - `hooks/` - Global hook scripts
