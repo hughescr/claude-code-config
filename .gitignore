@@ -40,3 +40,4 @@ daemon.status.json
 /jobs/
 /teams/
 .last-update-result.json
+plugins/plugin-catalog-cache.json

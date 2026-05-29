@@ -81,7 +81,8 @@
     "rust-analyzer-lsp@claude-plugins-official": true,
     "swift-lsp@claude-plugins-official": true,
     "typescript-lsp@claude-plugins-official": true,
-    "shortcuts-playground@shortcuts-playground": true
+    "shortcuts-playground@shortcuts-playground": true,
+    "skill-development@oaustegard-claude-skills": true
   },
   "extraKnownMarketplaces": {
     "ast-grep-marketplace": {
@@ -101,6 +102,12 @@
       "source": {
         "source": "git",
         "url": "https://github.com/viticci/shortcuts-playground-plugin.git"
+      }
+    },
+    "oaustegard-claude-skills": {
+      "source": {
+        "source": "github",
+        "repo": "oaustegard/claude-skills"
       }
     }
   },
@@ -122,6 +129,7 @@
     }
   },
   "skipDangerousModePermissionPrompt": true,
+  "skipWorkflowUsageWarning": true,
   "remoteControlAtStartup": true,
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
@@ -130,6 +138,5 @@
   "voiceEnabled": false,
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
-  },
-  "skipWorkflowUsageWarning": true
+  }
 }
