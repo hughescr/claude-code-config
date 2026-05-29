@@ -1,11 +1,14 @@
 #!/bin/bash
-# Clean up Claude Code temp files older than 3 days
+# Clean up Claude Code temp files using two retention tiers
 # Runs silently at end of each session
 #
-# Smart cleanup logic:
-# - Preserves CLI sessions that are linked to Desktop sessions
-# - Deletes orphaned CLI sessions older than 3 days
-# - Always cleans up debug logs and shell snapshots older than 3 days
+# Smart cleanup logic (two tiers):
+# - Session data is retained 60 days: CLI sessions, session dirs, sidecars,
+#   plans, paste-cache, tasks, file-history, teams, session-env, and sessions.
+# - Diagnostic files are retained only 3 days: debug logs, shell snapshots,
+#   and telemetry.
+# - Preserves CLI/session data linked to active (non-archived) Desktop
+#   sessions regardless of age.
 #
 # Usage:
 #   cleanup-old-files.sh           # Silent cleanup (default)
@@ -27,19 +30,20 @@ DESKTOP_SESSIONS="${HOME}/Library/Application Support/Claude/claude-code-session
 CLI_PROJECTS="${HOME}/.claude/projects"
 DEBUG_DIR="${HOME}/.claude/debug"
 SHELL_SNAPSHOTS="${HOME}/.claude/shell-snapshots"
-TODOS_DIR="${HOME}/.claude/todos"
 PLANS_DIR="${HOME}/.claude/plans"
 TASKS_DIR="${HOME}/.claude/tasks"
 PASTE_CACHE="${HOME}/.claude/paste-cache"
 FILE_HISTORY="${HOME}/.claude/file-history"
 TELEMETRY_DIR="${HOME}/.claude/telemetry"
+TEAMS_DIR="${HOME}/.claude/teams"
+SESSION_ENV_DIR="${HOME}/.claude/session-env"
+SESSIONS_DIR="${HOME}/.claude/sessions"
 
 # Initialize counters for dry-run summary
 sessions_to_delete=0
 sessions_protected=0
 debug_files_to_delete=0
 shell_snapshots_to_delete=0
-todos_to_delete=0
 plans_to_delete=0
 tasks_to_delete=0
 tasks_protected=0
@@ -50,6 +54,11 @@ telemetry_to_delete=0
 session_dirs_to_delete=0
 session_dirs_protected=0
 sidecar_files_to_delete=0
+teams_to_delete=0
+teams_protected=0
+session_env_to_delete=0
+session_env_protected=0
+sessions_to_delete_simple=0
 
 # Step 1: Collect protected session IDs from active (non-archived) Desktop sessions
 # Desktop sessions contain a cliSessionId field that references CLI session files
@@ -81,14 +90,14 @@ fi
 
 # Step 2: Clean up old CLI sessions selectively
 # Only delete sessions that are:
-# - Older than 3 days
+# - Older than 60 days
 # - NOT referenced by any Desktop session (not in protected_ids)
 if [[ "$DRY_RUN" == "true" ]]; then
-    echo "CLI Sessions older than 14 days:"
+    echo "CLI Sessions older than 60 days:"
 fi
 
 if [[ -d "$CLI_PROJECTS" ]]; then
-    find "$CLI_PROJECTS" -mindepth 2 -type f -name "*.jsonl" -mtime +14 2>/dev/null | while read -r session_file; do
+    find "$CLI_PROJECTS" -mindepth 2 -type f -name "*.jsonl" -mtime +60 2>/dev/null | while read -r session_file; do
         # Extract session ID from filename (remove .jsonl extension)
         session_id=$(basename "$session_file" .jsonl)
 
@@ -115,10 +124,10 @@ if [[ -d "$CLI_PROJECTS" ]]; then
     # Clean up old session directories (contain subagents/, tool-results/)
     if [[ "$DRY_RUN" == "true" ]]; then
         echo ""
-        echo "Session directories older than 14 days:"
+        echo "Session directories older than 60 days:"
     fi
 
-    find "$CLI_PROJECTS" -mindepth 2 -maxdepth 2 -type d -mtime +14 2>/dev/null | while read -r session_dir; do
+    find "$CLI_PROJECTS" -mindepth 2 -maxdepth 2 -type d -mtime +60 2>/dev/null | while read -r session_dir; do
         # Extract session ID from directory name
         session_id=$(basename "$session_dir")
 
@@ -138,13 +147,13 @@ if [[ -d "$CLI_PROJECTS" ]]; then
         fi
     done
 
-    # Clean up orphaned sidecar files older than 14 days
+    # Clean up orphaned sidecar files older than 60 days
     if [[ "$DRY_RUN" == "true" ]]; then
         echo ""
-        echo "Sidecar files older than 14 days:"
+        echo "Sidecar files older than 60 days:"
     fi
 
-    find "$CLI_PROJECTS" -mindepth 2 -type f \( -name "*.wakatime" -o -name "*.jpg" -o -name "*.pdf" -o -name "*.docx" \) -mtime +14 2>/dev/null | while read -r sidecar_file; do
+    find "$CLI_PROJECTS" -mindepth 2 -type f \( -name "*.wakatime" -o -name "*.jpg" -o -name "*.pdf" -o -name "*.docx" \) -mtime +60 2>/dev/null | while read -r sidecar_file; do
         if [[ "$DRY_RUN" == "true" ]]; then
             echo "  WOULD DELETE: $sidecar_file"
             echo "delete" >> /tmp/claude/cleanup_sidecar_delete_$$ 2>/dev/null
@@ -191,27 +200,30 @@ else
     find "$TELEMETRY_DIR" -type f -mtime +3 -delete 2>/dev/null
 fi
 
-# Step 4: Clean up simple directories (todos, plans, paste-cache)
-# These have no session protection needed
+# Step 4: Clean up simple directories (plans, paste-cache, sessions)
+# These have no session protection needed.
+# sessions/ holds files named by PID (e.g. 2692.json), NOT session UUIDs,
+# so no Desktop-session protection applies; the active session's file has a
+# fresh mtime so a 60-day purge won't touch it.
 if [[ "$DRY_RUN" == "true" ]]; then
-    todos_to_delete=$(find "$TODOS_DIR" -type f -mtime +14 2>/dev/null | wc -l | tr -d ' ')
-    plans_to_delete=$(find "$PLANS_DIR" -type f -mtime +14 2>/dev/null | wc -l | tr -d ' ')
-    paste_cache_to_delete=$(find "$PASTE_CACHE" -type f -mtime +14 2>/dev/null | wc -l | tr -d ' ')
+    plans_to_delete=$(find "$PLANS_DIR" -type f -mtime +60 2>/dev/null | wc -l | tr -d ' ')
+    paste_cache_to_delete=$(find "$PASTE_CACHE" -type f -mtime +60 2>/dev/null | wc -l | tr -d ' ')
+    sessions_to_delete_simple=$(find "$SESSIONS_DIR" -mindepth 1 -maxdepth 1 -type f -mtime +60 2>/dev/null | wc -l | tr -d ' ')
 else
-    find "$TODOS_DIR" -type f -mtime +14 -delete 2>/dev/null
-    find "$PLANS_DIR" -type f -mtime +14 -delete 2>/dev/null
-    find "$PASTE_CACHE" -type f -mtime +14 -delete 2>/dev/null
+    find "$PLANS_DIR" -type f -mtime +60 -delete 2>/dev/null
+    find "$PASTE_CACHE" -type f -mtime +60 -delete 2>/dev/null
+    find "$SESSIONS_DIR" -mindepth 1 -maxdepth 1 -type f -mtime +60 -delete 2>/dev/null
 fi
 
 # Step 5: Clean up old task directories with session protection
 # Each task is a directory containing .json, .lock, and .highwatermark files
 # Same logic as file-history - protect tasks linked to active Desktop sessions
 if [[ "$DRY_RUN" == "true" ]]; then
-    echo "Task directories older than 14 days:"
+    echo "Task directories older than 60 days:"
 fi
 
 if [[ -d "$TASKS_DIR" ]]; then
-    find "$TASKS_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +14 2>/dev/null | while read -r task_dir; do
+    find "$TASKS_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +60 2>/dev/null | while read -r task_dir; do
         # Extract session ID from directory name
         session_id=$(basename "$task_dir")
 
@@ -249,11 +261,11 @@ fi
 # Step 6: Clean up old file-history directories with session protection
 # file-history contains directories named by session ID
 if [[ "$DRY_RUN" == "true" ]]; then
-    echo "File history directories older than 14 days:"
+    echo "File history directories older than 60 days:"
 fi
 
 if [[ -d "$FILE_HISTORY" ]]; then
-    find "$FILE_HISTORY" -mindepth 1 -maxdepth 1 -type d -mtime +14 2>/dev/null | while read -r history_dir; do
+    find "$FILE_HISTORY" -mindepth 1 -maxdepth 1 -type d -mtime +60 2>/dev/null | while read -r history_dir; do
         # Extract session ID from directory name
         session_id=$(basename "$history_dir")
 
@@ -288,16 +300,101 @@ if [[ "$DRY_RUN" == "true" ]]; then
     echo ""
 fi
 
+# Step 6a: Clean up old teams directories with session protection
+# teams contains directories named by session ID (same as file-history)
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo "Teams directories older than 60 days:"
+fi
+
+if [[ -d "$TEAMS_DIR" ]]; then
+    find "$TEAMS_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +60 2>/dev/null | while read -r teams_dir; do
+        # Extract session ID from directory name
+        session_id=$(basename "$teams_dir")
+
+        # Check if this session is protected (linked to a Desktop session)
+        if [[ -n "$protected_ids" ]] && echo "$protected_ids" | grep -qx "$session_id"; then
+            # Session is protected, do not delete
+            if [[ "$DRY_RUN" == "true" ]]; then
+                echo "  PROTECTED: $teams_dir (linked to Desktop)"
+                echo "protected" >> /tmp/claude/cleanup_teams_protected_$$ 2>/dev/null
+            fi
+        else
+            if [[ "$DRY_RUN" == "true" ]]; then
+                echo "  WOULD DELETE: $teams_dir"
+                echo "delete" >> /tmp/claude/cleanup_teams_delete_$$ 2>/dev/null
+            else
+                rm -rf "$teams_dir" 2>/dev/null
+            fi
+        fi
+    done
+fi
+
+# Dry-run: Read teams counts from temp files
+if [[ "$DRY_RUN" == "true" ]]; then
+    if [[ -f /tmp/claude/cleanup_teams_delete_$$ ]]; then
+        teams_to_delete=$(wc -l < /tmp/claude/cleanup_teams_delete_$$ | tr -d ' ')
+        rm /tmp/claude/cleanup_teams_delete_$$ 2>/dev/null
+    fi
+    if [[ -f /tmp/claude/cleanup_teams_protected_$$ ]]; then
+        teams_protected=$(wc -l < /tmp/claude/cleanup_teams_protected_$$ | tr -d ' ')
+        rm /tmp/claude/cleanup_teams_protected_$$ 2>/dev/null
+    fi
+    echo ""
+fi
+
+# Step 6b: Clean up old session-env directories with session protection
+# session-env contains directories named by session ID (same as file-history)
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo "Session-env directories older than 60 days:"
+fi
+
+if [[ -d "$SESSION_ENV_DIR" ]]; then
+    find "$SESSION_ENV_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +60 2>/dev/null | while read -r session_env_dir; do
+        # Extract session ID from directory name
+        session_id=$(basename "$session_env_dir")
+
+        # Check if this session is protected (linked to a Desktop session)
+        if [[ -n "$protected_ids" ]] && echo "$protected_ids" | grep -qx "$session_id"; then
+            # Session is protected, do not delete
+            if [[ "$DRY_RUN" == "true" ]]; then
+                echo "  PROTECTED: $session_env_dir (linked to Desktop)"
+                echo "protected" >> /tmp/claude/cleanup_session_env_protected_$$ 2>/dev/null
+            fi
+        else
+            if [[ "$DRY_RUN" == "true" ]]; then
+                echo "  WOULD DELETE: $session_env_dir"
+                echo "delete" >> /tmp/claude/cleanup_session_env_delete_$$ 2>/dev/null
+            else
+                rm -rf "$session_env_dir" 2>/dev/null
+            fi
+        fi
+    done
+fi
+
+# Dry-run: Read session-env counts from temp files
+if [[ "$DRY_RUN" == "true" ]]; then
+    if [[ -f /tmp/claude/cleanup_session_env_delete_$$ ]]; then
+        session_env_to_delete=$(wc -l < /tmp/claude/cleanup_session_env_delete_$$ | tr -d ' ')
+        rm /tmp/claude/cleanup_session_env_delete_$$ 2>/dev/null
+    fi
+    if [[ -f /tmp/claude/cleanup_session_env_protected_$$ ]]; then
+        session_env_protected=$(wc -l < /tmp/claude/cleanup_session_env_protected_$$ | tr -d ' ')
+        rm /tmp/claude/cleanup_session_env_protected_$$ 2>/dev/null
+    fi
+    echo ""
+fi
+
 # Step 7: Clean up empty directories in all managed folders
 # After deleting files/directories, some parent directories may be empty
 if [[ "$DRY_RUN" != "true" ]]; then
     find "$CLI_PROJECTS" -type d -empty -delete 2>/dev/null
-    find "$TODOS_DIR" -type d -empty -delete 2>/dev/null
     find "$PLANS_DIR" -type d -empty -delete 2>/dev/null
     find "$TASKS_DIR" -type d -empty -delete 2>/dev/null
     find "$PASTE_CACHE" -type d -empty -delete 2>/dev/null
     find "$FILE_HISTORY" -type d -empty -delete 2>/dev/null
     find "$TELEMETRY_DIR" -type d -empty -delete 2>/dev/null
+    find "$TEAMS_DIR" -type d -empty -delete 2>/dev/null
+    find "$SESSION_ENV_DIR" -type d -empty -delete 2>/dev/null
 fi
 
 # Dry-run: Print summary
@@ -311,13 +408,17 @@ if [[ "$DRY_RUN" == "true" ]]; then
     echo "  Debug files to delete: $debug_files_to_delete"
     echo "  Shell snapshots to delete: $shell_snapshots_to_delete"
     echo "  Telemetry files to delete: $telemetry_to_delete"
-    echo "  Todos to delete: $todos_to_delete"
     echo "  Plans to delete: $plans_to_delete"
     echo "  Task dirs to delete: $tasks_to_delete"
     echo "  Task dirs protected: $tasks_protected"
     echo "  Paste cache to delete: $paste_cache_to_delete"
     echo "  File history dirs to delete: $file_history_to_delete"
     echo "  File history dirs protected: $file_history_protected"
+    echo "  Teams dirs to delete: $teams_to_delete"
+    echo "  Teams dirs protected: $teams_protected"
+    echo "  Session-env dirs to delete: $session_env_to_delete"
+    echo "  Session-env dirs protected: $session_env_protected"
+    echo "  Sessions files to delete: $sessions_to_delete_simple"
 fi
 
 # Hook requirement: always exit 0
