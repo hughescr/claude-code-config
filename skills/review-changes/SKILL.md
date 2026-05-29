@@ -1,12 +1,13 @@
 ---
 name: review-changes
-description: Multi-agent review of uncommitted changes against the plan. Delegates to four mandatory perspectives (Codex, code reviewer, code architect, and project-steward) to check for bugs, unintended consequences, dead code, correct wiring, and long-term project/maintainability alignment. Use after implementation is complete and lint/tests pass.
-disable-model-invocation: true
+description: Use after implementation is complete and lint/tests pass to run a multi-agent review of uncommitted changes. Delegates to multiple perspectives (Codex, code reviewer, code architect, project-steward) checking for bugs, wiring/call-graph, dead code, and long-term project alignment.
 ---
 
 # Review Changes
 
 Conduct a thorough multi-agent review of all uncommitted changes in the repository.
+
+> Distinct from the built-in `/code-review` skill: review-changes is a multi-perspective pre-commit gate that includes project-steward alignment, whereas `/code-review` is a diff-focused bug + cleanup pass (with an ultra cloud mode).
 
 ## What to Review
 
@@ -21,6 +22,8 @@ Conduct a thorough multi-agent review of all uncommitted changes in the reposito
 Delegate this review to **at least 4 different agents running in parallel**. Use different models and agent specializations for diverse perspectives. More agents are welcome if additional specialized agents are available — 4 is the minimum, not the target.
 
 Each agent has full access to the codebase, git history, and all tools. Do NOT pre-read diffs or gather context before delegating — just invoke the agents with their instructions and let each one do its own investigation. This preserves orchestrator context.
+
+Launch each reviewer agent asynchronously (`run_in_background: true`) with a distinct name, consistent with the orchestrator rules in `~/.claude/CLAUDE.md`.
 
 1. **A Codex-based agent** (mandatory — use whatever codex/OpenAI agent is available). Have it review the uncommitted changes for architectural soundness, potential bugs, and unintended side-effects.
 

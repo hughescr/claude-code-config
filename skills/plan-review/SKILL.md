@@ -1,7 +1,6 @@
 ---
 name: plan-review
-description: Walk through each issue or planned change one-by-one, explaining each to the user and using AskUserQuestion to choose how to proceed. Use when reviewing plans, proposals, or discussing features/fixes/bugs.
-disable-model-invocation: true
+description: Use when explicitly asked to walk through a plan or list of issues one-by-one, with the user deciding each via AskUserQuestion. Triggers only on a request to review/triage a plan interactively — NOT on any casual mention of a feature, fix, or bug.
 ---
 
 # Plan Review
@@ -22,3 +21,5 @@ Review and discuss issues that need fixing or implementing, one at a time.
 4. **Ask clarifying questions freely.** If anything is unclear at any point — about the codebase, the user's intent, or the best approach — use AskUserQuestion immediately rather than guessing.
 
 5. **Proceed through all issues sequentially.** Don't rush or batch. One issue at a time, fully resolved before moving to the next.
+
+6. **After all issues are decided, summarize, record, and delegate.** Recap the decisions made, then record the chosen actions into the task list with TaskCreate — capturing any sequential (`→`) or parallel (`||`) shape between them. Then DELEGATE the chosen fixes to sub-agents per the orchestrator rules in `~/.claude/CLAUDE.md`. This skill itself does NOT start writing code — it routes the decided work to sub-agents.
