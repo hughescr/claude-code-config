@@ -46,7 +46,7 @@ RUNDIR=$(mktemp -d /tmp/claude/codex.XXXXXX)
 mkfifo "$RUNDIR/ready"
 
 # Build full command as array
-CODEX_ARGS=("${CODEX_BIN_ARRAY[@]}" exec --full-auto --json)
+CODEX_ARGS=("${CODEX_BIN_ARRAY[@]}" exec -s workspace-write -c approval_policy="never" --json)
 [ -n "$SESSION_ID" ] && CODEX_ARGS+=(resume "$SESSION_ID")
 CODEX_ARGS+=(-C "$WORKING_DIR" "$QUERY")
 
