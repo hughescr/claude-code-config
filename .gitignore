@@ -39,3 +39,4 @@ daemon.status.json
 /daemon/
 /jobs/
 /teams/
+.last-update-result.json
