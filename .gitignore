@@ -41,3 +41,4 @@ daemon.status.json
 /teams/
 .last-update-result.json
 plugins/plugin-catalog-cache.json
+__pycache__/
