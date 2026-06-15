@@ -42,3 +42,4 @@ daemon.status.json
 .last-update-result.json
 plugins/plugin-catalog-cache.json
 __pycache__/
+/plugins/.last_inuse_sweep
