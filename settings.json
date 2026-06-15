@@ -92,7 +92,8 @@
     "swift-lsp@claude-plugins-official": true,
     "typescript-lsp@claude-plugins-official": true,
     "shortcuts-playground@shortcuts-playground": true,
-    "skill-development@oaustegard-claude-skills": true
+    "skill-development@oaustegard-claude-skills": true,
+    "learning-opportunities@learning-opportunities": true
   },
   "extraKnownMarketplaces": {
     "ast-grep-marketplace": {
@@ -118,6 +119,12 @@
       "source": {
         "source": "github",
         "repo": "oaustegard/claude-skills"
+      }
+    },
+    "learning-opportunities": {
+      "source": {
+        "source": "git",
+        "url": "https://github.com/DrCatHicks/learning-opportunities.git"
       }
     }
   },
