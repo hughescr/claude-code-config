@@ -27,16 +27,6 @@
     "ask": [],
     "defaultMode": "auto"
   },
-  "autoMode": {
-    "soft_deny": [
-      "Bash(git push:*)",
-      "Bash(git flow release finish:*)",
-      "Bash(git tag:*)"
-    ],
-    "environment": [
-      "Cutting a release, pushing to any git remote, and creating version tags are outward-facing, hard-to-reverse actions — they can publish code, trigger CI/CD, or upload builds to app stores (e.g. App Store Connect). Never run these without the user's explicit, in-the-moment authorization, even in auto mode. Knowing the release steps is not authorization to execute them."
-    ]
-  },
   "hooks": {
     "PreToolUse": [
       {
@@ -140,6 +130,7 @@
     }
   },
   "alwaysThinkingEnabled": true,
+  "promptSuggestionEnabled": false,
   "awaySummaryEnabled": false,
   "pluginConfigs": {
     "shortcuts-playground@shortcuts-playground": {
@@ -150,11 +141,24 @@
   },
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true,
+  "theme": "auto",
+  "preferredNotifChannel": "auto",
+  "teammateMode": "auto",
   "remoteControlAtStartup": true,
   "inputNeededNotifEnabled": true,
   "agentPushNotifEnabled": true,
   "skipAutoPermissionPrompt": true,
   "useAutoModeDuringPlan": true,
+  "autoMode": {
+    "soft_deny": [
+      "Bash(git push:*)",
+      "Bash(git flow release finish:*)",
+      "Bash(git tag:*)"
+    ],
+    "environment": [
+      "Cutting a release, pushing to any git remote, and creating version tags are outward-facing, hard-to-reverse actions — they can publish code, trigger CI/CD, or upload builds to app stores (e.g. App Store Connect). Never run these without the user's explicit, in-the-moment authorization, even in auto mode. Knowing the release steps is not authorization to execute them."
+    ]
+  },
   "voiceEnabled": false,
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
