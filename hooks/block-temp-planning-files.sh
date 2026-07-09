@@ -58,9 +58,10 @@ if [ "$has_heredoc" = true ]; then
     deny_heredoc
   fi
 
-  # Pattern 3: Any heredoc writing to planning-like files (.md, .txt, .log)
-  if [[ "$command" =~ \.(md|txt|log|json)[[:space:]\"\'\>] ]] || \
-     [[ "$command" =~ \.(md|txt|log|json)$ ]]; then
+  # Pattern 3: heredoc whose output is redirected into a planning-like file.
+  # Requires an actual > / >> redirect targeting the file — a heredoc body that
+  # merely MENTIONS a .md/.txt/.log/.json filename must not trigger.
+  if [[ "$command" =~ \>{1,2}[[:space:]]*[\'\"]?[^[:space:]\'\"]*\.(md|txt|log|json)[\'\"]?([[:space:]]|$) ]]; then
     deny_heredoc
   fi
 fi
