@@ -1,15 +1,16 @@
 #!/bin/bash
 # Block Read calls that don't match allowed codex patterns
 INPUT=$(cat)
-FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null) || FILE_PATH=""
 
 # Allow: /tmp/claude/codex-query.* (query files)
 if [[ "$FILE_PATH" =~ ^/tmp/claude/codex-query\. ]]; then
-  exit 0  # Allow
+  echo '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}'
+  exit 0
 fi
 
-# Block with explanation
-cat >&2 << 'EOF'
-{"decision": "block", "reason": "Codex agent can only read /tmp/claude/codex-query.* files. You are a relay - pass the query to Codex, don't read source files yourself."}
-EOF
-exit 2
+# Block with explanation (structured deny on stdout; exit 0 carries the decision)
+cat << 'DECISION'
+{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "Codex agent can only read /tmp/claude/codex-query.* files. You are a relay - pass the query to Codex, don't read source files yourself."}}
+DECISION
+exit 0

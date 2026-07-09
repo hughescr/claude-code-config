@@ -25,7 +25,8 @@
 set -euo pipefail
 
 input=$(cat)
-skill_full=$(echo "$input" | jq -r '.tool_input.skill // empty')
+# jq parse failure = no opinion, not a block (set -e would otherwise exit 2)
+skill_full=$(echo "$input" | jq -r '.tool_input.skill // empty' 2>/dev/null) || exit 0
 
 if [ -z "$skill_full" ]; then
   # No skill specified, passthrough (empty stdout = no opinion)

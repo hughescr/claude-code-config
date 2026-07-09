@@ -6,31 +6,31 @@
 #
 # Exit Code | Stream  | Behavior
 # ----------|---------|----------------------------------------------------------
-# 0         | stdout  | Success - tool proceeds. If stdout contains JSON with
-#           |         | {"hookSpecificOutput": {"permissionDecision": "allow"}},
-#           |         | the tool runs without user permission prompt.
-#           |         | Empty stdout = no opinion, normal permission flow.
+# 0         | stdout  | Success. JSON with {"hookSpecificOutput":
+#           |         | {"permissionDecision": "allow|deny|ask",
+#           |         |  "permissionDecisionReason": "..."}} sets the decision;
+#           |         | empty stdout = no opinion, normal permission flow.
 # ----------|---------|----------------------------------------------------------
-# 2         | stderr  | Decision provided - Claude reads stderr for JSON:
-#           |         | {"hookSpecificOutput": {"permissionDecision": "deny|ask"},
-#           |         |  "systemMessage": "explanation for Claude"}
-#           |         | "deny" = block the tool, "ask" = prompt user
+# 2         | stderr  | BLOCKING ERROR - the tool call is DENIED and stderr text
+#           |         | is fed back to Claude. Do NOT use for passthrough.
 # ----------|---------|----------------------------------------------------------
-# other     | stderr  | Error - shown to user only, Claude unaware, tool proceeds
+# other     | stderr  | Non-blocking error - shown to user, tool proceeds via
+#           |         | normal permission flow.
 # ============================================================================
 
 set -euo pipefail
 
 input=$(cat)
-command=$(echo "$input" | jq -r '.tool_input.command // empty')
+# jq parse failure = no opinion, not a block (set -e would otherwise exit 2)
+command=$(echo "$input" | jq -r '.tool_input.command // empty' 2>/dev/null) || exit 0
 
 [ -z "$command" ] && exit 0
 
 deny_heredoc() {
-  cat << 'ERRMSG' >&2
-{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny"}, "systemMessage": "BLOCKED: Creating files via heredoc is forbidden. Use TodoWrite for task tracking, or use the Write tool for legitimate file creation. See CLAUDE.md."}
-ERRMSG
-  exit 2
+  cat << 'DECISION'
+{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "BLOCKED: Creating files via heredoc is forbidden. Use TodoWrite for task tracking, or use the Write tool for legitimate file creation. See CLAUDE.md."}}
+DECISION
+  exit 0
 }
 
 # Check for heredoc marker (case-insensitive delimiter)
