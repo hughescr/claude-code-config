@@ -1,6 +1,6 @@
 {
   "name": "resin-print-prep",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "Prep 3D meshes for resin printing in Blender (via Blender MCP): repair defects, orient, scale to tabletop size, and reduce density to printer resolution with error-bounded decimation",
   "author": {
     "name": "hughescr"

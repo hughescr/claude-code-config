@@ -18,6 +18,12 @@ hollow/solid decision, main-cavity-only, per-lobe drains, pooling audit,
 vent, verified export) plus print-orientation search. Pure Python
 (trimesh/scipy/scikit-image/manifold3d), no Blender required.
 
+New in 1.3: `chitubox-support-injection` skill — write native, editable
+supports (and raft bridges) directly into CHITUBOX project files via a
+reverse-engineered, injection-validated format map (`chitubox_inject.py`
++ full format reference). A placement ("magic support") companion skill
+is planned.
+
 Shared machinery in `scripts/`: `decimate_pipeline.py` (also runs from the
 CLI: `blender --background host.blend --python decimate_pipeline.py -- --stl model.stl`)
 and `geometry_sweep.py` (repair loop + scale/center bake).
