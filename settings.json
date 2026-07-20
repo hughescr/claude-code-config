@@ -1,8 +1,5 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "env": {
-    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
-  },
   "includeCoAuthoredBy": false,
   "permissions": {
     "allow": [
@@ -27,6 +24,7 @@
     "ask": [],
     "defaultMode": "auto"
   },
+  "model": "fable",
   "hooks": {
     "PreToolUse": [
       {
@@ -130,6 +128,7 @@
     }
   },
   "alwaysThinkingEnabled": true,
+  "effortLevel": "high",
   "promptSuggestionEnabled": false,
   "awaySummaryEnabled": false,
   "pluginConfigs": {
@@ -139,6 +138,7 @@
       }
     }
   },
+  "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true,
   "theme": "auto",
