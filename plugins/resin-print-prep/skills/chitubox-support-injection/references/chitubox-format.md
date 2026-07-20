@@ -121,3 +121,20 @@ frame against a known support before computing placements.
   bytes not pinpointed)
 - from-scratch tip/shaft mesh synthesis not yet Chitubox-validated
 - format is version-pinned: 1.3.0. Re-verify on upgrade.
+
+## Real-scale specimen: magic-supported 100mm miniature (calibration corpus)
+
+56MB project, parser clean: 5,860 records = 469 supports + 261 raft
+bridges. Extended type vocabulary beyond the minimal set: type 2
+(x167, short 0.2->0.6 taper) and type 8 (x130, ~0.5mm coupler) compose
+the small-pillar/model-adsorbed supports; type 12 (x7) unmapped; the
+2,985 type-3 joiners likely include the cross-brace lattice. Pass
+attribution via tip radius works: r0.4=Heavy(198), r0.25=Middle full
+pillar(9), r0.15+r0.1 = the two small-pillar passes (130+132).
+
+REALIZED density (the user's accepted standard, "Better Support"
+4-pass): tip nearest-neighbor median 3.1mm overall; Heavy pass 3.8mm
+(p10 2.6, p90 8.1); small-pillar passes ~5.2mm. Bottom quarter of the
+model carries 40% of all tips. NOTE: config touchtipdistance (6-8mm)
+is NOT the realized spacing -- treat it as a max, calibrate from real
+projects, not config.
