@@ -138,3 +138,20 @@ REALIZED density (the user's accepted standard, "Better Support"
 model carries 40% of all tips. NOTE: config touchtipdistance (6-8mm)
 is NOT the realized spacing -- treat it as a max, calibrate from real
 projects, not config.
+
+## Edit-behavior findings (injected supports under Chitubox editing)
+
+Field-tested: injected supports (cloned AND fully synthesized meshes,
+off-palette sizes) are selectable/movable/deletable like natives.
+Nuances discovered when the user MOVES an injected support's base:
+- its raft BRIDGE (connected-mat link) regenerates/follows correctly --
+  bridge topology is read from the records themselves;
+- its own raft PAD vanishes -- per-support pad ownership lives in the
+  editor's registry (likely the unmapped per-support group-header
+  tables), and injected supports are not in it.
+Mitigations: emit raft last and let Chitubox own mat bookkeeping after
+any manual edit; or map the registry via a save-after-editing-an-
+injected-support specimen diff (the editor normalizes the file with its
+own bookkeeping around alien records - a Rosetta stone, not yet done).
+Synthesized-mesh validation is COMPLETE: from-scratch frustum soup with
+computed (non-palette) radii renders, edits, and behaves natively.
