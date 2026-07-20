@@ -11,9 +11,9 @@ connected (interactive mode; the decimation phase can also run headless).
 
 **Read the repair playbook before phases 2-4** (orientation, shells,
 sweep decision rules and hard-won warnings live there). The reference
-files sit beside this file: `skills/prep-mini/references/repair-playbook.md`
-and `skills/prep-mini/references/sizing.md` under the plugin root (there
-is no top-level references/ directory).
+files sit beside this file in `skills/prep-mini/references/`:
+`repair-playbook.md`, `sizing.md`, and `hollowing.md` (there is no
+top-level references/ directory).
 Shared scripts live in `${CLAUDE_PLUGIN_ROOT}/scripts/`.
 
 ## Ask the user up front (skip anything already provided)
@@ -88,6 +88,18 @@ headless batch). This replaces any
 resolution (not just degenerate slivers) while measuring and protecting
 real thin features. See the sibling skill `decimate-for-print` for
 operation details, batch mode, and timeout handling.
+
+### 6b. Hollow + drill (only when thresholds say so)
+`python ${CLAUDE_PLUGIN_ROOT}/scripts/hollow_drill.py in.stl out.stl`
+(pure Python, no Blender; deps in its docstring). Decides hollow-vs-solid
+from measured bulk thickness and resin savings, hollows only the main
+cavity (small pockets stay solid -- they'd be sealed resin traps), drills
+one drain per low lobe plus a vent, audits trapped resin, and refuses to
+export unless verification passes. It also picks the print orientation
+(so do NOT auto-rotate in the slicer afterward). Read
+`references/hollowing.md` first -- it explains the thresholds, the
+slicer false-positive decode, and why detector noise must not be
+"cleaned up".
 
 ### 7. Export + final verify
 Per-object STL export (`bpy.ops.wm.stl_export`, selected objects only).

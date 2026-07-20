@@ -69,6 +69,11 @@ sessions must use `obj=`.
 - Typical results: small minis (13-40mm) are wildly oversampled and
   reduce 10-15x; larger pieces (50-60mm) legitimately keep more (3-7x).
   Reduction below ~40k faces rarely happens - do not force it.
+- Set expectations honestly: decimation speeds up mesh HANDLING in the
+  slicer (loading, error checks, support editing). Slice time itself is
+  layers x screen resolution x anti-aliasing and barely depends on
+  triangle count -- tall models slice slowly regardless. Suggest AA
+  4x->2x and coarser layers before suggesting more decimation.
 - Report per-model: faces before/after, p99/p99.9/max um, watertight
   status. Flag any model whose max error is many pixels (a single feature
   took a hit - offer a targeted re-run or a visual check) and anything

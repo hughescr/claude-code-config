@@ -13,6 +13,11 @@ the [Blender MCP](https://extensions.blender.org/add-ons/mcp/):
   the deepest passing reduction, and verifies against the full original
   surface before exporting. Batch-friendly (headless Blender per model).
 
+New in 1.1: `scripts/hollow_drill.py` — supervised hollowing (EDT-based
+hollow/solid decision, main-cavity-only, per-lobe drains, pooling audit,
+vent, verified export) plus print-orientation search. Pure Python
+(trimesh/scipy/scikit-image/manifold3d), no Blender required.
+
 Shared machinery in `scripts/`: `decimate_pipeline.py` (also runs from the
 CLI: `blender --background host.blend --python decimate_pipeline.py -- --stl model.stl`)
 and `geometry_sweep.py` (repair loop + scale/center bake).
