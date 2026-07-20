@@ -28,6 +28,16 @@ have trapped 14ml, per-lobe drains cut it to 0.27ml.
 - Orientation is decided BEFORE drilling (holes are gravity-relative).
   In the slicer, the model must then NOT be auto-rotated.
 
+## Operational notes
+
+- Run hollow_drill.py foreground in one shell call (~20s typical); in
+  sandboxed VMs background processes are reaped between calls.
+- The orientation search changes bounding dims versus the sized input
+  (a 119mm-tall upright model may report 113mm tall x 107mm deep after
+  a lean). Footprint scaling is unaffected -- not a sizing error.
+- The pooling audit auto-adds drains (up to 3) when >0.5ml is trapped;
+  the report lists them with "added_by_audit": true.
+
 ## Slicer error-detection decode (CHITUBOX "Detect Errors")
 
 On a correctly hollowed+drilled mesh expect false positives:

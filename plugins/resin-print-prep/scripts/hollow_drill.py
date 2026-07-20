@@ -1,5 +1,11 @@
 """Supervised hollowing + drain drilling for resin printing. STL in, STL out.
 
+Runtime: ~20s at 0.5mm pitch on a 500k-face model -- run it in the
+FOREGROUND of a single shell call; do not background it in sandboxed
+environments (reaped between calls). Note the orientation search changes
+the bounding dims relative to the sized input (footprint scaling is
+unaffected) -- expect the final dims report to differ from pre-hollow.
+
 Runs in ANY Python 3.10+ (no Blender needed):
     pip install trimesh scipy scikit-image manifold3d fast-simplification
     python hollow_drill.py in.stl out.stl [--wall 2.5] [--no-orient] [--report r.json]
@@ -168,27 +174,53 @@ def run(in_path, out_path, wall=2.5, orient=True, log=None):
     cyls.append(c)
     log.update(drains=drains, vent={"xyz": [round(v, 1) for v in vp], "wall_mm": round(ventL, 1)})
 
-    # pooling audit
-    drain_ijk = [np.clip(trimesh.transformations.transform_points([d["xyz"]], Tinv)[0]
-                         .round().astype(int), 0, np.array(mat.shape) - 1) for d in drains]
-    pool = 0.0
-    for zcut in np.arange(lowz + 2, zw.max(), 4.0):
-        b2 = np.zeros_like(main)
-        s2 = idx[zw < zcut]
-        b2[tuple(s2.T)] = True
-        lb2, nb2 = ndimage.label(b2)
-        if nb2 <= 0:
-            continue
-        s = ndimage.sum(b2, lb2, range(1, nb2 + 1))
-        drained = set()
-        for dj in drain_ijk:
-            for dz in range(6):
-                q = np.clip(dj + [0, 0, dz], 0, np.array(mat.shape) - 1)
-                if lb2[tuple(q)] > 0:
-                    drained.add(lb2[tuple(q)]); break
-        pool = max(pool, sum(s[i - 1] for i in range(1, nb2 + 1) if i not in drained)
-                   * PITCH ** 3 / 1000.0)
-    log.update(trapped_resin_ml=round(pool, 2))
+    # pooling audit + remediation: lobes are gated on volume in the low band,
+    # which can miss a branch holding real volume higher up (field test: a
+    # 2.66ml branch with <0.5ml in-band got no drain, trapping 2.77ml). So:
+    # audit, and if >0.5ml is trapped, drill an extra drain at the largest
+    # trapped component's low point and re-audit (up to 3 extra drains).
+    def audit(drain_list):
+        dijk = [np.clip(trimesh.transformations.transform_points([d["xyz"]], Tinv)[0]
+                        .round().astype(int), 0, np.array(mat.shape) - 1) for d in drain_list]
+        worst = (0.0, None)
+        for zcut in np.arange(lowz + 2, zw.max(), 4.0):
+            b2 = np.zeros_like(main)
+            s2 = idx[zw < zcut]
+            b2[tuple(s2.T)] = True
+            lb2, nb2 = ndimage.label(b2)
+            if nb2 <= 0:
+                continue
+            s = ndimage.sum(b2, lb2, range(1, nb2 + 1))
+            drained = set()
+            for dj in dijk:
+                for dz in range(6):
+                    q = np.clip(dj + [0, 0, dz], 0, np.array(mat.shape) - 1)
+                    if lb2[tuple(q)] > 0:
+                        drained.add(lb2[tuple(q)]); break
+            trapped = [(s[i - 1] * PITCH ** 3 / 1000.0, i) for i in range(1, nb2 + 1)
+                       if i not in drained]
+            tot = sum(t for t, _ in trapped)
+            if tot > worst[0]:
+                big = max(trapped)[1]
+                cw = trimesh.transformations.transform_points(
+                    np.array(np.nonzero(lb2 == big)).T.astype(float), T)
+                p = cw[cw[:, 2] < cw[:, 2].min() + 1.0].mean(0); p[2] = cw[:, 2].min()
+                worst = (tot, p)
+        return worst
+    pool, ppt = audit(drains)
+    extra = 0
+    while pool > 0.5 and ppt is not None and extra < 3:
+        L, d = exit_ray(ppt, down)
+        seg = L + 8.0
+        c = trimesh.creation.cylinder(radius=DRAIN_R, height=seg, sections=24)
+        c.apply_transform(trimesh.geometry.align_vectors([0, 0, 1], d))
+        c.apply_translation(ppt + d * (L - seg / 2 + 4.0))
+        cyls.append(c)
+        drains.append({"xyz": [round(v, 1) for v in ppt], "lobe_ml": None,
+                       "wall_mm": round(L, 1), "added_by_audit": True})
+        extra += 1
+        pool, ppt = audit(drains)
+    log.update(trapped_resin_ml=round(pool, 2), audit_added_drains=extra, drains=drains)
 
     # interior shell (marching cubes is inside-out: fix normals, assert volume)
     mp = np.pad(main, 1)
@@ -201,7 +233,9 @@ def run(in_path, out_path, wall=2.5, orient=True, log=None):
         c.merge_vertices()
     assert all(x.is_volume for x in inputs), "non-volume boolean input"
     final = trimesh.boolean.difference(inputs, engine="manifold")
-    final.merge_vertices()
+    # Do NOT merge_vertices here: manifold3d output is already welded, and
+    # merging can pinch coincident seam vertices into a non-manifold edge,
+    # failing verification on an otherwise-valid mesh (found in field test).
 
     # verification triad + volume + breathing
     bodies = len(final.split(only_watertight=False))
