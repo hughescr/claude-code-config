@@ -143,15 +143,16 @@ projects, not config.
 
 Field-tested: injected supports (cloned AND fully synthesized meshes,
 off-palette sizes) are selectable/movable/deletable like natives.
-Nuances discovered when the user MOVES an injected support's base:
-- its raft BRIDGE (connected-mat link) regenerates/follows correctly --
-  bridge topology is read from the records themselves;
-- its own raft PAD vanishes -- per-support pad ownership lives in the
-  editor's registry (likely the unmapped per-support group-header
-  tables), and injected supports are not in it.
-Mitigations: emit raft last and let Chitubox own mat bookkeeping after
-any manual edit; or map the registry via a save-after-editing-an-
-injected-support specimen diff (the editor normalizes the file with its
-own bookkeeping around alien records - a Rosetta stone, not yet done).
+When the user MOVES an injected support's base, Chitubox ADOPTS the
+support completely (verified by diffing the saved-after-edit file):
+unmoved segments keep our meshes; moved segments are re-authored with
+Chitubox's own native tessellations, including a properly BENT taper
+articulating from the unmoved tip to the new base; the bridge start
+follows the foot; the pad is regenerated at the new position with a
+native mesh. Critically, our off-palette computed radii (0.55/0.9/1.3)
+SURVIVE native regeneration - continuous sizing is first-class.
+The live-session "pad vanishes" effect appears to be a render-refresh
+glitch only: the saved file contains a valid, correctly placed pad
+(confirm by reopening after save).
 Synthesized-mesh validation is COMPLETE: from-scratch frustum soup with
 computed (non-palette) radii renders, edits, and behaves natively.
