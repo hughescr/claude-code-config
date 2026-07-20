@@ -151,8 +151,16 @@ articulating from the unmoved tip to the new base; the bridge start
 follows the foot; the pad is regenerated at the new position with a
 native mesh. Critically, our off-palette computed radii (0.55/0.9/1.3)
 SURVIVE native regeneration - continuous sizing is first-class.
-The live-session "pad vanishes" effect appears to be a render-refresh
-glitch only: the saved file contains a valid, correctly placed pad
-(confirm by reopening after save).
+The "pad vanishes" effect is NOT a render glitch (survives save +
+reopen) and NOT in the records (all pads carry byte-identical trailing
+fields, and the pad record + mesh are valid and correctly placed).
+Rendering of a support's pad is evidently gated by REGISTRY state in
+the pre-mesh region, which save-after-edit rewrites wholesale (-3KB,
+near-total divergence) - mapping it requires structured group-header
+comparison (open task). Practical impact is small: pads DO render for
+injected supports until the user edits that specific support; the
+support itself, its bridges, and all data survive edits intact - only
+the edited support's own disc goes invisible (while remaining in the
+file and presumably the slice).
 Synthesized-mesh validation is COMPLETE: from-scratch frustum soup with
 computed (non-palette) radii renders, edits, and behaves natively.
