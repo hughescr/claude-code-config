@@ -10,6 +10,15 @@ Personal Claude Code configuration with plugin-based architecture, custom hooks,
 - **Marketplace Integration**: Install plugins from configured marketplaces
 - **Submodule Support**: Some plugins are managed as git submodules from external repos
 
+## Installing via marketplace
+
+```
+/plugin marketplace add hughescr/claude-code-config
+/plugin install resin-print-prep@hughescr
+```
+
+The marketplace manifest lives at `.claude-plugin/marketplace.json` and lists every plugin in `plugins/`.
+
 ## Plugin Structure
 
 Plugins live in `plugins/` and can contain:

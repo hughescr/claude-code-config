@@ -1,0 +1,53 @@
+{
+  "name": "hughescr",
+  "owner": {
+    "name": "hughescr",
+    "url": "https://github.com/hughescr"
+  },
+  "metadata": {
+    "description": "Craig Hughes' Claude Code plugins: language tooling, dev workflows, and 3D-print mesh prep",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "resin-print-prep",
+      "source": "./plugins/resin-print-prep",
+      "description": "Prep 3D meshes for resin printing in Blender (via Blender MCP): repair, orient, scale, error-bounded decimation, verified STL export"
+    },
+    {
+      "name": "javascript",
+      "source": "./plugins/javascript",
+      "description": "JavaScript/Node.js development tools - npm packages and Bun runtime"
+    },
+    {
+      "name": "typescript",
+      "source": "./plugins/typescript",
+      "description": "TypeScript-specific development tools - type checking, strict mode, and TSDoc"
+    },
+    {
+      "name": "generic-dev",
+      "source": "./plugins/generic-dev",
+      "description": "Generic development tools for any coding project - symbol editing, documentation, and code navigation"
+    },
+    {
+      "name": "hugo",
+      "source": "./plugins/hugo",
+      "description": "Hugo static site development plugin with agents for template development, content management, asset pipeline, and AWS deployment"
+    },
+    {
+      "name": "duckdb",
+      "source": "./plugins/duckdb",
+      "description": "DuckDB MCP server for data analysis"
+    },
+    {
+      "name": "tmux",
+      "source": "./plugins/tmux",
+      "description": "Tmux MCP server integration for terminal multiplexer support"
+    },
+    {
+      "name": "humanizer",
+      "source": "./plugins/humanizer",
+      "description": "Remove signs of AI-generated writing from text. Based on Wikipedia's 'Signs of AI writing' guide."
+    }
+  ]
+}
