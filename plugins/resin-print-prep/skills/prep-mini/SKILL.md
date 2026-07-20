@@ -9,16 +9,20 @@ Take a mesh with issues and walk it through repair -> staging -> density
 reduction -> export. Requires a running Blender with the Blender MCP addon
 connected (interactive mode; the decimation phase can also run headless).
 
-**Read `references/repair-playbook.md` before phases 2-4** (orientation,
-shells, sweep decision rules and hard-won warnings live there).
-Sizing conventions for phase 5 are in `references/sizing.md`.
+**Read the repair playbook before phases 2-4** (orientation, shells,
+sweep decision rules and hard-won warnings live there). The reference
+files sit beside this file: `skills/prep-mini/references/repair-playbook.md`
+and `skills/prep-mini/references/sizing.md` under the plugin root (there
+is no top-level references/ directory).
 Shared scripts live in `${CLAUDE_PLUGIN_ROOT}/scripts/`.
 
-## Ask the user up front
+## Ask the user up front (skip anything already provided)
 
 1. **Printer + resolution**: XY pixel pitch and layer height. (Saturn 4
    Ultra 16K = 14x19 um pixels; if unknown, look up the printer model.)
-   The decimation error budget = half the coarser pixel.
+   The decimation error budget = half the coarser pixel. Layer height is
+   collected only to confirm XY binds (it does whenever layers are coarser
+   than the pixel, i.e. almost always); it feeds no calculation.
 2. **Target size**: game-size class (see `references/sizing.md`) or explicit
    height/footprint in mm.
 3. **Output destination** for the final STL.
@@ -59,8 +63,11 @@ internal bubble shells; delete all but the largest component.
 
 ### 4. Geometry sweep (converging repair loop)
 `exec(open("${CLAUDE_PLUGIN_ROOT}/scripts/geometry_sweep.py").read())`
-then `sweep("ObjectName")` until all counts are 0 (2-5 passes typical;
-transient count bumps are normal). Collapse-based - NEVER dissolve-based
+then `sweep("ObjectName")` until all counts are 0 (2-6 passes typical;
+transient count bumps are normal). Sweep thresholds operate in LOCAL mesh
+units -- check `obj.scale` first: an object scaled to 0.01 makes the
+absolute thresholds 100x too aggressive in world terms (bake the scale or
+adjust `zero_thresh`). Collapse-based - NEVER dissolve-based
 cleanup or the Toolbox "Make Manifold" button on dense meshes (they create
 defects; verified repeatedly). Details and stubborn-case fixes (micro-fans)
 in the playbook.
@@ -73,7 +80,10 @@ units as mm.
 
 ### 6. Error-bounded decimation
 Now that units = printed mm, run the decimation pipeline
-(`${CLAUDE_PLUGIN_ROOT}/scripts/decimate_pipeline.py`). This replaces any
+(`${CLAUDE_PLUGIN_ROOT}/scripts/decimate_pipeline.py`). **In an
+interactive session pass `obj=` to `run()`** -- called with only a path it
+re-reads an empty homefile and wipes the open scene (path-only mode is for
+headless batch). This replaces any
 "remove tiny faces" cleanup: it removes ALL detail below printer
 resolution (not just degenerate slivers) while measuring and protecting
 real thin features. See the sibling skill `decimate-for-print` for

@@ -11,11 +11,20 @@ Criterion: p99 of two-sided deviation <= half pixel, p99.9 <= one pixel.
 IMPORTANT: mesh units must equal printed mm (final print scale). The budget
 is meaningless if the model gets rescaled in the slicer afterward.
 
-Use from Blender MCP (interactive or execute_blender_code_for_cli):
+Use from Blender MCP:
+
+  Headless / batch (fresh scene per model -- STL in, STL out):
     exec(open(".../decimate_pipeline.py").read())
     log = {}
     run("/path/model.stl", log, pixel_um=19.0)      # overwrite in place
     run("/path/model.stl", log, out_path="/path/out.stl")  # write elsewhere
+
+  Interactive (a scene is already open): you MUST pass obj=.
+    run("/path/out.stl", log, obj=bpy.data.objects["MyMesh"])
+    WARNING: without obj=, run() calls read_homefile(use_empty=True) and
+    WIPES the currently open scene. With obj= the scene is left alone and
+    stl_path is used only as the default export destination (out_path
+    overrides it).
 
 Or headless CLI:
     blender --background host.blend --python decimate_pipeline.py -- \
@@ -51,6 +60,15 @@ def run(stl_path, log, pixel_um=DEFAULT_PIXEL_UM, out_path=None,
 
     Results accumulate in `log` (dict) as the run progresses, so a caller
     that dumps `log` in a finally: block preserves partial state on timeout.
+
+    obj=None -> loads stl_path into a FRESH EMPTY scene (destroys any open
+    scene; headless/batch use). obj=<Object> -> operates on that object in
+    the current scene; stl_path then only names the default export target.
+
+    Verify slack: the ratio bisect uses sampled percentiles; the final
+    check re-measures the FULL population, which drifts slightly from the
+    sample. The 1.1x slack on the budget absorbs that sampling drift --
+    intentional, not a loosened spec.
     """
     tol = pixel_um / 2000.0      # half pixel, mm
     tol999 = pixel_um / 1000.0   # one pixel, mm

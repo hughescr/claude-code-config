@@ -42,13 +42,26 @@ MCP (interactive `execute_blender_code` or headless
    the FULL population (every original vert + every new face center) and
    requires watertightness no worse than input.
 4. Exports only on verified PASS - a written STL certifies its run.
+   (Final verify allows 1.1x slack on the budget: the bisect decides on
+   sampled percentiles, the verify re-measures the full population, and
+   the slack absorbs that sampling drift. Intentional.)
+
+Two calling modes -- this matters: `run(path, log)` loads the STL into a
+FRESH EMPTY scene (headless/batch; destroys any open scene), while
+`run(path, log, obj=some_object)` operates on an object already in the
+open scene, with `path` naming only the export destination. Interactive
+sessions must use `obj=`.
 
 ## Operational notes
 
 - **MCP timeouts**: client calls die around 60s; the Blender process
-  keeps going. Wrap `run()` so `log` dumps to a sidecar JSON in
-  `finally:`, then poll for the file. Never re-launch while a previous
-  run may still be writing the same STL.
+  keeps going. Two recovery patterns: (a) wrap `run()` so `log` dumps to
+  a sidecar JSON in `finally:` and poll for the file; (b) interactive
+  sessions can instead stash `log` in a module global and poll it with a
+  tiny `execute_blender_code` call -- the addon queues it behind the
+  running operation, and this works even when your file tools cannot see
+  Blender's filesystem. Never re-launch while a previous run may still be
+  writing the same STL.
 - **Batch folders**: triage first without loading anything - binary STL
   size = 84 + 50 x triangles, so the header/size gives face counts for
   free. Chitubox pain starts around 500k faces. Process one model per

@@ -20,6 +20,14 @@ are area < 1e-8. Clean at full/original scale where the threshold means
 something. Sub-printable-but-healthy density is the decimation pipeline's
 job, not the sweep's.
 
+Apparent tension, resolved: the sweep collapses everything under 1e-4 --
+deliberately wider than the 1e-8 "true degenerate" bar. At FULL import
+scale, faces under 1e-4 are slivers that are safe and desirable to
+collapse; 1e-8 is the bar for judging whether counts at MINI scale are
+real defects. Do not lower the sweep threshold to 1e-8, and do not run
+the 1e-4 sweep on an already-mini-scaled mesh. Note the sweep measures
+LOCAL mesh units: check obj.scale before trusting either threshold.
+
 ## NEVER dissolve-based cleanup on dense meshes
 
 `dissolve_degenerate` and the Toolbox **"Make Manifold" button CREATE
