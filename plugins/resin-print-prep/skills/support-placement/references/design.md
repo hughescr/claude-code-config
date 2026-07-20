@@ -39,15 +39,20 @@ Hard requirements from the user:
   vertical descent. Records are polyline chains natively (type-3
   joiners); kinked+braced is native vocabulary.
 
-## Calibration (measure, don't guess)
+## Calibration epistemics (measure, don't guess - and grade the source)
 
-A real magic-supported project (469 supports) provides: realized tip
-spacing 3.1mm median (Heavy 3.8) - config's 6-8mm touchtipdistance is
-a MAX, not the target; bottom quarter carries ~40% of tips; brace
-placement vs shaft free length is extractable and calibrates the
-slenderness constant; elbow geometry is observable. Calibrate against
-the corpus where the slicer was right; out-engineer it where it just
-applied the palette.
+The user's support profiles are NOT Chitubox defaults: they came from
+earlier LLM (Opus) conversations improving on defaults, without
+holistic placement redesign and without checking support lore against
+physics. Treat them - and the 469-support corpus generated with them -
+as EVIDENCE OF SUFFICIENCY (these prints succeed), never as optima.
+Policy: physics decides; the corpus bounds the feasible region from
+above (3.1mm median tip spacing is likely OVER-dense); print outcomes
+are the final arbiter. v2 ships a defensible-margin physics config
+(SF over green-state properties), then walks density/size down across
+test prints. Corpus remains useful for: brace placement vs free length
+(slenderness constant), elbow geometry, realized spatial distribution
+(where a competent-if-unprincipled algorithm judged support necessary).
 
 ## v0 -> v2 work list (priority order)
 
