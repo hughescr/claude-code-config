@@ -25,6 +25,17 @@ have trapped 14ml, per-lobe drains cut it to 0.27ml.
 - Drains 3mm dia, one per low lobe; vent 2.5mm near cavity top.
   The vent is not optional -- a sealed cavity alternates suction and
   pressure every layer and can blow out or crack.
+- **Drainability doctrine: every cavity voxel must either drain or not
+  exist.** After drain placement the script computes a per-voxel trapped
+  map (a voxel traps resin iff its cavity component below its own height
+  contains no drain). Trapped pockets with a short downward exit get an
+  extra drain (holes on down-facing surfaces are invisible; max 3);
+  pockets whose only exits are visible surfaces -- hollowed limbs, e.g.
+  drooping arms -- are REFILLED to solid. Refilling beats drilling
+  display surfaces and beats sealed resin: trapped liquid leaks at the
+  first pinhole and expands/cracks in heat. Bonus: refilled thin limbs
+  are stronger. The report lists `refilled_ml`; final trapped resin
+  should read 0.0.
 - Orientation is decided BEFORE drilling (holes are gravity-relative).
   In the slicer, the model must then NOT be auto-rotated.
 

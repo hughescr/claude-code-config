@@ -174,53 +174,83 @@ def run(in_path, out_path, wall=2.5, orient=True, log=None):
     cyls.append(c)
     log.update(drains=drains, vent={"xyz": [round(v, 1) for v in vp], "wall_mm": round(ventL, 1)})
 
-    # pooling audit + remediation: lobes are gated on volume in the low band,
-    # which can miss a branch holding real volume higher up (field test: a
-    # 2.66ml branch with <0.5ml in-band got no drain, trapping 2.77ml). So:
-    # audit, and if >0.5ml is trapped, drill an extra drain at the largest
-    # trapped component's low point and re-audit (up to 3 extra drains).
-    def audit(drain_list):
+    # Drainability doctrine: every cavity voxel must either drain or not
+    # exist. A voxel traps resin iff, at its own height, its cavity
+    # component below that level contains no drain (resin flows down and
+    # cannot climb saddles). Pockets with a discreet downward exit get an
+    # extra drain (max 3); everything else -- e.g. hollowed limbs where a
+    # hole would be visible -- is REFILLED to solid. Field-driven: arms
+    # were hollowed with no acceptable drain spot and held sealed resin.
+    kk_idx = idx[:, 2]  # z index per cavity voxel (index space, z-monotonic)
+
+    def trapped_map(drain_list):
         dijk = [np.clip(trimesh.transformations.transform_points([d["xyz"]], Tinv)[0]
                         .round().astype(int), 0, np.array(mat.shape) - 1) for d in drain_list]
-        worst = (0.0, None)
-        for zcut in np.arange(lowz + 2, zw.max(), 4.0):
+        trap = np.zeros_like(main)
+        band = 4  # voxels (=2mm at 0.5 pitch)
+        for kcut in range(int(kk_idx.min()) + band, int(kk_idx.max()) + band + 1, band):
             b2 = np.zeros_like(main)
-            s2 = idx[zw < zcut]
-            b2[tuple(s2.T)] = True
+            sel2 = idx[kk_idx < kcut]
+            b2[tuple(sel2.T)] = True
             lb2, nb2 = ndimage.label(b2)
             if nb2 <= 0:
                 continue
-            s = ndimage.sum(b2, lb2, range(1, nb2 + 1))
             drained = set()
             for dj in dijk:
                 for dz in range(6):
                     q = np.clip(dj + [0, 0, dz], 0, np.array(mat.shape) - 1)
                     if lb2[tuple(q)] > 0:
                         drained.add(lb2[tuple(q)]); break
-            trapped = [(s[i - 1] * PITCH ** 3 / 1000.0, i) for i in range(1, nb2 + 1)
-                       if i not in drained]
-            tot = sum(t for t, _ in trapped)
-            if tot > worst[0]:
-                big = max(trapped)[1]
-                cw = trimesh.transformations.transform_points(
-                    np.array(np.nonzero(lb2 == big)).T.astype(float), T)
-                p = cw[cw[:, 2] < cw[:, 2].min() + 1.0].mean(0); p[2] = cw[:, 2].min()
-                worst = (tot, p)
-        return worst
-    pool, ppt = audit(drains)
+            in_band = b2 & (~trap)
+            in_band[..., :max(0, kcut - band)] = False
+            lbl_band = lb2[in_band]
+            bad = ~np.isin(lbl_band, list(drained) or [0])
+            coords = np.array(np.nonzero(in_band)).T[bad]
+            trap[tuple(coords.T)] = True
+        return trap
+
+    trap = trapped_map(drains)
+    refilled_ml = 0.0
     extra = 0
-    while pool > 0.5 and ppt is not None and extra < 3:
-        L, d = exit_ray(ppt, down)
-        seg = L + 8.0
-        c = trimesh.creation.cylinder(radius=DRAIN_R, height=seg, sections=24)
-        c.apply_transform(trimesh.geometry.align_vectors([0, 0, 1], d))
-        c.apply_translation(ppt + d * (L - seg / 2 + 4.0))
-        cyls.append(c)
-        drains.append({"xyz": [round(v, 1) for v in ppt], "lobe_ml": None,
-                       "wall_mm": round(L, 1), "added_by_audit": True})
-        extra += 1
-        pool, ppt = audit(drains)
-    log.update(trapped_resin_ml=round(pool, 2), audit_added_drains=extra, drains=drains)
+    tl, tn = ndimage.label(trap)
+    tsz = ndimage.sum(trap, tl, range(1, tn + 1)) * PITCH ** 3 / 1000.0
+    for k in np.argsort(-tsz):
+        vol_k = tsz[k]
+        if vol_k <= 0:
+            continue
+        comp = tl == k + 1
+        cw = trimesh.transformations.transform_points(
+            np.array(np.nonzero(comp)).T.astype(float), T)
+        pk = cw[cw[:, 2] < cw[:, 2].min() + 1.0].mean(0); pk[2] = cw[:, 2].min()
+        drilled = False
+        if vol_k >= 0.5 and extra < 3:
+            r = exit_ray(pk, down)
+            if r and r[0] <= 8.0:  # short, downward exit = discreet drain spot
+                L, d = r
+                seg = L + 8.0
+                c = trimesh.creation.cylinder(radius=DRAIN_R, height=seg, sections=24)
+                c.apply_transform(trimesh.geometry.align_vectors([0, 0, 1], d))
+                c.apply_translation(pk + d * (L - seg / 2 + 4.0))
+                cyls.append(c)
+                drains.append({"xyz": [round(v, 1) for v in pk], "lobe_ml": round(float(vol_k), 2),
+                               "wall_mm": round(L, 1), "added_by_audit": True})
+                extra += 1
+                drilled = True
+        if not drilled:
+            main &= ~comp  # refill: no acceptable drain -> stays solid
+            refilled_ml += vol_k
+    if extra:  # drains changed; refill anything still trapped
+        trap2 = trapped_map(drains)
+        main &= ~trap2
+        refilled_ml += trap2.sum() * PITCH ** 3 / 1000.0
+    cavity_ml = main.sum() * PITCH ** 3 / 1000.0
+    # recompute cavity index/world arrays after refill
+    idx = np.array(np.nonzero(main)).T
+    world = trimesh.transformations.transform_points(idx.astype(float), T)
+    zw = world[:, 2]
+    log.update(trapped_resin_ml=0.0, audit_added_drains=extra,
+               refilled_ml=round(float(refilled_ml), 2),
+               cavity_ml=round(cavity_ml, 1), drains=drains)
 
     # interior shell (marching cubes is inside-out: fix normals, assert volume)
     mp = np.pad(main, 1)
