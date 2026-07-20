@@ -184,29 +184,65 @@ def run(in_path, out_path, wall=2.5, orient=True, log=None):
     kk_idx = idx[:, 2]  # z index per cavity voxel (index space, z-monotonic)
 
     def trapped_map(drain_list):
-        dijk = [np.clip(trimesh.transformations.transform_points([d["xyz"]], Tinv)[0]
-                        .round().astype(int), 0, np.array(mat.shape) - 1) for d in drain_list]
+        """Exact per-voxel drainability via bottom-up union-find (priority
+        flood): process cavity voxels level by level; v drains iff, once
+        its own level is merged, its component already contains a drain.
+        No z-banding -- a 1mm pocket saddling into the main cavity 1mm
+        higher is correctly caught (field bug: 2mm bands missed short
+        arm-stub pockets that merge with the main hollow at their top)."""
+        vid = np.full(mat.shape, -1, dtype=np.int64)
+        order = np.argsort(idx[:, 2], kind="stable")
+        oidx = idx[order]
+        vid[tuple(oidx.T)] = np.arange(len(oidx))
+        parent = np.arange(len(oidx))
+        has_drain = np.zeros(len(oidx), bool)
+        def find(a):
+            while parent[a] != a:
+                parent[a] = parent[parent[a]]
+                a = parent[a]
+            return a
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+                has_drain[ra] |= has_drain[rb]
+        for d in drain_list:
+            dj = np.clip(trimesh.transformations.transform_points([d["xyz"]], Tinv)[0]
+                         .round().astype(int), 0, np.array(mat.shape) - 1)
+            # mark cavity voxels in a small ball around the drain point
+            for off in np.ndindex(3, 3, 3):
+                q = np.clip(dj + np.array(off) - 1, 0, np.array(mat.shape) - 1)
+                v = vid[tuple(q)]
+                if v >= 0:
+                    has_drain[v] = True
+        nbrs = np.array([[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]])
+        drainable = np.zeros(len(oidx), bool)
+        ks = oidx[:, 2]
+        i = 0
+        N = len(oidx)
+        shp = np.array(mat.shape)
+        while i < N:
+            j = i
+            k = ks[i]
+            while j < N and ks[j] == k:
+                j += 1
+            for t in range(i, j):  # merge this level with itself + below
+                p0 = oidx[t]
+                for nb in nbrs:
+                    q = p0 + nb
+                    if (q < 0).any() or (q >= shp).any():
+                        continue
+                    if q[2] > k:
+                        continue  # only lateral and downward links exist yet
+                    v = vid[tuple(q)]
+                    if v >= 0 and ks[v] <= k:
+                        union(vid[tuple(p0)], v)
+            for t in range(i, j):  # judge at own level, after level merged
+                drainable[t] = has_drain[find(vid[tuple(oidx[t])])]
+            i = j
         trap = np.zeros_like(main)
-        band = 4  # voxels (=2mm at 0.5 pitch)
-        for kcut in range(int(kk_idx.min()) + band, int(kk_idx.max()) + band + 1, band):
-            b2 = np.zeros_like(main)
-            sel2 = idx[kk_idx < kcut]
-            b2[tuple(sel2.T)] = True
-            lb2, nb2 = ndimage.label(b2)
-            if nb2 <= 0:
-                continue
-            drained = set()
-            for dj in dijk:
-                for dz in range(6):
-                    q = np.clip(dj + [0, 0, dz], 0, np.array(mat.shape) - 1)
-                    if lb2[tuple(q)] > 0:
-                        drained.add(lb2[tuple(q)]); break
-            in_band = b2 & (~trap)
-            in_band[..., :max(0, kcut - band)] = False
-            lbl_band = lb2[in_band]
-            bad = ~np.isin(lbl_band, list(drained) or [0])
-            coords = np.array(np.nonzero(in_band)).T[bad]
-            trap[tuple(coords.T)] = True
+        bad = oidx[~drainable]
+        trap[tuple(bad.T)] = True
         return trap
 
     trap = trapped_map(drains)

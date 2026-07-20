@@ -35,7 +35,12 @@ have trapped 14ml, per-lobe drains cut it to 0.27ml.
   display surfaces and beats sealed resin: trapped liquid leaks at the
   first pinhole and expands/cracks in heat. Bonus: refilled thin limbs
   are stronger. The report lists `refilled_ml`; final trapped resin
-  should read 0.0.
+  should read 0.0. The trapped map is computed exactly (bottom-up
+  union-find, judged at each voxel's own height) -- an earlier banded
+  approximation missed pockets shorter than the band that saddle into
+  the main cavity just above themselves; a user caught two such 1mm arm
+  stubs in slice preview. Cross-check slice preview after hollowing:
+  limbs should show solid cross-sections.
 - Orientation is decided BEFORE drilling (holes are gravity-relative).
   In the slicer, the model must then NOT be auto-rotated.
 
