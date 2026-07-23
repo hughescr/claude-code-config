@@ -39,6 +39,12 @@ Before calling significant work done: tests pass, lint clean, docs updated, and 
 
 ---
 
+## Language Choice
+
+Never pick Python because it's the easy default — for Craig it's a last resort, and he's been bitten repeatedly. The public Python corpus is dominated by unprofiled notebook/glue code, so Python-shaped instincts drift toward scalar loops and unbatched hot paths; fight that pull in EVERY language: design data flow batch-first (gather → one batched call → scatter) — a per-item call in a hot path is a defect, not a style choice. Prefer ecosystems whose norms pull toward quality: Rust for performance-critical or parallel work; TypeScript on bun (Craig's usual) or Go for services and tooling. If Python is genuinely unavoidable (existing codebase, irreplaceable library), write it like a systems language, profile it before calling it done, and surface the dependency to Craig as debt to retire.
+
+---
+
 ## Installed CLI Tools (beyond defaults)
 
 jq, httpie, gh, bat, diff-so-fancy, hyperfine, tree, watch, ag, parallel, awscli, csvkit (csvcut/csvjoin/csvstat), imagemagick, optipng, webp, ffmpeg
