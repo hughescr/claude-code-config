@@ -24,10 +24,26 @@ fi
 # completed (exitcode present) with the lock file already gone. Treat exitcode as
 # the authoritative "done" signal, regardless of whether the lock file still exists.
 
+# Extract the agent's reply text, or (if none was found) a diagnostic
+# explaining why, so a failed run is never silently reported as empty
+# success. Prints to stdout; caller always treats "done" as exit 0.
+emit_result() {
+    local reply
+    reply=$(grep '^{' "$RUNDIR/output" | jq -r 'select(.type == "item.completed" and .item.type == "agent_message") | .item.text')
+    if [ -n "$reply" ]; then
+        printf '%s\n' "$reply"
+    else
+        local codex_exit
+        codex_exit=$(cat "$RUNDIR/exitcode" 2>/dev/null)
+        echo "CODEX-ERROR: codex exited with code ${codex_exit:-unknown} and produced no agent_message."
+        echo "--- raw output (last 4000 bytes of $RUNDIR/output) ---"
+        tail -c 4000 "$RUNDIR/output"
+    fi
+}
+
 if [ -f "$RUNDIR/exitcode" ]; then
     # Codex is DONE (lock may or may not still exist). Extract and exit 0.
-    # Extract agent message text from JSONL output (skip non-JSON stderr lines)
-    grep '^{' "$RUNDIR/output" | jq -r 'select(.type == "item.completed" and .item.type == "agent_message") | .item.text'
+    emit_result
     exit 0
 elif [ -e "$RUNDIR/lock" ]; then
     # Codex is still running; block on a shared lock with 10-minute timeout.
@@ -36,7 +52,7 @@ elif [ -e "$RUNDIR/lock" ]; then
     # the script before we can re-check / return the "call again" signal.
     if lockf -s -t 600 "$RUNDIR/lock" true && [ -f "$RUNDIR/exitcode" ]; then
         # Lock acquired (codex released it) and exitcode present = done.
-        grep '^{' "$RUNDIR/output" | jq -r 'select(.type == "item.completed" and .item.type == "agent_message") | .item.text'
+        emit_result
         exit 0
     fi
     # Lock timed out, or released but exitcode not yet written: not done, call again.

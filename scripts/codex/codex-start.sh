@@ -46,7 +46,15 @@ RUNDIR=$(mktemp -d /tmp/claude/codex.XXXXXX)
 mkfifo "$RUNDIR/ready"
 
 # Build full command as array
-CODEX_ARGS=("${CODEX_BIN_ARRAY[@]}" exec -s workspace-write -c approval_policy="never" --json)
+# --skip-git-repo-check: these runs are always headless/unattended (approval_policy
+# is already forced to "never" below, so there is no one present to interactively
+# grant trust anyway). Without this flag, codex refuses to start whenever the
+# working directory is neither a recognized git repo nor already marked
+# trust_level = "trusted" in ~/.codex/config.toml, exiting immediately with
+# "Not inside a trusted directory and --skip-git-repo-check was not specified."
+# before emitting any JSONL — which codex-wait.sh would otherwise be unable to
+# distinguish from a genuinely empty response.
+CODEX_ARGS=("${CODEX_BIN_ARRAY[@]}" exec -s workspace-write -c approval_policy="never" --skip-git-repo-check --json)
 [ -n "$SESSION_ID" ] && CODEX_ARGS+=(resume "$SESSION_ID")
 CODEX_ARGS+=(-C "$WORKING_DIR" "$QUERY")
 
