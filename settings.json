@@ -24,7 +24,6 @@
     "ask": [],
     "defaultMode": "auto"
   },
-  "model": "fable",
   "hooks": {
     "Notification": [
       {
