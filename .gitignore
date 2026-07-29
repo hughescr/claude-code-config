@@ -50,6 +50,11 @@ estimator/estimator.db*
 estimator/spool/
 estimator/backups/
 estimator/sweep.lock
+# P2.7: the rendered board carries real subjects, real ids and real figures — local
+# only, same rule as the DB itself. `--out <dir>` can point elsewhere, but the
+# default location (alongside estimator.db) must never be committable.
+estimator/board.html
+estimator/board.md
 # gate probes: the .ts scanners are code and committed; everything they PRODUCE is
 # corpus-derived data and stays local — this repo is public (decision 11: no
 # estimate/actual/spend data, no prompt or conversation content, ever)
