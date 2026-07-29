@@ -3,9 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Token-based task estimation and tracking for Claude Code (Phase 0: collector).",
+  "description": "Token-based task estimation, tracking and calibration for Claude Code.",
   "engines": {
     "bun": ">=1.2.0"
+  },
+  "bin": {
+    "est": "src/cli.ts"
   },
   "dependencies": {},
   "devDependencies": {
@@ -18,6 +21,11 @@
     "backfill": "bun run src/cli.ts backfill",
     "prices": "bun run src/cli.ts prices",
     "census": "bun run src/cli.ts census",
+    "config": "bun run src/cli.ts config",
+    "burn": "bun run src/cli.ts burn",
+    "board": "bun run src/cli.ts board",
+    "close": "bun run src/cli.ts close",
+    "retro": "bun run src/cli.ts retro",
     "check:schema": "bun run scripts/check-schema.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test"

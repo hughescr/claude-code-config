@@ -24,7 +24,7 @@ leave this machine; only source code is committed.
 | `DECISIONS.md` | Decision ledger: gate verdicts, policy rulings, calibration row zero, deliberate deferrals. LOCAL/untracked. |
 | `schema.sql` | The complete DDL. The only source of schema; applied verbatim on init. |
 | `src/` | CLI and library code (`db.ts` is the open-or-init helper every path goes through). |
-| `scripts/` | Maintenance and operational scripts, plus the two hook entry points — see below. |
+| `scripts/` | Maintenance and operational scripts, plus the two hook entry points and the ccstatusline burn segment — see below. |
 | `gates/` | Phase 0 pre-build gate probes (`*.ts`, committed) and their reports (`*.md`, local). |
 | `test/` | `bun test` suite. `support.ts` is the shared synthetic fixture builder, not a test file. |
 | `tsconfig.json` | Typecheck-only config (`bun run typecheck`); nothing here ever emits. |
@@ -38,7 +38,7 @@ and this repository is public (`DECISIONS.md` §2, as superseded).
 
 ## Commands
 
-Package scripts (Phase 0):
+Package scripts:
 
 | Command | What it does |
 |---|---|
@@ -47,16 +47,27 @@ Package scripts (Phase 0):
 | `bun run backfill` | Full re-sweep over every surviving transcript. |
 | `bun run prices` | Refresh the model price table from the upstream pricing JSON. |
 | `bun run census` | Read-only status: what the collector has, versus what is on disk. |
-| `bun run check:schema` | Load `schema.sql` into a throwaway database and assert its shape. |
+| `bun run config` | Read/tune the calibration constants: list, `get <k>`, `set <k> <v>`. |
+| `bun run burn` / `board` / `close` / `retro` | Shorthands for the Phase 1 verbs of the same name. |
+| `bun run check:schema` | `scripts/check-schema.ts`: load `schema.sql` into a throwaway database and assert its shape. |
 | `bun run typecheck` | `tsc --noEmit` over `src/`, `test/`, `scripts/`, `gates/` (see below). |
 | `bun test` | Test suite. |
 
-The full CLI surface is `est <verb>` (`bun run src/cli.ts <verb>`, or the `est` shim on `PATH`).
+The full CLI surface is `est <verb>`. **On a fresh clone there is no `est` on `PATH`** — every
+verb is spelled `bun run ~/.claude/estimator/src/cli.ts <verb>` until you mint the shim, which is
+one command from this directory:
+
+```sh
+bun link            # package.json declares bin.est -> src/cli.ts; puts `est` in ~/.bun/bin
+```
+
+Nothing depends on the shim: `scripts/est-lib.sh` (and therefore every hook) already falls back to
+`bun run "$EST_HOME/src/cli.ts"`. It exists so the docs, and an agent following them, can say `est`.
 Phase 0 collects; **Phase 1 is the estimation loop** and is what the verbs below are:
 
 | Verb | What it does |
 |---|---|
-| `est refclass --text "<subject>" [--kind <k>] [--fanout <n>] [--full]` | The reference class, **shown before any number is stated** — top-5 FTS5 matches among completed tasks with their raw band, actual and velocity, plus one bucket line. Read-only, takes no lock, capped at 8,000 characters, and **always exits 0**: an empty reference class is a valid answer. Below 10 comparable tasks it prints the raw actual-cost distribution and **no multiplier**. |
+| `est refclass --text "<subject>" [--kind <k>] [--fanout <n>] [--full]` | The reference class, **shown before any number is stated** — top-5 FTS5 matches among completed tasks with their raw band, actual and velocity, plus one bucket line. Read-only, takes no lock, capped at 8,000 characters, and **always exits 0**: an empty reference class is a valid answer. Below 10 comparable tasks it prints the raw actual-cost distribution and **no multiplier**. `--fanout` narrows to a comparable agent fan-out as a **tolerance band** (half to double, minimum ±2), never equality, and falls back to the unfiltered class — saying so — rather than manufacturing an empty one. |
 | `est open --kind <k> --subject <t> --raw-p50 <n> --raw-p90 <n> --exp-…` | Mint a task (uuidv7) or append a re-estimate with `--tid <tid> --reason refinement\|scope_change\|recalibration`. Applies the bucket multiplier at write time, snapshots `ref_model`/`estimand`/`price_epoch`, and prints the band plus the exact `TaskUpdate` call that plants `est_tid`. `--continue <tid>` is sugar for bind + refinement. |
 | `est block <tid> --phase <i> --title <t> --p50 <n> --p90 <n>` | One estimate per declared workflow phase, **before the launch**. `--phase` is **0-based** — the `phases[]` index, not the 1-based `workflowProgress.phaseIndex`. |
 | `est bind <tid> [--session] [--task] [--run] [--agent]` | Attach a harness identity to a tid. Idempotent; an alias already bound to a *different* tid is a conflict, never a silent re-point. |
@@ -65,9 +76,13 @@ Phase 0 collects; **Phase 1 is the estimation loop** and is what the verbs below
 | `est close <tid> [--status …] [--force]` | Finalize **by arithmetic**. No flag accepts a token count, a cost or a velocity, and none ever will. Blocks on the quiescence gate unless forced (which is recorded). A reopen is a new outcome revision, never an edit. |
 | `est board [--status <col>] [--limit <n>]` | Terminal/JSON read model: Estimating · In Progress · Pending Verification · Done (7d) · Abandoned. The HTML/markdown board is Phase 2. |
 | `est retro [--as-of <iso>] [--dry-run]` | Weekly calibration panel plus the write-back that makes the ceremony non-inert: one `refclass` snapshot per bucket and one `calib_run` row. `--dry-run` writes nothing and is the right habit while *n* is small. |
+| `est config` · `est config get <k>` · `est config set <k> <v>` | The calibration constants. §1.1 keeps **every** tunable in the `config` table rather than in code, and this is the write path that makes that true — before it existed, moving `ref_model` or `attr_stale_turns` on a live database meant hand-written SQL. An unseeded key and `schema_version` are both refused: the first is a typo, the second is migration state. |
 
-Two hook entry points ship with them — `est nudge` (PostToolUse) and `est capture-delete`
-(PreToolUse) — via the wrappers in `scripts/`; both are advisory, fail open, and always exit 0.
+Two hook entry points ship alongside them, and they are **not** `est` verbs: `scripts/nudge-hook.sh`
+(`PostToolUse`, matcher `Task|Workflow`) and `scripts/capture-delete-hook.sh` (`PreToolUse`, matcher
+`TaskUpdate`), thin shell wrappers around `scripts/nudge.ts` and `scripts/capture-delete.ts`. Both
+are advisory, fail open, and always exit 0. Nothing dispatches them through `src/cli.ts`, and
+nothing should: registering them as verbs would add a second, unused invocation path.
 Phase 2 adds the OTLP receiver, `est recon` and the rendered board.
 
 **Exit codes** are a contract: `0` success *including a well-formed empty result* · `1` usage or
@@ -98,21 +113,32 @@ the database **read-only**, never sweeps, and prints four things:
 bun run census                 # or: bun run src/cli.ts census --limit 30 --root <path>
 ```
 
-## Operational scripts — what's wired and what's still manual
+## Operational scripts — what's wired, and where the wiring lives
 
-`scripts/` holds the scheduled and hook-driven legs of the collector. The cron/launchd leg is
-still a separate, undecided install step; the four `~/.claude/settings.json` hooks (`SessionEnd`,
-`PreToolUse(TaskUpdate)`, `PostToolUse(Task|Workflow)`) **are wired in** as of Phase 1. Each file's
-own header has the detail; this table says only what exists and what its state is.
+`scripts/` holds the scheduled, hook-driven and statusline legs of the collector. As of Phase 1
+(2026-07-28) **every leg is live**, and the wiring lives in three different places, only one of
+which is this repository:
+
+- `~/.claude/settings.json` — the `SessionEnd`, `PreToolUse(TaskUpdate)` and
+  `PostToolUse(Task|Workflow)` hooks;
+- `~/Library/LaunchAgents/com.craig.estimator.plist` — the launchd job, installed and bootstrapped
+  (it is a *copy* of the repo file, not a symlink: re-copy after editing the repo one);
+- `~/.config/ccstatusline/settings.json` — the `custom-command` widget for `statusline-burn.ts`.
+
+The last two are **outside** this repository and outside the weekly `backups/` snapshot (which is
+database-only), so the table below carries whatever is needed to reproduce them on another machine.
+Each file's own header has the rest of the detail; this table says only what exists and what its
+state is.
 
 | File | State | What it does / where the install steps are |
 |---|---|---|
-| `est-cron.sh` | **NOT INSTALLED** (safe to run by hand) | The scheduled maintenance leg: daily `est sweep --blocking --budget 300s`, plus a stamp-driven weekly `est prices --sync` and `scripts/backup.ts`. Stamp-driven, not day-of-week-driven, so a sleeping laptop delays the weekly leg instead of skipping it. Run it manually any time — every write path is idempotent: `sh scripts/est-cron.sh [--daily|--weekly]`. |
-| `com.craig.estimator.plist` | **NOT INSTALLED** | The launchd job that would run `est-cron.sh`. It lives in the repo as a reviewable artefact and takes effect only once copied to `~/Library/LaunchAgents/` and bootstrapped — the exact `cp` + `launchctl bootstrap` + `launchctl enable` sequence, and the removal sequence, are in the file's own header comment. |
+| `est-cron.sh` | **WIRED IN** (daily 03:30, via launchd; also safe to run by hand) | The scheduled maintenance leg: daily `est sweep --blocking --budget 300s`, plus a stamp-driven weekly `est prices --sync` and `scripts/backup.ts`. Stamp-driven, not day-of-week-driven, so a sleeping laptop delays the weekly leg instead of skipping it. Run it manually any time — every write path is idempotent: `sh scripts/est-cron.sh [--daily|--weekly]`. |
+| `com.craig.estimator.plist` | **INSTALLED** (2026-07-28) | The launchd job that runs `est-cron.sh`. Copied to `~/Library/LaunchAgents/com.craig.estimator.plist` and bootstrapped as `gui/501/com.craig.estimator`; fires `StartCalendarInterval` 03:30 local (`RunAtLoad` is deliberately **false**, so installing it did not kick off a sweep — the one run on the clock so far was a manual `launchctl kickstart`, exit 0). Logs to `~/Library/Logs/com.craig.estimator.log`, outside this repo. The repo copy is the reviewable source; the installed copy is a snapshot of it, so re-`cp` after editing. The exact `cp` + `launchctl bootstrap` + `launchctl enable` sequence, the `kickstart`/`print` commands and the `launchctl bootout` removal sequence are all in the file's own header comment. |
 | `session-end-sweep.sh` | **WIRED IN** (`SessionEnd`) | The blocking sweep (`--budget 20s`, inside the 30 s hook timeout) so a session's own transcripts land in the DB before the process exits. Referenced by `~/.claude/settings.json` as an **additional** user-level `SessionEnd` entry (hooks merge additively across settings levels — never a replacement). |
 | `nudge-hook.sh` / `nudge.ts` | **WIRED IN** (`PostToolUse`, matcher `Task\|Workflow`) | P1.10: one read-only check for an open estimate bound to the session (nudges naming the `estimating` skill if not, ≤500 chars), one spool append to `spool/compliance.jsonl` (never a DB write), and a throttled **detached** micro-sweep so the hook can never consume its own timeout. Also carries the best-effort overrun nudge against `burn_cache` (P1.9); no-ops cleanly on a pre-migration (schema v4) database. Advisory, fail-open, always exits 0 — see the file headers and `test/nudge.test.ts`. |
 | `capture-delete-hook.sh` / `capture-delete.ts` | **WIRED IN** (`PreToolUse`, matcher `TaskUpdate`) | P1.11, required by G-DELETE (§6.1): if `tool_input.status === 'deleted'`, appends one atomic line to `spool/task-events.jsonl` before the tool call runs — the only signal that survives a process death between the `tool_use` write and its `tool_result`. Always allows, never denies, always exits 0 — see `test/capture-delete.test.ts` for the mandated kill-simulation regression test. |
-| `backup.ts` | Runs on demand; **scheduled only via the plist** | The weekly leg: `VACUUM INTO backups/estimator-<UTC date>.db`, `PRAGMA wal_checkpoint(TRUNCATE)`, then prune to the newest `--keep` (default 8 ≈ two months). Deliberately does **not** take the sweep lock — `VACUUM INTO` is a reader, and a snapshot taken mid-sweep is a valid earlier state, never a torn one. `bun run scripts/backup.ts [--db <path>] [--dir <path>] [--keep <n>]`. |
+| `backup.ts` | **WIRED IN** (weekly, on the installed plist's schedule) — also runs on demand | The weekly leg: `VACUUM INTO backups/estimator-<UTC date>.db`, `PRAGMA wal_checkpoint(TRUNCATE)`, then prune to the newest `--keep` (default 8 ≈ two months). Deliberately does **not** take the sweep lock — `VACUUM INTO` is a reader, and a snapshot taken mid-sweep is a valid earlier state, never a torn one. `bun run scripts/backup.ts [--db <path>] [--dir <path>] [--keep <n>]`. |
+| `statusline-burn.ts` | **WIRED IN** (ccstatusline `custom-command` widget) | P1.9: the burn segment in the prompt. Imports `burnRead` directly (one bun process, one 50 ms read-only DB read), prints percent-of-band and never a clock ETA, and degrades to an **empty segment** on every failure — no stack trace, no stale number. "Failure" includes two well-formed payloads it refuses to render: a `stale` cache row (older than the sweep window, so the percentage is a number from the past) and `target: "fallback"` (nothing bound the task to this session, so the band may be another session's). Its wiring lives **outside this repo**, in `~/.config/ccstatusline/settings.json`, as a widget entry with a hardcoded absolute path: `{"type": "custom-command", "commandPath": "/Users/craig/.claude/estimator/scripts/statusline-burn.ts", "timeout": 300}`. That only renders because `~/.claude/settings.json` sets `statusLine.command` to `bunx -y ccstatusline@latest`; both halves are needed to reproduce it. See the file's own header; its read path is `burnRead`, covered by `test/burn.test.ts`. |
 
 `est-lib.sh` is not in that list because it is never executed: it is sourced by the shell entry
 points to locate `bun` and the `est` CLI, because launchd and hook processes run with a minimal
@@ -148,7 +174,7 @@ reference fails to resolve, and the run drowns in ~220 phantom errors that bury 
 raw `tsc --noEmit` in a tree that has never been `bun install`ed reports ~230 errors and means
 nothing — that is a missing toolchain, not a finding.
 
-Last run (2026-07-28, TypeScript 7.0.2, suite green at 412 tests across 17 files): **0 errors**.
+Last run (2026-07-28, TypeScript 7.0.2, suite green across every test file): **0 errors**.
 The twelve that stood here before were all real drift between a caller and the code it calls, none
 reached at runtime by any test, and all are fixed:
 

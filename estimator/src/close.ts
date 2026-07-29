@@ -26,6 +26,7 @@ import { join } from "node:path";
 import { attributeTasks } from "./attribute.ts";
 import { intervalUnion, taskIntervals } from "./burn.ts";
 import { getConfig } from "./db.ts";
+import { clearOverrunMarker, SPOOL_DIR } from "./spool.ts";
 import { InvariantError, isoNow } from "./tasks.ts";
 
 /** Where the harness records live sessions (`<pid>.json`); `EST_SESSIONS` overrides. */
@@ -234,6 +235,8 @@ export interface CloseInput {
   status?: FinalStatus;
   force?: boolean;
   now?: Date;
+  /** Where the hook markers live; tests point this at a temp dir. Defaults to the spool. */
+  spoolDir?: string;
 }
 
 export interface CloseResult {
@@ -607,6 +610,12 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
       );
     }
   }).immediate();
+
+  // The overrun nudge arms a marker file per task (P1.10 job 4). This is the moment it
+  // stops meaning anything: the band is closed out, and a marker left behind would both
+  // leak a file the sweep can only reap on a 30-day timer and, after a reopen, swallow
+  // the first legitimate nudge of the new run.
+  clearOverrunMarker(input.tid, input.spoolDir ?? SPOOL_DIR);
 
   const alerts: string[] = [];
   if (unpricedShare > 0) alerts.push(`unpriced_share=${(unpricedShare * 100).toFixed(1)}%`);

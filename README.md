@@ -55,9 +55,10 @@ alias claude="claude --mcp-config ~/.claude/mcp.json"
 
 `estimator/` is a self-contained TypeScript-on-bun tool (zero npm dependencies) that turns Claude
 Code's own transcripts into token-based **actuals** — API requests, turns, agent runs, workflow
-runs and phases, task lifecycle events — in a local sqlite database, and will grow into estimate
-bands, live burn tracking and calibration on top of them. Phase 0 (the collector) is built; the
-`est` verbs that record and score estimates are Phase 1.
+runs and phases, task lifecycle events — in a local sqlite database, and turns them into estimate
+bands, live burn tracking and calibration. Phase 0 (the collector) collects; Phase 1 — the `est`
+verbs that record, track and score estimates, the hook wiring and the statusline segment — has
+shipped.
 
 **Its source is committed here; its data never is.** The database and its WAL sidecars, the OTLP
 spool, the weekly backups, the sweep lock, and everything corpus-derived — the gate probes' raw
@@ -65,9 +66,16 @@ dumps AND their `gates/*.md` reports, the specification (`estimator/DESIGN.md`) 
 log (`estimator/DECISIONS.md`) — are all gitignored and stay on this machine: they quote private
 prompts and real usage data, and this repo is public.
 
-Nothing in it runs on a schedule or on a hook unless deliberately installed: the launchd job and
-the `SessionEnd` sweep ship inert, with their install steps in their own headers. See
-`estimator/README.md` for commands and where the local-only spec and decision log live.
+**What adopting this config actually runs.** `settings.json` wires three estimator hooks — a
+`SessionEnd` sweep, a `PreToolUse`/`TaskUpdate` delete capture, and a `PostToolUse`/`Task|Workflow`
+nudge — plus a statusline burn segment. Every one of them is advisory and fails open: no hook ever
+denies a tool call, each exits 0 whatever happens inside it (the `SessionEnd` sweep is budgeted to
+finish inside its own timeout), and the statusline segment degrades to nothing rather than to a
+stale number or a stack trace. The scheduled leg (a launchd job running the daily
+sweep and the weekly price sync and backup) is the one piece that is **not** wired by adopting this
+repo: it stays an explicit `cp` + `launchctl bootstrap`, with the exact sequence in the plist's own
+header. See `estimator/README.md` for commands, the per-file wiring table, and where the local-only
+spec and decision log live.
 
 ## Submodule Management
 

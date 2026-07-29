@@ -247,8 +247,15 @@ describe("est close — P1.7 the actual is arithmetic", () => {
 
   test("velocity is computed from actual_wcet_at_epoch and judged against the FIRST estimate", async () => {
     const tid = await quietTask();
-    // A refinement that moves the band must not become the baseline.
-    await h.cli(...openArgs({ subject: "" }), "--tid", tid, "--reason", "refinement", "--raw-p50", "1000000");
+    // A refinement that moves the band must not become the baseline. BOTH ends move:
+    // `est open` refuses a p90 below the p50, so the fixture cannot raise p50 alone.
+    await h.cli(
+      ...openArgs({ subject: "", "raw-p50": 1_000_000, "raw-p90": 3_000_000 }),
+      "--tid",
+      tid,
+      "--reason",
+      "refinement",
+    );
     const r = closeTask(h.db, { tid, now: NOW });
 
     const eids = h.db.query<{ eid: number }, [string]>(

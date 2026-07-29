@@ -4,17 +4,27 @@
   com.craig.estimator — launchd job for scripts/est-cron.sh (design R3 §2, §8).
 
   ############################################################################
-  #  NOT INSTALLED. This file lives in the repo as a reviewable artefact.    #
-  #  Nothing here takes effect until it is copied into LaunchAgents and      #
-  #  bootstrapped, which is a deliberate, separate step.                     #
+  #  INSTALLED as of 2026-07-28: copied to ~/Library/LaunchAgents and        #
+  #  bootstrapped as gui/$(id -u)/com.craig.estimator. This repo file is     #
+  #  the reviewable source, NOT the live one — the installed copy is a       #
+  #  snapshot of it, so editing this file alone changes nothing.             #
+  #  Re-run the cp + bootstrap below after every edit.                       #
   ############################################################################
 
-  To install (only when you actually want the daily job):
+  To install (first time):
 
       cp ~/.claude/estimator/scripts/com.craig.estimator.plist \
          ~/Library/LaunchAgents/com.craig.estimator.plist
       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.craig.estimator.plist
       launchctl enable gui/$(id -u)/com.craig.estimator
+
+  To re-install after editing this file (bootstrap refuses an already-loaded
+  label, so bootout first — the job is idle between 03:30 runs, so this is safe):
+
+      launchctl bootout gui/$(id -u)/com.craig.estimator
+      cp ~/.claude/estimator/scripts/com.craig.estimator.plist \
+         ~/Library/LaunchAgents/com.craig.estimator.plist
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.craig.estimator.plist
 
   To check on it / run it now / remove it:
 

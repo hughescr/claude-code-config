@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
-  "includeCoAuthoredBy": false,
   "cleanupPeriodDays": 3650,
+  "includeCoAuthoredBy": false,
   "permissions": {
     "allow": [
       "WebSearch",
@@ -25,6 +25,7 @@
     "ask": [],
     "defaultMode": "auto"
   },
+  "model": "fable",
   "hooks": {
     "PreToolUse": [
       {
@@ -77,20 +78,6 @@
           {
             "type": "command",
             "command": "${HOME}/.claude/estimator/scripts/session-end-sweep.sh",
-            "timeout": 30000
-          }
-        ]
-      }
-    ]
-  },
-  "_disabledHooks": {
-    "_note": "Disabled 2026-07-28: preserving transcript/task history as calibration data for the token-estimation project. To re-enable, move SessionEnd back under hooks and remove cleanupPeriodDays override.",
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/hooks/cleanup-old-files.sh",
             "timeout": 30000
           }
         ]
@@ -196,8 +183,21 @@
     ]
   },
   "voiceEnabled": false,
+  "_disabledHooks": {
+    "_note": "Disabled 2026-07-28: preserving transcript/task history as calibration data for the token-estimation project. To re-enable, move SessionEnd back under hooks and remove cleanupPeriodDays override.",
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/cleanup-old-files.sh",
+            "timeout": 30000
+          }
+        ]
+      }
+    ]
+  },
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
-  },
-  "model": "fable"
+  }
 }

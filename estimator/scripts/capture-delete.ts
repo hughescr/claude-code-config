@@ -15,8 +15,16 @@
  * spool write is a single O_APPEND of one short line — no lock, no failure
  * mode, and it survives the process dying immediately afterwards, which is
  * the exact scenario this hook exists for. The next sweep drains it into
- * `task_event(source='pretooluse')`; `task_event`'s UNIQUE key collapses the
- * hook row against the later transcript row when both land.
+ * `task_event(source='pretooluse')`.
+ *
+ * The hook row is a REDUNDANT WITNESS, not a deduplicated one. `task_event`'s
+ * UNIQUE key includes `ts`, and the two timestamps cannot match: this hook
+ * stamps its own wall clock at PreToolUse (below), while the transcript row
+ * carries the tool-completion instant from the JSONL record. A normally
+ * completing deletion therefore leaves TWO rows, one per source. Every
+ * consumer today folds them (`COUNT(*) > 0`, set-like status folding), so the
+ * duplicate is inert — but any future consumer that COUNTS task_event rows
+ * must group by `source` or it will double-count this case.
  *
  * Budget: <=20ms of actual work (bun's own cold start is separate).
  */

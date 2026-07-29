@@ -21,14 +21,20 @@
  * **Drain is crash-safe by rename.** The live file is renamed to `<name>.draining`
  * before it is read, so a hook's next append creates a fresh file and nothing written
  * during the drain is lost to a truncate. If the process dies mid-drain the
- * `.draining` file survives and is picked up first on the next sweep. Deduplication
- * is free: `task_event`'s `UNIQUE (session_id, task_num, ts, to_status, kind)`
- * collapses the hook row and the later transcript row when both land, which is the
- * common case since most deletions complete normally.
+ * `.draining` file survives and is picked up first on the next sweep.
+ *
+ * **The drained hook row is a redundant witness, not a deduplicated one.**
+ * `task_event`'s `UNIQUE (session_id, task_num, ts, to_status, kind)` includes `ts`,
+ * and the two sources cannot agree on it: the hook stamps its own wall clock at
+ * PreToolUse, the transcript row carries the tool-completion instant from the JSONL
+ * record. A normally completing deletion therefore lands TWO rows, one per `source`.
+ * That is inert for every consumer today — all of them fold (`COUNT(*) > 0`, or
+ * set-like status folding) rather than count — but a consumer that ever COUNTS
+ * `task_event` rows must group by `source` or it will double-count the common case.
  */
 
 import type { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { ROOT } from "./db.ts";
 import type { IngestAnomaly } from "./ingest.ts";
@@ -59,6 +65,29 @@ export const TASK_EVENTS_FILE = "task-events.jsonl";
 const DRAINING_SUFFIX = ".draining";
 
 /**
+ * Hook marker files (P1.10 jobs 3 and 4) live in the spool directory too, and the
+ * names are declared HERE rather than in `scripts/nudge.ts` because two other places
+ * have to recognise them: `pruneMarkers` below, and `est close` (`clearOverrunMarker`).
+ * A name that drifts between writer and pruner is an unbounded leak nothing notices.
+ *
+ * `.microsweep` is deliberately ONE file, not one per session: the throttle exists to
+ * stop a fan-out from launching N corpus-wide sweeps, and N concurrent sessions each
+ * with their own marker is exactly the fan-out it is supposed to collapse (§6.3).
+ */
+export const MICROSWEEP_MARKER = ".microsweep";
+export const OVERRUN_MARKER_PREFIX = ".overrun-notified.";
+
+/** Filesystem-safe form of an id used inside a marker filename. */
+export function sanitizeForFilename(id: string): string {
+  return id.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
+}
+
+/** Marker filename (not path) recording that `tid` has been nudged about its band. */
+export function overrunMarkerFile(tid: string): string {
+  return `${OVERRUN_MARKER_PREFIX}${sanitizeForFilename(tid)}`;
+}
+
+/**
  * One `PostToolUse` observation (P1.10 job 2). Written for EVERY matched call,
  * nudged or not, because a compliance rate needs a denominator.
  */
@@ -69,6 +98,22 @@ export interface ComplianceRecord {
   tool_input_sha256: string;
   bound_tid: string | null;
   nudged: boolean;
+  /** Which nudge the hook actually emitted; `"none"` when it stayed silent. */
+  nudge_kind: NudgeKind;
+  /**
+   * The hook could not READ the database (missing, locked, schema mismatch). Such a
+   * line carries no evidence either way about compliance — `bound_tid` is null because
+   * nothing could be looked up, not because nothing was bound — so it is excluded from
+   * both the counters and the `missed_estimate` anomaly below.
+   */
+  db_unavailable: boolean;
+}
+
+/** P1.10: which of the hook's two nudges fired. */
+export type NudgeKind = "none" | "no_estimate" | "overrun";
+
+function nudgeKind(v: unknown): NudgeKind {
+  return v === "no_estimate" || v === "overrun" || v === "none" ? v : "none";
 }
 
 /** One `PreToolUse(TaskUpdate)` delete capture (P1.11). */
@@ -133,13 +178,27 @@ export function parseComplianceLines(text: string): SpoolRead<ComplianceRecord> 
       bad += 1;
       continue;
     }
+    const boundTid = str(o.bound_tid);
+    const nudged = o.nudged === true;
+    // A line written before `nudge_kind` existed still says WHICH nudge it was, by
+    // construction: the only nudge a bound task could have got is the overrun one.
+    const kind: NudgeKind =
+      o.nudge_kind === undefined
+        ? nudged
+          ? boundTid === null
+            ? "no_estimate"
+            : "overrun"
+          : "none"
+        : nudgeKind(o.nudge_kind);
     rows.push({
       ts,
       session_id: session,
       tool_name: tool,
       tool_input_sha256: str(o.tool_input_sha256) ?? "",
-      bound_tid: str(o.bound_tid),
-      nudged: o.nudged === true,
+      bound_tid: boundTid,
+      nudged,
+      nudge_kind: kind,
+      db_unavailable: o.db_unavailable === true,
     });
   }
   return { rows, malformed: bad, truncatedTail };
@@ -170,7 +229,17 @@ export function parseTaskEventLines(text: string): SpoolRead<TaskEventRecord> {
 
 export interface DrainResult {
   task_events: { read: number; inserted: number; malformed: number; truncated: number };
-  compliance: { read: number; nudged: number; unbound: number; malformed: number; truncated: number };
+  compliance: {
+    read: number;
+    nudged: number;
+    unbound: number;
+    /** Lines the hook wrote with no readable database — evidence-free, counted apart. */
+    db_unavailable: number;
+    malformed: number;
+    truncated: number;
+  };
+  /** Stale hook marker files removed this drain (P1.10 jobs 3/4 leave them behind). */
+  markers_pruned: number;
   anomalies: IngestAnomaly[];
   /**
    * Delete the claimed `.draining` files. **Call this only AFTER the surrounding
@@ -184,7 +253,8 @@ export interface DrainResult {
 export function emptyDrain(): DrainResult {
   return {
     task_events: { read: 0, inserted: 0, malformed: 0, truncated: 0 },
-    compliance: { read: 0, nudged: 0, unbound: 0, malformed: 0, truncated: 0 },
+    compliance: { read: 0, nudged: 0, unbound: 0, db_unavailable: 0, malformed: 0, truncated: 0 },
+    markers_pruned: 0,
     anomalies: [],
     cleanup: () => {},
   };
@@ -250,6 +320,10 @@ export function drainSpool(db: Database, dir: string = SPOOL_DIR): DrainResult {
   const result = emptyDrain();
   if (!existsSync(dir)) return result;
 
+  // Marker files are the hooks' other residue: nothing else enumerates this directory,
+  // so without this every sweep leaves them and `ls spool/` stops being diagnostic.
+  result.markers_pruned = pruneMarkers(dir);
+
   const claimed: string[] = [];
   result.cleanup = (): void => {
     for (const p of claimed) rmSync(p, { force: true });
@@ -263,17 +337,22 @@ export function drainSpool(db: Database, dir: string = SPOOL_DIR): DrainResult {
     result.task_events.malformed = parsed.malformed;
     result.task_events.truncated = parsed.truncatedTail;
     const stmt = db.prepare(INSERT_HOOK_EVENT_SQL);
-    const before = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_event").get()?.n ?? 0;
+    // `changes` from the statement itself, NOT a COUNT(*) either side of the loop: the
+    // INSERT is `ON CONFLICT … DO NOTHING`, so a suppressed duplicate reports 0 changes
+    // and the sum is exactly the delta the two scans used to compute — minus two full
+    // table reads per drain, inside the sweep's write transaction.
+    let inserted = 0;
     for (const row of parsed.rows) {
-      stmt.run({
-        $session_id: row.session_id,
-        $task_num: row.task_num,
-        $ts: row.ts,
-        $to_status: row.to_status,
-      } as never);
+      inserted += Number(
+        stmt.run({
+          $session_id: row.session_id,
+          $task_num: row.task_num,
+          $ts: row.ts,
+          $to_status: row.to_status,
+        } as never).changes ?? 0,
+      );
     }
-    const after = db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_event").get()?.n ?? 0;
-    result.task_events.inserted = after - before;
+    result.task_events.inserted = inserted;
     if (parsed.malformed > 0) {
       result.anomalies.push({
         kind: "malformed_line",
@@ -290,6 +369,13 @@ export function drainSpool(db: Database, dir: string = SPOOL_DIR): DrainResult {
     result.compliance.malformed = parsed.malformed;
     result.compliance.truncated = parsed.truncatedTail;
     for (const row of parsed.rows) {
+      // "The hook could not open the database" is not a compliance fact. Counting it
+      // as one turns a missing/locked/unmigrated database into a permanent
+      // `missed_estimate` anomaly and poisons the denominator §3.3 actually enforces.
+      if (row.db_unavailable) {
+        result.compliance.db_unavailable += 1;
+        continue;
+      }
       if (row.nudged) result.compliance.nudged += 1;
       if (row.bound_tid === null) {
         result.compliance.unbound += 1;
@@ -316,4 +402,64 @@ export function drainSpool(db: Database, dir: string = SPOOL_DIR): DrainResult {
 export function ensureSpool(dir: string = SPOOL_DIR): string {
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** A `.microsweep` marker older than this is dead weight (the throttle window is ~20 s). */
+export const MICROSWEEP_MARKER_TTL_MS = 60 * 60 * 1000;
+/**
+ * An `.overrun-notified.<tid>` marker is armed for as long as its task can plausibly
+ * still be open. The primary reclaim is `est close` (`clearOverrunMarker`); this is the
+ * backstop for tasks that were never closed, and it is deliberately long because
+ * deleting a live one re-arms a nudge Craig has already been shown.
+ */
+export const OVERRUN_MARKER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Delete stale hook marker files. Called from `drainSpool`, so it runs on every sweep
+ * and every cron leg without a scheduler entry of its own.
+ *
+ * Only files this module NAMES are considered — the two spool files, their `.draining`
+ * staging copies and anything a future hook drops in here are untouched, because a
+ * pruner that guesses at ownership is how a crash-safety mechanism loses its records.
+ */
+export function pruneMarkers(dir: string = SPOOL_DIR, now: Date = new Date()): number {
+  let pruned = 0;
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return 0; // no directory, no markers; a sweep never fails over housekeeping
+  }
+  for (const name of entries) {
+    let ttl: number;
+    if (name === MICROSWEEP_MARKER || name.startsWith(`${MICROSWEEP_MARKER}.`)) {
+      ttl = MICROSWEEP_MARKER_TTL_MS; // `.microsweep.<sid>` = a pre-global-throttle leftover
+    } else if (name.startsWith(OVERRUN_MARKER_PREFIX)) {
+      ttl = OVERRUN_MARKER_TTL_MS;
+    } else {
+      continue;
+    }
+    const path = join(dir, name);
+    try {
+      if (now.getTime() - statSync(path).mtimeMs < ttl) continue;
+      rmSync(path, { force: true });
+      pruned += 1;
+    } catch {
+      // Raced with another sweep or the hook itself; the next sweep tries again.
+    }
+  }
+  return pruned;
+}
+
+/**
+ * Disarm the overrun nudge for `tid`. Called by `est close`: a finalized task cannot
+ * overrun again, and leaving the marker would both leak a file and (after a reopen)
+ * suppress the first legitimate nudge of the new run.
+ */
+export function clearOverrunMarker(tid: string, dir: string = SPOOL_DIR): void {
+  try {
+    rmSync(join(dir, overrunMarkerFile(tid)), { force: true });
+  } catch {
+    // Never fail a close over a marker file.
+  }
 }

@@ -43,7 +43,7 @@ import {
   type WeightedSample,
 } from "./calibrate.ts";
 import { getConfig } from "./db.ts";
-import { COLD_START_N, isoNow } from "./tasks.ts";
+import { COLD_START_N, InvariantError, isoNow } from "./tasks.ts";
 import { priceFamily } from "./prices.ts";
 
 /** The G-ATTR bar. Below this, the historical corpus is not calibration-grade. */
@@ -695,6 +695,33 @@ function writeBack(
   alerts: readonly string[],
 ): { refclass: number; calib_run: number } {
   let refclassRows = 0;
+  // `refclass` is append-only and keyed on (as_of, bucket, estimator_family, ref_model,
+  // estimand), and `isoNow` truncates to the second — so two retros at the same `as_of`
+  // (trivially: `--as-of` twice, or two unflagged runs inside one second) collide. Left
+  // to the driver that surfaces as a raw SQLITE_CONSTRAINT, which `verb()` now maps to
+  // exit 2 but with the driver's message and no useful remedy. Say it ourselves, with
+  // the append path named, and say it BEFORE the transaction so nothing is half-written.
+  // Deliberately NOT an upsert, unlike the `calib_run` row below: a snapshot is
+  // evidence of what the multipliers were at an instant, and overwriting one rewrites
+  // history that `est open` has already issued bands against.
+  // The check is on the FULL key, not on `as_of` alone: re-running a retro at the same
+  // instant under a different `ref_model` or `estimand` writes a different snapshot and
+  // has always been legal (§4.2 delta 3), and rejecting that would be a new refusal
+  // rather than a clearer one.
+  const clash = db.query<{ n: number }, [string, string, string, string, string]>(
+    `SELECT COUNT(*) AS n FROM refclass
+      WHERE as_of = ? AND bucket = ? AND estimator_family = ? AND ref_model = ? AND estimand = ?`,
+  );
+  for (const b of buckets) {
+    const n = clash.get(asOf, b.bucket, b.estimator_family, b.ref_model, b.estimand)?.n ?? 0;
+    if (n > 0) {
+      throw new InvariantError(
+        `a refclass snapshot already exists at as_of ${asOf} for bucket ${b.bucket} ` +
+          `(${b.estimator_family}, ${b.ref_model}, ${b.estimand})`,
+        "pass a later `--as-of`, or run `est retro --dry-run` to recompute the panel without writing",
+      );
+    }
+  }
   db.transaction(() => {
     const stmt = db.prepare(
       `INSERT INTO refclass (as_of, bucket, estimator_family, n, n_eff, med_log_v, iqr_log_v,

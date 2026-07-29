@@ -27,17 +27,24 @@
  * wrapped and treated as "nothing to report" on any failure, per the no-op
  * requirement this file is tested against.
  *
- * Every DB access opens **read-only** and is independently wrapped: a missing
- * database, a schema-version mismatch, a locked file, or a missing table are
- * all "no binding found" / "no overrun to report", never a crash.
+ * Every DB access opens **read-only**, with a 50 ms busy timeout, and is
+ * independently wrapped: a missing database, a schema-version mismatch, a
+ * locked file, or a missing table are never a crash. They are also never a
+ * NUDGE — "the database could not be read" is recorded as `db_unavailable` and
+ * stays silent, because claiming "no estimate is bound" on evidence nobody
+ * could gather both nags Craig for a broken file and writes a permanent
+ * `missed_estimate` anomaly into the compliance rate that is supposed to be
+ * the enforcement (P1.10 fail-open, §3.3).
  */
 
-import { appendFileSync, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import type { Database } from "bun:sqlite";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { DB_PATH, ROOT, openDb } from "../src/db.ts";
+import { MICROSWEEP_MARKER, overrunMarkerFile, type NudgeKind } from "../src/spool.ts";
 
 // `EST_DB` already overrides the database path (db.ts); this mirrors that
 // convention for the spool directory so tests never have to touch the real
@@ -50,6 +57,13 @@ const MIN_MICROSWEEP_INTERVAL_S = Number.parseInt(
   process.env.EST_MICROSWEEP_MIN_INTERVAL_S ?? "20",
   10,
 );
+/**
+ * Every `openDb` here overrides the 5 000 ms default (src/db.ts) for the same reason
+ * `est burn --json` does (src/burn.ts): this runs on Craig's hot path, and a hook that
+ * can wait five seconds on a busy file is a hook that stalls a delegation. WAL readers
+ * do not block on writers today, so this is a ceiling, not a hot code path.
+ */
+const BUSY_TIMEOUT_MS = 50;
 
 const NUDGE_TEXT =
   "est: no open estimate is bound to this session. If this Task/Workflow launch is " +
@@ -85,13 +99,30 @@ function nudgePayload(text: string): Record<string, unknown> {
 }
 
 /**
- * Does an open, non-terminal task have a task_alias binding to this session?
- * Read-only. A session can host several (schema v6), so this picks the newest — the
- * same task `est burn --session` puts on the statusline, which is what keeps the
- * overrun nudge and the band it is nudging about about the same piece of work.
+ * Three outcomes, and the third is the point: "the database could not be read" is NOT
+ * "nothing is bound". Collapsing them nudges Craig about a missing estimate whenever
+ * the file is missing, locked or a schema ahead of this script (P1.10 fail-open says
+ * print nothing), and — worse — spools that guess as a permanent `missed_estimate`
+ * anomaly against a compliance rate that is supposed to mean something (§3.3).
  */
-function findBoundTid(sessionId: string): string | null {
-  const db = openDb({ readonly: true });
+type Binding =
+  | { kind: "bound"; tid: string }
+  | { kind: "unbound" }
+  | { kind: "unavailable" };
+
+/**
+ * Does an open, non-terminal task have a task_alias binding to this session?
+ * Read-only, and never throws. A session can host several (schema v6), so this picks
+ * the newest — the same task `est burn --session` puts on the statusline, which is what
+ * keeps the overrun nudge and the band it is nudging about about the same piece of work.
+ */
+function findBoundTid(sessionId: string): Binding {
+  let db: Database;
+  try {
+    db = openDb({ readonly: true, busyTimeoutMs: BUSY_TIMEOUT_MS });
+  } catch {
+    return { kind: "unavailable" }; // missing, uninitialised, or a schema we do not know
+  }
   try {
     const row = db
       .query<{ tid: string }, [string]>(
@@ -104,7 +135,9 @@ function findBoundTid(sessionId: string): string | null {
           LIMIT 1`,
       )
       .get(sessionId);
-    return row?.tid ?? null;
+    return row?.tid === undefined ? { kind: "unbound" } : { kind: "bound", tid: row.tid };
+  } catch {
+    return { kind: "unavailable" }; // locked, or a table this script expects and the file lacks
   } finally {
     db.close();
   }
@@ -117,11 +150,11 @@ function findBoundTid(sessionId: string): string | null {
  */
 function tryOverrunNudge(tid: string): string | null {
   try {
-    const db = openDb({ readonly: true });
+    const db = openDb({ readonly: true, busyTimeoutMs: BUSY_TIMEOUT_MS });
     try {
       const row = db
-        .query<{ consumed_wcet: number; cal_p90_wcet: number }, [string]>(
-          `SELECT bc.consumed_wcet AS consumed_wcet, e.cal_p90_wcet AS cal_p90_wcet
+        .query<{ consumed_wcet: number; cal_p90_wcet: number; version: number }, [string]>(
+          `SELECT bc.consumed_wcet AS consumed_wcet, e.cal_p90_wcet AS cal_p90_wcet, e.version AS version
              FROM burn_cache bc
              JOIN estimate e
                ON e.tid = bc.tid
@@ -132,11 +165,16 @@ function tryOverrunNudge(tid: string): string | null {
       if (!row || row.cal_p90_wcet <= 0) return null;
       if (row.consumed_wcet < row.cal_p90_wcet) return null;
 
-      // Once per threshold crossing per task (§6.3, P1.10 job 4).
-      const marker = join(SPOOL_DIR, `.overrun-notified.${sanitizeForFilename(tid)}`);
-      if (existsSync(marker)) return null;
+      // Once per threshold crossing per task (§6.3, P1.10 job 4) — and a `refinement`
+      // or `scope_change` mints a NEW band, which is a new threshold. So the marker
+      // records the band it fired against rather than merely "fired": a task that
+      // re-estimates and then blows the wider band gets nudged again, while a task
+      // sitting over the same band stays silent no matter how many times this runs.
+      const band = `v${row.version}:${row.cal_p90_wcet}`;
+      const marker = join(SPOOL_DIR, overrunMarkerFile(tid));
+      if (readMarkerBand(marker) === band) return null;
       mkdirSync(SPOOL_DIR, { recursive: true });
-      writeFileSync(marker, new Date().toISOString());
+      writeFileSync(marker, `${JSON.stringify({ band, ts: new Date().toISOString() })}\n`);
 
       return (
         `est: task ${tid} is over its p90 band ` +
@@ -153,8 +191,18 @@ function tryOverrunNudge(tid: string): string | null {
   }
 }
 
-function sanitizeForFilename(id: string): string {
-  return id.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 128);
+/**
+ * The band an existing overrun marker was written for, or null when there is no
+ * marker / it is unreadable / it predates this format (in which case re-firing once is
+ * the safe direction: a nudge Craig has seen before beats a band he has not).
+ */
+function readMarkerBand(path: string): string | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as { band?: unknown };
+    return typeof parsed.band === "string" ? parsed.band : null;
+  } catch {
+    return null;
+  }
 }
 
 function recordCompliance(
@@ -162,7 +210,8 @@ function recordCompliance(
   toolName: string,
   toolInput: unknown,
   boundTid: string | null,
-  nudged: boolean,
+  nudgeKind: NudgeKind,
+  dbUnavailable: boolean,
 ): void {
   try {
     const sha256 = createHash("sha256").update(JSON.stringify(toolInput ?? null)).digest("hex");
@@ -172,7 +221,14 @@ function recordCompliance(
       tool_name: toolName,
       tool_input_sha256: sha256,
       bound_tid: boundTid,
-      nudged,
+      // `nudged` is what was ACTUALLY emitted, overrun nudges included — computing it
+      // from "no binding" made the overrun nudge invisible to the spool, which is the
+      // one thing the spool adds over `v_missed_estimate` (P1.10 job 2).
+      nudged: nudgeKind !== "none",
+      nudge_kind: nudgeKind,
+      // Only present when it is true: the reader excludes these lines from the
+      // compliance counters and from the `missed_estimate` anomaly (src/spool.ts).
+      ...(dbUnavailable ? { db_unavailable: true } : {}),
     });
     mkdirSync(SPOOL_DIR, { recursive: true });
     // Single O_APPEND write of one short line: atomic without a lock (§3.3, P1.10).
@@ -205,17 +261,26 @@ function findBun(): string | null {
  * Phase 1 CLI verb surface is built concurrently with this file); passing
  * them today would make cli.ts's flag validator reject the call outright and
  * do NO sweep at all, which is worse than the corpus-wide fallback. So this
- * spawns the existing, idempotent, ~3s full-corpus `est sweep --quiet`
- * instead. When `--session`/`--since` land, this is the only line to change.
+ * spawns the existing, idempotent, incremental `est sweep --quiet` instead —
+ * sub-second on a swept corpus, but corpus-wide in its discovery walk and
+ * contending for the writer lock every time. When `--session`/`--since` land,
+ * the spawn line below is the only one to change.
+ *
+ * **The throttle marker is therefore GLOBAL, not per-session.** A per-session
+ * marker gives every concurrently active session its own window, so N sessions
+ * fan out into N unscoped corpus sweeps — precisely the pile-up the throttle
+ * exists to prevent, and unobservable because the child is detached. One marker
+ * collapses the whole machine to one sweep per window. If the scoped flags ever
+ * land, per-session scoping becomes correct again and the marker can follow.
  */
-function maybeSpawnMicrosweep(sessionId: string): void {
+function maybeSpawnMicrosweep(): void {
   // Test-only escape hatch: unset (the production default) leaves this job
   // fully active. A real sweep is slow and corpus-wide (see comment above),
   // which makes it unsuitable to actually exec from unit tests.
   if (process.env.EST_DISABLE_MICROSWEEP === "1") return;
   try {
     mkdirSync(SPOOL_DIR, { recursive: true });
-    const marker = join(SPOOL_DIR, `.microsweep.${sanitizeForFilename(sessionId)}`);
+    const marker = join(SPOOL_DIR, MICROSWEEP_MARKER);
     let lastMs = 0;
     try {
       lastMs = statSync(marker).mtimeMs;
@@ -260,29 +325,39 @@ function main(): void {
     process.exit(0); // nothing to check, nothing to log
   }
 
-  let boundTid: string | null = null;
-  try {
-    boundTid = findBoundTid(sessionId);
-  } catch {
-    boundTid = null; // missing/locked/uninitialised DB: treat as "no binding found"
-  }
+  const binding = findBoundTid(sessionId);
 
-  const nudged = boundTid === null;
-  recordCompliance(sessionId, toolName, toolInput, boundTid, nudged);
-
+  // Decide FIRST, record second: the spool line has to say which nudge was emitted,
+  // and "unbound" is not the same question as "was anything printed" (P1.10 job 2).
   let payload: Record<string, unknown> | null = null;
-  if (boundTid === null) {
+  let kind: NudgeKind = "none";
+  if (binding.kind === "unbound") {
     payload = nudgePayload(truncate(NUDGE_TEXT, NUDGE_BUDGET));
-  } else {
-    const overrun = tryOverrunNudge(boundTid);
-    if (overrun !== null) payload = nudgePayload(truncate(overrun, OVERRUN_BUDGET));
+    kind = "no_estimate";
+  } else if (binding.kind === "bound") {
+    const overrun = tryOverrunNudge(binding.tid);
+    if (overrun !== null) {
+      payload = nudgePayload(truncate(overrun, OVERRUN_BUDGET));
+      kind = "overrun";
+    }
   }
+  // binding.kind === "unavailable": nothing was looked up, so nothing is claimed —
+  // print nothing (P1.10 fail-open) and mark the line so the reader ignores it.
+
+  recordCompliance(
+    sessionId,
+    toolName,
+    toolInput,
+    binding.kind === "bound" ? binding.tid : null,
+    kind,
+    binding.kind === "unavailable",
+  );
 
   if (payload !== null) {
     process.stdout.write(JSON.stringify(payload));
   }
 
-  maybeSpawnMicrosweep(sessionId);
+  maybeSpawnMicrosweep();
 
   process.exit(0);
 }

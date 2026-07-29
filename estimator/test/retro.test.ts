@@ -182,6 +182,33 @@ describe("est retro — P1.8", () => {
     expect(() => h.db.query("UPDATE refclass SET n = 99").run()).toThrow(/append-only/);
   });
 
+  test("a second retro at the SAME --as-of is REJECTED (exit 2) with the append path named", async () => {
+    // `refclass` is keyed on (as_of, bucket, estimator_family, ref_model, estimand) and
+    // append-only, so the second write is a constraint failure. Left to the driver it
+    // surfaced as exit 1 with a raw `UNIQUE constraint failed:` line — which reads as
+    // "transient, retry it", the exact response P1.12 exists to prevent.
+    await completedTask(1);
+    expect((await h.cli("retro", "--as-of", "2026-02-01T00:00:00Z")).code).toBe(0);
+    expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM refclass").get()?.n).toBe(1);
+
+    const again = await h.cli("retro", "--as-of", "2026-02-01T00:00:00Z");
+    expect(again.code).toBe(2);
+    expect(again.err).toContain("already exists");
+    expect(again.err).toContain("est: instead:");
+    expect(again.err).toContain("--dry-run");
+    // Nothing half-written: the check runs before the transaction.
+    expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM refclass").get()?.n).toBe(1);
+  });
+
+  test("the same rejection is typed at the library boundary, not just at the CLI", async () => {
+    // `verb()` maps a raw SQLITE_CONSTRAINT to exit 2 as a backstop, but a caller of
+    // `retro()` gets the InvariantError itself — with the remedy — rather than a
+    // driver message it would have to pattern-match.
+    await completedTask(1);
+    retro(h.db, { asOf: NOW });
+    expect(() => retro(h.db, { asOf: NOW })).toThrow(/already exists/);
+  });
+
   test("velocity is measured, not asserted: a 3x overrun produces a ~3x multiplier", async () => {
     for (let i = 1; i <= 12; i += 1) await completedTask(i, { rawP50: 1000, actualOut: 3000 });
     const report = retro(h.db, { asOf: NOW });

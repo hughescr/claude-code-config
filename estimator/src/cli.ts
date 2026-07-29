@@ -7,6 +7,7 @@
  *   est backfill                full re-sweep over every surviving transcript + spend report
  *   est prices --sync           refresh model_price from the upstream pricing JSON
  *   est census                  sweep_census history + live corpus counts
+ *   est config                  read/tune the calibration constants (§1.1 lives in `config`)
  *   est refclass                the reference class, shown BEFORE any number is stated
  *   est open                    mint or re-estimate a task; prints the calibrated band
  *   est block                   one per declared workflow phase, before the launch
@@ -20,7 +21,12 @@
  * Three properties this file is responsible for (§2):
  *
  *  1. **Single writer.** Every path that writes takes the `flock`-style sweep lock
- *     from src/lock.ts. Nothing else in Phase 0 writes to the database.
+ *     from src/lock.ts, and takes it BEFORE opening a writable connection — `openDb()`
+ *     applies pending migrations the moment it sees a stale `schema_version`, so a
+ *     handle opened outside the lock is a schema write outside the lock, on a command
+ *     that may never get the lock at all. Read-only paths (`census`, `refclass`,
+ *     `burn`, `board`, `prices --show`, `retro --dry-run`) open `readonly: true`, which
+ *     never migrates and never takes the lock. Nothing else in Phase 0 writes.
  *  2. **Idempotence.** A re-sweep of an unchanged corpus is a no-op: row writes go
  *     through the upsert-with-MAX statements in src/ingest.ts, `sweep_state` is a
  *     pure performance watermark, and anomalies are de-duplicated on (kind, detail)
@@ -44,7 +50,7 @@
 import type { Database } from "bun:sqlite";
 import { mkdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { DB_PATH, ROOT, SCHEMA_VERSION, getConfig, openDb } from "./db.ts";
+import { DB_PATH, ROOT, SCHEMA_VERSION, getConfig, openDb, setConfig } from "./db.ts";
 import { PROJECTS_ROOT, discoverCorpus, sessionFiles, type Corpus } from "./discover.ts";
 import {
   INSERT_ANOMALY_SQL,
@@ -64,7 +70,7 @@ import {
 import { LOCK_PATH, LockBusyError, withLock } from "./lock.ts";
 import { isoSeconds, setManualPrice, showPrices, sync, type SyncResult } from "./prices.ts";
 import { attributeTasks } from "./attribute.ts";
-import { burnJson, burnRead, refreshBurnCache, renderBurn } from "./burn.ts";
+import { burnJson, burnRead, classifyOpenError, refreshBurnCache, renderBurn } from "./burn.ts";
 import { closeTask, type FinalStatus } from "./close.ts";
 import { board, retro, type RetroReport } from "./retro.ts";
 import { drainSpool, emptyDrain, ensureSpool, SPOOL_DIR } from "./spool.ts";
@@ -95,6 +101,7 @@ export const COMMANDS = [
   "backfill",
   "prices",
   "census",
+  "config",
   // Phase 1 (§Phase 1 interfaces).
   "refclass",
   "open",
@@ -129,6 +136,7 @@ export const COMMAND_FLAGS: Record<Command, FlagSpec> = {
   backfill: { booleans: ["strict"], values: ["budget", "root", "chunk", "top"] },
   prices: { booleans: ["sync", "show"], values: ["source", "set", "in", "out", "cw", "cr", "at"] },
   census: { booleans: [], values: ["limit", "root"] },
+  config: { booleans: [], values: [] },
   refclass: { booleans: ["full"], values: ["kind", "fanout", "text", "limit"] },
   open: {
     booleans: [],
@@ -287,6 +295,17 @@ function flagString(p: Parsed, name: string): string | null {
   const v = p.flags[name];
   return typeof v === "string" ? v : null;
 }
+/**
+ * "Absent" and "empty" are different answers, and `est scope` is where the difference
+ * bites: `appendScope` preserves the previous value only for `undefined`, so passing
+ * `flagString`'s `null` for an omitted `--description` DELETES the description — and,
+ * worse, that deletion changes `scope_hash`, which turns a re-submitted identical
+ * subject into an "accepted" revision and manufactures the `scope_change` precondition
+ * the no-op guard exists to make unforgeable (P1.12).
+ */
+function flagStringOpt(p: Parsed, name: string): string | undefined {
+  return name in p.flags ? (flagString(p, name) ?? "") : undefined;
+}
 function flagBool(p: Parsed, name: string, dflt = false): boolean {
   const v = p.flags[name];
   return typeof v === "boolean" ? v : dflt;
@@ -423,7 +442,11 @@ export interface SweepReport {
     task_events_inserted: number;
     compliance_read: number;
     compliance_unbound: number;
+    /** Hook lines written with no readable database — not compliance evidence (P1.10). */
+    compliance_db_unavailable: number;
     malformed: number;
+    /** Stale `.microsweep` / `.overrun-notified.*` marker files reaped this sweep. */
+    markers_pruned: number;
   };
   /** §5.4: what the binding-driven attribution pass assigned. */
   attribution: {
@@ -629,7 +652,9 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
       task_events_inserted: 0,
       compliance_read: 0,
       compliance_unbound: 0,
+      compliance_db_unavailable: 0,
       malformed: 0,
+      markers_pruned: 0,
     },
     attribution: { tasks: 0, turns: 0, agents: 0, requests: 0, by_attr: {} },
     burn_cache_rows: 0,
@@ -818,7 +843,9 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     task_events_inserted: spool.task_events.inserted,
     compliance_read: spool.compliance.read,
     compliance_unbound: spool.compliance.unbound,
+    compliance_db_unavailable: spool.compliance.db_unavailable,
     malformed: spool.task_events.malformed + spool.compliance.malformed,
+    markers_pruned: spool.markers_pruned,
   };
 
   const attribution = attributeTasks(db);
@@ -977,6 +1004,17 @@ export function unpricedSummary(db: Database): UnpricedSummary {
   };
 }
 
+/**
+ * The three tables `est backfill` prints after the sweep. Gathered inside the writer
+ * lock (with the connection that ran the sweep) and rendered outside it, so no read
+ * outlives the handle and no handle outlives the critical section.
+ */
+export interface SpendTables {
+  models: SpendRow[];
+  origins: SpendRow[];
+  unpriced: UnpricedSummary;
+}
+
 // ---------------------------------------------------------------------------
 // rendering
 // ---------------------------------------------------------------------------
@@ -1082,6 +1120,9 @@ function sweepSummary(r: SweepReport): string {
     lines.push(
       `spool   ${num(r.spool.task_events_read)} hook task_event(s) read (${num(r.spool.task_events_inserted)} new), ` +
         `${num(r.spool.compliance_read)} compliance record(s) (${num(r.spool.compliance_unbound)} with no bound task)` +
+        (r.spool.compliance_db_unavailable > 0
+          ? `, ${num(r.spool.compliance_db_unavailable)} with no readable db`
+          : "") +
         (r.spool.malformed > 0 ? `, ${r.spool.malformed} malformed` : ""),
     );
   }
@@ -1198,98 +1239,116 @@ async function cmdSweep(ctx: Ctx, full: boolean): Promise<number> {
   const blocking = flagBool(p, "blocking");
   const chunk = flagInt(p, "chunk", 25);
 
-  const db = openDb({ path: ctx.dbPath });
+  // --blocking waits for the lock instead of stepping aside — the SessionEnd
+  // hook must not silently skip. Waiting is capped at HALF the budget so a
+  // contended lock cannot eat the whole 20 s and leave nothing for the sweep;
+  // whatever the wait costs is then subtracted from the sweep's own budget.
+  const timeoutMs = blocking ? (budgetMs === null ? 30_000 : Math.min(budgetMs / 2, 10_000)) : 0;
+  const tStart = Date.now();
+  const top = flagInt(p, "top", 40);
+
+  // The connection is opened INSIDE the lock (see `cmdOpen` for the whole reason):
+  // `openDb()` migrates a stale `schema_version` on sight, so a handle opened here
+  // would rewrite the schema even on the path that goes on to print "the lock is held
+  // by another writer; skipping". `--backfill`'s spend tables are gathered inside the
+  // critical section too — they read the rows this sweep just wrote, and the handle
+  // must not outlive the lock — but they are pure reads on a database this process
+  // already has open, so they cost the lock nothing the sweep did not already cost it.
+  let result: { report: SweepReport; spend: SpendTables | null };
   try {
-    // --blocking waits for the lock instead of stepping aside — the SessionEnd
-    // hook must not silently skip. Waiting is capped at HALF the budget so a
-    // contended lock cannot eat the whole 20 s and leave nothing for the sweep;
-    // whatever the wait costs is then subtracted from the sweep's own budget.
-    const timeoutMs = blocking ? (budgetMs === null ? 30_000 : Math.min(budgetMs / 2, 10_000)) : 0;
-    const tStart = Date.now();
-    let report: SweepReport;
-    try {
-      report = await withLock(
-        (): Promise<SweepReport> =>
-          runSweep(db, {
+    result = await withLock(
+      async (): Promise<{ report: SweepReport; spend: SpendTables | null }> => {
+        const db = openDb({ path: ctx.dbPath });
+        try {
+          const report = await runSweep(db, {
             root,
             budgetMs: budgetMs === null ? null : Math.max(budgetMs - (Date.now() - tStart), 1),
             full,
             chunkSessions: chunk,
-          }),
-        { path: ctx.lockPath, timeoutMs, note: lockNote(full ? "backfill" : "sweep") },
-      );
-    } catch (e) {
-      if (e instanceof LockBusyError) {
-        // Not an error for a detached micro-sweep: another writer is already
-        // doing this work, and every write path is idempotent.
-        if (!ctx.quiet) ctx.err(`est: ${e.message}; skipping (this sweep is a no-op)`);
-        return 4;
-      }
-      throw e;
+          });
+          const spend: SpendTables | null = full
+            ? {
+                models: spendByModel(db).slice(0, top),
+                origins: spendByOrigin(db),
+                unpriced: unpricedSummary(db),
+              }
+            : null;
+          return { report, spend };
+        } finally {
+          db.close();
+        }
+      },
+      { path: ctx.lockPath, timeoutMs, note: lockNote(full ? "backfill" : "sweep") },
+    );
+  } catch (e) {
+    if (e instanceof LockBusyError) {
+      // Not an error for a detached micro-sweep: another writer is already
+      // doing this work, and every write path is idempotent.
+      if (!ctx.quiet) ctx.err(`est: ${e.message}; skipping (this sweep is a no-op)`);
+      return 4;
     }
-
-    if (ctx.json) ctx.out(JSON.stringify(report, null, 2));
-    else if (!ctx.quiet) ctx.out(sweepSummary(report));
-
-    if (full) {
-      const top = flagInt(p, "top", 40);
-      const models = spendByModel(db).slice(0, top);
-      const origins = spendByOrigin(db);
-      const unpriced = unpricedSummary(db);
-      if (ctx.json) {
-        ctx.out(JSON.stringify({ by_model: models, by_origin: origins, unpriced }, null, 2));
-      } else if (!ctx.quiet) {
-        ctx.out("");
-        ctx.out(spendTable(`Work-CET / Spend-CET by model (ref_model = ${unpriced.ref_model ?? "unset"})`, models));
-        ctx.out("");
-        ctx.out(spendTable("Work-CET / Spend-CET by origin (§4.6)", origins));
-        ctx.out("");
-        if (unpriced.n_req > 0) {
-          ctx.out(
-            `unpriced: ${num(unpriced.n_req)} request(s) across ${unpriced.families.length} family(ies) ` +
-              `are excluded from the tables above — ${unpriced.families.join(", ")}\n` +
-              `          run \`est prices --sync\` and re-run \`est backfill\` (no re-parse: the DB already has the rows)`,
-          );
-          // A bracketed family reaching this list means `--sync` has not run since
-          // the row was ingested (or the base family itself is unpriced) — NOT the
-          // old structural dead end, where ingest kept the suffix and the price
-          // table dropped it so no sync could ever produce a joinable row.
-          const bracketed = unpriced.families.filter((f) => /\[[^\]]*\]$/.test(f));
-          if (bracketed.length > 0) {
-            ctx.out(
-              `          NOTE: ${bracketed.join(", ")} carr${bracketed.length === 1 ? "ies" : "y"} a "[...]" context suffix. ` +
-                `\`est prices --sync\` resolves these against the base family's rate (its >200k tier when the ` +
-                `suffix names a window past 200k), so a sync should clear them; if it does not, the BASE family ` +
-                `has no price row either.`,
-            );
-          }
-        } else {
-          ctx.out("unpriced: 0 requests — every observed model family has a price row.");
-        }
-        if (unpriced.n_pre_epoch > 0) {
-          ctx.out(
-            `pre-epoch: ${num(unpriced.n_pre_epoch)} request(s) are older than the earliest price row for their ` +
-              `own family, so they fall out of BOTH tables above and out of the unpriced count. ` +
-              `Backdate a price row (\`est prices --set\`) if that spend needs to be included.`,
-          );
-        }
-        if (unpriced.n_no_ref > 0) {
-          ctx.out(
-            `WARNING:  ${num(unpriced.n_no_ref)} priced request(s) yield a NULL Work-CET because ref_model ` +
-              `"${unpriced.ref_model ?? "unset"}" has no model_price row. Fix with \`est prices --sync\` ` +
-              `or point config.ref_model at a family that does.`,
-          );
-        }
-      }
-    }
-
-    if (report.budget_exceeded) return 3;
-    if (report.anomalies.alerting > 0) return 3;
-    if (strict && report.anomalies.recorded > 0) return 3;
-    return 0;
-  } finally {
-    db.close();
+    throw e;
   }
+
+  // Rendered outside the lock, from values already in memory: printing is not a write,
+  // and holding the writer lock across it would block every other writer on a terminal.
+  const { report, spend } = result;
+  if (ctx.json) ctx.out(JSON.stringify(report, null, 2));
+  else if (!ctx.quiet) ctx.out(sweepSummary(report));
+
+  if (spend !== null) {
+    const { models, origins, unpriced } = spend;
+    if (ctx.json) {
+      ctx.out(JSON.stringify({ by_model: models, by_origin: origins, unpriced }, null, 2));
+    } else if (!ctx.quiet) {
+      ctx.out("");
+      ctx.out(spendTable(`Work-CET / Spend-CET by model (ref_model = ${unpriced.ref_model ?? "unset"})`, models));
+      ctx.out("");
+      ctx.out(spendTable("Work-CET / Spend-CET by origin (§4.6)", origins));
+      ctx.out("");
+      if (unpriced.n_req > 0) {
+        ctx.out(
+          `unpriced: ${num(unpriced.n_req)} request(s) across ${unpriced.families.length} family(ies) ` +
+            `are excluded from the tables above — ${unpriced.families.join(", ")}\n` +
+            `          run \`est prices --sync\` and re-run \`est backfill\` (no re-parse: the DB already has the rows)`,
+        );
+        // A bracketed family reaching this list means `--sync` has not run since
+        // the row was ingested (or the base family itself is unpriced) — NOT the
+        // old structural dead end, where ingest kept the suffix and the price
+        // table dropped it so no sync could ever produce a joinable row.
+        const bracketed = unpriced.families.filter((f) => /\[[^\]]*\]$/.test(f));
+        if (bracketed.length > 0) {
+          ctx.out(
+            `          NOTE: ${bracketed.join(", ")} carr${bracketed.length === 1 ? "ies" : "y"} a "[...]" context suffix. ` +
+              `\`est prices --sync\` resolves these against the base family's rate (its >200k tier when the ` +
+              `suffix names a window past 200k), so a sync should clear them; if it does not, the BASE family ` +
+              `has no price row either.`,
+          );
+        }
+      } else {
+        ctx.out("unpriced: 0 requests — every observed model family has a price row.");
+      }
+      if (unpriced.n_pre_epoch > 0) {
+        ctx.out(
+          `pre-epoch: ${num(unpriced.n_pre_epoch)} request(s) are older than the earliest price row for their ` +
+            `own family, so they fall out of BOTH tables above and out of the unpriced count. ` +
+            `Backdate a price row (\`est prices --set\`) if that spend needs to be included.`,
+        );
+      }
+      if (unpriced.n_no_ref > 0) {
+        ctx.out(
+          `WARNING:  ${num(unpriced.n_no_ref)} priced request(s) yield a NULL Work-CET because ref_model ` +
+            `"${unpriced.ref_model ?? "unset"}" has no model_price row. Fix with \`est prices --sync\` ` +
+            `or point config.ref_model at a family that does.`,
+        );
+      }
+    }
+  }
+
+  if (report.budget_exceeded) return 3;
+  if (report.anomalies.alerting > 0) return 3;
+  if (strict && report.anomalies.recorded > 0) return 3;
+  return 0;
 }
 
 async function cmdPrices(ctx: Ctx): Promise<number> {
@@ -1323,8 +1382,14 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
     at = new Date(t);
   }
 
-  const db = openDb({ path: ctx.dbPath });
-  try {
+  // Writes take the lock, and the connection is opened INSIDE it (see `cmdOpen` for
+  // the whole reason): `openDb()` migrates a stale `schema_version` on sight, so a
+  // handle opened before the lock is itself a schema write outside the lock. ONE lock
+  // spans the whole command rather than one per write — `--set --sync` in a single
+  // invocation used to take it twice, and a nested `withLock` on the same path could
+  // not be re-entered anyway.
+  const writes = setModel !== null || wantSync;
+  const body = async (db: Database): Promise<number> => {
     let result: SyncResult | null = null;
 
     if (setModel !== null) {
@@ -1347,14 +1412,7 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
         return 1;
       }
       const rates = { usd_in, usd_out, usd_cw, usd_cr };
-      const set = await withLock(
-        () => setManualPrice(db, setModel, rates, { at: at ?? undefined }),
-        {
-          path: ctx.lockPath,
-          timeoutMs: 5000,
-          note: lockNote("prices --set"),
-        },
-      );
+      const set = setManualPrice(db, setModel, rates, { at: at ?? undefined });
       if (ctx.json) {
         ctx.out(JSON.stringify(set, null, 2));
       } else if (!ctx.quiet) {
@@ -1379,11 +1437,7 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
         ctx.err(`est prices --source: expected auto|live|fixture, got "${sourceFlag}"`);
         return 1;
       }
-      result = await withLock(() => sync(db, { source }), {
-        path: ctx.lockPath,
-        timeoutMs: 30_000,
-        note: lockNote("prices --sync"),
-      });
+      result = await sync(db, { source });
       if (ctx.json) {
         ctx.out(JSON.stringify(result, null, 2));
       } else if (!ctx.quiet) {
@@ -1427,9 +1481,29 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
 
     if (result !== null && !result.ok) return 3;
     return 0;
-  } finally {
-    db.close();
+  };
+
+  if (!writes) {
+    // `--show` on its own never writes, so it must never migrate either: a read-only
+    // connection is incapable of both, and it stays callable beside a live sweep.
+    const db = openDb({ path: ctx.dbPath, readonly: true });
+    try {
+      return await body(db);
+    } finally {
+      db.close();
+    }
   }
+  return await withLock(
+    async (): Promise<number> => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
+        return await body(db);
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 30_000, note: lockNote("prices") },
+  );
 }
 
 async function cmdCensus(ctx: Ctx): Promise<number> {
@@ -1536,6 +1610,93 @@ async function cmdCensus(ctx: Ctx): Promise<number> {
   }
 }
 
+/**
+ * `est config` — list / `get <k>` / `set <k> <v>` over the calibration constants.
+ *
+ * §1.1 puts EVERY tunable in the `config` table so none of them needs a code edit, and
+ * schema.sql tells the reader to tune them with `est config set …` in four places. Until
+ * this verb existed that instruction was false: `setConfig` had no caller outside the
+ * migrations and the tests, so the only way to move `ref_model` or `attr_stale_turns` on
+ * a live database was hand-written SQL — the one edit path with no lock, no validation
+ * and no record of who wrote what.
+ *
+ * Two guards, both §2 loud failures rather than silent no-ops:
+ *  - an unseeded key is rejected by name, because a typo'd key would otherwise upsert a
+ *    row no reader ever looks at and read back as "set";
+ *  - `schema_version` is refused outright — it is migration state, and hand-editing it
+ *    either re-runs a migration over migrated data or skips one entirely.
+ */
+async function cmdConfig(ctx: Ctx): Promise<number> {
+  const sub = positional(ctx, 0);
+  if (sub !== null && sub !== "get" && sub !== "set") {
+    throw new UsageError(
+      `est config: unknown subcommand: ${sub} (expected \`get <key>\`, \`set <key> <value>\`, or no argument to list)`,
+    );
+  }
+
+  if (sub === null) {
+    const db = openDb({ path: ctx.dbPath, readonly: true });
+    try {
+      const rows = db.query<{ k: string; v: string }, []>("SELECT k, v FROM config ORDER BY k").all();
+      if (ctx.json) {
+        ctx.out(JSON.stringify({ schema: 1, config: Object.fromEntries(rows.map((r) => [r.k, r.v])) }));
+      } else if (!ctx.quiet) {
+        ctx.out(renderTable(["key", "value"], rows.map((r) => [r.k, r.v])));
+      }
+      return 0;
+    } finally {
+      db.close();
+    }
+  }
+
+  const key = positional(ctx, 1);
+  if (key === null) throw new UsageError(`est config ${sub}: missing <key>`);
+
+  if (sub === "get") {
+    const db = openDb({ path: ctx.dbPath, readonly: true });
+    try {
+      const value = getConfig(db, key);
+      if (value === null) throw new UsageError(`est config get: unknown key: ${key}`);
+      // Bare value on stdout, so `$(est config get shrink_k)` is the number itself.
+      if (ctx.json) ctx.out(JSON.stringify({ schema: 1, key, value }));
+      else if (!ctx.quiet) ctx.out(value);
+      return 0;
+    } finally {
+      db.close();
+    }
+  }
+
+  const value = positional(ctx, 2);
+  if (value === null) throw new UsageError(`est config set ${key}: missing <value>`);
+
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
+        if (key === "schema_version") {
+          throw new InvariantError(
+            "config key `schema_version` is migration state, not a tunable",
+            "let src/db.ts migrate the database — `est init` applies every pending step and writes the row itself",
+          );
+        }
+        const old = getConfig(db, key);
+        if (old === null) {
+          throw new UsageError(
+            `est config set: unknown key: ${key}; every key is seeded by schema.sql — add it there (with a migration step) before tuning it`,
+          );
+        }
+        setConfig(db, key, value);
+        if (ctx.json) ctx.out(JSON.stringify({ schema: 1, key, old, value }));
+        else if (!ctx.quiet) ctx.out(`${key}: ${old} → ${value}`);
+        return 0;
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("config") },
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Phase 1 verbs (§Phase 1 interfaces)
 // ---------------------------------------------------------------------------
@@ -1586,8 +1747,29 @@ async function verb(ctx: Ctx, fn: () => Promise<number> | number): Promise<numbe
       ctx.err(`est: ${e.message}`);
       return 4;
     }
+    if (isConstraintError(e)) {
+      // A constraint failure that reaches here is the SAME refusal an InvariantError
+      // names — five tables carry `RAISE(ABORT,'append-only')` triggers and several
+      // more carry UNIQUE keys — it just arrived from the driver instead of from our
+      // own guard. Falling through to run()'s generic catch would print it as exit 1,
+      // which reads as "transient, retry it": exactly the response P1.12 exists to
+      // prevent. Exit 2 with the append path named, like every other rejection.
+      ctx.err(`est: REJECTED: ${e instanceof Error ? e.message : String(e)}`);
+      ctx.err(
+        "est: instead: these tables are append-only or uniquely keyed — append a NEW row " +
+          "(`est open` / `est scope` / `est retro --as-of <later>`) rather than rewriting one",
+      );
+      return 2;
+    }
     throw e;
   }
+}
+
+/** A SQLite constraint refusal, however the driver chose to surface it. */
+export function isConstraintError(e: unknown): boolean {
+  if (!(e instanceof Error)) return false;
+  const code = String((e as { code?: unknown }).code ?? "");
+  return /^SQLITE_CONSTRAINT/.test(code) || /constraint failed|append-only/i.test(e.message);
 }
 
 const NUMERIC_OPEN_FLAGS = [
@@ -1603,10 +1785,17 @@ const NUMERIC_OPEN_FLAGS = [
 async function cmdOpen(ctx: Ctx): Promise<number> {
   const p = ctx.parsed;
   const cont = flagString(p, "continue");
-  const db = openDb({ path: ctx.dbPath });
-  try {
-    return await withLock(
-      (): number => {
+  // The connection is opened INSIDE the lock, like `cmdInit`'s, and for the same
+  // reason: `openDb()` applies pending migrations the moment it sees a stale
+  // `schema_version`, and a migration is a write — it DROPs and rebuilds tables. A
+  // handle opened before the lock therefore rewrites the schema while another process
+  // holds the writer lock, which makes invariant 1 in this file's header ("every path
+  // that writes takes the sweep lock") false rather than merely untidy. Every writing
+  // verb below is built the same way.
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
         const now = new Date();
         let result;
         if (cont !== null) {
@@ -1725,7 +1914,7 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
           );
           ctx.out(
             `band  ${num(result.band.p50)} / ${num(result.band.p90)} Work-CET` +
-              `  ·  requests ${result.band.reqP50 ?? "?"}–${result.band.reqP90 ?? "?"}` +
+              `  ·  requests ${result.band.reqP50}–${result.band.reqP90}` +
               `  ·  active time: not predicted yet (§7.3 — the model has not beaten its baseline)` +
               `  ·  Spend-CET forecast ${usd(result.band.spendUsdP50)}–${usd(result.band.spendUsdP90)} (a LOWER bound: input and cache_read are excluded from Work-CET)`,
           );
@@ -1737,22 +1926,22 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
           ctx.out(`${PLANT_MARKER} ${result.plant.call}`);
         }
         return 0;
-      },
-      { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("open") },
-    );
-  } finally {
-    db.close();
-  }
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("open") },
+  );
 }
 
 async function cmdBlock(ctx: Ctx): Promise<number> {
   const tid = positional(ctx, 0);
   if (tid === null) throw new UsageError("est block: missing <tid>");
   const p = ctx.parsed;
-  const db = openDb({ path: ctx.dbPath });
-  try {
-    return await withLock(
-      (): number => {
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
         const r = addBlock(db, {
           tid,
           phaseIdx: requireInt(p, "phase"),
@@ -1776,22 +1965,22 @@ async function cmdBlock(ctx: Ctx): Promise<number> {
           }
         }
         return 0;
-      },
-      { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("block") },
-    );
-  } finally {
-    db.close();
-  }
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("block") },
+  );
 }
 
 async function cmdBind(ctx: Ctx): Promise<number> {
   const tid = positional(ctx, 0);
   if (tid === null) throw new UsageError("est bind: missing <tid>");
   const p = ctx.parsed;
-  const db = openDb({ path: ctx.dbPath });
-  try {
-    return await withLock(
-      (): number => {
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
         const r = bindTask(db, {
           tid,
           session: flagString(p, "session"),
@@ -1807,29 +1996,32 @@ async function cmdBind(ctx: Ctx): Promise<number> {
           }
         }
         return 0;
-      },
-      { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("bind") },
-    );
-  } finally {
-    db.close();
-  }
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("bind") },
+  );
 }
 
 async function cmdScope(ctx: Ctx): Promise<number> {
   const tid = positional(ctx, 0);
   if (tid === null) throw new UsageError("est scope: missing <tid>");
   const p = ctx.parsed;
-  const dodRaw = flagString(p, "dod");
-  const db = openDb({ path: ctx.dbPath });
-  try {
-    return await withLock(
-      (): number => {
+  // `flagStringOpt`, not `flagString`: a scope revision names the fields it CHANGES,
+  // and an omitted flag must reach `appendScope` as `undefined` so the previous value
+  // is carried forward. `null` there means "clear it" (see flagStringOpt's header).
+  const dodRaw = flagStringOpt(p, "dod");
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
         const r = appendScope(db, {
           tid,
           reason: requireFlag(p, "reason"),
-          subject: flagString(p, "subject"),
-          description: flagString(p, "description"),
-          dod: dodRaw === null ? null : parseDod(dodRaw),
+          subject: flagStringOpt(p, "subject"),
+          description: flagStringOpt(p, "description"),
+          dod: dodRaw === undefined ? undefined : parseDod(dodRaw),
           now: new Date(),
         });
         if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...r }));
@@ -1841,12 +2033,12 @@ async function cmdScope(ctx: Ctx): Promise<number> {
           );
         }
         return 0;
-      },
-      { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("scope") },
-    );
-  } finally {
-    db.close();
-  }
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("scope") },
+  );
 }
 
 /**
@@ -1871,8 +2063,10 @@ function cmdBurn(ctx: Ctx): number {
     try {
       db = openDb({ path: ctx.dbPath, readonly: true });
       payload = burnJson(db, opts);
-    } catch {
-      payload = { schema: 1 as const, active: false as const, as_of: isoNow(), reason: "db_missing" as const };
+    } catch (e) {
+      // Same classifier the read path uses: a locked file is `db_busy`, and only a
+      // genuinely absent or unreadable one is `db_missing`.
+      payload = { schema: 1 as const, active: false as const, as_of: isoNow(), reason: classifyOpenError(e) };
     } finally {
       db?.close();
     }
@@ -1892,10 +2086,10 @@ async function cmdClose(ctx: Ctx): Promise<number> {
   if (statusRaw !== null && !allowed.includes(statusRaw)) {
     throw new UsageError(`--status must be one of: ${allowed.join(" | ")}`);
   }
-  const db = openDb({ path: ctx.dbPath });
-  try {
-    return await withLock(
-      (): number => {
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
         const r = closeTask(db, {
           tid,
           status: (statusRaw as FinalStatus | null) ?? "completed",
@@ -1925,12 +2119,12 @@ async function cmdClose(ctx: Ctx): Promise<number> {
           if (r.alerts.length > 0) ctx.out(`alerts  ${r.alerts.join(", ")}`);
         }
         return r.alerts.length > 0 ? 3 : 0;
-      },
-      { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("close") },
-    );
-  } finally {
-    db.close();
-  }
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("close") },
+  );
 }
 
 function cmdRefclass(ctx: Ctx): number {
@@ -1938,11 +2132,18 @@ function cmdRefclass(ctx: Ctx): number {
   const text = flagString(p, "text") ?? positional(ctx, 0);
   if (text === null) throw new UsageError("est refclass: --text \"<subject>\" is required");
   const fanoutRaw = flagString(p, "fanout");
+  // Rejected rather than defaulted: --fanout narrows the class now, so a value the
+  // parser could not read must not be silently dropped on the floor (which is what
+  // the whole flag used to be).
+  const fanout = fanoutRaw === null ? null : Number(fanoutRaw);
+  if (fanout !== null && (!Number.isFinite(fanout) || fanout < 0)) {
+    throw new UsageError(`est refclass: --fanout must be a non-negative number; got ${fanoutRaw}`);
+  }
   const db = openDb({ path: ctx.dbPath, readonly: true });
   try {
     const r = refclass(db, {
       kind: flagString(p, "kind"),
-      fanout: fanoutRaw === null ? null : Number(fanoutRaw),
+      fanout,
       text,
       limit: optInt(p, "limit", 5),
     });
@@ -1969,6 +2170,16 @@ function cmdRefclass(ctx: Ctx): number {
       );
       for (const m of r.matches) {
         if (m.excerpt !== "") lines.push(`  · ${m.subject}: ${m.excerpt}`);
+      }
+      if (r.fanout_relaxed && r.fanout_band !== null) {
+        // The flag must not manufacture an empty class, and it must not silently
+        // widen one either — a match list that ignored --fanout has to say so.
+        lines.push(
+          `  note: no completed task ran at a comparable fan-out (${r.fanout_band.lo}–${r.fanout_band.hi} agents for --fanout ${r.fanout}); ` +
+            "these matches are the UNFILTERED class",
+        );
+      } else if (r.fanout_band !== null) {
+        lines.push(`  fan-out filter: ${r.fanout_band.lo}–${r.fanout_band.hi} agents (--fanout ${r.fanout})`);
       }
     }
     if (r.bucket.uncalibrated) {
@@ -2061,18 +2272,35 @@ async function cmdRetro(ctx: Ctx): Promise<number> {
     if (!Number.isFinite(t)) throw new UsageError(`--as-of: expected an ISO instant, got "${asOfRaw}"`);
     asOf = new Date(t);
   }
-  const db = openDb({ path: ctx.dbPath, readonly: dryRun });
-  try {
-    const compute = (): RetroReport => retro(db, { asOf, dryRun });
-    const r = dryRun
-      ? compute()
-      : await withLock(compute, { path: ctx.lockPath, timeoutMs: 30_000, note: lockNote("retro") });
+  const emit = (r: RetroReport): number => {
     if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...r }));
     else if (!ctx.quiet) ctx.out(renderRetro(r));
     return r.alerts.length > 0 ? 3 : 0;
-  } finally {
-    db.close();
+  };
+
+  // `--dry-run` is read-only by contract, so it takes no lock — and therefore must not
+  // open a connection that could migrate: `readonly: true` makes both true at once.
+  if (dryRun) {
+    const db = openDb({ path: ctx.dbPath, readonly: true });
+    try {
+      return emit(retro(db, { asOf, dryRun: true }));
+    } finally {
+      db.close();
+    }
   }
+  // The writing path opens INSIDE the lock (see `cmdOpen`): `openDb()` migrates a
+  // stale `schema_version` on sight, and a migration is a write.
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
+        return emit(retro(db, { asOf, dryRun: false }));
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 30_000, note: lockNote("retro") },
+  );
 }
 
 function pct(v: number | null): string {
@@ -2164,6 +2392,7 @@ commands:
   backfill                full re-sweep over every surviving transcript, plus a spend report
   prices                  model price table: --sync, --show, --set
   census                  sweep_census history, corpus counts and the anomaly ledger
+  config                  read/tune the calibration constants: list, get <k>, set <k> <v>
   refclass                the reference class — run this BEFORE stating any number
   open                    mint or re-estimate a task; prints the calibrated band
   block                   one estimate per declared workflow phase, before the launch
@@ -2206,9 +2435,17 @@ census:
   --limit <n>             sweep_census rows to show (default 10)
   --root <path>
 
+config (the calibration constants — §1.1 keeps every tunable in the DB, not in code):
+  (no args)               list every key and value
+  get <key>               the value alone on stdout, so it substitutes into a shell var
+  set <key> <value>       tune a SEEDED key; an unknown key and schema_version are refused
+
 refclass (read-only, takes no lock, ALWAYS exits 0 — an empty class is a valid answer):
   --text "<subject>"      what the work is about (FTS5 over completed tasks)
-  --kind <k> --fanout <n> --limit <n>
+  --kind <k> --limit <n>
+  --fanout <n>            comparable agent fan-out: a TOLERANCE band (half to double,
+                          minimum ±2), not equality. If nothing in the corpus ran at a
+                          comparable fan-out the unfiltered class is shown and says so.
   --full                  write the unbudgeted form to spool/ and print its path
 
 open:
@@ -2283,6 +2520,8 @@ export async function run(argv: readonly string[], io: RunOptions = {}): Promise
         return await cmdPrices(ctx);
       case "census":
         return await cmdCensus(ctx);
+      case "config":
+        return await verb(ctx, () => cmdConfig(ctx));
       case "refclass":
         return await verb(ctx, () => cmdRefclass(ctx));
       case "open":

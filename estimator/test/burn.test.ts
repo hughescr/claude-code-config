@@ -18,6 +18,7 @@
  * family and the ref model, which makes Work-CET numerically `out_tok + cw_tok`.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { join } from "node:path";
 import {
   agentRun,
@@ -40,6 +41,8 @@ import {
   type BurnEmpty,
 } from "../src/burn.ts";
 import { attributeTasks } from "../src/attribute.ts";
+import { openDb } from "../src/db.ts";
+import { formatSegment } from "../scripts/statusline-burn.ts";
 
 let h: Harness;
 
@@ -139,6 +142,34 @@ describe("est burn — P1.9 the empty result", () => {
     expect(r.json<BurnEmpty>().active).toBe(false);
   });
 
+  test("a database an exclusive writer is holding is db_busy, not db_missing", () => {
+    // `openDb` probes sqlite_master for the `config` table before it can report a
+    // version, and that probe needs a shared lock — so a sweeper holding the file
+    // makes the OPEN throw, not the query. The first catch used to hardcode
+    // db_missing, which made db_busy unreachable and left the reason unable to tell
+    // "never initialised" from "the sweeper has it for a moment".
+    const path = join(h.dir, "busy.db");
+    openDb({ path }).close(); // a real, fully initialised database
+
+    const writer = new Database(path);
+    try {
+      writer.exec("PRAGMA locking_mode = EXCLUSIVE;");
+      writer.exec("BEGIN IMMEDIATE;");
+      writer.query("UPDATE config SET v = v WHERE k = 'schema_version'").run();
+
+      const body = burnRead(path) as BurnEmpty;
+      expect(body.active).toBe(false);
+      expect(body.reason).toBe("db_busy");
+    } finally {
+      try {
+        writer.exec("ROLLBACK;");
+      } catch {
+        /* nothing to roll back */
+      }
+      writer.close();
+    }
+  });
+
   test("the human renderer says nothing-to-show rather than printing a zero band", () => {
     const text = renderBurn({ schema: 1, active: false, as_of: "2026-01-01T00:00:00Z", reason: "no_cache" });
     expect(text).toContain("nothing to show");
@@ -201,6 +232,45 @@ describe("est burn --json — P1.9 the contract", () => {
     expect(
       h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM request WHERE attr = 'overhead'").get()?.n,
     ).toBe(1);
+  });
+
+  test("ceremony overhead is out of the DOLLAR terms too, so $/h stays per unit of work", async () => {
+    // `usd_per_hour` and `projection.total_usd` are both `usd / consumed_wcet` scaled.
+    // The Work-CET denominator has always excluded overhead; the dollar numerator did
+    // not, so §5.4's ceremony requests — booked to the SAME tid with attr='overhead' —
+    // inflated a rate per unit of work with spend no unit of work produced.
+    const tid = await openTask();
+    request(h.db, "r-work1", { out: 300, ts: "2026-01-01T00:01:00Z" });
+    request(h.db, "r-work2", { out: 200, ts: "2026-01-01T00:02:00Z" });
+    attributeTasks(h.db);
+    const now = new Date("2026-01-01T00:03:00Z");
+    refreshBurnCache(h.db, now);
+    const before = burnJson(h.db, { tid, now }) as BurnActive;
+    expect(before.wcet.consumed).toBe(500);
+    expect(before.burn.usd_per_hour).toBeGreaterThan(0);
+
+    // One ceremony request, at an instant the task was already active so the burn
+    // window's observed span — and therefore the rate — cannot move. Everything the
+    // payload reports about work must be identical.
+    request(h.db, "r-ceremony", { out: 900, ts: "2026-01-01T00:02:00Z", skill: "estimating" });
+    attributeTasks(h.db);
+    expect(
+      h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM request WHERE attr = 'overhead'").get()?.n,
+    ).toBe(1);
+    refreshBurnCache(h.db, now);
+    const after = burnJson(h.db, { tid, now }) as BurnActive;
+
+    expect(after.wcet.consumed).toBe(500);
+    expect(after.burn.usd_per_hour).toBe(before.burn.usd_per_hour);
+    expect(after.projection.total_usd).toBe(before.projection.total_usd);
+    // ...and the cached dollars are the overhead-exclusive figure the ratio divides.
+    const cached = h.db
+      .query<{ usd: number; consumed_wcet: number }, [string]>(
+        "SELECT usd, consumed_wcet FROM burn_cache WHERE tid = ?",
+      )
+      .get(tid)!;
+    expect(cached.usd).toBeCloseTo(500 / 1_000_000, 12); // $1/Mtok on 500 Work-CET of work
+    expect(cached.consumed_wcet).toBe(500);
   });
 
   test("warns over_p50 then over_p90 as consumption crosses the band", async () => {
@@ -281,6 +351,50 @@ describe("est burn — P1.6 resolution and the cache", () => {
     expect(b.tid).toBe(second);
   });
 
+  test("the payload says HOW the task was chosen, so a guess is not read as an answer", async () => {
+    const tid = await taskWithSpend();
+    await h.cli("bind", tid, "--session", "s7");
+    refreshBurnCache(h.db, new Date("2026-01-01T00:03:00Z"));
+
+    expect((burnJson(h.db, { tid }) as BurnActive).target).toBe("explicit");
+    expect((burnJson(h.db, { session: "s7" }) as BurnActive).target).toBe("session");
+
+    // A session nothing is bound to still resolves — P1.6's order ends at "the most
+    // recently touched non-terminal task", which is the right answer for a human
+    // typing `est burn` — but the payload must not present it as this session's work.
+    const guess = burnJson(h.db, { session: "a-session-with-no-binding" }) as BurnActive;
+    expect(guess.tid).toBe(tid);
+    expect(guess.target).toBe("fallback");
+    expect(renderBurn(guess)).toContain("GUESSED TARGET");
+  });
+
+  test("the cached read path answers from the ROW, not from a live count", async () => {
+    // P1.9's budget is one indexed row read. Agent totals and the price warnings used
+    // to be per-render queries over `agent_run` / the priced views — unbounded in
+    // corpus size. They are columns now, and the proof is that the cached answer does
+    // not move until a sweep rewrites the row.
+    const tid = await taskWithSpend();
+    const now = new Date("2026-01-01T00:03:00Z");
+    refreshBurnCache(h.db, now);
+    expect((burnJson(h.db, { tid, now }) as BurnActive).agents).toEqual({ live: 1, total: 1 });
+
+    agentRun(h.db, "a2", {
+      session: "s1",
+      launchPrompt: "p1",
+      startedAt: "2026-01-01T00:02:30Z",
+      endedAt: null,
+    });
+    attributeTasks(h.db);
+    // Cached: still the swept row. Live: the new agent.
+    expect((burnJson(h.db, { tid, now }) as BurnActive).agents).toEqual({ live: 1, total: 1 });
+    expect((burnJson(h.db, { tid, now, refresh: true }) as BurnActive).agents).toEqual({
+      live: 2,
+      total: 2,
+    });
+    refreshBurnCache(h.db, now);
+    expect((burnJson(h.db, { tid, now }) as BurnActive).agents).toEqual({ live: 2, total: 2 });
+  });
+
   test("--refresh reproduces the cached numbers without reading the cache", async () => {
     const tid = await taskWithSpend();
     const now = new Date("2026-01-01T00:03:00Z");
@@ -291,6 +405,10 @@ describe("est burn — P1.6 resolution and the cache", () => {
     const live = burnJson(h.db, { tid, now, refresh: true }) as BurnActive;
     expect(live.wcet.consumed).toBe(cached.wcet.consumed);
     expect(live.split).toEqual(cached.split);
+    // The derived counts are cached too, so the two paths must agree on them as well.
+    expect(live.agents).toEqual(cached.agents);
+    expect(live.warn).toEqual(cached.warn);
+    expect(live.burn.usd_per_hour).toBe(cached.burn.usd_per_hour);
   });
 
   test("the cache is a cache: dropping every row costs exactly one refresh", async () => {
@@ -334,6 +452,58 @@ describe("est burn — P1.6 resolution and the cache", () => {
     expect(agg.consumed_wcet).toBe(0);
     expect(agg.burn_wcet_per_min).toBe(0);
     expect(agg.proj_total_wcet).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P1.9 — the statusline segment, where "wrong number" costs the most
+// ---------------------------------------------------------------------------
+
+describe("the ccstatusline segment — P1.9", () => {
+  /** A bound, freshly swept task: the one case the segment is allowed to render. */
+  async function boundAndSwept(now: Date): Promise<string> {
+    const tid = await taskWithSpend();
+    await h.cli("bind", tid, "--session", "s7");
+    refreshBurnCache(h.db, now);
+    return tid;
+  }
+
+  test("renders the band for a session-bound, freshly swept task", async () => {
+    const now = new Date("2026-01-01T00:03:00Z");
+    await boundAndSwept(now);
+    const text = formatSegment(burnJson(h.db, { session: "s7", now }));
+    expect(text).toContain("WCET");
+    expect(text).toContain("[unvalidated]");
+  });
+
+  test("renders NOTHING from a stale cache row rather than a number from the past", async () => {
+    // `stale_s` exists so the display can show staleness instead of implying
+    // freshness; the segment has one line of budget and no room to qualify a number,
+    // so its honest rendering of a stale row is no row at all. It comes back on the
+    // next sweep.
+    const swept = new Date("2026-01-01T00:03:00Z");
+    await boundAndSwept(swept);
+    const later = new Date("2026-01-01T06:00:00Z");
+    const b = burnJson(h.db, { session: "s7", now: later }) as BurnActive;
+    expect(b.warn).toContain("stale");
+    expect(formatSegment(b)).toBe("");
+  });
+
+  test("renders NOTHING when the target was GUESSED — that band may be another session's", async () => {
+    // The statusline always supplies a session. If nothing is bound to it, P1.6's
+    // last step hands back the most recently touched open task in the whole database:
+    // a fine answer at a terminal, and someone else's number in Craig's prompt.
+    const now = new Date("2026-01-01T00:03:00Z");
+    await boundAndSwept(now);
+    const b = burnJson(h.db, { session: "some-other-session", now }) as BurnActive;
+    expect(b.target).toBe("fallback");
+    expect(formatSegment(b)).toBe("");
+  });
+
+  test("renders nothing for every empty result", () => {
+    for (const reason of ["no_open_estimate", "no_cache", "db_busy", "db_missing"] as const) {
+      expect(formatSegment({ schema: 1, active: false, as_of: "2026-01-01T00:00:00Z", reason })).toBe("");
+    }
   });
 });
 

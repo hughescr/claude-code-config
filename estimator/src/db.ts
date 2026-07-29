@@ -32,6 +32,16 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
 /**
  * Must match the config.schema_version seed in schema.sql.
  *
+ * 7 — the statusline read path becomes a BOUNDED read. `est burn`'s cached path was
+ *     nine statements per render, three of which walked history: a `task_alias`
+ *     lookup by session (the PK starts with `id_kind`, so it SCANNED), a
+ *     `COUNT(*) FROM agent_run WHERE tid = ?` (SCAN — the only index was on
+ *     `(run_id, wf_launch_id)`), and provisional/unpriced counts that priced every
+ *     request of the task by correlated subquery (~127 ms on a large task, against a
+ *     0.01 ms row read). Two indexes kill the scans; the three derived counts become
+ *     COLUMNS of `burn_cache`, computed once per sweep where the same aggregation
+ *     already runs. P1.9 promises one indexed row read at a >= 5 s cadence forever,
+ *     and that promise has to be true of the corpus in a year, not just today's.
  * 6 — `task_alias` keys on `tid` as well, because a session hosts MANY tasks.
  *     Under v5's `(id_kind, session_id, local_id)` key the pair ('session', S, S)
  *     was unique, so the second `est open` in a session silently wrote no alias:
@@ -67,7 +77,7 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
  *     `v_phase_actual.phase_conf`, auxiliary origin excluded from calibration.
  * 1 — initial R3 §4.2 shape.
  */
-export const SCHEMA_VERSION = "6";
+export const SCHEMA_VERSION = "7";
 
 /**
  * Forward-only, additive migrations, applied by {@link openDb} on a WRITABLE
@@ -221,6 +231,41 @@ JOIN model_price rf ON rf.family = e.ref_model
 WHERE r.tid IS NOT NULL AND r.attr <> 'overhead'
   AND r.origin IN ('main','subagent')   -- task effort only; 'auxiliary' excluded (§4.6)
 GROUP BY r.tid;
+`,
+  },
+  {
+    from: "6",
+    to: "7",
+    // `burn_cache` is REBUILT rather than widened by ALTER, and that is the one place
+    // in this file where dropping a table is not a hole in the append-only spine: it
+    // is the single table schema.sql declares droppable ("dropping it costs one sweep
+    // and nothing else"), it holds no evidence, and the next sweep writes every row
+    // back from `request`. The rebuild is also what makes this step safe to apply to a
+    // file that already has the v7 shape but an older version marker, which
+    // ADD COLUMN — with no `IF NOT EXISTS` in SQLite — is not.
+    sql: `
+DROP TABLE burn_cache;
+CREATE TABLE burn_cache (
+  tid TEXT PRIMARY KEY REFERENCES task(tid),
+  as_of TEXT NOT NULL,
+  consumed_wcet INTEGER,
+  wcet_main INTEGER, wcet_sub INTEGER, wcet_aux INTEGER,
+  usd REAL,
+  n_req INTEGER,
+  n_agents_live INTEGER,
+  n_agents_total INTEGER,
+  n_provisional INTEGER,
+  n_unpriced INTEGER,
+  active_s INTEGER,
+  burn_wcet_per_min REAL,
+  proj_total_wcet INTEGER
+) STRICT, WITHOUT ROWID;
+
+-- The two scans the statusline paid for on every render. IF NOT EXISTS for the same
+-- reason burn_cache is rebuilt rather than altered: this step must land cleanly on a
+-- file that already has the shape and only lacks the marker.
+CREATE INDEX IF NOT EXISTS ix_agent_run_tid ON agent_run(tid);
+CREATE INDEX IF NOT EXISTS ix_alias_session ON task_alias(session_id);
 `,
   },
 ];

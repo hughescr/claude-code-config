@@ -52,6 +52,27 @@ async function open(...extra: string[]): Promise<string> {
   return r.json<{ tid: string }>().tid;
 }
 
+/**
+ * One COMPLETED task that realized `agents` distinct sub-agents — the only shape
+ * `est refclass` can match, and the only way `outcome.n_agents` (COUNT(DISTINCT
+ * agent_id) over the task's requests) becomes anything but zero.
+ */
+async function completedWithFanout(n: number, subject: string, agents: number): Promise<string> {
+  const session = `sf${n}`;
+  const at = `2026-01-0${(n % 9) + 1}T00:00:00Z`;
+  turn(h.db, { session, prompt: "p1", at, durationMs: 60_000 });
+  const r = await h.cli(...openArgs({ subject }), "--session", session, "--prompt", "p1", "--json");
+  expect(r.code).toBe(0);
+  const tid = r.json<{ tid: string }>().tid;
+  request(h.db, `rq-${n}-main`, { session, out: 100, ts: at });
+  for (let i = 0; i < agents; i++) {
+    request(h.db, `rq-${n}-a${i}`, { session, origin: "subagent", agent: `ag-${n}-${i}`, out: 10, ts: at });
+  }
+  attributeTasks(h.db);
+  expect((await h.cli("close", tid, "--force")).code).toBeLessThanOrEqual(3);
+  return tid;
+}
+
 /** A second, distinct task in the same session — the sequential case (§5.4). */
 async function openOther(...extra: string[]): Promise<string> {
   const r = await h.cli(
@@ -167,6 +188,105 @@ describe("est open — P1.1 mint", () => {
     expect(row.cal_p50_wcet).toBe(1000);
   });
 
+  test("the request band is symmetric at cold start — both ends, or the caveat means nothing", async () => {
+    // It used to write the raw guess into p50 and NULL into p90, so P1.9's
+    // `requests: {n, p50, p90}` contract carried half a band and no consumer could
+    // render it. The WCET band has never done that: multipliers are 1.0 when the
+    // class is cold, and the `uncalibrated` flag is what says so.
+    const r = await h.cli(...openArgs(), "--session", "s1", "--prompt", "p1", "--json");
+    const body = r.json<{ uncalibrated: boolean; band: { req_p50: number; req_p90: number } }>();
+    expect(body.uncalibrated).toBe(true);
+    expect(body.band.req_p50).toBe(40);
+    expect(body.band.req_p90).toBe(40);
+
+    const row = h.db.query<{ cal_req_p50: number | null; cal_req_p90: number | null }, []>(
+      "SELECT cal_req_p50, cal_req_p90 FROM estimate",
+    ).get()!;
+    expect(row).toEqual({ cal_req_p50: 40, cal_req_p90: 40 });
+
+    const human = await h.cli(...openArgs({ subject: "another" }), "--session", "s1", "--prompt", "p1");
+    expect(human.out).toContain("requests 40–40");
+    expect(human.out).not.toContain("requests ?");
+  });
+
+  test("an inverted raw band is REJECTED before anything is written (exit 1)", async () => {
+    // `estimate` is append-only, so a p90 below the p50 could never be corrected in
+    // place: it has to be refused at the door or it is in the corpus forever.
+    const r = await h.cli(...openArgs({ "raw-p50": 5000, "raw-p90": 100 }), "--session", "s1", "--prompt", "p1");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("--raw-p90");
+    expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task").get()?.n).toBe(0);
+    expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM estimate").get()?.n).toBe(0);
+  });
+
+  test("an equal p50 and p90 is accepted — a degenerate band is narrow, not inverted", async () => {
+    const r = await h.cli(...openArgs({ "raw-p50": 900, "raw-p90": 900 }), "--session", "s1", "--prompt", "p1");
+    expect(r.code).toBe(0);
+  });
+
+  test("the estimator identity is read from the session's own main requests, not from 'unknown'", async () => {
+    // Nothing in this repo writes EST_ESTIMATOR_MODEL or config.estimator_model, so
+    // every band from every family used to land under one 'unknown' key and
+    // `est retro` pooled them into a single calibration bucket.
+    request(h.db, "r-main", {
+      session: "s1",
+      prompt: "p1",
+      family: "claude-test-orchestrator-9",
+      out: 10,
+      ts: "2026-01-01T00:00:10Z",
+    });
+    // A subagent request names the model the orchestrator DELEGATED to; it must not
+    // become the estimator's identity.
+    request(h.db, "r-sub", {
+      session: "s1",
+      prompt: "p1",
+      origin: "subagent",
+      agent: "a1",
+      family: "claude-test-worker-1",
+      out: 10,
+      ts: "2026-01-01T00:00:20Z",
+    });
+    const tid = await open();
+    const row = h.db.query<{ estimator_model: string }, [string]>(
+      "SELECT estimator_model FROM estimate WHERE tid = ?",
+    ).get(tid)!;
+    expect(row.estimator_model).toBe("claude-test-orchestrator-9");
+  });
+
+  test("a session with no swept main request still says 'unknown' rather than guessing", async () => {
+    const tid = await open();
+    const row = h.db.query<{ estimator_model: string }, [string]>(
+      "SELECT estimator_model FROM estimate WHERE tid = ?",
+    ).get(tid)!;
+    expect(row.estimator_model).toBe("unknown");
+  });
+
+  test("an explicit override still wins over the derived identity", async () => {
+    request(h.db, "r-main", { session: "s1", prompt: "p1", family: "claude-test-derived-1", out: 10 });
+
+    // config.estimator_model — the pin a hook or an operator sets deliberately.
+    h.db.query("INSERT INTO config (k, v) VALUES ('estimator_model', 'claude-test-pinned-2')").run();
+    const pinned = await open();
+    expect(
+      h.db.query<{ estimator_model: string }, [string]>(
+        "SELECT estimator_model FROM estimate WHERE tid = ?",
+      ).get(pinned)!.estimator_model,
+    ).toBe("claude-test-pinned-2");
+
+    // EST_ESTIMATOR_MODEL outranks even that.
+    process.env.EST_ESTIMATOR_MODEL = "claude-test-env-3";
+    try {
+      const fromEnv = await openOther();
+      expect(
+        h.db.query<{ estimator_model: string }, [string]>(
+          "SELECT estimator_model FROM estimate WHERE tid = ?",
+        ).get(fromEnv)!.estimator_model,
+      ).toBe("claude-test-env-3");
+    } finally {
+      delete process.env.EST_ESTIMATOR_MODEL;
+    }
+  });
+
   test("the human band line says UNCALIBRATED in words, not only in a JSON field", async () => {
     const r = await h.cli(...openArgs(), "--session", "s1", "--prompt", "p1");
     expect(r.out).toContain("UNCALIBRATED");
@@ -242,14 +362,14 @@ describe("est open — P1.1 mint", () => {
 describe("est open — P1.1 re-estimate", () => {
   test("appends version 2 and leaves version 1 untouched (append-only)", async () => {
     const tid = await open();
+    // The re-estimate moves BOTH ends: raising p50 past the previous p90 and leaving
+    // p90 where it was would be an inverted band, which `est open` now refuses.
     const r = await h.cli(
-      ...openArgs({ subject: "" }),
+      ...openArgs({ subject: "", "raw-p50": 5000, "raw-p90": 12_000 }),
       "--tid",
       tid,
       "--reason",
       "refinement",
-      "--raw-p50",
-      "5000",
       "--json",
     );
     expect(r.code).toBe(0);
@@ -399,6 +519,16 @@ describe("est block — P1.2", () => {
     expect(tid).not.toBe("");
   });
 
+  test("an inverted block band is REJECTED (exit 1) — estimate_block is append-only too", async () => {
+    const tid = await open();
+    const r = await h.cli("block", tid, "--phase", "0", "--title", "survey", "--p50", "900", "--p90", "10");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("--p90");
+    expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM estimate_block").get()?.n).toBe(0);
+    // Equal ends are a narrow band, not an inverted one.
+    expect((await h.cli("block", tid, "--phase", "0", "--title", "survey", "--p50", "10", "--p90", "10")).code).toBe(0);
+  });
+
   test("a negative or out-of-range --phase is a usage error", async () => {
     const tid = await open();
     expect((await h.cli("block", tid, "--phase", "-1", "--title", "x", "--p50", "1", "--p90", "2")).code).toBe(1);
@@ -527,6 +657,47 @@ describe("est scope — P1.5", () => {
     ).toBe(1);
   });
 
+  test("an omitted --description is NOT a cleared description", async () => {
+    // A scope revision names the fields it CHANGES. An omitted flag used to arrive as
+    // `null`, which `appendScope` reads as "clear it", so revising the subject silently
+    // deleted the description — and re-indexed FTS with the truncated text.
+    const tid = await open("--description", "the original description text");
+    const r = await h.cli("scope", tid, "--reason", "clarified subject", "--subject", "widget pipeline rewrite v2");
+    expect(r.code).toBe(0);
+    const row = h.db.query<{ subject: string; description: string | null }, [string]>(
+      "SELECT subject, description FROM task_scope WHERE tid = ? AND seq = 2",
+    ).get(tid)!;
+    expect(row.subject).toBe("widget pipeline rewrite v2");
+    expect(row.description).toBe("the original description text");
+    expect(
+      h.db.query<{ description: string | null }, [string]>("SELECT description FROM task_fts WHERE tid = ?").get(tid)!
+        .description,
+    ).toBe("the original description text");
+  });
+
+  test("with a description present, re-submitting the identical subject is still a no-op (exit 2)", async () => {
+    // The security half: clearing the description changed `scope_hash`, so the no-op
+    // guard — the reason the `scope_change` precondition cannot be manufactured —
+    // could be walked past by simply omitting a flag.
+    const tid = await open("--description", "the original description text");
+    const r = await h.cli("scope", tid, "--reason", "no-op", "--subject", "widget pipeline rewrite");
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("changes nothing");
+    expect(
+      h.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM task_scope WHERE tid = ?").get(tid)?.n,
+    ).toBe(1);
+  });
+
+  test("an explicitly empty --description clears it — absent and empty are different answers", async () => {
+    const tid = await open("--description", "the original description text");
+    expect((await h.cli("scope", tid, "--reason", "description withdrawn", "--description", "")).code).toBe(0);
+    expect(
+      h.db.query<{ description: string | null }, [string]>(
+        "SELECT description FROM task_scope WHERE tid = ? AND seq = 2",
+      ).get(tid)!.description,
+    ).toBe("");
+  });
+
   test("re-indexes task_fts so the reference class sees the new subject", async () => {
     const tid = await open();
     await h.cli("scope", tid, "--reason", "renamed", "--subject", "sprocket calibration");
@@ -623,6 +794,69 @@ describe("est refclass — P1.4", () => {
     await open();
     const r = await h.cli("refclass", "--text", "widget pipeline");
     expect(r.out.length).toBeLessThanOrEqual(8000);
+  });
+
+  test("the bucket line names the family `est open` will stamp, not a blanket 'unknown'", async () => {
+    // Step 1 and step 7 of the ceremony must agree about whose calibration history is
+    // on screen; a bucket line keyed on 'unknown' would show a different family's.
+    request(h.db, "r-main", { session: "s1", prompt: "p1", family: "claude-test-orchestrator-9", out: 10 });
+    const r = await h.cli("refclass", "--text", "widget", "--json");
+    expect(r.code).toBe(0);
+    expect(r.json<{ bucket: { estimator_family: string } }>().bucket.estimator_family).toBe(
+      "claude-test-orchestrator-9",
+    );
+  });
+
+  test("--fanout narrows the class to a comparable fan-out instead of being ignored", async () => {
+    // The flag was parsed, echoed, documented and instructed by the skill, and never
+    // reached the SQL: `est refclass --fanout 2` returned exactly what `--fanout 40`
+    // did. It is a TOLERANCE (half to double, minimum ±2), because n_agents is a
+    // realized count and equality would empty the class at this corpus size.
+    await completedWithFanout(1, "small pipeline job", 2);
+    await completedWithFanout(2, "large pipeline job", 9);
+
+    const narrow = await h.cli("refclass", "--text", "pipeline job", "--fanout", "2", "--json");
+    expect(narrow.code).toBe(0);
+    const nb = narrow.json<{
+      fanout: number;
+      fanout_band: { lo: number; hi: number };
+      fanout_relaxed: boolean;
+      matches: Array<{ subject: string; fanout: number }>;
+    }>();
+    expect(nb.fanout_band).toEqual({ lo: 1, hi: 4 });
+    expect(nb.fanout_relaxed).toBe(false);
+    expect(nb.matches.map((m) => m.subject)).toEqual(["small pipeline job"]);
+
+    // The wide end of the same corpus, from the other side.
+    const wide = await h.cli("refclass", "--text", "pipeline job", "--fanout", "9", "--json");
+    expect(wide.json<{ matches: Array<{ subject: string }> }>().matches.map((m) => m.subject)).toEqual([
+      "large pipeline job",
+    ]);
+
+    // And without the flag, both are still the reference class.
+    const all = await h.cli("refclass", "--text", "pipeline job", "--json");
+    expect(all.json<{ matches: unknown[]; fanout_band: null }>().matches).toHaveLength(2);
+    expect(all.json<{ fanout_band: unknown }>().fanout_band).toBeNull();
+  });
+
+  test("a fan-out that matches nothing falls back to the unfiltered class AND says so", async () => {
+    // A filter that empties the reference class is worse than no filter: the estimator
+    // would read "no comparable work exists" when what happened is that a flag was set.
+    await completedWithFanout(3, "pipeline job", 2);
+    const r = await h.cli("refclass", "--text", "pipeline job", "--fanout", "40", "--json");
+    expect(r.code).toBe(0);
+    const body = r.json<{ fanout_relaxed: boolean; matches: unknown[] }>();
+    expect(body.fanout_relaxed).toBe(true);
+    expect(body.matches).toHaveLength(1);
+
+    const human = await h.cli("refclass", "--text", "pipeline job", "--fanout", "40");
+    expect(human.out).toContain("UNFILTERED");
+  });
+
+  test("a --fanout the parser cannot read is a usage error, not a silently dropped filter", async () => {
+    const r = await h.cli("refclass", "--text", "pipeline", "--fanout", "lots");
+    expect(r.code).toBe(1);
+    expect(r.err).toContain("--fanout");
   });
 
   test("a price change cannot retroactively move a completed task's unit", async () => {

@@ -63,3 +63,5 @@ nothing launched. It runs `est refclass`, then `est open`, which prints the band
 `Workflow`, run `est block` per declared `meta.phases` entry before launching, and give every
 `agent()` call a `label` and a `phase` (0-based). Re-estimate by appending: `est open --reason
 refinement`, or `est scope` then `--reason scope_change` if the goal moved. Never self-report tokens.
+`est` is `bun run ~/.claude/estimator/src/cli.ts` unless a shim is on `PATH` (`cd
+~/.claude/estimator && bun link` mints one) — use the long form rather than skipping the step.

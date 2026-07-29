@@ -15,7 +15,15 @@
  * unset.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
@@ -68,6 +76,15 @@ function complianceLines(): Array<Record<string, unknown>> {
     .split("\n")
     .filter((l) => l.trim().length > 0)
     .map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+/**
+ * Create an empty, initialised database. Several cases need "the hook CAN read the
+ * database and found nothing bound", which is a different fact from "there is no
+ * database" — the hook nudges on the first and stays silent on the second.
+ */
+function initDb(): void {
+  openDb({ path: dbPath }).close();
 }
 
 function seedTask(opts: {
@@ -125,6 +142,57 @@ function seedTask(opts: {
   }
 }
 
+/** A later `est open --reason refinement`: a NEW estimate version, so a NEW band. */
+function refineEstimate(tid: string, version: number, calP90: number): void {
+  const db = openDb({ path: dbPath });
+  const now = new Date().toISOString();
+  try {
+    db.run(
+      `INSERT INTO estimate (tid,version,created_at,reason,scope_seq,raw_p50_wcet,raw_p90_wcet,
+         exp_agents,exp_wf_phases,exp_files_write,exp_turns,exp_requests,bucket,bucket_n,shrink_w,
+         cal_p50_wcet,cal_p90_wcet,price_epoch,ref_model,estimand,estimator_model)
+       VALUES (?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [
+        tid,
+        version,
+        now,
+        "refinement",
+        1000,
+        calP90,
+        1,
+        0,
+        1,
+        2,
+        5,
+        "global",
+        0,
+        0,
+        1000,
+        calP90,
+        now,
+        "claude-sonnet-4-5",
+        "work_cet",
+        "claude-sonnet-4-5",
+      ],
+    );
+  } finally {
+    db.close();
+  }
+}
+
+function setConsumed(tid: string, consumedWcet: number): void {
+  const db = openDb({ path: dbPath });
+  try {
+    db.run("UPDATE burn_cache SET consumed_wcet = ?, proj_total_wcet = ? WHERE tid = ?", [
+      consumedWcet,
+      consumedWcet,
+      tid,
+    ]);
+  } finally {
+    db.close();
+  }
+}
+
 function seedBurnCache(tid: string, consumedWcet: number): void {
   const db = openDb({ path: dbPath });
   const now = new Date().toISOString();
@@ -160,20 +228,38 @@ describe("nudge.ts — P1.10 fail-open contract", () => {
     expect(complianceLines()).toHaveLength(0); // nothing to log without a session id
   });
 
-  test("exits 0 and still nudges when the database file does not exist", () => {
+  test("exits 0 and stays SILENT when the database file does not exist", () => {
+    // P1.10 fail-open: a missing database is "print nothing", not "nudge". Nudging
+    // there nags Craig about an unbound estimate on evidence nothing could gather.
     const r = runNudge(
       JSON.stringify({ session_id: "s1", tool_name: "Workflow", tool_input: {} }),
       { EST_DB: join(dir, "does-not-exist.db") },
     );
     expect(r.exitCode).toBe(0);
-    const payload = JSON.parse(r.stdout);
-    expect(payload.hookSpecificOutput.hookEventName).toBe("PostToolUse");
-    expect(payload.hookSpecificOutput.additionalContext).toContain("estimating");
+    expect(r.stdout).toBe("");
+  });
+
+  test("an unreadable database is recorded as db_unavailable, never as a compliance miss", () => {
+    const r = runNudge(
+      JSON.stringify({ session_id: "s1", tool_name: "Workflow", tool_input: {} }),
+      { EST_DB: join(dir, "does-not-exist.db") },
+    );
+    expect(r.exitCode).toBe(0);
+    const lines = complianceLines();
+    expect(lines).toHaveLength(1);
+    // src/spool.ts drops these before the missed_estimate anomaly and the counters.
+    expect(lines[0]).toMatchObject({
+      bound_tid: null,
+      nudged: false,
+      nudge_kind: "none",
+      db_unavailable: true,
+    });
   });
 });
 
 describe("nudge.ts — P1.10 job 1: decide", () => {
   test("nudges (naming the estimating skill) when no task is bound to the session", () => {
+    initDb();
     const r = runNudge(
       JSON.stringify({ session_id: "unbound-session", tool_name: "Task", tool_input: {} }),
     );
@@ -228,15 +314,18 @@ describe("nudge.ts — P1.10 job 2: compliance recording", () => {
   });
 
   test("records nudged:true and bound_tid:null when unbound", () => {
+    initDb();
     runNudge(
       JSON.stringify({ session_id: "unbound-session", tool_name: "Workflow", tool_input: {} }),
     );
     const lines = complianceLines();
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatchObject({ bound_tid: null, nudged: true });
+    expect(lines[0]).toMatchObject({ bound_tid: null, nudged: true, nudge_kind: "no_estimate" });
+    expect(lines[0]!.db_unavailable).toBeUndefined();
   });
 
   test("appends, never overwrites, across repeated invocations", () => {
+    initDb();
     runNudge(JSON.stringify({ session_id: "s1", tool_name: "Task", tool_input: {} }));
     runNudge(JSON.stringify({ session_id: "s1", tool_name: "Task", tool_input: {} }));
     runNudge(JSON.stringify({ session_id: "s1", tool_name: "Task", tool_input: {} }));
@@ -287,6 +376,54 @@ describe("nudge.ts — P1.10 job 4: overrun nudge (burn_cache, schema v5)", () =
     expect(second.exitCode).toBe(0);
     expect(second.stdout).toBe(""); // once per threshold crossing per task
   });
+
+  test("re-arms when a refinement mints a NEW band, then goes quiet inside that one", () => {
+    // "Once per threshold crossing", not "once per task ever": a task that
+    // re-estimates and then blows the wider band has crossed a second threshold.
+    const fire = (): RunResult =>
+      runNudge(JSON.stringify({ session_id: "bound-session", tool_name: "Task", tool_input: {} }));
+
+    seedTask({ tid: "t-bound", sessionId: "bound-session", calP90: 3000 });
+    seedBurnCache("t-bound", 3500);
+    expect(JSON.parse(fire().stdout).systemMessage).toContain("3000");
+    expect(fire().stdout).toBe(""); // same band
+
+    refineEstimate("t-bound", 2, 20000);
+    setConsumed("t-bound", 25000);
+    const third = fire();
+    expect(third.exitCode).toBe(0);
+    expect(JSON.parse(third.stdout).systemMessage).toContain("20000");
+
+    expect(fire().stdout).toBe(""); // and quiet again inside the new band
+  });
+
+  test("a refinement that widens the band past the burn nudges nothing at all", () => {
+    seedTask({ tid: "t-bound", sessionId: "bound-session", calP90: 3000 });
+    seedBurnCache("t-bound", 3500);
+    const fire = (): RunResult =>
+      runNudge(JSON.stringify({ session_id: "bound-session", tool_name: "Task", tool_input: {} }));
+    expect(fire().stdout).not.toBe("");
+
+    refineEstimate("t-bound", 2, 50000); // now comfortably inside the band
+    expect(fire().stdout).toBe("");
+  });
+
+  test("an emitted overrun nudge is visible in the compliance spool", () => {
+    // `nudged` used to be "was there no binding", which made every overrun nudge
+    // invisible to the spool — the one thing the spool adds over v_missed_estimate.
+    seedTask({ tid: "t-bound", sessionId: "bound-session", calP90: 3000 });
+    seedBurnCache("t-bound", 3500);
+    runNudge(JSON.stringify({ session_id: "bound-session", tool_name: "Task", tool_input: {} }));
+
+    const lines = complianceLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      bound_tid: "t-bound",
+      nudged: true,
+      nudge_kind: "overrun",
+    });
+    expect(existsSync(join(spoolDir, ".overrun-notified.t-bound"))).toBe(true);
+  });
 });
 
 describe("nudge.ts — P1.10 job 3: EST_DISABLE_MICROSWEEP escape hatch", () => {
@@ -297,6 +434,32 @@ describe("nudge.ts — P1.10 job 3: EST_DISABLE_MICROSWEEP escape hatch", () => 
   // actually suppressing it. This confirms the flag itself does that.
   test("no throttle marker is created when the microsweep is disabled", () => {
     runNudge(JSON.stringify({ session_id: "no-marker-session", tool_name: "Task", tool_input: {} }));
+    expect(existsSync(join(spoolDir, ".microsweep"))).toBe(false);
     expect(existsSync(join(spoolDir, ".microsweep.no-marker-session"))).toBe(false);
+  });
+
+  test("the throttle is GLOBAL: a fresh marker suppresses every session's sweep", () => {
+    // The marker is checked (and honoured) before anything is spawned, so a
+    // pre-touched one lets this exercise the real job-3 path without exec'ing a
+    // corpus-wide sweep. The property under test is that a SECOND session sees the
+    // same marker: a per-session marker gave each concurrent session its own window,
+    // which is the N-sweep fan-out the throttle exists to collapse.
+    mkdirSync(spoolDir, { recursive: true });
+    writeFileSync(join(spoolDir, ".microsweep"), String(Date.now()));
+    const before = readFileSync(join(spoolDir, ".microsweep"), "utf8");
+
+    for (const sid of ["session-a", "session-b", "session-c"]) {
+      const r = runNudge(JSON.stringify({ session_id: sid, tool_name: "Task", tool_input: {} }), {
+        EST_DISABLE_MICROSWEEP: "",
+        EST_MICROSWEEP_MIN_INTERVAL_S: "3600",
+      });
+      expect(r.exitCode).toBe(0);
+    }
+
+    // Throttled: the marker was not re-touched, and no per-session marker exists.
+    expect(readFileSync(join(spoolDir, ".microsweep"), "utf8")).toBe(before);
+    expect(readdirSync(spoolDir).filter((f) => f.startsWith(".microsweep"))).toEqual([
+      ".microsweep",
+    ]);
   });
 });

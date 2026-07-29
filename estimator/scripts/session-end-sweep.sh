@@ -2,12 +2,11 @@
 # scripts/session-end-sweep.sh — the SessionEnd blocking sweep (design R3 §3.4).
 #
 # ############################################################################
-# # NOT WIRED IN. This file is not referenced by ~/.claude/settings.json yet. #
-# # Installing it is the orchestrator's job, not this script's. When it goes  #
-# # in, it goes in ~/.claude/settings.json (USER level) as an ADDITIONAL      #
-# # SessionEnd entry — hooks merge additively across settings levels and all  #
-# # levels' hooks run, so never "replace the SessionEnd block": that would    #
-# # silently drop whatever else is registered there.                          #
+# # WIRED IN as of commit 7b512db: registered in ~/.claude/settings.json      #
+# # (USER level) as an ADDITIONAL SessionEnd entry. Hooks merge additively    #
+# # across settings levels and ALL levels' hooks run, so never "replace the   #
+# # SessionEnd block" when editing it: that would silently drop whatever else #
+# # is registered there.                                                      #
 # ############################################################################
 #
 # What it does: one blocking, budgeted sweep so the session's own transcripts are

@@ -42,6 +42,9 @@ export interface BurnAggregate {
   usd: number;
   n_req: number;
   n_agents_live: number;
+  n_agents_total: number;
+  n_provisional: number;
+  n_unpriced: number;
   active_s: number;
   burn_wcet_per_min: number;
   proj_total_wcet: number;
@@ -49,13 +52,24 @@ export interface BurnAggregate {
   last_ts: string | null;
 }
 
+/**
+ * `usd` carries the SAME `attr <> 'overhead'` guard as the Work-CET terms, and that
+ * is not a stylistic matter: §5.4 rule 1 books the estimating skill's own requests to
+ * the task's tid with `attr='overhead'`, so a dollar total that counted them while the
+ * Work-CET denominator did not made `usd / consumed_wcet` — the ratio behind
+ * `usd_per_hour` and `projection.total_usd` — a rate per unit of work that includes
+ * spend no unit of work produced. One ceremony request inflated both several-fold.
+ * Improving the ceremony must not worsen the numbers the ceremony produces.
+ */
 const AGG_SQL = `
 SELECT
   COALESCE(SUM(CASE WHEN attr <> 'overhead' THEN wcet ELSE 0 END), 0) AS consumed_wcet,
   COALESCE(SUM(CASE WHEN origin='main'      AND attr<>'overhead' THEN wcet ELSE 0 END), 0) AS wcet_main,
   COALESCE(SUM(CASE WHEN origin='subagent'  AND attr<>'overhead' THEN wcet ELSE 0 END), 0) AS wcet_sub,
   COALESCE(SUM(CASE WHEN origin='auxiliary' AND attr<>'overhead' THEN wcet ELSE 0 END), 0) AS wcet_aux,
-  COALESCE(SUM((in_tok*usd_in + out_tok*usd_out + cw_tok*usd_cw + cr_tok*usd_cr) / 1000000.0), 0) AS usd,
+  COALESCE(SUM(CASE WHEN attr <> 'overhead'
+                    THEN (in_tok*usd_in + out_tok*usd_out + cw_tok*usd_cw + cr_tok*usd_cr) / 1000000.0
+                    ELSE 0 END), 0) AS usd,
   COUNT(*) AS n_req,
   MIN(ts) AS first_ts, MAX(ts) AS last_ts
 FROM v_wcet WHERE tid = ?
@@ -119,28 +133,67 @@ export function aggregateBurn(db: Database, tid: string, now: Date = new Date())
   const burnPerMin = spanMin > 0 ? win.wcet / spanMin : 0;
 
   const activeS = activeSeconds(db, tid);
+  const agents = agentCounts(db, tid);
+  const prices = priceFlagCounts(db, tid);
   // Linear: consumed + rate * (remaining time in this window). With no rate the
   // projection IS the consumption, which is the honest degenerate answer.
   const projectedExtra = burnPerMin > 0 ? burnPerMin * Math.max(0, windowMin - spanMin) : 0;
   return {
     tid,
     ...base,
-    n_agents_live: liveAgents(db, tid),
+    n_agents_live: agents.live,
+    n_agents_total: agents.total,
+    n_provisional: prices.provisional,
+    n_unpriced: prices.unpriced,
     active_s: activeS,
     burn_wcet_per_min: burnPerMin,
     proj_total_wcet: Math.round(base.consumed_wcet + projectedExtra),
   };
 }
 
-/** Bound agents that have started and not ended — the "2 agents live" of §6.3. */
+/**
+ * Bound agents: live (started, not ended — the "2 agents live" of §6.3) and total,
+ * from ONE indexed pass over `agent_run(tid)`.
+ *
+ * Both land in `burn_cache`. The statusline reads them back off that row and never
+ * calls this: `COUNT(*) FROM agent_run WHERE tid = ?` on the render path was a table
+ * SCAN before `ix_agent_run_tid` and is a per-render count of an unbounded table
+ * after it, and P1.9's budget is ONE indexed row read, not "a cheap query".
+ */
+export function agentCounts(db: Database, tid: string): { live: number; total: number } {
+  const row = db
+    .query<{ live: number; total: number }, [string]>(
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(CASE WHEN started_at IS NOT NULL AND ended_at IS NULL THEN 1 ELSE 0 END), 0) AS live
+         FROM agent_run WHERE tid = ?`,
+    )
+    .get(tid);
+  return { live: row?.live ?? 0, total: row?.total ?? 0 };
+}
+
+/** Live agents alone — kept as the named concept §6.3 talks about. */
 export function liveAgents(db: Database, tid: string): number {
-  return (
-    db
-      .query<{ n: number }, [string]>(
-        "SELECT COUNT(*) AS n FROM agent_run WHERE tid = ? AND started_at IS NOT NULL AND ended_at IS NULL",
-      )
-      .get(tid)?.n ?? 0
-  );
+  return agentCounts(db, tid).live;
+}
+
+/**
+ * Requests on this task priced provisionally, and requests with no price at all —
+ * the evidence behind the `provisional_price` / `unpriced` warnings.
+ *
+ * This walks the task's whole request history through `v_priced`/`v_unpriced`, each
+ * row of which resolves its own price by correlated subquery. That is a per-sweep
+ * cost, never a per-render one: measured at ~127 ms on a task with 200k requests, it
+ * was by far the dominant term in a statusline render before it moved into the cache.
+ */
+export function priceFlagCounts(db: Database, tid: string): { provisional: number; unpriced: number } {
+  const row = db
+    .query<{ n_prov: number; n_unpriced: number }, [string, string]>(
+      `SELECT
+         (SELECT COUNT(*) FROM v_priced WHERE tid = ? AND provisional = 1) AS n_prov,
+         (SELECT COUNT(*) FROM v_unpriced WHERE tid = ?) AS n_unpriced`,
+    )
+    .get(tid, tid);
+  return { provisional: row?.n_prov ?? 0, unpriced: row?.n_unpriced ?? 0 };
 }
 
 export interface TimeInterval {
@@ -229,13 +282,17 @@ export function activeSeconds(db: Database, tid: string): number {
 
 const UPSERT_BURN_SQL = `
 INSERT INTO burn_cache (tid, as_of, consumed_wcet, wcet_main, wcet_sub, wcet_aux, usd, n_req,
-                        n_agents_live, active_s, burn_wcet_per_min, proj_total_wcet)
+                        n_agents_live, n_agents_total, n_provisional, n_unpriced,
+                        active_s, burn_wcet_per_min, proj_total_wcet)
 VALUES ($tid, $as_of, $consumed_wcet, $wcet_main, $wcet_sub, $wcet_aux, $usd, $n_req,
-        $n_agents_live, $active_s, $burn_wcet_per_min, $proj_total_wcet)
+        $n_agents_live, $n_agents_total, $n_provisional, $n_unpriced,
+        $active_s, $burn_wcet_per_min, $proj_total_wcet)
 ON CONFLICT(tid) DO UPDATE SET
   as_of = excluded.as_of, consumed_wcet = excluded.consumed_wcet,
   wcet_main = excluded.wcet_main, wcet_sub = excluded.wcet_sub, wcet_aux = excluded.wcet_aux,
   usd = excluded.usd, n_req = excluded.n_req, n_agents_live = excluded.n_agents_live,
+  n_agents_total = excluded.n_agents_total, n_provisional = excluded.n_provisional,
+  n_unpriced = excluded.n_unpriced,
   active_s = excluded.active_s, burn_wcet_per_min = excluded.burn_wcet_per_min,
   proj_total_wcet = excluded.proj_total_wcet
 `;
@@ -274,6 +331,9 @@ export function refreshBurnCache(db: Database, now: Date = new Date()): number {
       $usd: agg.usd,
       $n_req: agg.n_req,
       $n_agents_live: agg.n_agents_live,
+      $n_agents_total: agg.n_agents_total,
+      $n_provisional: agg.n_provisional,
+      $n_unpriced: agg.n_unpriced,
       $active_s: agg.active_s,
       $burn_wcet_per_min: agg.burn_wcet_per_min,
       $proj_total_wcet: agg.proj_total_wcet,
@@ -292,6 +352,20 @@ export function refreshBurnCache(db: Database, now: Date = new Date()): number {
 export type BurnWarn = "over_p50" | "over_p90" | "stale" | "provisional_price" | "unpriced";
 export type EmptyReason = "no_open_estimate" | "no_cache" | "db_busy" | "db_missing";
 
+/**
+ * HOW the task in this payload was chosen (P1.6's resolution order), so a consumer can
+ * tell an answer from a guess.
+ *
+ *  - `explicit`  — the caller named the tid.
+ *  - `session`   — a `task_alias` row bound the caller's session to it.
+ *  - `fallback`  — NOTHING bound it: this is the most recently touched non-terminal
+ *    task in the whole database, which may belong to another session entirely. It is
+ *    a reasonable answer for a human typing `est burn`, and a WRONG number for a
+ *    statusline that supplied a session and got someone else's task back, so the
+ *    segment renders nothing at all for it (P1.9).
+ */
+export type BurnTarget = "explicit" | "session" | "fallback";
+
 export interface BurnEmpty {
   schema: 1;
   active: false;
@@ -305,6 +379,8 @@ export interface BurnActive {
   as_of: string;
   stale_s: number;
   tid: string;
+  /** Provenance of `tid` — see {@link BurnTarget}. A guess is labelled as one. */
+  target: BurnTarget;
   subject: string;
   kind: string;
   status: string;
@@ -341,12 +417,24 @@ export interface BurnTargetOptions {
   session?: string | null;
 }
 
+export interface BurnTargetResolution {
+  tid: string | null;
+  /** Which step of the order produced `tid` (or would have, when it is null). */
+  target: BurnTarget;
+}
+
 /**
  * Target resolution, in P1.6's order: explicit `<tid>` -> the tid bound to
  * `--session` -> the resolved anchor session's binding -> the most recently touched
  * non-terminal task. **If none resolves, that is the EMPTY RESULT, not an error.**
+ *
+ * The last step is a GUESS and is reported as one. It is kept — a human typing
+ * `est burn` with no arguments means "the thing I am working on", and the most
+ * recently touched open task is the best available reading of that — but the payload
+ * says `target: "fallback"` so a caller that supplied a session and got an unrelated
+ * task back can decline to render it.
  */
-export function resolveBurnTarget(db: Database, opts: BurnTargetOptions = {}): string | null {
+export function resolveBurnTarget(db: Database, opts: BurnTargetOptions = {}): BurnTargetResolution {
   const nonTerminal = (tid: string): boolean => {
     const t = db.query<{ status: string }, [string]>("SELECT status FROM task WHERE tid = ?").get(tid);
     if (t === null || t === undefined) return false;
@@ -358,7 +446,7 @@ export function resolveBurnTarget(db: Database, opts: BurnTargetOptions = {}): s
   };
 
   if (opts.tid !== null && opts.tid !== undefined && opts.tid !== "") {
-    return nonTerminal(opts.tid) ? opts.tid : null;
+    return { tid: nonTerminal(opts.tid) ? opts.tid : null, target: "explicit" };
   }
   const session = opts.session ?? process.env.EST_SESSION_ID ?? process.env.CLAUDE_SESSION_ID ?? null;
   if (session !== null && session !== "") {
@@ -371,7 +459,7 @@ export function resolveBurnTarget(db: Database, opts: BurnTargetOptions = {}): s
         "SELECT tid FROM task_alias WHERE session_id = ? ORDER BY first_seen DESC, tid DESC",
       )
       .all(session);
-    for (const b of bound) if (nonTerminal(b.tid)) return b.tid;
+    for (const b of bound) if (nonTerminal(b.tid)) return { tid: b.tid, target: "session" };
   }
   const recent = db
     .query<{ tid: string }, []>(
@@ -383,7 +471,7 @@ export function resolveBurnTarget(db: Database, opts: BurnTargetOptions = {}): s
         LIMIT 1`,
     )
     .get();
-  return recent?.tid ?? null;
+  return { tid: recent?.tid ?? null, target: "fallback" };
 }
 
 interface BandRow {
@@ -430,7 +518,10 @@ export interface BurnJsonOptions {
 export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
   const now = opts.now ?? new Date();
   const asOf = isoNow(now);
-  const tid = resolveBurnTarget(db, { tid: opts.tid ?? null, session: opts.session ?? null });
+  const { tid, target } = resolveBurnTarget(db, {
+    tid: opts.tid ?? null,
+    session: opts.session ?? null,
+  });
   if (tid === null) return { schema: 1, active: false, as_of: asOf, reason: "no_open_estimate" };
 
   const band = currentBand(db, tid);
@@ -453,6 +544,9 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
   let usd: number;
   let nReq: number;
   let liveAgentCount: number;
+  let totalAgents: number;
+  let nProvisional: number;
+  let nUnpriced: number;
   let activeS: number;
   let perMin: number;
   let projTotal: number;
@@ -467,11 +561,18 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
     usd = agg.usd;
     nReq = agg.n_req;
     liveAgentCount = agg.n_agents_live;
+    totalAgents = agg.n_agents_total;
+    nProvisional = agg.n_provisional;
+    nUnpriced = agg.n_unpriced;
     activeS = agg.active_s;
     perMin = agg.burn_wcet_per_min;
     projTotal = agg.proj_total_wcet;
     cacheAsOf = asOf;
   } else {
+    // ONE primary-key row, and every derived fact the payload needs is a column of
+    // it. Nothing on this path may touch `request`, `agent_run` or a priced view:
+    // those are unbounded in corpus size, and P1.9's budget is a bounded read at a
+    // 5 s cadence forever, not "fast enough on today's database".
     const row = db
       .query<
         {
@@ -483,6 +584,9 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
           usd: number | null;
           n_req: number | null;
           n_agents_live: number | null;
+          n_agents_total: number | null;
+          n_provisional: number | null;
+          n_unpriced: number | null;
           active_s: number | null;
           burn_wcet_per_min: number | null;
           proj_total_wcet: number | null;
@@ -500,6 +604,11 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
     usd = row.usd ?? 0;
     nReq = row.n_req ?? 0;
     liveAgentCount = row.n_agents_live ?? 0;
+    // NULL only for a row written before the v6 -> v7 widening; the next sweep
+    // fills it, which is the documented cost of this cache being a cache.
+    totalAgents = row.n_agents_total ?? 0;
+    nProvisional = row.n_provisional ?? 0;
+    nUnpriced = row.n_unpriced ?? 0;
     activeS = row.active_s ?? 0;
     perMin = row.burn_wcet_per_min ?? 0;
     projTotal = row.proj_total_wcet ?? consumed;
@@ -507,8 +616,6 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
   }
 
   const staleS = Math.max(0, Math.round((now.getTime() - Date.parse(cacheAsOf)) / 1000));
-  const totalAgents =
-    db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM agent_run WHERE tid = ?").get(tid)?.n ?? 0;
   const windowMin = burnWindowMin(db);
   const usdPerHour = consumed > 0 && perMin > 0 ? (usd / consumed) * perMin * 60 : 0;
   const projUsd = consumed > 0 ? (usd / consumed) * projTotal : usd;
@@ -521,15 +628,8 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
   if (consumed >= band.cal_p90_wcet && band.cal_p90_wcet > 0) warn.push("over_p90");
   else if (consumed >= band.cal_p50_wcet && band.cal_p50_wcet > 0) warn.push("over_p50");
   if (opts.refresh !== true && staleS > (opts.staleAfterS ?? 120)) warn.push("stale");
-  const priceFlags = db
-    .query<{ n_prov: number; n_unpriced: number }, [string, string]>(
-      `SELECT
-         (SELECT COUNT(*) FROM v_priced WHERE tid = ? AND provisional = 1) AS n_prov,
-         (SELECT COUNT(*) FROM v_unpriced WHERE tid = ?) AS n_unpriced`,
-    )
-    .get(tid, tid);
-  if ((priceFlags?.n_prov ?? 0) > 0) warn.push("provisional_price");
-  if ((priceFlags?.n_unpriced ?? 0) > 0) warn.push("unpriced");
+  if (nProvisional > 0) warn.push("provisional_price");
+  if (nUnpriced > 0) warn.push("unpriced");
 
   return {
     schema: 1,
@@ -537,6 +637,7 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
     as_of: cacheAsOf,
     stale_s: staleS,
     tid,
+    target,
     subject: meta.subject.length > 80 ? `${meta.subject.slice(0, 79)}…` : meta.subject,
     kind: meta.kind,
     status: meta.status,
@@ -586,6 +687,22 @@ function round2(n: number): number {
 }
 
 /**
+ * Which empty result a thrown open/read failure is.
+ *
+ * ONE classifier for every catch on this path. `openDb` probes `sqlite_master` for the
+ * `config` table before it can report a version, and that probe needs a shared lock —
+ * so a sweeper holding the file makes the OPEN throw, not just the query. A catch that
+ * hardcoded `db_missing` therefore made `db_busy` unreachable and left the reason field
+ * unable to tell "never initialised" from "the sweeper has it for a moment". Both still
+ * render nothing; only the diagnosis was wrong, and only a shared classifier keeps the
+ * two catches from drifting apart again.
+ */
+export function classifyOpenError(e: unknown): EmptyReason {
+  const msg = e instanceof Error ? e.message : String(e);
+  return /busy|locked/i.test(msg) ? "db_busy" : "db_missing";
+}
+
+/**
  * The whole statusline read path: open read-only with a 50 ms timeout, answer, close.
  *
  * Every failure — missing file, uninitialised database, a schema this binary does not
@@ -598,15 +715,13 @@ export function burnRead(dbPath: string, opts: BurnJsonOptions = {}): BurnJson {
   let db: Database;
   try {
     db = openDb({ path: dbPath, readonly: true, busyTimeoutMs: 50 });
-  } catch {
-    return { schema: 1, active: false, as_of: asOf, reason: "db_missing" };
+  } catch (e) {
+    return { schema: 1, active: false, as_of: asOf, reason: classifyOpenError(e) };
   }
   try {
     return burnJson(db, opts);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    const reason: EmptyReason = /busy|locked/i.test(msg) ? "db_busy" : "db_missing";
-    return { schema: 1, active: false, as_of: asOf, reason };
+    return { schema: 1, active: false, as_of: asOf, reason: classifyOpenError(e) };
   } finally {
     db.close();
   }
@@ -623,7 +738,11 @@ export function renderBurn(b: BurnJson): string {
   const bar = `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
   const fmt = (n: number): string => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
   const lines = [
-    `${b.subject}  [${b.kind}/${b.status}]`,
+    `${b.subject}  [${b.kind}/${b.status}]` +
+      // Nothing bound this task to the caller: it is the most recently touched open
+      // task, which may be someone else's. Say so rather than let the band be read
+      // as an answer about the work in front of the reader.
+      (b.target === "fallback" ? "  (GUESSED TARGET: no binding — most recently touched open task)" : ""),
     `${bar} ${fmt(b.wcet.consumed)}/${fmt(b.wcet.p50)} WCET (${pct}% of p50, ${b.wcet.pct_p90}% of p90)` +
       (b.band.uncalibrated ? "  UNCALIBRATED" : ""),
     `main ${fmt(b.split.main)} · sub ${fmt(b.split.sub)} · aux ${fmt(b.split.aux)} · ` +

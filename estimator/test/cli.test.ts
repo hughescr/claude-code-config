@@ -16,6 +16,7 @@ import {
   COMMAND_FLAGS,
   HELP,
   insertAnomalies,
+  isConstraintError,
   parseArgs,
   parseDuration,
   renderTable,
@@ -363,6 +364,79 @@ describe("est sweep", () => {
     db.close();
   });
 
+  test("a sweep that never gets the lock does not MIGRATE either (§2 invariant 1)", async () => {
+    // The subtle half of "nothing is written": `openDb()` applies pending migrations
+    // the moment it sees a stale `schema_version`, and a migration is not a benign
+    // write — the 5 -> 6 step DROPs and rebuilds `task_alias` and `refclass`. With the
+    // connection opened before the lock, THIS command — which reports the lock is held
+    // and returns 4 — still rewrote the schema underneath the process that holds it.
+    await run(["init", ...base(), "-q"], io());
+    const seed = new Database(dbPath);
+    seed.query("UPDATE config SET v='5' WHERE k='schema_version'").run();
+    seed.close();
+
+    writeFileSync(
+      lockPath,
+      JSON.stringify({
+        pid: process.pid,
+        host: hostname(),
+        token: "test",
+        acquiredAt: new Date().toISOString(),
+      }),
+    );
+
+    expect(await run(["sweep", ...sweepArgs()], io())).toBe(4);
+
+    const db = new Database(dbPath, { readonly: true });
+    expect(db.query<{ v: string }, []>("SELECT v FROM config WHERE k='schema_version'").get()!.v).toBe("5");
+    db.close();
+  });
+
+  test("a writing verb that cannot take the lock opens no writable connection at all", async () => {
+    // The general form of the test above, and the one that does not depend on which
+    // migrations happen to exist: an absent database is not created. `openDb()` opens
+    // with `create: true` and applies schema.sql, so a file appearing here would mean a
+    // writable connection was opened outside the lock.
+    const untouched = join(dir, "never-created.db");
+    writeFileSync(
+      lockPath,
+      JSON.stringify({
+        pid: process.pid,
+        host: hostname(),
+        token: "test",
+        acquiredAt: new Date().toISOString(),
+      }),
+    );
+
+    const code = await run(["sweep", "--db", untouched, "--lock", lockPath, "--root", FIXTURE_CORPUS], io());
+    expect(code).toBe(4);
+    expect(await Bun.file(untouched).exists()).toBe(false);
+  });
+
+  test("a driver constraint failure is classified as a REJECTION, not a transient error", async () => {
+    // The exit-2 backstop in `verb()`: five tables carry `RAISE(ABORT,'append-only')`
+    // and several more carry unique keys, so a refusal can arrive from the driver
+    // rather than from one of our own typed guards. Printing it as exit 1 would invite
+    // the retry that P1.12 exists to forbid, so the classifier is pinned against a
+    // REAL SQLite error rather than a hand-written string.
+    const db = openDb({ path: dbPath });
+    let unique: unknown;
+    try {
+      db.query("INSERT INTO config (k, v) VALUES ('ref_model', 'x')").run();
+    } catch (e) {
+      unique = e;
+    } finally {
+      db.close();
+    }
+    expect(unique).toBeInstanceOf(Error);
+    expect(isConstraintError(unique)).toBe(true);
+    // The append-only triggers raise by message, so both shapes have to be recognised.
+    expect(isConstraintError(new Error("constraint failed: append-only"))).toBe(true);
+    // And nothing else may be: a read error must stay exit 1.
+    expect(isConstraintError(new Error("unable to open database file"))).toBe(false);
+    expect(isConstraintError("not even an error")).toBe(false);
+  });
+
   test("a vanished transcript raises corpus_shrink and drops its sweep_state row (§5.8)", async () => {
     const corpus = join(dir, "corpus");
     cpSync(join(import.meta.dir, "fixtures", "corpus"), corpus, { recursive: true });
@@ -629,6 +703,74 @@ describe("est census", () => {
     // create one as a side effect of asking a question.
     const code = await run(["census", ...base(), "--root", FIXTURE_CORPUS], io());
     expect(code).toBe(1);
+    expect(errText().length).toBeGreaterThan(0);
+  });
+});
+
+describe("est config", () => {
+  test("lists every seeded key, and `get` prints the bare value", async () => {
+    await run(["init", ...base(), "-q"], io());
+    stdout = [];
+    expect(await run(["config", ...base(), "--json"], io())).toBe(0);
+    const listed = (JSON.parse(outText()) as { config: Record<string, string> }).config;
+    expect(listed.attr_stale_turns).toBe("5");
+    expect(listed.attr_stale_minutes).toBe("120");
+    expect(listed.shrink_k).toBe("10");
+
+    stdout = [];
+    expect(await run(["config", "get", "attr_stale_turns", ...base()], io())).toBe(0);
+    expect(outText()).toBe("5");
+  });
+
+  test("`set` tunes a seeded key and the next read sees the new value", async () => {
+    // The whole point of the verb: schema.sql tells the reader the retro tunes
+    // `attr_stale_turns`, and this is the write path that claim depends on.
+    await run(["init", ...base(), "-q"], io());
+    stdout = [];
+    expect(await run(["config", "set", "attr_stale_turns", "7", ...base()], io())).toBe(0);
+    expect(outText()).toContain("5 → 7");
+
+    stdout = [];
+    expect(await run(["config", "get", "attr_stale_turns", ...base(), "--json"], io())).toBe(0);
+    expect(JSON.parse(outText())).toMatchObject({ key: "attr_stale_turns", value: "7" });
+
+    const db = openDb({ path: dbPath, readonly: true });
+    expect(db.query<{ v: string }, []>("SELECT v FROM config WHERE k='attr_stale_turns'").get()!.v).toBe("7");
+    db.close();
+  });
+
+  test("an unseeded key is a usage error, not a silent upsert nobody reads", async () => {
+    await run(["init", ...base(), "-q"], io());
+    expect(await run(["config", "set", "attr_stale_turnz", "7", ...base()], io())).toBe(1);
+    expect(errText()).toContain("unknown key");
+    const db = openDb({ path: dbPath, readonly: true });
+    expect(db.query<{ n: number }, []>("SELECT COUNT(*) n FROM config WHERE k LIKE 'attr_stale_turn%'").get()!.n).toBe(1);
+    db.close();
+  });
+
+  test("schema_version is migration state and is REJECTED with the remedy", async () => {
+    await run(["init", ...base(), "-q"], io());
+    expect(await run(["config", "set", "schema_version", "99", ...base()], io())).toBe(2);
+    expect(errText()).toContain("REJECTED");
+    expect(errText()).toContain("est init");
+    const db = openDb({ path: dbPath, readonly: true });
+    expect(db.query<{ v: string }, []>("SELECT v FROM config WHERE k='schema_version'").get()!.v).toBe(
+      String(SCHEMA_VERSION),
+    );
+    db.close();
+  });
+
+  test("`get` of an unknown key and an unknown subcommand both exit 1", async () => {
+    await run(["init", ...base(), "-q"], io());
+    expect(await run(["config", "get", "nope", ...base()], io())).toBe(1);
+    expect(errText()).toContain("unknown key: nope");
+    stderr = [];
+    expect(await run(["config", "frob", ...base()], io())).toBe(1);
+    expect(errText()).toContain("unknown subcommand");
+  });
+
+  test("listing and `get` never create a database — they open read-only", async () => {
+    expect(await run(["config", ...base()], io())).toBe(1);
     expect(errText().length).toBeGreaterThan(0);
   });
 });

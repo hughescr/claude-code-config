@@ -8,6 +8,10 @@ description: Record a calibrated token estimate before starting substantial work
 Record an estimate **before** starting substantial work, then let the system score it against
 what actually happened. Under a minute of friction. Nothing here blocks anything.
 
+**`est` means `bun run ~/.claude/estimator/src/cli.ts`** wherever it appears below. A shim on
+`PATH` is optional (`cd ~/.claude/estimator && bun link` mints one); if `which est` comes back
+empty, use the long form rather than skipping the step.
+
 ## 1. The predicate — when this applies
 
 An estimate is required before starting work when the planned goal involves **ANY** of:
@@ -55,7 +59,10 @@ of the whole thing.
    and informative answer. It returns similar completed tasks with their raw estimate, actual, and
    velocity, plus the bucket's calibration state. **Anti-anchoring is the entire reason it comes
    first.** Below a bucket of 10 it labels itself `uncalibrated` and shows no multiplier; that is
-   honesty, not a defect. `--full` spills the unbudgeted form to a file and prints the path.
+   honesty, not a defect. `--fanout <n>` is your planned agent count and narrows to a comparable
+   fan-out as a tolerance band (half to double); if nothing in the corpus ran at a comparable
+   fan-out it says so and shows the unfiltered class. `--full` spills the unbudgeted form to a file
+   and prints the path.
 
 2. **Parametric commitment — drivers as numbers, before any token figure.**
 
@@ -95,8 +102,23 @@ of the whole thing.
    task back together across sessions. If no Task-tool task exists, skip this — the `tid` stands
    alone and everything else still works.
 
-7. **Show the band.** One line to the user: Work-CET p50/p90, request-count band, active-time band,
-   spend forecast. That line is the entire user-facing friction. Do not narrate the ceremony.
+7. **Show the band.** One line to the user: Work-CET p50/p90, request-count band, spend forecast —
+   whatever `est open` actually printed, and nothing it did not. (There is no active-time band:
+   Phase 1 predicts none, so do not invent one.) That line is the entire user-facing friction. Do
+   not narrate the ceremony.
+
+**The rest of the surface**, for when the ceremony above is not what you need:
+
+- `est bind <tid> [--session <sid>] [--task <n>] [--run <runId>] [--agent <agentId>]` — attach a
+  harness identity to a task after the fact. This is how a resumed session, a workflow run or a
+  sub-agent gets its spend booked to the right `tid`.
+- `est burn [<tid>] [--session <sid>]` — consumption so far against the band. Read-only, never
+  writes, always exits `0`; `--json` is the statusline's contract, so leave its shape alone.
+- `est board [--status <column>] [--limit <n>]` — the read model: every task with its band, its
+  burn and its status.
+- `est config` / `est config get <k>` / `est config set <k> <v>` — the calibration constants.
+  Tuning is the user's call, not yours.
+- `est --help` lists everything, and is the authority when this file and the CLI disagree.
 
 ## 4. Per-block estimates — every workflow block, no exceptions
 
@@ -156,8 +178,11 @@ message names the append path that *is* allowed. Take that path or leave the rec
 ## 6. Closing and scoring on completion
 
 ```
-est close <tid> [--status completed|abandoned|deleted]
+est close <tid> [--status completed|abandoned|deleted|reopened]
 ```
+
+`--status reopened` is the append-only remedy the exit-`2` message points you at when a task is
+already closed: reopen it, then close it again. There is no edit of the previous close.
 
 **There is no flag that accepts a token count, a cost, or a velocity, and there never will be.**
 The actual is computed by deterministic SQL over the harness's own logs — never from anything you

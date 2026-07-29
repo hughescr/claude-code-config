@@ -34,8 +34,23 @@ function fmtNum(n: number): string {
   return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n);
 }
 
-function formatSegment(b: BurnJson): string {
+/** Exported so `test/burn.test.ts` can pin what the segment refuses to render. */
+export function formatSegment(b: BurnJson): string {
   if (!b.active) return "";
+  // Two ways a well-formed payload is still the wrong thing to put on Craig's screen,
+  // and both render as NOTHING (P1.9: "a statusline that shows a wrong number is worse
+  // than one that shows nothing"):
+  //
+  //  1. `target: "fallback"` — nothing bound this task to this session, so the payload
+  //     is about the most recently touched open task in the whole database, which may
+  //     belong to a session Craig is not looking at. `est burn` on a terminal will
+  //     still answer (and label the guess); a segment that silently points at someone
+  //     else's band cannot.
+  //  2. `stale` — the sweeper has not refreshed this row inside the staleness window,
+  //     so the numbers are older than `staleAfterS` and the percentage is a number from
+  //     the past dressed as the present. The segment reappears on the next sweep.
+  if (b.target === "fallback") return "";
+  if (b.warn.includes("stale")) return "";
   const pct = b.wcet.pct_p50;
   const bits = [`${fmtNum(b.wcet.consumed)}/${fmtNum(b.wcet.p50)} WCET`, `${pct}% p50`];
   if (b.agents.live > 0) {
@@ -62,10 +77,15 @@ function main(): string {
   return formatSegment(burn);
 }
 
-try {
-  const out = main();
-  if (out) process.stdout.write(out);
-} catch {
-  // Degrade to empty output, never an error — see file header rule 2.
+// `import.meta.main` guard: ccstatusline runs this file, and a test IMPORTS it for
+// `formatSegment`. Without the guard the import would read fd 0 and `process.exit(0)`
+// out of the test runner.
+if (import.meta.main) {
+  try {
+    const out = main();
+    if (out) process.stdout.write(out);
+  } catch {
+    // Degrade to empty output, never an error — see file header rule 2.
+  }
+  process.exit(0);
 }
-process.exit(0);

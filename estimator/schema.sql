@@ -93,6 +93,9 @@ CREATE TABLE task_alias (           -- many harness ids -> one logical task
   PRIMARY KEY (id_kind, session_id, local_id, tid)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX ix_alias_tid ON task_alias(tid);
+-- The PK starts with id_kind, so a lookup BY SESSION could not use it and scanned the
+-- whole table — on the statusline's target-resolution path, at a >= 5 s cadence.
+CREATE INDEX ix_alias_session ON task_alias(session_id);
 -- Every OTHER identity is exclusive: one agent, one workflow run, one Task-tool
 -- number is exactly one task's, and two tasks claiming it would split a single
 -- stream of spend across two actuals with no way to tell which is right. Enforced
@@ -287,6 +290,10 @@ CREATE TABLE agent_run (
   tid TEXT REFERENCES task(tid)
 ) STRICT;
 CREATE INDEX ix_agent_run ON agent_run(run_id, wf_launch_id);
+-- Every per-task question about agents ("how many are bound", "which intervals does
+-- this task own") filters on tid, and without this it was a SCAN of every agent run
+-- ever recorded.
+CREATE INDEX ix_agent_run_tid ON agent_run(tid);
 
 CREATE TABLE task_event (           -- lifecycle from transcript toolUseResult (§6.1)
   ev INTEGER PRIMARY KEY,
@@ -503,14 +510,24 @@ CREATE TABLE sweep_state (          -- performance only; losing it costs seconds
 --
 -- The FK is deliberate even for a cache: a burn row for a tid that no longer exists
 -- is not a stale number, it is a wrong one, and `est burn` would happily render it.
+--
+-- EVERY derived fact the P1.9 payload needs is a COLUMN here, including the counts
+-- that look cheap (agents bound to the task, requests priced provisionally, requests
+-- with no price). Each of those was a per-render query over `agent_run` or a priced
+-- view — unbounded in corpus size, and measured at ~127 ms per render on a large task
+-- while the row read itself was 0.01 ms. A statusline read must be bounded by the ROW,
+-- not by the history behind it.
 CREATE TABLE burn_cache (
   tid TEXT PRIMARY KEY REFERENCES task(tid),
   as_of TEXT NOT NULL,              -- when the sweep that wrote this row ran; `stale_s` derives
   consumed_wcet INTEGER,
   wcet_main INTEGER, wcet_sub INTEGER, wcet_aux INTEGER,
-  usd REAL,
+  usd REAL,                         -- overhead-EXCLUSIVE, like consumed_wcet: the two are divided
   n_req INTEGER,
   n_agents_live INTEGER,            -- bound agent_runs with no ended_at
+  n_agents_total INTEGER,           -- bound agent_runs, live or finished
+  n_provisional INTEGER,            -- requests priced from a provisional rate -> `provisional_price`
+  n_unpriced INTEGER,               -- requests whose family has no price row  -> `unpriced`
   active_s INTEGER,                 -- §7.3 interval UNION, not a sum
   burn_wcet_per_min REAL,           -- over the current rolling window (config burn_window_min)
   proj_total_wcet INTEGER           -- linear projection; CRUDE, and both output modes say so
@@ -768,7 +785,7 @@ WHERE o.scope_changed = 0 AND o.censored = 0 AND o.final_status = 'completed'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '6'),
+  ('schema_version',          '7'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.
@@ -785,7 +802,9 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   -- on. 42.9% of harness tasks never reach a terminal status, which is what drove the
   -- measured open set to 25 and the coverage figure to 18.7%; this is the single
   -- highest-leverage fix available and it costs one config row. Both seeds are
-  -- CONVENTIONS, not measurements — the retro tunes them and watches coverage move.
+  -- CONVENTIONS, not measurements. Tune them BY HAND with `est config set
+  -- attr_stale_turns <n>` and watch coverage move; the retro takes them over once its
+  -- cross-validation lands (§1.1 — it needs n>=20 before it can pick either one).
   ('attr_stale_turns',        '5'),
   ('attr_stale_minutes',      '120'),
   ('shrink_k',                '10'),

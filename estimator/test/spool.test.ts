@@ -23,7 +23,17 @@
  * `deleted` outcome with `censored = 1`.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import {
   makeHarness,
@@ -35,10 +45,13 @@ import {
 } from "./support.ts";
 import {
   COMPLIANCE_FILE,
+  MICROSWEEP_MARKER,
   TASK_EVENTS_FILE,
   drainSpool,
+  overrunMarkerFile,
   parseComplianceLines,
   parseTaskEventLines,
+  pruneMarkers,
   spoolDirFrom,
 } from "../src/spool.ts";
 import { INSERT_TASK_EVENT_SQL } from "../src/ingest.ts";
@@ -166,6 +179,22 @@ describe("drainSpool — P1.11 task events", () => {
     expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_event").get()?.n).toBe(1);
   });
 
+  test("a mixed batch counts only the rows that actually landed", () => {
+    // `inserted` is summed from each statement's `changes`, so a batch straddling the
+    // dedup boundary has to come out at the number of NEW rows — not the batch size,
+    // and not zero because one line collided.
+    const dup = { ts: LONG_AGO, session_id: "s1", task_num: "7", to_status: "deleted" };
+    appendLine(TASK_EVENTS_FILE, dup);
+    expect(drain().task_events.inserted).toBe(1);
+
+    appendLine(TASK_EVENTS_FILE, dup);
+    appendLine(TASK_EVENTS_FILE, { ...dup, task_num: "8" });
+    appendLine(TASK_EVENTS_FILE, { ...dup, task_num: "9" });
+    const result = drain();
+    expect(result.task_events).toMatchObject({ read: 3, inserted: 2, malformed: 0 });
+    expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_event").get()?.n).toBe(3);
+  });
+
   test("alternative field spellings a hook might emit are accepted", () => {
     const parsed = parseTaskEventLines(
       `${JSON.stringify({ ts: LONG_AGO, sessionId: "s1", taskId: "9", status: "deleted" })}\n`,
@@ -249,6 +278,102 @@ describe("drainSpool — P1.10 compliance records", () => {
     expect(result.compliance.read).toBe(1);
     expect(result.compliance.malformed).toBe(1);
     expect(parseComplianceLines("null\n").malformed).toBe(1);
+  });
+
+  test("a db_unavailable line is NOT a compliance miss — it is evidence of nothing", () => {
+    // The hook writes this when it could not read the database at all (missing,
+    // locked, schema ahead of it). Counting its null `bound_tid` as unbound turns a
+    // broken file into a permanent missed_estimate anomaly and poisons §3.3's rate.
+    appendLine(COMPLIANCE_FILE, {
+      ts: LONG_AGO,
+      session_id: "s9",
+      tool_name: "Task",
+      tool_input_sha256: "c".repeat(64),
+      bound_tid: null,
+      nudged: false,
+      nudge_kind: "none",
+      db_unavailable: true,
+    });
+    const result = drain();
+    expect(result.compliance).toMatchObject({ read: 1, nudged: 0, unbound: 0, db_unavailable: 1 });
+    expect(result.anomalies.filter((a) => a.kind === "missed_estimate")).toHaveLength(0);
+  });
+
+  test("nudge_kind carries the overrun nudge, which `nudged` alone used to hide", () => {
+    const rows = parseComplianceLines(
+      `${JSON.stringify({ ts: LONG_AGO, session_id: "s1", tool_name: "Task", bound_tid: "t1", nudged: true, nudge_kind: "overrun" })}\n`,
+    ).rows;
+    expect(rows[0]).toMatchObject({ nudged: true, nudge_kind: "overrun", db_unavailable: false });
+
+    // A line written before the field existed still says which nudge it was: a bound
+    // task can only have been nudged about its band.
+    const legacy = parseComplianceLines(
+      `${JSON.stringify({ ts: LONG_AGO, session_id: "s1", tool_name: "Task", bound_tid: null, nudged: true })}\n`,
+    ).rows;
+    expect(legacy[0]!.nudge_kind).toBe("no_estimate");
+  });
+
+  test("an overrun nudge counts into compliance.nudged without being a miss", () => {
+    appendLine(COMPLIANCE_FILE, {
+      ts: LONG_AGO,
+      session_id: "s1",
+      tool_name: "Task",
+      bound_tid: "t1",
+      nudged: true,
+      nudge_kind: "overrun",
+    });
+    const result = drain();
+    expect(result.compliance).toMatchObject({ read: 1, nudged: 1, unbound: 0 });
+    expect(result.anomalies).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// hook marker files — the spool's other residue
+// ---------------------------------------------------------------------------
+
+describe("pruneMarkers — nothing else enumerates the spool directory", () => {
+  const touch = (name: string, ageMs: number): void => {
+    const path = join(spool, name);
+    writeFileSync(path, "x");
+    const when = new Date(Date.now() - ageMs);
+    utimesSync(path, when, when);
+  };
+
+  test("a stale .microsweep marker is reaped and a fresh one is left armed", () => {
+    touch(MICROSWEEP_MARKER, 2 * 60 * 60 * 1000);
+    expect(pruneMarkers(spool)).toBe(1);
+    expect(existsSync(join(spool, MICROSWEEP_MARKER))).toBe(false);
+
+    touch(MICROSWEEP_MARKER, 5 * 1000); // inside the 20 s throttle window
+    expect(pruneMarkers(spool)).toBe(0);
+    expect(existsSync(join(spool, MICROSWEEP_MARKER))).toBe(true);
+  });
+
+  test("per-session markers from the pre-global throttle are reaped too", () => {
+    touch(`${MICROSWEEP_MARKER}.some-session-id`, 2 * 60 * 60 * 1000);
+    expect(pruneMarkers(spool)).toBe(1);
+    expect(readdirSync(spool)).toEqual([]);
+  });
+
+  test("an overrun marker survives an hour and is reaped on the long horizon", () => {
+    touch(overrunMarkerFile("t-live"), 2 * 60 * 60 * 1000);
+    touch(overrunMarkerFile("t-forgotten"), 31 * 24 * 60 * 60 * 1000);
+    expect(pruneMarkers(spool)).toBe(1);
+    expect(existsSync(join(spool, overrunMarkerFile("t-live")))).toBe(true);
+    expect(existsSync(join(spool, overrunMarkerFile("t-forgotten")))).toBe(false);
+  });
+
+  test("the spool files themselves are never touched, however old", () => {
+    touch(COMPLIANCE_FILE, 365 * 24 * 60 * 60 * 1000);
+    touch(`${TASK_EVENTS_FILE}.draining`, 365 * 24 * 60 * 60 * 1000);
+    expect(pruneMarkers(spool)).toBe(0);
+    expect(readdirSync(spool).sort()).toEqual([COMPLIANCE_FILE, `${TASK_EVENTS_FILE}.draining`].sort());
+  });
+
+  test("every drain prunes, so no scheduler entry of its own is needed", () => {
+    touch(MICROSWEEP_MARKER, 2 * 60 * 60 * 1000);
+    expect(drain().markers_pruned).toBe(1);
   });
 });
 
@@ -353,6 +478,20 @@ describe("P1.11 mandatory regression — a deletion whose tool_result was never 
     // Censored rows never enter the velocity corpus — an abandoned task's actual is
     // not evidence about how big the work was.
     expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM v_velocity").get()?.n).toBe(0);
+  });
+
+  test("closing a task disarms its overrun marker rather than leaving it to the 30-day prune", async () => {
+    turn(h.db, { session: "s2", prompt: "p2", at: LONG_AGO, durationMs: 60_000 });
+    const opened = await h.cli(...openArgs(), "--session", "s2", "--prompt", "p2", "--json");
+    const tid = opened.json<{ tid: string }>().tid;
+    request(h.db, "r2", { out: 400, ts: "2026-01-01T00:01:00Z" });
+    attributeTasks(h.db);
+
+    const marker = join(spool, overrunMarkerFile(tid));
+    writeFileSync(marker, JSON.stringify({ band: "v1:1000", ts: LONG_AGO }));
+    closeTask(h.db, { tid, status: "completed", now: NOW, force: true, spoolDir: spool });
+    // Left behind, it would leak a file AND swallow the first nudge after a reopen.
+    expect(existsSync(marker)).toBe(false);
   });
 
   test("without the spooled row there is no deletion record at all — which is the point", () => {

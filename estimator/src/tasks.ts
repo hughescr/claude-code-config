@@ -449,8 +449,9 @@ export interface OpenInput {
 export interface Band {
   p50: number;
   p90: number;
-  reqP50: number | null;
-  reqP90: number | null;
+  /** Both ends or neither: an uncalibrated request band is the raw guess, labelled. */
+  reqP50: number;
+  reqP90: number;
   activeP50S: number | null;
   activeP90S: number | null;
   spendUsdP50: number | null;
@@ -484,15 +485,44 @@ export const PLANT_MARKER = "EST_PLANT:";
  * The estimator model family velocity history is keyed by.
  *
  * There is no documented harness variable that names the model answering the
- * current turn, so this reads `EST_ESTIMATOR_MODEL` first (a hook or the skill can
- * set it), then `config.estimator_model`, then gives up honestly with `'unknown'`.
- * `'unknown'` is not a failure: it is one more bucket key, and it keeps every band
- * comparable to the other bands issued under the same not-known-model.
+ * current turn, so the identity is taken from the two explicit overrides first —
+ * `EST_ESTIMATOR_MODEL` (a hook or the skill may set it), then
+ * `config.estimator_model` — and otherwise DERIVED FROM DATA THIS DATABASE ALREADY
+ * HOLDS: the newest `origin='main'` request of the anchor session, whose
+ * `model_family` is the orchestrator that is doing the estimating. Nothing in this
+ * repo has ever written either override, so before the derivation every band from
+ * every family landed under one `'unknown'` key and `est retro` pooled them all
+ * into a single calibration bucket (retro.ts keys on `priceFamily(estimator_model)`).
+ *
+ * `'unknown'` survives as the last resort — a brand-new session no sweep has seen
+ * yet has no main request to read — and it is not a failure: it is one more bucket
+ * key, and it keeps every band comparable to the other bands issued under the same
+ * not-known-model. What it must not be is the ONLY key.
+ *
+ * `session` is the anchor session; callers with no anchor fall back to the same
+ * environment variables `resolveAnchor` reads.
  */
-export function estimatorModel(db: Database): string {
+export function estimatorModel(db: Database, session?: string | null): string {
   const env = process.env.EST_ESTIMATOR_MODEL;
   if (env !== undefined && env.trim() !== "") return env.trim();
-  return getConfig(db, "estimator_model") ?? "unknown";
+  const cfg = getConfig(db, "estimator_model");
+  if (cfg !== null && cfg.trim() !== "") return cfg.trim();
+
+  const sid =
+    session ?? process.env.EST_SESSION_ID ?? process.env.CLAUDE_SESSION_ID ?? null;
+  if (sid !== null && sid.trim() !== "") {
+    // 'main' only: a subagent request names the model the ORCHESTRATOR delegated to,
+    // which is exactly the identity this key must not collect.
+    const row = db
+      .query<{ model_family: string }, [string]>(
+        "SELECT model_family FROM request WHERE session_id = ? AND origin = 'main' ORDER BY ts DESC LIMIT 1",
+      )
+      .get(sid.trim());
+    if (row !== null && row !== undefined && row.model_family.trim() !== "") {
+      return row.model_family.trim();
+    }
+  }
+  return "unknown";
 }
 
 /** The newest successful price sync — the vintage this band is denominated in. */
@@ -587,10 +617,20 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
   const dodJson = JSON.stringify(dod);
   const description = input.description ?? null;
 
+  // Before anything is resolved, minted or written: an inverted band is not an
+  // uncertainty band. `estimate` is append-only (est_ro_u / est_ro_d), so a row
+  // whose p90 sits below its p50 could never be corrected in place — it would sit
+  // in the corpus forever, scored against an actual by a coverage check that reads
+  // p90 as the upper edge. The only guards here used to be `Math.max(0, …)`.
+  if (input.rawP90 < input.rawP50) {
+    throw new UsageError(
+      `--raw-p90 (${input.rawP90}) must be >= --raw-p50 (${input.rawP50}): a p90 below the p50 is not an uncertainty band, ` +
+        "and `estimate` is append-only, so the row could never be corrected",
+    );
+  }
+
   const refModel = getConfig(db, "ref_model") ?? "claude-sonnet-4-5";
   const estimand = getConfig(db, "estimand") ?? "work_cet";
-  const estModel = estimatorModel(db);
-  const estFamily = priceFamily(estModel);
   const priceEpoch = currentPriceEpoch(db, now);
 
   const existingTid = input.tid ?? null;
@@ -695,17 +735,25 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
     };
   }
 
+  // Resolved from the anchor, so the identity is the model that actually answered
+  // this session's turns rather than an environment variable nobody sets.
+  const estModel = estimatorModel(db, anchor.sessionId);
+  const estFamily = priceFamily(estModel);
+
   const bucket = "global";
   const liveN = liveBucketN(db, bucket, refModel, estimand);
   const cal = calibrationFor(db, bucket, estFamily, refModel, estimand, liveN);
 
   const calP50 = Math.max(0, Math.round(input.rawP50 * cal.multP50));
   const calP90 = Math.max(0, Math.round(input.rawP90 * cal.multP90));
-  // A request band only exists once a reference class does: multiplying the raw
-  // request guess by 1.0 and calling it "calibrated" would be the same lie the
-  // uncalibrated label exists to prevent.
-  const calReqP50 = cal.uncalibrated ? input.expRequests : Math.round(input.expRequests * cal.multP50);
-  const calReqP90 = cal.uncalibrated ? null : Math.round(input.expRequests * cal.multP90);
+  // The request band is calibrated exactly like the WCET band, including when there
+  // is no reference class: `calibrationFor` returns multipliers of 1.0 for a cold
+  // start, so both ends are then the raw guess and the `uncalibrated` flag carries
+  // the caveat. It used to write the raw guess into p50 and NULL into p90, which
+  // handed P1.9's `requests: {n, p50, p90}` contract a half-populated band — an
+  // asymmetry no consumer could render and the WCET band never had.
+  const calReqP50 = Math.max(0, Math.round(input.expRequests * cal.multP50));
+  const calReqP90 = Math.max(0, Math.round(input.expRequests * cal.multP90));
 
   db.transaction(() => {
     if (existingTid === null) {
@@ -906,6 +954,14 @@ export function addBlock(db: Database, input: BlockInput): BlockResult {
   const ts = isoNow(input.now ?? new Date());
   if (!Number.isInteger(input.phaseIdx) || input.phaseIdx < 0 || input.phaseIdx >= MAX_PHASE_IDX) {
     throw new UsageError(`--phase must be an integer in [0, ${MAX_PHASE_IDX}); got ${input.phaseIdx}`);
+  }
+  // Same rule as the task band, and for the same reason: `estimate_block` carries
+  // estb_ro_u / estb_ro_d, so an inverted phase band is permanent.
+  if (input.p90 < input.p50) {
+    throw new UsageError(
+      `--p90 (${input.p90}) must be >= --p50 (${input.p50}): a p90 below the p50 is not an uncertainty band, ` +
+        "and `estimate_block` is append-only, so the row could never be corrected",
+    );
   }
   const est = db
     .query<{ eid: number }, [string]>("SELECT MAX(eid) AS eid FROM estimate WHERE tid = ?")
@@ -1238,6 +1294,14 @@ export interface RefclassResult {
   query: string;
   kind: string | null;
   fanout: number | null;
+  /** The `--fanout` tolerance band actually applied, or null when none was asked for. */
+  fanout_band: { lo: number; hi: number } | null;
+  /**
+   * True when `--fanout` matched nothing and the UNFILTERED class is shown instead.
+   * The flag must never manufacture an empty reference class, and it must never
+   * quietly widen one either — so the fallback is reported, not just taken.
+   */
+  fanout_relaxed: boolean;
   matches: RefclassMatch[];
   bucket: RefclassBucketLine;
   /** Cold start: the raw actual-cost distribution, since no multiplier is honest. */
@@ -1249,6 +1313,20 @@ export interface RefclassResult {
 /** P1.4's hard budget: 8,000 chars against the 10,000-char hook cap. */
 export const REFCLASS_BUDGET_CHARS = 8000;
 export const EXCERPT_CHARS = 200;
+
+/**
+ * The `--fanout n` neighbourhood: half to double, with a floor of +2 so small
+ * fan-outs still have a band (`--fanout 1` is 0..3, not 0..2).
+ *
+ * `outcome.n_agents` is a realized count, not a label, so equality is the wrong
+ * comparison: two agents and three agents are the same shape of work and the corpus
+ * is far too small to spend a whole reference class on the difference. Half-to-double
+ * is the same order-of-magnitude reading the rest of the design uses for velocity.
+ */
+export function fanoutBand(fanout: number): { lo: number; hi: number } {
+  const f = Math.max(0, Math.trunc(fanout));
+  return { lo: Math.floor(f / 2), hi: Math.max(2 * f, f + 2) };
+}
 
 /**
  * FTS5 MATCH strings are a query language, so raw user text is not merely unsafe,
@@ -1275,6 +1353,15 @@ export function ftsQuery(text: string): string | null {
  * **Cold-start honesty:** below `bucket_n = 10` this returns the raw actual-cost
  * distribution for similar work and NO velocity multiplier. Pretending to a
  * multiplier at n = 3 is how a backfill-seeded reference class overclaims `[CA]`.
+ *
+ * **`--fanout` is a TOLERANCE, not an equality.** `o.n_agents` is a realized count,
+ * so "the same fan-out" is a neighbourhood — {@link fanoutBand} — and never `= n`,
+ * which at this corpus size would empty the class for almost every value. And a
+ * filter that empties the class is worse than no filter, so when the band matches
+ * nothing the unfiltered class is returned with `fanout_relaxed: true` rather than
+ * an empty reference class manufactured by the flag. Until this landed the flag was
+ * accepted, echoed, documented in README.md and instructed by the estimating skill,
+ * and filtered exactly nothing.
  */
 export function refclass(
   db: Database,
@@ -1282,12 +1369,35 @@ export function refclass(
 ): RefclassResult {
   const refModel = getConfig(db, "ref_model") ?? "claude-sonnet-4-5";
   const estimand = getConfig(db, "estimand") ?? "work_cet";
-  const estFamily = priceFamily(estimatorModel(db));
+  // The SAME identity `est open` will stamp on the band a moment later: step 1 and
+  // step 7 of the ceremony have to agree about whose history is on screen, or the
+  // bucket line shown before the number is a different family's calibration. The
+  // session is resolved leniently — newest turn, no ambiguity check — because
+  // `est refclass` never fails, and an unresolved session simply reads 'unknown'.
+  const estFamily = priceFamily(
+    estimatorModel(
+      db,
+      process.env.EST_SESSION_ID ??
+        process.env.CLAUDE_SESSION_ID ??
+        db
+          .query<{ session_id: string }, []>(
+            "SELECT session_id FROM turn ORDER BY started_at DESC LIMIT 1",
+          )
+          .get()?.session_id ??
+        null,
+    ),
+  );
   const bucket = "global";
   const limit = opts.limit ?? 5;
 
+  const fanout =
+    opts.fanout === null || opts.fanout === undefined || !Number.isFinite(opts.fanout)
+      ? null
+      : Math.max(0, Math.trunc(opts.fanout));
+  const band = fanout === null ? null : fanoutBand(fanout);
+
   const q = ftsQuery(opts.text);
-  const params: Array<string | number> = [];
+  const baseParams: Array<string | number> = [];
   let sql = `
     SELECT t.tid AS tid, s.subject AS subject, t.kind AS kind,
            o.n_agents AS fanout,
@@ -1303,25 +1413,44 @@ export function refclass(
       JOIN estimate e     ON e.eid = o.eid_at_start
      WHERE o.final_status = 'completed'
        AND e.ref_model = ? AND e.estimand = ?`;
-  params.push(refModel, estimand);
+  baseParams.push(refModel, estimand);
   if (q !== null) {
     sql += " AND t.tid IN (SELECT tid FROM task_fts WHERE task_fts MATCH ?)";
-    params.push(q);
+    baseParams.push(q);
   }
   if (opts.kind !== null && opts.kind !== undefined) {
     sql += " AND t.kind = ?";
-    params.push(opts.kind);
+    baseParams.push(opts.kind);
   }
-  sql += " ORDER BY o.finalized_at DESC LIMIT ?";
-  params.push(limit);
 
-  let rows: RefclassMatch[] = [];
-  try {
-    rows = db.query<RefclassMatch, Array<string | number>>(sql).all(...params);
-  } catch {
-    // A malformed MATCH must degrade to "no matches", never to a stack trace on the
-    // ceremony's first step.
-    rows = [];
+  const runMatches = (within: { lo: number; hi: number } | null): RefclassMatch[] => {
+    let q2 = sql;
+    const params = [...baseParams];
+    if (within !== null && fanout !== null) {
+      q2 += " AND o.n_agents BETWEEN ? AND ?";
+      params.push(within.lo, within.hi);
+      // Nearest fan-out first WITHIN the band, then newest: at five rows, recency is
+      // the tie-break, not the ranking.
+      q2 += " ORDER BY ABS(o.n_agents - ?) ASC, o.finalized_at DESC LIMIT ?";
+      params.push(fanout, limit);
+    } else {
+      q2 += " ORDER BY o.finalized_at DESC LIMIT ?";
+      params.push(limit);
+    }
+    try {
+      return db.query<RefclassMatch, Array<string | number>>(q2).all(...params);
+    } catch {
+      // A malformed MATCH must degrade to "no matches", never to a stack trace on the
+      // ceremony's first step.
+      return [];
+    }
+  };
+
+  let rows = runMatches(band);
+  let fanoutRelaxed = false;
+  if (band !== null && rows.length === 0) {
+    rows = runMatches(null);
+    fanoutRelaxed = rows.length > 0;
   }
   const matches = rows.map((r) => ({
     ...r,
@@ -1373,7 +1502,9 @@ export function refclass(
   return {
     query: opts.text,
     kind: opts.kind ?? null,
-    fanout: opts.fanout ?? null,
+    fanout,
+    fanout_band: band,
+    fanout_relaxed: fanoutRelaxed,
     matches,
     bucket: bucketLine,
     cold_distribution: cold,
