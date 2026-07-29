@@ -14,7 +14,7 @@ import type { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDb } from "../src/db.ts";
+import { openDb, SCHEMA_VERSION, schemaVersion } from "../src/db.ts";
 import { INSERT_TASK_EVENT_SQL } from "../src/ingest.ts";
 import { ABOVE_200K_SUFFIX, LONG_CONTEXT_THRESHOLD } from "../src/prices.ts";
 
@@ -598,5 +598,189 @@ describe("calibration aggregates", () => {
       )
       .get()!.wcet_at_epoch;
     expect(wcet).toBe(1500); // (1000 * 22.5) / 15
+  });
+
+  // -- the actual is denominated ONCE, at issue time ------------------------
+  // A measurement whose unit can be changed after the fact is not a measurement.
+  // `est config set ref_model` / `set estimand` are one-line changes; neither may
+  // reach backwards into a number the corpus has already recorded.
+
+  const epochWcet = (tid: string): number | null =>
+    db
+      .query<{ wcet_at_epoch: number | null }, [string]>(
+        "SELECT wcet_at_epoch FROM v_task_actual_epoch WHERE tid = ?",
+      )
+      .get(tid)?.wcet_at_epoch ?? null;
+
+  test("a later ref_model flip does NOT restate an already-measured actual", () => {
+    price("claude-opus-5", { in: 15, out: 75, cw: 18.75, cr: 1.5 });
+    task("t7");
+    estimate("t7", { ref_model: "claude-sonnet-4-5" });
+    request("u_main", { tid: "t7", origin: "main", out_tok: 1000 });
+    expect(epochWcet("t7")).toBe(1000); // (1000*15)/15, in sonnet output-equivalents
+
+    // The flip the design explicitly anticipates. It touches no request, no price
+    // row and no estimate — so it must move no actual.
+    db.query("UPDATE config SET v = 'claude-opus-5' WHERE k = 'ref_model'").run();
+    // Normalising by opus's 75 would have reported 200: a 5x restatement, arriving
+    // inside v_velocity labelled `ref_model = 'claude-sonnet-4-5'` (the view projects
+    // e.ref_model), i.e. mis-denominated without ever looking mislabelled.
+    expect(epochWcet("t7")).toBe(1000);
+  });
+
+  test("the counter set comes from the estimate's estimand, not from config", () => {
+    task("t8");
+    estimate("t8", { estimand: "out" }); // out only: cache-creation is NOT in this unit
+    request("v_main", { tid: "t8", origin: "main", out_tok: 1000, cw_tok: 4000 });
+    // 'out' => (1000*15)/15. Hardcoding work_cet would have added (4000*3.75)/15.
+    expect(epochWcet("t8")).toBe(1000);
+
+    task("t9");
+    estimate("t9", { estimand: "out_cw_in" });
+    request("v_main9", { tid: "t9", origin: "main", in_tok: 5000, out_tok: 1000, cw_tok: 4000 });
+    // (1000*15 + 4000*3.75 + 5000*3)/15
+    expect(epochWcet("t9")).toBe(3000);
+
+    // And config cannot reach in either: t8 stays an 'out' measurement.
+    db.query("UPDATE config SET v = 'out_cw_in' WHERE k = 'estimand'").run();
+    expect(epochWcet("t8")).toBe(1000);
+  });
+
+  test("an estimand outside §4.1 yields NULL rather than a number in an unknown unit", () => {
+    task("t10");
+    estimate("t10", { estimand: "typo_cet" });
+    request("w_main", { tid: "t10", origin: "main", out_tok: 1000, cw_tok: 1000 });
+    // NULL is what v_velocity's `actual_wcet_at_epoch IS NOT NULL` filter excludes,
+    // so a bad unit costs the corpus a row instead of poisoning it with one.
+    expect(epochWcet("t10")).toBeNull();
+  });
+
+  test("refclass keys on the unit, so two units coexist at one as_of", () => {
+    const snapshot = (asOf: string, refModel: string): void => {
+      db.query(
+        `INSERT INTO refclass (as_of, bucket, estimator_family, n, n_eff, med_log_v, iqr_log_v,
+                               shrink_w, shrink_k, half_life_days, mult_p50, mult_p90,
+                               boot_lo_p50, boot_hi_p50, boot_lo_p90, boot_hi_p90,
+                               method, ref_model, estimand, params_json)
+         VALUES (?, 'global', '*', 12, 9.5, 1.1, 0.4, 0.545, 10, 30, 3.0, 6.0,
+                 NULL, NULL, NULL, NULL, 'bootstrap', ?, 'work_cet', '{}')`,
+      ).run(asOf, refModel);
+    };
+    snapshot("2026-02-01T00:00:00Z", "claude-sonnet-4-5");
+    // Under a (as_of, bucket, estimator_family) key this was a PRIMARY KEY violation
+    // on a table nothing may update or delete, so the units could not both exist.
+    snapshot("2026-02-01T00:00:00Z", "claude-opus-5");
+    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM refclass").get()!.n).toBe(2);
+    // The same unit twice is still a duplicate, which is what append-only means.
+    expect(() => snapshot("2026-02-01T00:00:00Z", "claude-opus-5")).toThrow(/UNIQUE constraint/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The v5 -> v6 migration reaches the same shape schema.sql builds from scratch
+// ---------------------------------------------------------------------------
+
+describe("schema migration", () => {
+  /**
+   * Downgrade the unit-keyed objects to their v5 shape in place, then let `openDb`
+   * migrate the file forward. `schema.sql` is the only source of shape, so the test
+   * of a migration is that it lands on exactly what a fresh database has — not that
+   * it runs without error.
+   */
+  test("a downgraded database migrates to the same refclass and epoch view a fresh one has", () => {
+    db.exec(`
+      DROP TRIGGER rc_ro_u;
+      DROP TRIGGER rc_ro_d;
+      CREATE TABLE refclass_v5 (
+        as_of TEXT NOT NULL,
+        bucket TEXT NOT NULL REFERENCES bucket_def(bucket),
+        estimator_family TEXT NOT NULL,
+        n INTEGER NOT NULL, n_eff REAL NOT NULL,
+        med_log_v REAL NOT NULL, iqr_log_v REAL NOT NULL,
+        shrink_w REAL NOT NULL, shrink_k REAL NOT NULL, half_life_days REAL NOT NULL,
+        mult_p50 REAL NOT NULL, mult_p90 REAL NOT NULL,
+        boot_lo_p50 REAL, boot_hi_p50 REAL,
+        boot_lo_p90 REAL, boot_hi_p90 REAL,
+        method TEXT NOT NULL CHECK (method IN ('plugin','bootstrap')),
+        estimand TEXT NOT NULL, params_json TEXT NOT NULL,
+        PRIMARY KEY (as_of, bucket, estimator_family)
+      ) STRICT, WITHOUT ROWID;
+      DROP TABLE refclass;
+      ALTER TABLE refclass_v5 RENAME TO refclass;
+      INSERT INTO refclass VALUES ('2026-02-01T00:00:00Z','global','*',12,9.5,1.1,0.4,
+        0.545,10,30,3.0,6.0,NULL,NULL,NULL,NULL,'bootstrap','work_cet',
+        '{"ref_model":"claude-opus-5","cold_start_n":10}');
+      INSERT INTO refclass VALUES ('2026-01-01T00:00:00Z','global','*',5,5,0.9,0.3,
+        0.33,10,30,2.0,4.0,NULL,NULL,NULL,NULL,'plugin','work_cet','{}');
+      DROP VIEW v_task_actual_epoch;
+      CREATE VIEW v_task_actual_epoch AS
+      SELECT r.tid,
+        SUM(CAST((r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw) / rf.usd_out AS INTEGER)) AS wcet_at_epoch,
+        e.price_epoch, e.eid AS eid_at_start
+      FROM v_request_live r
+      JOIN estimate e ON e.eid = (SELECT MIN(eid) FROM estimate WHERE tid = r.tid)
+      JOIN model_price pe ON pe.family = r.model_family
+       AND pe.effective_from = (SELECT MAX(effective_from) FROM model_price
+                                WHERE family = pe.family AND effective_from <= e.price_epoch)
+      JOIN model_price rf ON rf.family = (SELECT v FROM config WHERE k='ref_model')
+       AND rf.effective_from = (SELECT MAX(effective_from) FROM model_price
+                                WHERE family = rf.family AND effective_from <= e.price_epoch)
+      WHERE r.tid IS NOT NULL AND r.attr <> 'overhead'
+        AND r.origin IN ('main','subagent')
+      GROUP BY r.tid;
+      UPDATE config SET v = '5' WHERE k = 'schema_version';
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+
+    db = openDb({ path }); // migrates on open
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    // Both rows survive, and ref_model is backfilled from params_json where it was,
+    // falling back to the config value in force for a snapshot that never carried it.
+    expect(
+      db
+        .query<{ as_of: string; ref_model: string; n: number }, []>(
+          "SELECT as_of, ref_model, n FROM refclass ORDER BY as_of",
+        )
+        .all(),
+    ).toEqual([
+      { as_of: "2026-01-01T00:00:00Z", ref_model: "claude-sonnet-4-5", n: 5 },
+      { as_of: "2026-02-01T00:00:00Z", ref_model: "claude-opus-5", n: 12 },
+    ]);
+    // Rebuilt, not abandoned: the append-only triggers came back with the table.
+    expect(() => db.query("UPDATE refclass SET n = 99").run()).toThrow(/append-only/);
+
+    const freshDir = mkdtempSync(join(tmpdir(), "estimator-schema-fresh-"));
+    const fresh = openDb({ path: join(freshDir, "estimator.db") });
+    try {
+      const shape = (d: Database, table: string): unknown =>
+        d
+          .query<unknown, []>(
+            `SELECT name, type, "notnull", pk FROM pragma_table_info('${table}') ORDER BY name`,
+          )
+          .all();
+      const definition = (d: Database, name: string): string =>
+        d.query<{ sql: string }, [string]>("SELECT sql FROM sqlite_master WHERE name = ?").get(name)!
+          .sql;
+      expect(shape(db, "refclass")).toEqual(shape(fresh, "refclass"));
+      expect(definition(db, "v_task_actual_epoch")).toBe(definition(fresh, "v_task_actual_epoch"));
+      expect(
+        db
+          .query<unknown, []>(
+            "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+          )
+          .all(),
+      ).toEqual(
+        fresh
+          .query<unknown, []>(
+            "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+          )
+          .all(),
+      );
+    } finally {
+      fresh.close();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
   });
 });

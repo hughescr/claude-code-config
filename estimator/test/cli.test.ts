@@ -69,9 +69,13 @@ describe("parseArgs", () => {
   });
 
   test("an unknown command is an error, not a silent no-op", () => {
-    const p = parseArgs(["retro"]);
+    // Deliberately a word that is NOT a verb and is not scheduled to become one.
+    // `retro` used to stand here and became real in Phase 1, which is the failure
+    // mode this comment exists to prevent: a negative-case test whose subject the
+    // roadmap later implements starts asserting the opposite of what it means.
+    const p = parseArgs(["reticulate"]);
     expect(p.command).toBeNull();
-    expect(p.errors).toEqual(["unknown command: retro"]);
+    expect(p.errors).toEqual(["unknown command: reticulate"]);
   });
 
   test("value flags accept both --x v and --x=v", () => {

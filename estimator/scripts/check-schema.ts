@@ -23,6 +23,7 @@ const EXPECTED_TABLES = [
   "agent_run",
   "anomaly",
   "bucket_def",
+  "burn_cache",
   "calib_run",
   "config",
   "estimate",
@@ -75,6 +76,8 @@ const EXPECTED_TRIGGERS = [
 ];
 
 const EXPECTED_CONFIG_KEYS = [
+  "attr_stale_minutes",
+  "attr_stale_turns",
   "boot_resamples",
   "coverage_prior",
   "estimand",

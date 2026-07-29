@@ -16,7 +16,9 @@ PRAGMA foreign_keys  = ON;
 CREATE TABLE config (k TEXT PRIMARY KEY, v TEXT NOT NULL) STRICT;
 -- seed: ref_model | estimand='work_cet' | quiesce_main_min='60' | shrink_k='10'
 --       velocity_half_life_days='30' | split_min_pinball_gain='0.02'
---       boot_resamples='200' | coverage_prior='jeffreys' | schema_version='4'
+--       boot_resamples='200' | coverage_prior='jeffreys' | schema_version
+--       (the version literal lives in the seed block at the foot of this file and
+--        in src/db.ts SCHEMA_VERSION; naming it twice more is how it goes stale)
 -- EVERY calibration constant lives here, not in code: none is empirically backed
 -- (§1.1), and the retro tunes them by cross-validation from n>=20.
 
@@ -82,9 +84,22 @@ CREATE TABLE task_alias (           -- many harness ids -> one logical task
     ('session_task','session','workflow_run','agent','job')),
   session_id TEXT NOT NULL, local_id TEXT NOT NULL, first_seen TEXT NOT NULL,
   source TEXT NOT NULL DEFAULT 'sweeper',   -- 'task_metadata'|'est_bind'|'sweeper'
-  PRIMARY KEY (id_kind, session_id, local_id)
+  -- `tid` is IN the key (v6) because a SESSION HOSTS MANY TASKS. One `est open`
+  -- per piece of work, sequentially or overlapping, is the ordinary case, and
+  -- §5.4's staleness closure exists precisely to tell those tasks apart. Without
+  -- `tid` here, ('session', S, S) was unique: the second `est open` in a session
+  -- wrote NO alias at all (the mint path upserts DO NOTHING), so it was invisible
+  -- to attribution and its spend booked to the FIRST task's actual.
+  PRIMARY KEY (id_kind, session_id, local_id, tid)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX ix_alias_tid ON task_alias(tid);
+-- Every OTHER identity is exclusive: one agent, one workflow run, one Task-tool
+-- number is exactly one task's, and two tasks claiming it would split a single
+-- stream of spend across two actuals with no way to tell which is right. Enforced
+-- physically, so `est bind`'s guard (P1.3) is a better error message rather than
+-- the only thing standing between the corpus and a re-pointed alias.
+CREATE UNIQUE INDEX ux_alias_exclusive ON task_alias(id_kind, session_id, local_id)
+  WHERE id_kind <> 'session';
 
 CREATE TABLE bucket_def (           -- buckets are DEFINED, not free text (R2)
   bucket TEXT PRIMARY KEY,
@@ -374,8 +389,17 @@ CREATE TABLE refclass (      -- APPEND-ONLY snapshots: the reference-class table
   boot_lo_p50 REAL, boot_hi_p50 REAL,    -- bootstrap CI: PARAMETER uncertainty, which dominates
   boot_lo_p90 REAL, boot_hi_p90 REAL,    -- at n~10 and which R1's plug-in argument discarded
   method TEXT NOT NULL CHECK (method IN ('plugin','bootstrap')),
+  -- THE UNIT, and it is IN THE KEY (v6). A multiplier is a ratio of Work-CETs, so it
+  -- only means anything against the (ref_model, estimand) pair it was fitted in
+  -- (§4.1, §4.2 delta 3). `ref_model` used to live inside params_json, which no
+  -- reader parses: `newestRefclass` matched on bucket and family alone, so after a
+  -- one-line `est config set ref_model` the newest sonnet-denominated snapshot was
+  -- handed straight to an opus-denominated band — calibrated-looking, zero
+  -- comparable tasks, silently mis-denominated. Keying on the pair also lets two
+  -- units coexist at one `as_of` instead of colliding on an append-only table.
+  ref_model TEXT NOT NULL,
   estimand TEXT NOT NULL, params_json TEXT NOT NULL,
-  PRIMARY KEY (as_of, bucket, estimator_family)
+  PRIMARY KEY (as_of, bucket, estimator_family, ref_model, estimand)
 ) STRICT, WITHOUT ROWID;
 CREATE TRIGGER rc_ro_u BEFORE UPDATE ON refclass BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER rc_ro_d BEFORE DELETE ON refclass BEGIN SELECT RAISE(ABORT,'append-only'); END;
@@ -448,9 +472,15 @@ CREATE TABLE anomaly (              -- loud, queryable failure ledger
                                     -- fork_replay and symlink_alias are BENIGN in src/cli.ts too:
                                     -- both are structural facts of a forked corpus (46 of them on
                                     -- the live tree), correctly handled by the global request PK.
+                                    -- WRITTEN BY PHASE 1 (§Phase 1 interfaces):
+                                    --   src/tasks.ts:  anchor_inferred -- `est open` resolved its
+                                    --      session/prompt without an explicit flag; a wrong guess
+                                    --      is visible rather than silent (P1.0)
+                                    --   src/close.ts:  forced_close|scope_undeclared|tid_unplanted
+                                    --   src/spool.ts:  missed_estimate -- a drained PostToolUse
+                                    --      compliance record with no bound task (P1.10)
                                     -- STILL UNWRITTEN, reserved for later phases:
-                                    --   tid_unplanted|scope_undeclared|recon_mismatch
-                                    --   |gate_override
+                                    --   recon_mismatch|gate_override
   detail TEXT NOT NULL,
   tid TEXT REFERENCES task(tid)     -- nullable: many anomalies are corpus-wide
 ) STRICT;
@@ -459,6 +489,32 @@ CREATE TABLE sweep_state (          -- performance only; losing it costs seconds
   path TEXT PRIMARY KEY, inode INTEGER NOT NULL, bytes_read INTEGER NOT NULL,
   last_swept TEXT NOT NULL
 ) STRICT;
+
+-- Phase 1 (P1.9): the statusline's read path, and the ONLY reason `est burn --json`
+-- can promise a sub-100 ms budget. Aggregating v_wcet over `request` at a >=5 s
+-- refresh interval, forever, is not acceptable; one indexed row read is.
+--
+-- It is a CACHE, NOT A SOURCE. Every column is recomputed from `request` by
+-- `refreshBurnCache` (src/burn.ts) at the end of each sweep, inside the sweep's
+-- existing transaction, and `est burn --refresh` recomputes the same numbers live
+-- without reading this table at all. Dropping it costs one sweep and nothing else,
+-- which is why it carries no history and no append-only trigger — it is the one
+-- table in this schema that is allowed to be overwritten in place.
+--
+-- The FK is deliberate even for a cache: a burn row for a tid that no longer exists
+-- is not a stale number, it is a wrong one, and `est burn` would happily render it.
+CREATE TABLE burn_cache (
+  tid TEXT PRIMARY KEY REFERENCES task(tid),
+  as_of TEXT NOT NULL,              -- when the sweep that wrote this row ran; `stale_s` derives
+  consumed_wcet INTEGER,
+  wcet_main INTEGER, wcet_sub INTEGER, wcet_aux INTEGER,
+  usd REAL,
+  n_req INTEGER,
+  n_agents_live INTEGER,            -- bound agent_runs with no ended_at
+  active_s INTEGER,                 -- §7.3 interval UNION, not a sum
+  burn_wcet_per_min REAL,           -- over the current rolling window (config burn_window_min)
+  proj_total_wcet INTEGER           -- linear projection; CRUDE, and both output modes say so
+) STRICT, WITHOUT ROWID;
 
 CREATE VIRTUAL TABLE task_fts USING fts5(tid UNINDEXED, subject, description);
 
@@ -614,12 +670,28 @@ LEFT JOIN v_phase_actual pa
 -- is NOT hidden: v_task_actual keeps wcet_aux / n_req_aux and SUM(scet), which are
 -- the Spend-CET totals reconciliation and cost reporting read.
 --
--- The normaliser row is resolved via the ref_model IN FORCE NOW. Once `estimate`
--- rows exist, prefer e.ref_model / e.estimand — the unit snapshotted at issue
--- time — so a later `est config set ref_model` cannot restate historical actuals.
+-- UNIT ENFORCED, on BOTH axes, from e.ref_model / e.estimand — the unit snapshotted
+-- at issue time (§4.1), never from `config`. price_epoch pins the RATES; these two
+-- pin the DEFINITION of a CET: which family's output token is "one", and which
+-- counters are summed. Reading either from config made a one-line `est config set`
+-- restate every historical actual — a 5x swing for a sonnet->opus normaliser flip,
+-- against a band issued in the old unit, on a measurement nothing else touched.
+-- v_velocity projects e.ref_model / e.estimand as the row's LABEL, so a
+-- config-denominated number here would not even be mislabelled loudly: it would
+-- arrive inside the right reference class wearing the right name and quietly mix
+-- currencies, which is precisely what the snapshot columns exist to prevent.
+--
+-- An `estimand` outside the three §4.1 values yields NULL rather than a work_cet
+-- number wearing an unknown label: NULL is what v_velocity's
+-- `actual_wcet_at_epoch IS NOT NULL` filter already excludes, so a typo costs the
+-- corpus rows instead of corrupting them.
 CREATE VIEW v_task_actual_epoch AS
 SELECT r.tid,
-  SUM(CAST((r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw) / rf.usd_out AS INTEGER)) AS wcet_at_epoch,
+  SUM(CAST((CASE e.estimand
+              WHEN 'out'       THEN r.out_tok*pe.usd_out
+              WHEN 'work_cet'  THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw
+              WHEN 'out_cw_in' THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw + r.in_tok*pe.usd_in
+            END) / rf.usd_out AS INTEGER)) AS wcet_at_epoch,
   e.price_epoch, e.eid AS eid_at_start
 FROM v_request_live r
 JOIN estimate e ON e.eid = (SELECT MIN(eid) FROM estimate WHERE tid = r.tid)
@@ -639,7 +711,10 @@ JOIN model_price pe
                       ELSE r.model_family END
  AND pe.effective_from = (SELECT MAX(effective_from) FROM model_price
                           WHERE family = pe.family AND effective_from <= e.price_epoch)
-JOIN model_price rf ON rf.family = (SELECT v FROM config WHERE k='ref_model')
+-- The normaliser. `e.ref_model`, not config: the whole view is an INNER JOIN to
+-- `estimate`, so the snapshot is always available and config could only ever be a
+-- late substitute for it.
+JOIN model_price rf ON rf.family = e.ref_model
  AND rf.effective_from = (SELECT MAX(effective_from) FROM model_price
                           WHERE family = rf.family AND effective_from <= e.price_epoch)
 WHERE r.tid IS NOT NULL AND r.attr <> 'overhead'
@@ -693,7 +768,7 @@ WHERE o.scope_changed = 0 AND o.censored = 0 AND o.final_status = 'completed'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '4'),
+  ('schema_version',          '6'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.
@@ -703,6 +778,16 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   -- NULL wcet. Change with `est config set ref_model <family>`.
   ('ref_model',               'claude-sonnet-4-5'),
   ('quiesce_main_min',        '60'),
+  -- STALENESS CLOSURE (§5.4, DECISIONS.md §1 G-ATTR). Sticky attribution is bounded
+  -- by a quiet period: a task with no bound activity inside the window stops
+  -- absorbing later turns FOR ATTRIBUTION ONLY — never on the board — and those
+  -- tokens fall to the residual class instead of inflating a task nobody is working
+  -- on. 42.9% of harness tasks never reach a terminal status, which is what drove the
+  -- measured open set to 25 and the coverage figure to 18.7%; this is the single
+  -- highest-leverage fix available and it costs one config row. Both seeds are
+  -- CONVENTIONS, not measurements — the retro tunes them and watches coverage move.
+  ('attr_stale_turns',        '5'),
+  ('attr_stale_minutes',      '120'),
   ('shrink_k',                '10'),
   ('velocity_half_life_days', '30'),
   ('split_min_pinball_gain',  '0.02'),

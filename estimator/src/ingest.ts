@@ -203,6 +203,9 @@ export interface IngestAnomaly {
     | "corpus_shrink"
     | "sweep_budget_exceeded"
     | "unpriced_model"
+    // Phase 1, raised by src/spool.ts when the sweep drains the hook spool: a
+    // matched `Task`/`Workflow` launch that no open estimate was bound to.
+    | "missed_estimate"
     // Discovery-level, passed through unchanged by {@link toIngestAnomalies}.
     | AnomalyKind;
   detail: string;

@@ -1,12 +1,21 @@
 #!/usr/bin/env bun
 /**
- * src/cli.ts — the `est` command. Phase 0 verbs only (§8).
+ * src/cli.ts — the `est` command. Phase 0 collection + Phase 1 estimation (§8).
  *
  *   est init                    bootstrap ~/.claude/estimator + the database (idempotent)
  *   est sweep                   single-writer incremental sweep of the transcript corpus
  *   est backfill                full re-sweep over every surviving transcript + spend report
  *   est prices --sync           refresh model_price from the upstream pricing JSON
  *   est census                  sweep_census history + live corpus counts
+ *   est refclass                the reference class, shown BEFORE any number is stated
+ *   est open                    mint or re-estimate a task; prints the calibrated band
+ *   est block                   one per declared workflow phase, before the launch
+ *   est bind                    attach a harness identity (session/task/run/agent) to a tid
+ *   est scope                   append a scope revision (the `scope_change` precondition)
+ *   est burn                    consumption against the band; --json is the statusline contract
+ *   est close                   finalize by arithmetic — no flag accepts a token count
+ *   est board                   the terminal/JSON read model
+ *   est retro                   weekly calibration + the write-back that makes it non-inert
  *
  * Three properties this file is responsible for (§2):
  *
@@ -20,8 +29,12 @@
  *     `anomaly`, is counted in the report, and raises the process exit code.
  *
  * Exit codes:
- *   0  success
+ *   0  success — INCLUDING a well-formed empty result
  *   1  usage error, or a fatal error (unreadable schema, schema_version mismatch)
+ *   2  rejected by an invariant. The command was well-formed and the operation is
+ *      not permitted. This is the ANTI-GOODHART code (P1.0/P1.12) and it must never
+ *      be retried, worked around, or downgraded to a warning; its message names the
+ *      append path that IS allowed.
  *   3  completed, but alerting anomalies were recorded (or the budget was exceeded)
  *   4  the sweep lock is held by another writer and `--blocking` was not given
  *
@@ -29,9 +42,9 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { mkdirSync, realpathSync, statSync } from "node:fs";
+import { mkdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { DB_PATH, ROOT, getConfig, openDb } from "./db.ts";
+import { DB_PATH, ROOT, SCHEMA_VERSION, getConfig, openDb } from "./db.ts";
 import { PROJECTS_ROOT, discoverCorpus, sessionFiles, type Corpus } from "./discover.ts";
 import {
   INSERT_ANOMALY_SQL,
@@ -50,12 +63,51 @@ import {
 } from "./ingest.ts";
 import { LOCK_PATH, LockBusyError, withLock } from "./lock.ts";
 import { isoSeconds, setManualPrice, showPrices, sync, type SyncResult } from "./prices.ts";
+import { attributeTasks } from "./attribute.ts";
+import { burnJson, burnRead, refreshBurnCache, renderBurn } from "./burn.ts";
+import { closeTask, type FinalStatus } from "./close.ts";
+import { board, retro, type RetroReport } from "./retro.ts";
+import { drainSpool, emptyDrain, ensureSpool, SPOOL_DIR } from "./spool.ts";
+import {
+  addBlock,
+  appendScope,
+  bindTask,
+  InvariantError,
+  isoNow,
+  openTask,
+  parseDod,
+  PLANT_MARKER,
+  refclass,
+  REFCLASS_BUDGET_CHARS,
+  TASK_KINDS,
+  UsageError,
+  type EstimateReason,
+  type TaskKind,
+} from "./tasks.ts";
 
 // ---------------------------------------------------------------------------
 // argument parsing — pure, exported, and tested without running any command
 // ---------------------------------------------------------------------------
 
-export const COMMANDS = ["init", "sweep", "backfill", "prices", "census", "help", "version"] as const;
+export const COMMANDS = [
+  "init",
+  "sweep",
+  "backfill",
+  "prices",
+  "census",
+  // Phase 1 (§Phase 1 interfaces).
+  "refclass",
+  "open",
+  "block",
+  "bind",
+  "scope",
+  "burn",
+  "close",
+  "board",
+  "retro",
+  "help",
+  "version",
+] as const;
 export type Command = (typeof COMMANDS)[number];
 
 export interface FlagSpec {
@@ -77,6 +129,35 @@ export const COMMAND_FLAGS: Record<Command, FlagSpec> = {
   backfill: { booleans: ["strict"], values: ["budget", "root", "chunk", "top"] },
   prices: { booleans: ["sync", "show"], values: ["source", "set", "in", "out", "cw", "cr", "at"] },
   census: { booleans: [], values: ["limit", "root"] },
+  refclass: { booleans: ["full"], values: ["kind", "fanout", "text", "limit"] },
+  open: {
+    booleans: [],
+    values: [
+      "kind",
+      "subject",
+      "description",
+      "dod",
+      "raw-p50",
+      "raw-p90",
+      "exp-agents",
+      "exp-wf-phases",
+      "exp-files-write",
+      "exp-turns",
+      "exp-requests",
+      "tid",
+      "reason",
+      "session",
+      "prompt",
+      "continue",
+    ],
+  },
+  block: { booleans: [], values: ["phase", "title", "p50", "p90", "exp-agents", "model"] },
+  bind: { booleans: [], values: ["session", "task", "run", "agent"] },
+  scope: { booleans: [], values: ["reason", "subject", "description", "dod"] },
+  burn: { booleans: ["refresh"], values: ["session"] },
+  close: { booleans: ["force"], values: ["status"] },
+  board: { booleans: [], values: ["status", "limit"] },
+  retro: { booleans: ["dry-run"], values: ["as-of"] },
   help: { booleans: [], values: [] },
   version: { booleans: [], values: [] },
 };
@@ -336,6 +417,24 @@ export interface SweepReport {
   sidechain_replays: number;
   anomalies: { recorded: number; alerting: number; by_kind: Record<string, number> };
   vanished: { total: number; lt_60d: number; paths: string[] };
+  /** P1.10/P1.11: what the hook spool contributed to this sweep. */
+  spool: {
+    task_events_read: number;
+    task_events_inserted: number;
+    compliance_read: number;
+    compliance_unbound: number;
+    malformed: number;
+  };
+  /** §5.4: what the binding-driven attribution pass assigned. */
+  attribution: {
+    tasks: number;
+    turns: number;
+    agents: number;
+    requests: number;
+    by_attr: Record<string, number>;
+  };
+  /** P1.9: non-terminal tasks whose materialised burn row was rewritten. */
+  burn_cache_rows: number;
 }
 
 const SIXTY_DAYS_MS = 60 * 24 * 3600 * 1000;
@@ -525,6 +624,15 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     sidechain_replays: 0,
     anomalies: { recorded: 0, alerting: 0, by_kind: {} },
     vanished: { total: vanished.length, lt_60d: vanishedLt60d, paths: vanished },
+    spool: {
+      task_events_read: 0,
+      task_events_inserted: 0,
+      compliance_read: 0,
+      compliance_unbound: 0,
+      malformed: 0,
+    },
+    attribution: { tasks: 0, turns: 0, agents: 0, requests: 0, by_attr: {} },
+    burn_cache_rows: 0,
   };
 
   // --- buffered ingest, flushed in bounded chunks ---------------------------
@@ -684,6 +792,47 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
   }).immediate();
   report.sidechain_replays = replayGroups.reduce((n, g) => n + g.n_losers, 0);
   pendingAnomalies.push(...replayAnomalies(replayGroups));
+
+  // --- the Phase 1 tail of every sweep -------------------------------------
+  // Three steps, in this order and nowhere else:
+  //
+  //  1. **Drain the hook spool** (P1.10, P1.11). The hooks cannot write to the
+  //     database — a `BEGIN IMMEDIATE` on Craig's hot path queues behind exactly the
+  //     sweeps a fan-out triggers — so they append a line and this is where those
+  //     lines become rows. `cleanup()` runs AFTER the commit, so a crash mid-drain
+  //     leaves the records on disk for the next sweep rather than losing them.
+  //  2. **Attribute** (§5.4). Requests get their `tid` from EXPLICIT bindings, which
+  //     is the corpus shape the live G-ATTR re-gate needs — attribution read off
+  //     bindings rather than inferred from `TaskCreate`/`TaskUpdate` traces.
+  //  3. **Refresh `burn_cache`** (P1.9). This is what buys `est burn --json` its
+  //     sub-100 ms budget, and doing it here — including on the §6.3 micro-sweep — is
+  //     what makes the statusline live rather than session-stale.
+  let spool = emptyDrain();
+  db.transaction(() => {
+    spool = drainSpool(db, SPOOL_DIR);
+  }).immediate();
+  spool.cleanup();
+  pendingAnomalies.push(...spool.anomalies);
+  report.spool = {
+    task_events_read: spool.task_events.read,
+    task_events_inserted: spool.task_events.inserted,
+    compliance_read: spool.compliance.read,
+    compliance_unbound: spool.compliance.unbound,
+    malformed: spool.task_events.malformed + spool.compliance.malformed,
+  };
+
+  const attribution = attributeTasks(db);
+  report.attribution = {
+    tasks: attribution.tasks,
+    turns: attribution.turns_assigned,
+    agents: attribution.agents_assigned,
+    requests: attribution.requests_assigned,
+    by_attr: attribution.by_attr,
+  };
+
+  db.transaction(() => {
+    report.burn_cache_rows = refreshBurnCache(db, now);
+  }).immediate();
 
   // §4.3 loud failure: a model family with no price row silently drops out of
   // v_priced (an INNER JOIN, deliberately) and would otherwise be invisible until
@@ -929,6 +1078,24 @@ function sweepSummary(r: SweepReport): string {
       `replay  ${num(r.sidechain_replays)} request(s) demoted to attr='replay' (§5.2 message_id pass) — kept for audit, excluded from every sum`,
     );
   }
+  if (r.spool.task_events_read > 0 || r.spool.compliance_read > 0 || r.spool.malformed > 0) {
+    lines.push(
+      `spool   ${num(r.spool.task_events_read)} hook task_event(s) read (${num(r.spool.task_events_inserted)} new), ` +
+        `${num(r.spool.compliance_read)} compliance record(s) (${num(r.spool.compliance_unbound)} with no bound task)` +
+        (r.spool.malformed > 0 ? `, ${r.spool.malformed} malformed` : ""),
+    );
+  }
+  if (r.attribution.tasks > 0) {
+    const split = Object.entries(r.attribution.by_attr)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, n]) => `${k}=${num(n)}`)
+      .join(" ");
+    lines.push(
+      `attrib  ${num(r.attribution.tasks)} task(s): ${num(r.attribution.turns)} turn, ${num(r.attribution.agents)} agent, ` +
+        `${num(r.attribution.requests)} request row(s) changed${split === "" ? "" : ` (${split})`}`,
+    );
+    lines.push(`burn    ${num(r.burn_cache_rows)} materialised burn_cache row(s) refreshed`);
+  }
   if (r.files_incomplete > 0) {
     lines.push(
       `PARTIAL ${r.files_incomplete} file(s) could not be read to EOF; their watermarks were NOT advanced, so the next sweep re-reads them`,
@@ -978,7 +1145,12 @@ function lockNote(verb: string): string {
  * checkout instead of failing loudly (§2).
  */
 function ensureDirs(): void {
-  for (const d of ["spool", "backups"]) mkdirSync(join(ROOT, d), { recursive: true });
+  // `spool/` in particular is not optional: the PostToolUse and PreToolUse hooks
+  // append to it on Craig's hot path and must never have to create it themselves
+  // (P1.10's "missing spool directory -> print nothing, exit 0" fail-open would
+  // silently discard every delete capture).
+  ensureSpool();
+  mkdirSync(join(ROOT, "backups"), { recursive: true });
 }
 
 async function cmdInit(ctx: Ctx): Promise<number> {
@@ -1364,7 +1536,625 @@ async function cmdCensus(ctx: Ctx): Promise<number> {
   }
 }
 
-export const HELP = `est — token-based task estimation and tracking for Claude Code (Phase 0)
+// ---------------------------------------------------------------------------
+// Phase 1 verbs (§Phase 1 interfaces)
+// ---------------------------------------------------------------------------
+
+function requireFlag(p: Parsed, name: string): string {
+  const v = flagString(p, name);
+  if (v === null || v.trim() === "") throw new UsageError(`--${name} is required`);
+  return v;
+}
+
+function requireInt(p: Parsed, name: string): number {
+  const raw = requireFlag(p, name);
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) throw new UsageError(`--${name} must be a non-negative number; got "${raw}"`);
+  return Math.round(n);
+}
+
+function optInt(p: Parsed, name: string, dflt: number): number {
+  const raw = flagString(p, name);
+  if (raw === null) return dflt;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.round(n) : dflt;
+}
+
+function positional(ctx: Ctx, index: number): string | null {
+  return ctx.parsed.positionals[index] ?? null;
+}
+
+/**
+ * Translate the two typed failures into exit codes and prose. Exit 2 always prints
+ * the remedy: "its message names the append path that IS allowed" (P1.0) is a
+ * contract, not a nicety — a caller that cannot see the legal path will invent one.
+ */
+async function verb(ctx: Ctx, fn: () => Promise<number> | number): Promise<number> {
+  try {
+    return await fn();
+  } catch (e) {
+    if (e instanceof InvariantError) {
+      ctx.err(`est: REJECTED: ${e.message}`);
+      ctx.err(`est: instead: ${e.remedy}`);
+      return 2;
+    }
+    if (e instanceof UsageError) {
+      ctx.err(`est: ${e.message}`);
+      return 1;
+    }
+    if (e instanceof LockBusyError) {
+      ctx.err(`est: ${e.message}`);
+      return 4;
+    }
+    throw e;
+  }
+}
+
+const NUMERIC_OPEN_FLAGS = [
+  "raw-p50",
+  "raw-p90",
+  "exp-agents",
+  "exp-wf-phases",
+  "exp-files-write",
+  "exp-turns",
+  "exp-requests",
+] as const;
+
+async function cmdOpen(ctx: Ctx): Promise<number> {
+  const p = ctx.parsed;
+  const cont = flagString(p, "continue");
+  const db = openDb({ path: ctx.dbPath });
+  try {
+    return await withLock(
+      (): number => {
+        const now = new Date();
+        let result;
+        if (cont !== null) {
+          // `est open --continue <tid>` — sugar: bind this session to the task and
+          // append a refinement re-issuing the previous band under the CURRENT
+          // multipliers. It exists because a resumed session is the common case and
+          // re-typing seven driver numbers to say "still working on this" is exactly
+          // the friction that makes a ceremony get skipped.
+          const prev = db
+            .query<
+              {
+                raw_p50_wcet: number;
+                raw_p90_wcet: number;
+                exp_agents: number;
+                exp_wf_phases: number;
+                exp_files_write: number;
+                exp_turns: number;
+                exp_requests: number;
+              },
+              [string]
+            >(
+              "SELECT raw_p50_wcet, raw_p90_wcet, exp_agents, exp_wf_phases, exp_files_write, exp_turns, exp_requests FROM estimate WHERE tid = ? ORDER BY eid DESC LIMIT 1",
+            )
+            .get(cont);
+          if (prev === null || prev === undefined) {
+            throw new InvariantError(
+              `unknown tid: ${cont}`,
+              "run `est open` without --continue to mint a new task",
+            );
+          }
+          const session = flagString(p, "session");
+          if (session !== null) bindTask(db, { tid: cont, session, now });
+          const kindRow = db
+            .query<{ kind: string }, [string]>("SELECT kind FROM task WHERE tid = ?")
+            .get(cont)!;
+          const scope = db
+            .query<{ subject: string }, [string]>("SELECT subject FROM v_scope_current WHERE tid = ?")
+            .get(cont)!;
+          result = openTask(db, {
+            kind: kindRow.kind as TaskKind,
+            subject: scope.subject,
+            rawP50: Number(flagString(p, "raw-p50") ?? prev.raw_p50_wcet),
+            rawP90: Number(flagString(p, "raw-p90") ?? prev.raw_p90_wcet),
+            expAgents: optInt(p, "exp-agents", prev.exp_agents),
+            expWfPhases: optInt(p, "exp-wf-phases", prev.exp_wf_phases),
+            expFilesWrite: optInt(p, "exp-files-write", prev.exp_files_write),
+            expTurns: optInt(p, "exp-turns", prev.exp_turns),
+            expRequests: optInt(p, "exp-requests", prev.exp_requests),
+            tid: cont,
+            reason: (flagString(p, "reason") as EstimateReason | null) ?? "refinement",
+            session,
+            prompt: flagString(p, "prompt"),
+            now,
+          });
+        } else {
+          const tid = flagString(p, "tid");
+          const kind = flagString(p, "kind");
+          if (tid === null && (kind === null || !(TASK_KINDS as readonly string[]).includes(kind))) {
+            throw new UsageError(`--kind is required and must be one of: ${TASK_KINDS.join(" | ")}`);
+          }
+          for (const f of NUMERIC_OPEN_FLAGS) requireFlag(p, f);
+          result = openTask(db, {
+            kind: (kind ?? "implement") as TaskKind,
+            subject: tid === null ? requireFlag(p, "subject") : (flagString(p, "subject") ?? ""),
+            description: flagString(p, "description"),
+            dod: parseDod(flagString(p, "dod")),
+            rawP50: requireInt(p, "raw-p50"),
+            rawP90: requireInt(p, "raw-p90"),
+            expAgents: requireInt(p, "exp-agents"),
+            expWfPhases: requireInt(p, "exp-wf-phases"),
+            expFilesWrite: requireInt(p, "exp-files-write"),
+            expTurns: requireInt(p, "exp-turns"),
+            expRequests: requireInt(p, "exp-requests"),
+            tid,
+            reason: flagString(p, "reason") as EstimateReason | null,
+            session: flagString(p, "session"),
+            prompt: flagString(p, "prompt"),
+            now,
+          });
+        }
+
+        if (ctx.json) {
+          ctx.out(
+            JSON.stringify({
+              schema: 1,
+              tid: result.tid,
+              eid: result.eid,
+              version: result.version,
+              reason: result.reason,
+              band: {
+                p50_wcet: result.band.p50,
+                p90_wcet: result.band.p90,
+                req_p50: result.band.reqP50,
+                req_p90: result.band.reqP90,
+                active_p50_s: result.band.activeP50S,
+                active_p90_s: result.band.activeP90S,
+                spend_usd_p50: result.band.spendUsdP50,
+                spend_usd_p90: result.band.spendUsdP90,
+              },
+              raw: result.raw,
+              uncalibrated: result.uncalibrated,
+              plant: result.plant,
+              bucket: result.bucket,
+              bucket_n: result.bucketN,
+              ref_model: result.refModel,
+              estimand: result.estimand,
+              price_epoch: result.priceEpoch,
+              refclass_as_of: result.refclassAsOf,
+              anchor: { session: result.anchor.sessionId, prompt: result.anchor.promptId },
+            }),
+          );
+        } else if (!ctx.quiet) {
+          const usd = (v: number | null): string => (v === null ? "?" : `$${v.toFixed(2)}`);
+          ctx.out(
+            `${result.minted ? "opened" : `re-estimated (${result.reason}, v${result.version})`} ${result.tid}`,
+          );
+          ctx.out(
+            `band  ${num(result.band.p50)} / ${num(result.band.p90)} Work-CET` +
+              `  ·  requests ${result.band.reqP50 ?? "?"}–${result.band.reqP90 ?? "?"}` +
+              `  ·  active time: not predicted yet (§7.3 — the model has not beaten its baseline)` +
+              `  ·  Spend-CET forecast ${usd(result.band.spendUsdP50)}–${usd(result.band.spendUsdP90)} (a LOWER bound: input and cache_read are excluded from Work-CET)`,
+          );
+          ctx.out(
+            result.uncalibrated
+              ? `      UNCALIBRATED — bucket "${result.bucket}" has ${result.bucketN} comparable completed task(s); calibration starts at 10. This is your raw band, unchanged.`
+              : `      calibrated from refclass ${result.refclassAsOf} (bucket ${result.bucket}, n=${result.bucketN}); raw was ${num(result.raw.p50)} / ${num(result.raw.p90)}`,
+          );
+          ctx.out(`${PLANT_MARKER} ${result.plant.call}`);
+        }
+        return 0;
+      },
+      { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("open") },
+    );
+  } finally {
+    db.close();
+  }
+}
+
+async function cmdBlock(ctx: Ctx): Promise<number> {
+  const tid = positional(ctx, 0);
+  if (tid === null) throw new UsageError("est block: missing <tid>");
+  const p = ctx.parsed;
+  const db = openDb({ path: ctx.dbPath });
+  try {
+    return await withLock(
+      (): number => {
+        const r = addBlock(db, {
+          tid,
+          phaseIdx: requireInt(p, "phase"),
+          title: requireFlag(p, "title"),
+          p50: requireInt(p, "p50"),
+          p90: requireInt(p, "p90"),
+          expAgents: optInt(p, "exp-agents", 1),
+          model: flagString(p, "model"),
+          now: new Date(),
+        });
+        if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...r }));
+        else if (!ctx.quiet) {
+          ctx.out(
+            `block ${r.phaseIdx} "${r.title}" → ${num(r.p50)} / ${num(r.p90)} Work-CET (eid ${r.eid}, ${r.blocksSoFar}` +
+              `${r.declaredPhases === null ? "" : `/${r.declaredPhases}`} block(s) recorded)`,
+          );
+          if (r.declaredPhases !== null && r.blocksSoFar < r.declaredPhases) {
+            ctx.out(
+              `      ${r.declaredPhases - r.blocksSoFar} declared phase(s) still unblocked — a T1 estimate whose blocks do not cover every declared phase is reported as incomplete in the retro's data-quality panel`,
+            );
+          }
+        }
+        return 0;
+      },
+      { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("block") },
+    );
+  } finally {
+    db.close();
+  }
+}
+
+async function cmdBind(ctx: Ctx): Promise<number> {
+  const tid = positional(ctx, 0);
+  if (tid === null) throw new UsageError("est bind: missing <tid>");
+  const p = ctx.parsed;
+  const db = openDb({ path: ctx.dbPath });
+  try {
+    return await withLock(
+      (): number => {
+        const r = bindTask(db, {
+          tid,
+          session: flagString(p, "session"),
+          task: flagString(p, "task"),
+          run: flagString(p, "run"),
+          agent: flagString(p, "agent"),
+          now: new Date(),
+        });
+        if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...r }));
+        else if (!ctx.quiet) {
+          for (const w of r.written) {
+            ctx.out(`${w.existed ? "already bound" : "bound"} ${w.id_kind}=${w.local_id} → ${r.tid}`);
+          }
+        }
+        return 0;
+      },
+      { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("bind") },
+    );
+  } finally {
+    db.close();
+  }
+}
+
+async function cmdScope(ctx: Ctx): Promise<number> {
+  const tid = positional(ctx, 0);
+  if (tid === null) throw new UsageError("est scope: missing <tid>");
+  const p = ctx.parsed;
+  const dodRaw = flagString(p, "dod");
+  const db = openDb({ path: ctx.dbPath });
+  try {
+    return await withLock(
+      (): number => {
+        const r = appendScope(db, {
+          tid,
+          reason: requireFlag(p, "reason"),
+          subject: flagString(p, "subject"),
+          description: flagString(p, "description"),
+          dod: dodRaw === null ? null : parseDod(dodRaw),
+          now: new Date(),
+        });
+        if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...r }));
+        else if (!ctx.quiet) {
+          ctx.out(`scope seq ${r.seq} appended for ${r.tid} (${r.scopeHash.slice(0, 12)}…)`);
+          ctx.out(r.diffSummary);
+          ctx.out(
+            "`est open --tid <tid> --reason scope_change …` is now permitted; it is the ONLY reason that removes a task from the velocity corpus.",
+          );
+        }
+        return 0;
+      },
+      { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("scope") },
+    );
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * `est burn` — read-only; **never sweeps, never writes, never takes the lock.**
+ * Exit 0 always, including every empty case.
+ */
+function cmdBurn(ctx: Ctx): number {
+  const p = ctx.parsed;
+  const refresh = flagBool(p, "refresh");
+  const opts = {
+    tid: positional(ctx, 0),
+    session: flagString(p, "session"),
+    refresh,
+    now: new Date(),
+  };
+  // `--refresh` is the live aggregation, and a live aggregation needs a normal
+  // connection; the cached path uses the 50 ms read-only one that must fail fast
+  // rather than queue behind a sweep.
+  let payload;
+  if (refresh) {
+    let db: ReturnType<typeof openDb> | null = null;
+    try {
+      db = openDb({ path: ctx.dbPath, readonly: true });
+      payload = burnJson(db, opts);
+    } catch {
+      payload = { schema: 1 as const, active: false as const, as_of: isoNow(), reason: "db_missing" as const };
+    } finally {
+      db?.close();
+    }
+  } else {
+    payload = burnRead(ctx.dbPath, opts);
+  }
+  if (ctx.json) ctx.out(JSON.stringify(payload));
+  else if (!ctx.quiet) ctx.out(renderBurn(payload));
+  return 0;
+}
+
+async function cmdClose(ctx: Ctx): Promise<number> {
+  const tid = positional(ctx, 0);
+  if (tid === null) throw new UsageError("est close: missing <tid>");
+  const statusRaw = flagString(ctx.parsed, "status");
+  const allowed = ["completed", "abandoned", "deleted", "reopened"];
+  if (statusRaw !== null && !allowed.includes(statusRaw)) {
+    throw new UsageError(`--status must be one of: ${allowed.join(" | ")}`);
+  }
+  const db = openDb({ path: ctx.dbPath });
+  try {
+    return await withLock(
+      (): number => {
+        const r = closeTask(db, {
+          tid,
+          status: (statusRaw as FinalStatus | null) ?? "completed",
+          force: flagBool(ctx.parsed, "force"),
+          now: new Date(),
+        });
+        if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...r }));
+        else if (!ctx.quiet) {
+          ctx.out(
+            `closed ${r.tid} as ${r.final_status} (revision ${r.revision}${r.censored ? ", CENSORED — the actual is a lower bound" : ""})`,
+          );
+          ctx.out(
+            `actual  ${num(r.actual_wcet)} Work-CET (main ${num(r.wcet_main)} / sub ${num(r.wcet_sub)} / aux ${num(r.wcet_aux)}), ` +
+              `${num(r.n_requests)} requests, ${num(r.n_agents)} agents, overhead ${num(r.overhead_wcet)}`,
+          );
+          ctx.out(
+            `time    active ${Math.round(r.active_s / 60)}m (union), busy ${Math.round(r.busy_s / 60)}m, ` +
+              `max concurrency ${r.max_concurrency}, parallelism ${r.parallelism_factor === null ? "n/a" : r.parallelism_factor.toFixed(2)}×`,
+          );
+          ctx.out(
+            r.velocity_raw === null
+              ? `velocity  not computable: actual_wcet_at_epoch is NULL (no price row at the estimate's vintage), so this task stays OUT of the velocity corpus rather than joining it under a vintage that never existed`
+              : `velocity  raw ${r.velocity_raw.toFixed(2)}× · calibrated ${r.velocity_cal === null ? "n/a" : `${r.velocity_cal.toFixed(2)}×`} · ` +
+                `${r.in_band === true ? "inside" : "OUTSIDE"} the p90 band (judged against eid ${r.eid_at_start}, the FIRST estimate — always)`,
+          );
+          if (r.forced) ctx.out(`FORCED  the quiescence gate was overridden: ${r.quiescence.failing.join("; ")}`);
+          if (r.alerts.length > 0) ctx.out(`alerts  ${r.alerts.join(", ")}`);
+        }
+        return r.alerts.length > 0 ? 3 : 0;
+      },
+      { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("close") },
+    );
+  } finally {
+    db.close();
+  }
+}
+
+function cmdRefclass(ctx: Ctx): number {
+  const p = ctx.parsed;
+  const text = flagString(p, "text") ?? positional(ctx, 0);
+  if (text === null) throw new UsageError("est refclass: --text \"<subject>\" is required");
+  const fanoutRaw = flagString(p, "fanout");
+  const db = openDb({ path: ctx.dbPath, readonly: true });
+  try {
+    const r = refclass(db, {
+      kind: flagString(p, "kind"),
+      fanout: fanoutRaw === null ? null : Number(fanoutRaw),
+      text,
+      limit: optInt(p, "limit", 5),
+    });
+    if (ctx.json) {
+      ctx.out(JSON.stringify({ schema: 1, ...r }));
+      return 0;
+    }
+    const lines: string[] = [];
+    if (r.matches.length === 0) {
+      lines.push(`no completed task matches "${text}" — an empty reference class is a valid answer, not a failure`);
+    } else {
+      lines.push(
+        renderTable(
+          ["subject", "kind", "fanout", "raw p50", "actual", "velocity"],
+          r.matches.map((m) => [
+            m.subject.length > 48 ? `${m.subject.slice(0, 47)}…` : m.subject,
+            m.kind,
+            String(m.fanout),
+            num(m.raw_p50),
+            num(m.actual_wcet),
+            m.velocity === null ? "n/a" : `${m.velocity.toFixed(2)}×`,
+          ]),
+        ),
+      );
+      for (const m of r.matches) {
+        if (m.excerpt !== "") lines.push(`  · ${m.subject}: ${m.excerpt}`);
+      }
+    }
+    if (r.bucket.uncalibrated) {
+      const d = r.cold_distribution;
+      lines.push(
+        `bucket ${r.bucket.bucket}: n=${r.bucket.n} — UNCALIBRATED. No velocity multiplier is shown, deliberately: ` +
+          `below 10 comparable completed tasks a multiplier is a rumour, not a measurement.`,
+      );
+      if (d !== null && d.n > 0) {
+        lines.push(
+          `  raw actual-cost distribution over ${d.n} completed task(s): p10 ${num(d.p10 ?? 0)} · p50 ${num(d.p50 ?? 0)} · p90 ${num(d.p90 ?? 0)} Work-CET`,
+        );
+      }
+    } else {
+      const ci = (x: { lo: number; hi: number } | null): string =>
+        x === null ? "" : ` [${x.lo.toFixed(2)}–${x.hi.toFixed(2)}]`;
+      lines.push(
+        `bucket ${r.bucket.bucket}: n=${r.bucket.n} (n_eff ${(r.bucket.n_eff ?? 0).toFixed(1)}), ` +
+          `×${(r.bucket.mult_p50 ?? 1).toFixed(2)} p50${ci(r.bucket.boot_p50)} · ` +
+          `×${(r.bucket.mult_p90 ?? 1).toFixed(2)} p90${ci(r.bucket.boot_p90)} · snapshot ${r.bucket.as_of}`,
+      );
+    }
+    lines.push(`unit: ${r.estimand} normalised by ${r.ref_model} output tokens`);
+
+    let text_ = lines.join("\n");
+    if (flagBool(p, "full")) {
+      ensureSpool();
+      const path = join(SPOOL_DIR, `refclass-${isoNow().replace(/[:]/g, "")}.txt`);
+      writeFileSync(path, `${text_}\n`, "utf8");
+      ctx.out(`full reference class written to ${path}`);
+      text_ = text_.slice(0, REFCLASS_BUDGET_CHARS);
+    } else if (text_.length > REFCLASS_BUDGET_CHARS) {
+      text_ = `${text_.slice(0, REFCLASS_BUDGET_CHARS - 40)}\n… [truncated to the 8,000-char budget; --full]`;
+    }
+    ctx.out(text_);
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+function cmdBoard(ctx: Ctx): number {
+  const db = openDb({ path: ctx.dbPath, readonly: true });
+  try {
+    const r = board(db, {
+      column: flagString(ctx.parsed, "status"),
+      limit: optInt(ctx.parsed, "limit", 20),
+      now: new Date(),
+    });
+    if (ctx.json) {
+      ctx.out(JSON.stringify({ schema: 1, ...r }));
+      return 0;
+    }
+    for (const col of r.columns) {
+      ctx.out(`${col.column} (${col.cards.length})`);
+      if (col.cards.length === 0) {
+        ctx.out("  —");
+        continue;
+      }
+      ctx.out(
+        renderTable(
+          ["subject", "kind", "consumed", "p50", "p90", "main/sub", "phase_conf"],
+          col.cards.map((c) => [
+            c.subject.length > 44 ? `${c.subject.slice(0, 43)}…` : c.subject,
+            c.kind,
+            num(c.consumed_wcet),
+            `${num(c.cal_p50)}${c.uncalibrated ? "*" : ""}`,
+            num(c.cal_p90),
+            `${num(c.wcet_main)}/${num(c.wcet_sub)}`,
+            c.phase_conf ?? "—",
+          ]),
+        ).replace(/^/gm, "  "),
+      );
+    }
+    ctx.out("");
+    ctx.out("* = uncalibrated band (cold start). The HTML/markdown board is Phase 2 (§7.1); --html is the flag it will land under.");
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+async function cmdRetro(ctx: Ctx): Promise<number> {
+  const p = ctx.parsed;
+  const dryRun = flagBool(p, "dry-run");
+  const asOfRaw = flagString(p, "as-of");
+  let asOf: Date | undefined;
+  if (asOfRaw !== null) {
+    const t = Date.parse(asOfRaw);
+    if (!Number.isFinite(t)) throw new UsageError(`--as-of: expected an ISO instant, got "${asOfRaw}"`);
+    asOf = new Date(t);
+  }
+  const db = openDb({ path: ctx.dbPath, readonly: dryRun });
+  try {
+    const compute = (): RetroReport => retro(db, { asOf, dryRun });
+    const r = dryRun
+      ? compute()
+      : await withLock(compute, { path: ctx.lockPath, timeoutMs: 30_000, note: lockNote("retro") });
+    if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...r }));
+    else if (!ctx.quiet) ctx.out(renderRetro(r));
+    return r.alerts.length > 0 ? 3 : 0;
+  } finally {
+    db.close();
+  }
+}
+
+function pct(v: number | null): string {
+  return v === null ? "n/a" : `${(v * 100).toFixed(1)}%`;
+}
+
+function renderRetro(r: RetroReport): string {
+  const q = r.quality;
+  const s = r.scoring;
+  const lines: string[] = [
+    `est retro ${r.as_of}${r.dry_run ? "  [DRY RUN — nothing written]" : ""}  ·  unit: ${r.estimand} / ${r.ref_model}`,
+    "",
+    // The headline, not a line in the panel: this is the number that licenses
+    // calibration at all, until the live G-ATTR re-gate clears 70% (§7.4 R4 (i)).
+    `ATTRIBUTION COVERAGE  ${pct(q.coverage_tracked)} over tracked sessions (${pct(q.coverage_all)} corpus-wide)  ·  gate 70%`,
+    `  ambiguous ${pct(q.ambiguous_share)} · pre_task ${pct(q.pre_task_share)} · closed by staleness ${pct(q.stale_closed_share)}`,
+    "",
+    `calibration   n=${s.n_scored} scored outcome(s)`,
+  ];
+  if (s.n_scored === 0) {
+    lines.push("  (nothing to calibrate yet — velocity needs completed, uncensored, fully-priced tasks)");
+  } else {
+    lines.push(
+      `  pinball p50 ${s.pinball_p50?.toFixed(0) ?? "n/a"} · p90 ${s.pinball_p90?.toFixed(0) ?? "n/a"} · log-score ${s.log_score?.toFixed(2) ?? "n/a"}`,
+      `  coverage p50 ${pct(s.coverage_p50)} (target 50%) · p90 ${pct(s.coverage_p90)} (target 90%), Jeffreys [${pct(s.cov_lo)}–${pct(s.cov_hi)}]`,
+      `  refinements n=${s.refinement.n}, pinball ${s.refinement.pinball_p50?.toFixed(0) ?? "n/a"}, moved toward actual ${pct(s.refinement.moved_toward_actual_pct)} — scored BESIDE the baseline, never blended into it`,
+      `  blocks vs task: ${s.blocks.verdict} (rollup ${s.blocks.rollup_pinball_p50?.toFixed(0) ?? "n/a"} vs task ${s.blocks.task_pinball_p50?.toFixed(0) ?? "n/a"} over ${s.blocks.n_tasks} task(s))`,
+      `  origin: velocity main ${s.origin.velocity_main?.toFixed(2) ?? "n/a"}× · sub ${s.origin.velocity_sub?.toFixed(2) ?? "n/a"}× · ` +
+        `exp_agents residual ${s.origin.exp_agents_residual?.toFixed(1) ?? "n/a"} · parallelism ${s.origin.parallelism_p50?.toFixed(2) ?? "n/a"}×`,
+    );
+  }
+  lines.push("");
+  if (r.buckets.length > 0) {
+    lines.push("multipliers in force after this retro");
+    lines.push(
+      renderTable(
+        ["bucket", "estimator", "n", "n_eff", "×p50", "×p90", "shrink_w", "method"],
+        r.buckets.map((b) => [
+          b.bucket,
+          b.estimator_family,
+          String(b.n),
+          b.n_eff.toFixed(1),
+          b.mult_p50.toFixed(2),
+          b.mult_p90.toFixed(2),
+          b.shrink_w.toFixed(2),
+          b.method,
+        ]),
+      ).replace(/^/gm, "  "),
+    );
+    lines.push("");
+  }
+  lines.push(
+    "data quality",
+    `  compliance_t1t2 ${pct(q.compliance_t1t2)} (EXACT, and T1/T2 only — an upper bound on true compliance)`,
+    `  t3_candidates ${q.t3_candidates} — an UPPER BOUND on T3 misses, never a gate input.  ${q.t4_note}`,
+    `  scope declared ${pct(q.scope_declared_pct)} · identity planted ${pct(q.identity_planted_pct)} · overhead ${pct(q.overhead_share)}`,
+    `  unpriced ${pct(q.unpriced_share)} · provisional ${pct(q.provisional_share)} · cross-epoch tasks ${q.cross_epoch_tasks}`,
+    `  fork replays ${q.fork_replays} · sidechain replays ${q.sidechain_replays} · compactions ${q.compactions} · spawn_depth>1 ${q.spawn_depth_gt1}`,
+    `  dangling agents ${q.dangling_agents} · phase-unmapped ${q.phase_unmapped_agents} · unlabelled workflow agents ${q.unlabeled_wf_agents}`,
+    `  workflowProgress completeness ${pct(q.wf_progress_completeness)} over COMPLETED runs (${q.wf_in_flight_agents} agent(s) in flight, counted separately)`,
+    `  block-estimate completeness: ${q.block_complete_tasks} complete / ${q.block_incomplete_tasks} incomplete`,
+    `  censored outcomes ${q.censored_outcomes} · corpus_shrink events ${q.corpus_shrink_events} (§5.8 expects ZERO)`,
+  );
+  if (q.recon.length === 0) {
+    lines.push("  reconciliation: none — `est recon` is Phase 2 (§7.5), so every number above is OURS and unvalidated");
+  } else {
+    for (const rec of q.recon) lines.push(`  reconciliation ${rec.as_of} ${rec.source}: ${rec.delta_pct.toFixed(1)}%`);
+  }
+  if (r.splits.length > 0) {
+    lines.push("", "candidate bucket splits (RECORDED, never auto-applied)");
+    for (const sp of r.splits) {
+      lines.push(`  ${sp.dimension}=${sp.level} n=${sp.n} pinball delta ${(sp.pinball_delta * 100).toFixed(1)}%`);
+    }
+  }
+  if (r.alerts.length > 0) lines.push("", `ALERTS: ${r.alerts.join(" · ")}`);
+  if (!r.dry_run) {
+    lines.push("", `written: ${r.written.refclass} refclass snapshot(s), ${r.written.calib_run} calib_run row`);
+  }
+  return lines.join("\n");
+}
+
+export const HELP = `est — token-based task estimation and tracking for Claude Code (Phase 0 + Phase 1)
 
 usage: est <command> [flags]
 
@@ -1374,6 +2164,15 @@ commands:
   backfill                full re-sweep over every surviving transcript, plus a spend report
   prices                  model price table: --sync, --show, --set
   census                  sweep_census history, corpus counts and the anomaly ledger
+  refclass                the reference class — run this BEFORE stating any number
+  open                    mint or re-estimate a task; prints the calibrated band
+  block                   one estimate per declared workflow phase, before the launch
+  bind                    attach a session / task number / run / agent to a tid
+  scope                   append a scope revision (the scope_change precondition)
+  burn                    consumption against the band (--json is the statusline contract)
+  close                   finalize by arithmetic
+  board                   terminal/JSON read model
+  retro                   weekly calibration + refclass write-back
   help, version
 
 global flags:
@@ -1407,7 +2206,34 @@ census:
   --limit <n>             sweep_census rows to show (default 10)
   --root <path>
 
-exit codes: 0 ok · 1 usage/fatal · 3 anomalies recorded or budget exceeded · 4 lock held
+refclass (read-only, takes no lock, ALWAYS exits 0 — an empty class is a valid answer):
+  --text "<subject>"      what the work is about (FTS5 over completed tasks)
+  --kind <k> --fanout <n> --limit <n>
+  --full                  write the unbudgeted form to spool/ and print its path
+
+open:
+  --kind <research|design|implement|refactor|debug|review|ops>
+  --subject <t> [--description <t>] [--dod <json|@file>]
+  --raw-p50 <n> --raw-p90 <n>        raw Work-CET band; a FEATURE and a FLOOR, never a mean
+  --exp-agents <n> --exp-wf-phases <n> --exp-files-write <n> --exp-turns <n> --exp-requests <n>
+  [--tid <tid> --reason refinement|scope_change|recalibration]   append a re-estimate
+  [--session <sid>] [--prompt <promptId>]
+  --continue <tid>        sugar: bind this session and append a refinement
+
+block <tid>:
+  --phase <i>             0-BASED — the phases[] index, NOT workflowProgress.phaseIndex
+  --title <t> --p50 <n> --p90 <n> [--exp-agents <n>] [--model <m>]
+
+bind <tid>:               [--session <sid>] [--task <n>] [--run <runId>] [--agent <agentId>]
+scope <tid>:              --reason <text> [--subject <t>] [--description <t>] [--dod <json|@file>]
+burn [<tid>]:             [--session <sid>] [--refresh]      read-only; never writes; always exits 0
+close <tid>:              [--status completed|abandoned|deleted|reopened] [--force]
+board:                    [--status <column>] [--limit <n>]
+retro:                    [--as-of <iso>] [--dry-run]
+
+exit codes: 0 ok (including a well-formed empty result) · 1 usage/fatal ·
+            2 REJECTED BY AN INVARIANT (append-only; never retry, never work around) ·
+            3 anomalies recorded or budget exceeded · 4 lock held
 `;
 
 export interface RunOptions {
@@ -1427,7 +2253,7 @@ export async function run(argv: readonly string[], io: RunOptions = {}): Promise
     return 1;
   }
   if (flagBool(parsed, "version") || parsed.command === "version") {
-    out("est 0.1.0 (estimator Phase 0)");
+    out(`est 0.1.0 (estimator Phase 0 + Phase 1, schema ${SCHEMA_VERSION})`);
     return 0;
   }
   if (parsed.command === null || parsed.command === "help" || flagBool(parsed, "help")) {
@@ -1457,6 +2283,24 @@ export async function run(argv: readonly string[], io: RunOptions = {}): Promise
         return await cmdPrices(ctx);
       case "census":
         return await cmdCensus(ctx);
+      case "refclass":
+        return await verb(ctx, () => cmdRefclass(ctx));
+      case "open":
+        return await verb(ctx, () => cmdOpen(ctx));
+      case "block":
+        return await verb(ctx, () => cmdBlock(ctx));
+      case "bind":
+        return await verb(ctx, () => cmdBind(ctx));
+      case "scope":
+        return await verb(ctx, () => cmdScope(ctx));
+      case "burn":
+        return await verb(ctx, () => cmdBurn(ctx));
+      case "close":
+        return await verb(ctx, () => cmdClose(ctx));
+      case "board":
+        return await verb(ctx, () => cmdBoard(ctx));
+      case "retro":
+        return await verb(ctx, () => cmdRetro(ctx));
       default:
         out(HELP);
         return 1;
