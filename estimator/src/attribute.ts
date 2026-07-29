@@ -107,6 +107,7 @@ interface ReqRow {
   ts: string;
   attr: string;
   tid: string | null;
+  origin: string;
   attribution_skill: string | null;
 }
 
@@ -705,7 +706,7 @@ export function attributeTasks(db: Database): AttributionResult {
   const requests: ReqRow[] = db
     .query<ReqRow, string[]>(
       `SELECT request_id, session_id, prompt_id, agent_id, run_id, wf_launch_id, ts, attr, tid,
-              attribution_skill
+              origin, attribution_skill
          FROM request
         WHERE (${claimHolders})${
           sessionList.length === 0 ? "" : ` OR session_id IN (${placeholders(sessionList.length)})`
@@ -739,7 +740,19 @@ export function attributeTasks(db: Database): AttributionResult {
     // Rule 1 of §5.4, applied last because it OVERRIDES the others: the ceremony's
     // own spend books to `overhead` and is excluded from `actual_wcet`, otherwise
     // improving the ceremony worsens the numbers it produces.
-    if (r.attribution_skill === "estimating" && assign.tid !== null) {
+    //
+    // MAIN-CHAIN ONLY. The rule's subject is the handful of requests the estimating
+    // skill itself makes while anchoring a task, and those are by construction
+    // `origin='main'`. `attribution_skill` is not scoped that way: the harness stamps
+    // the ACTIVE skill onto every request that descends from the turn it was active
+    // on, so a workflow launched from an anchoring turn hands the tag to every one of
+    // its subagents. Without this qualifier those subagents — the delegated WORK, not
+    // the ceremony — were booked to `overhead` and dropped out of `actual_wcet`,
+    // which understated one live task by 3.4x (a majority of its Work-CET vanished
+    // into the ceremony bucket; DECISIONS.md §8.7b). Narrowing here rather than at
+    // ingest keeps `attribution_skill` an honest record of what the harness reported
+    // and leaves the correction one idempotent re-attribution away.
+    if (r.attribution_skill === "estimating" && r.origin === "main" && assign.tid !== null) {
       assign = { tid: assign.tid, attr: "overhead" };
     }
 

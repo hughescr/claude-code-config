@@ -2,7 +2,7 @@
  * test/backfill-idempotence.test.ts — `est backfill` run twice over an unchanged
  * fixture corpus must leave the database in the same state.
  *
- * `est backfill` is `est sweep --full`: it deliberately ignores the `sweep_state`
+ * `est backfill` is the full-corpus form of `est sweep`: it deliberately ignores the `sweep_state`
  * watermarks and re-reads every transcript from byte 0. That makes it the one verb
  * that re-derives the ENTIRE corpus on every invocation, so any writer that appends
  * where it should upsert, double-counts a request, re-raises a settled anomaly or

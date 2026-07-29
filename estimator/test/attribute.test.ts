@@ -577,6 +577,85 @@ describe("F5: relaunch and delegation ownership", () => {
 });
 
 // ---------------------------------------------------------------------------
+// F6 — the ceremony bucket is the ceremony's own spend, not everything downstream
+// ---------------------------------------------------------------------------
+
+describe("F6: rule 1's `overhead` bucket is scoped to the MAIN chain", () => {
+  /**
+   * `attribution_skill` records the skill that was ACTIVE on the turn, and the
+   * harness propagates it across agent boundaries: every subagent launched from an
+   * anchoring turn inherits `estimating`. Rule 1 reads that tag to route the
+   * ceremony's own spend to `overhead` (excluded from `actual_wcet`), so before the
+   * `origin='main'` qualifier it also swallowed the delegated WORK — the exact shape
+   * measured live, where 820 inherited-tag subagent requests left one task reading a
+   * fraction of its true Work-CET.
+   *
+   * Synthetic figures throughout; what is pinned is the SPLIT, not the magnitudes.
+   */
+  test("a subagent request tagged `estimating` attributes to the task; the main-chain one is overhead", () => {
+    turn(h.db, { session: "s1", prompt: "anchor", at: "2026-02-01T10:00:00Z" });
+    seedTask(h.db, TID, { session: "s1", prompt: "anchor", createdAt: "2026-02-01T10:00:00Z" });
+    agentRun(h.db, "ag-work", {
+      session: "s1",
+      launchPrompt: "anchor",
+      startedAt: "2026-02-01T10:00:30Z",
+      endedAt: "2026-02-01T10:20:00Z",
+    });
+
+    // The ceremony itself: `est open` running on the anchor turn, main chain.
+    request(h.db, "rq-ceremony", {
+      session: "s1",
+      prompt: "anchor",
+      origin: "main",
+      ts: "2026-02-01T10:00:10Z",
+      out: 100,
+      skill: "estimating",
+    });
+    // The delegated work, wearing the SAME tag purely because it descends from that
+    // turn. `origin` is the only thing that tells the two apart.
+    request(h.db, "rq-sub", {
+      session: "s1",
+      prompt: "anchor",
+      origin: "subagent",
+      agent: "ag-work",
+      ts: "2026-02-01T10:10:00Z",
+      out: 900,
+      skill: "estimating",
+    });
+
+    attributeTasks(h.db);
+    expect(req("rq-ceremony")).toEqual({ tid: TID, attr: "overhead" });
+    expect(req("rq-sub")).toEqual({ tid: TID, attr: "exclusive" });
+
+    // And the split is what `v_task_actual` reads: `overhead` is excluded from the
+    // task's Work-CET, the inherited-tag subagent spend is not. Priced 1:1 by the
+    // harness's test family, so 900 out-tokens is 900 Work-CET.
+    const actual = h.db
+      .query<{ wcet: number; wcet_task_effort: number; overhead_wcet: number }, [string]>(
+        "SELECT wcet, wcet_task_effort, overhead_wcet FROM v_task_actual WHERE tid = ?",
+      )
+      .get(TID);
+    expect(actual).toEqual({ wcet: 900, wcet_task_effort: 900, overhead_wcet: 100 });
+  });
+
+  test("an auxiliary request carrying the inherited tag is not booked to the ceremony either", () => {
+    turn(h.db, { session: "s1", prompt: "anchor", at: "2026-02-01T10:00:00Z" });
+    seedTask(h.db, TID, { session: "s1", prompt: "anchor", createdAt: "2026-02-01T10:00:00Z" });
+    request(h.db, "rq-aux", {
+      session: "s1",
+      prompt: "anchor",
+      origin: "auxiliary",
+      ts: "2026-02-01T10:02:00Z",
+      out: 50,
+      skill: "estimating",
+    });
+
+    attributeTasks(h.db);
+    expect(req("rq-aux")).toEqual({ tid: TID, attr: "exclusive" });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // The whole chain, through the real sweep, against the fixture corpus
 // ---------------------------------------------------------------------------
 

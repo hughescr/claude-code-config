@@ -44,7 +44,7 @@
  * re-points an existing `task_alias` row: that is the one operation `est bind` refuses
  * by design, and doing it here silently would be worse.
  *
- * It does not re-read the corpus either. `est sweep --full` is the follow-up, and it
+ * It does not re-read the corpus either. `est backfill` is the follow-up, and it
  * is what re-emits the classified `agent_never_returned` / `wf_relaunch_orphan` rows
  * for the agents whose old rows this script retracts. The script prints the command.
  */
@@ -341,7 +341,7 @@ export function repairAttribution(db: Database, options: RepairOptions = {}): Re
           .sort()
           .join(", ")}) — in-flight sweep races, a duplicated journal cross-check and ` +
         `wave-count dedup failures. Full rows dumped beside the pre-repair snapshot in backups/. ` +
-        `The classifier re-emits the correct, benign rows on the next \`est sweep --full\`.`;
+        `The classifier re-emits the correct, benign rows on the next \`est backfill\`.`;
       const already =
         db
           .query<{ n: number }, [string]>(
@@ -414,7 +414,7 @@ export function repairAttribution(db: Database, options: RepairOptions = {}): Re
     out(`the database is unchanged; the pre-repair snapshot is still at ${snapshot}`);
   }
   out("");
-  out("next: `bun run src/cli.ts sweep --full` — the corpus re-read that re-emits the");
+  out("next: `bun run src/cli.ts backfill` — the corpus re-read that re-emits the");
   out("      classified anomaly rows, then run it a SECOND time and confirm it writes none.");
 
   return {

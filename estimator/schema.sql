@@ -636,7 +636,7 @@ CREATE TABLE sweep_state (          -- performance only; losing it costs seconds
   path TEXT PRIMARY KEY, inode INTEGER NOT NULL, bytes_read INTEGER NOT NULL,
   last_swept TEXT NOT NULL,
   mtime TEXT                        -- v9: the file's own mtime at last read. NULL until
-                                    -- `est backfill --full` rewrites it; D1's vanish-age split
+                                    -- `est backfill` rewrites it; D1's vanish-age split
                                     -- falls back to `last_swept` (a lower bound; §5.8) until then.
 ) STRICT;
 
