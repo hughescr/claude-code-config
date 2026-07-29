@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.craig.estimator — launchd job for scripts/est-cron.sh (design R3 §2, §8).
+
+  ############################################################################
+  #  NOT INSTALLED. This file lives in the repo as a reviewable artefact.    #
+  #  Nothing here takes effect until it is copied into LaunchAgents and      #
+  #  bootstrapped, which is a deliberate, separate step.                     #
+  ############################################################################
+
+  To install (only when you actually want the daily job):
+
+      cp ~/.claude/estimator/scripts/com.craig.estimator.plist \
+         ~/Library/LaunchAgents/com.craig.estimator.plist
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.craig.estimator.plist
+      launchctl enable gui/$(id -u)/com.craig.estimator
+
+  To check on it / run it now / remove it:
+
+      launchctl print gui/$(id -u)/com.craig.estimator
+      launchctl kickstart -p gui/$(id -u)/com.craig.estimator
+      launchctl bootout gui/$(id -u)/com.craig.estimator
+
+  Notes:
+    * RunAtLoad is false on purpose — installing the job should not kick off a
+      full sweep in the middle of whatever you were doing.
+    * StartCalendarInterval fires at 03:30 local. launchd runs a MISSED calendar
+      job once the machine wakes, which is why est-cron.sh's weekly leg is
+      stamp-driven rather than keyed to a weekday.
+    * PATH is set explicitly: launchd jobs do NOT inherit a login shell's PATH,
+      and bun lives in /opt/homebrew/bin or ~/.bun/bin. est-lib.sh also probes
+      those paths directly, so the job works even if this PATH is wrong.
+    * ProcessType Background asks the scheduler to treat this as low priority.
+    * Logs go to ~/Library/Logs — outside the dotfiles repo, so nothing here ever
+      shows up in `git status`.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.craig.estimator</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>/Users/craig/.claude/estimator/scripts/est-cron.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/craig</string>
+        <key>EST_HOME</key>
+        <string>/Users/craig/.claude/estimator</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/craig/.claude/estimator</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>900</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/craig/Library/Logs/com.craig.estimator.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/craig/Library/Logs/com.craig.estimator.log</string>
+</dict>
+</plist>

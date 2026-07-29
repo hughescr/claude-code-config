@@ -44,3 +44,22 @@ plugins/plugin-catalog-cache.json
 __pycache__/
 /plugins/.last_inuse_sweep
 gh-pr-status-cache.json
+
+# estimator — the CLI's source is committed, its data never is (design R3 §4, §10 Q11)
+estimator/estimator.db*
+estimator/spool/
+estimator/backups/
+estimator/sweep.lock
+# gate probes: the .ts scanners are code and committed; everything they PRODUCE is
+# corpus-derived data and stays local — this repo is public (decision 11: no
+# estimate/actual/spend data, no prompt or conversation content, ever)
+estimator/gates/*.json
+estimator/gates/*.md
+# the spec and decision log quote private prompts and real usage data — local only,
+# covered by the weekly backups/ snapshot, not by git
+estimator/DESIGN.md
+estimator/DECISIONS.md
+# `bun install` materialises the two typecheck-only devDependencies here. Runtime
+# dependencies are still zero; `bun.lock` IS committed, so `bun run typecheck`
+# reproduces exactly the compiler the last recorded run used.
+estimator/node_modules/

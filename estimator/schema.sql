@@ -1,0 +1,713 @@
+-- estimator schema — token-estimation-design-r3.md §4.2 (rev. R3, decisions applied).
+-- This file is the ONLY source of DDL. src/db.ts applies it verbatim when
+-- config.schema_version is absent; the leading connection PRAGMAs below are
+-- applied by the opener OUTSIDE the DDL transaction (journal_mode cannot be
+-- changed from inside a transaction) and are repeated here so a manual
+--   sqlite3 estimator.db < schema.sql
+-- produces an identical database.
+
+PRAGMA journal_mode = WAL;
+PRAGMA busy_timeout  = 5000;
+PRAGMA synchronous   = NORMAL;
+PRAGMA foreign_keys  = ON;
+-- Writers: est CLI (tiny BEGIN IMMEDIATE txns) and the flock-guarded sweeper
+-- (ONE transaction per sweep, not per file). Cron: wal_checkpoint(TRUNCATE) weekly.
+
+CREATE TABLE config (k TEXT PRIMARY KEY, v TEXT NOT NULL) STRICT;
+-- seed: ref_model | estimand='work_cet' | quiesce_main_min='60' | shrink_k='10'
+--       velocity_half_life_days='30' | split_min_pinball_gain='0.02'
+--       boot_resamples='200' | coverage_prior='jeffreys' | schema_version='4'
+-- EVERY calibration constant lives here, not in code: none is empirically backed
+-- (§1.1), and the retro tunes them by cross-validation from n>=20.
+
+CREATE TABLE model_price (          -- pricing is DATA; dated aliases collapse to family
+  family TEXT NOT NULL,             -- model name with trailing -YYYYMMDD stripped at ingest
+  effective_from TEXT NOT NULL,
+  usd_in REAL NOT NULL, usd_out REAL NOT NULL,
+  usd_cw REAL NOT NULL, usd_cr REAL NOT NULL,          -- per Mtok
+  provisional INTEGER NOT NULL DEFAULT 0,   -- 1 = inferred from a tier peer, NOT authoritative
+  source TEXT NOT NULL,             -- R3: 'litellm' (primary, ccusage's own upstream)
+                                    -- | 'models_dev' (secondary) | 'otel' | 'manual'
+                                    -- | 'claude-api-skill' | 'model-selection' (now occasional
+                                    -- cross-checks only, §4.3)
+  synced_epoch TEXT,                -- R3 -> price_sync(price_epoch): which sync wrote this row
+  ingested_at TEXT NOT NULL,
+  PRIMARY KEY (family, effective_from)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE price_sync (           -- R3: the DB IS the local price snapshot/cache (§4.3).
+                                    -- ccusage keeps no on-disk cache to read [R3]; we keep ours.
+  price_epoch TEXT PRIMARY KEY,     -- ISO ts of a successful sync; estimate.price_epoch names one
+  synced_at TEXT NOT NULL,
+  source TEXT NOT NULL,             -- 'litellm'|'models_dev'|'manual'|'otel'
+  url TEXT, etag TEXT,
+  n_families INTEGER NOT NULL,
+  n_provisional INTEGER NOT NULL DEFAULT 0,
+  ok INTEGER NOT NULL DEFAULT 1     -- 0 = fetch failed; the last good snapshot stays in force
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE task (
+  tid TEXT PRIMARY KEY,             -- uuidv7 minted by `est open`
+  kind TEXT NOT NULL CHECK (kind IN
+    ('research','design','implement','refactor','debug','review','ops')),
+  status TEXT NOT NULL CHECK (status IN
+    ('estimating','in_progress','pending_verification','completed','abandoned','deleted')),
+  created_at TEXT NOT NULL, started_at TEXT, ended_at TEXT,
+  anchor_session TEXT NOT NULL,
+  anchor_prompt TEXT NOT NULL       -- turn where work began: planning spend is INSIDE the window
+  -- NOTE (R2): subject/description/scope_hash MOVED to task_scope. A mutable scope column
+  -- cannot answer "what was the scope when the baseline estimate was issued", which is the
+  -- baseline all accuracy is judged against. Current scope = v_scope_current.
+) STRICT;
+
+CREATE TABLE task_scope (           -- APPEND-ONLY scope history (REQ-4 'otherwise modified')
+  tid TEXT NOT NULL REFERENCES task(tid),
+  seq INTEGER NOT NULL,
+  ts TEXT NOT NULL,
+  subject TEXT NOT NULL, description TEXT,
+  dod_json TEXT NOT NULL DEFAULT '[]',
+  scope_hash TEXT NOT NULL,         -- sha256(subject||description||dod_json)
+  source TEXT NOT NULL CHECK (source IN
+    ('est_open','est_scope','sweeper_diff','transcript','classifier')),
+  reason TEXT,                      -- free text from `est scope --reason`
+  diff_summary TEXT,                -- unified-diff summary vs seq-1; NULL at seq=1
+  PRIMARY KEY (tid, seq)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER scope_ro_u BEFORE UPDATE ON task_scope BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER scope_ro_d BEFORE DELETE ON task_scope BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
+CREATE TABLE task_alias (           -- many harness ids -> one logical task
+  tid TEXT NOT NULL REFERENCES task(tid),
+  id_kind TEXT NOT NULL CHECK (id_kind IN
+    ('session_task','session','workflow_run','agent','job')),
+  session_id TEXT NOT NULL, local_id TEXT NOT NULL, first_seen TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'sweeper',   -- 'task_metadata'|'est_bind'|'sweeper'
+  PRIMARY KEY (id_kind, session_id, local_id)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX ix_alias_tid ON task_alias(tid);
+
+CREATE TABLE bucket_def (           -- buckets are DEFINED, not free text (R2)
+  bucket TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  dims_json TEXT NOT NULL,          -- {} for global; e.g. {"kind":"implement","fanout":"2-5"}
+  parent_bucket TEXT REFERENCES bucket_def(bucket),   -- split lineage
+  split_pinball_gain REAL,          -- CV loss reduction that justified the split; NULL for global
+  active INTEGER NOT NULL DEFAULT 1
+) STRICT;
+-- seed: ('global', now, '{}', NULL, NULL, 1)
+
+CREATE TABLE estimate (             -- APPEND-ONLY, physically enforced
+  eid INTEGER PRIMARY KEY,
+  tid TEXT NOT NULL REFERENCES task(tid),
+  version INTEGER NOT NULL, created_at TEXT NOT NULL,
+  reason TEXT NOT NULL CHECK (reason IN
+    ('initial','refinement','scope_change','recalibration')),
+  scope_seq INTEGER NOT NULL,       -- WHICH scope this band was issued against (R2)
+  -- CET quantiles are non-negative token quantities; see request's counter CHECKs.
+  raw_p50_wcet INTEGER NOT NULL CHECK (raw_p50_wcet >= 0),       -- a feature, a floor
+  raw_p90_wcet INTEGER NOT NULL CHECK (raw_p90_wcet >= 0),
+  exp_agents INTEGER NOT NULL, exp_wf_phases INTEGER NOT NULL,
+  exp_files_write INTEGER NOT NULL, exp_turns INTEGER NOT NULL,
+  exp_requests INTEGER NOT NULL,
+  bucket TEXT NOT NULL REFERENCES bucket_def(bucket),
+  bucket_n INTEGER NOT NULL,
+  refclass_as_of TEXT,              -- WHICH refclass snapshot issued the multipliers (R2);
+                                    -- NULL only for uncalibrated cold-start bands
+  shrink_w REAL NOT NULL,           -- n/(n+k) actually applied; 0 = uncalibrated cold start
+  cal_p50_wcet INTEGER NOT NULL CHECK (cal_p50_wcet >= 0),       -- what Craig is shown
+  cal_p90_wcet INTEGER NOT NULL CHECK (cal_p90_wcet >= 0),
+  cal_req_p50 INTEGER CHECK (cal_req_p50 IS NULL OR cal_req_p50 >= 0),
+  cal_req_p90 INTEGER CHECK (cal_req_p90 IS NULL OR cal_req_p90 >= 0),
+  active_p50_s INTEGER, active_p90_s INTEGER,  -- driver-conditioned quantiles, NOT token-derived
+  active_model TEXT,                -- 'baseline_req'|'fanout_cond' — which §7.3 model produced them
+  price_epoch TEXT NOT NULL,        -- estimate and its actual computed under ONE price vintage;
+                                    -- R3: names the price_sync snapshot in force at `est open`
+  -- The UNIT this band is denominated in, snapshotted at `est open` alongside the
+  -- vintage. price_epoch alone pins the RATES but not the DEFINITION of a CET:
+  -- config.ref_model is the normaliser's family and config.estimand chooses which
+  -- counters are summed ('out' | 'work_cet' | 'out_cw_in', §4.1). Either can be
+  -- changed with `est config set` at any time, and a band issued in
+  -- sonnet-4-5-output-equivalents is simply not comparable to one issued in
+  -- opus-5-output-equivalents. Without these two columns a config flip would mix
+  -- currencies inside the SAME reference class, silently, forever.
+  -- v_velocity therefore MUST compare like with like: group/filter on
+  -- (ref_model, estimand) — a row with a different pair is a different unit, not
+  -- an outlier, and blending them corrupts the multipliers rather than widening them.
+  ref_model TEXT NOT NULL,          -- config.ref_model as of `est open`
+  estimand TEXT NOT NULL,           -- config.estimand as of `est open`
+  estimator_model TEXT NOT NULL,    -- velocity history is keyed by this (model churn decay)
+  UNIQUE (tid, version),
+  FOREIGN KEY (tid, scope_seq) REFERENCES task_scope(tid, seq)
+) STRICT;
+CREATE TRIGGER est_ro_u BEFORE UPDATE ON estimate BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER est_ro_d BEFORE DELETE ON estimate BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
+CREATE TABLE estimate_block (       -- R3: per-block (per-phase) workflow estimates, APPEND-ONLY.
+                                    -- One row per declared meta.phases entry, written at
+                                    -- script-authoring time BEFORE the launch (§3.2).
+                                    -- Rolls UP to the task band; never replaces it.
+  eid INTEGER NOT NULL REFERENCES estimate(eid),
+  phase_idx INTEGER NOT NULL,       -- the declared meta.phases index == workflowProgress.phaseIndex
+  created_at TEXT NOT NULL,
+  title TEXT NOT NULL,              -- declared phase title; joins workflow_phase.title
+  p50_wcet INTEGER NOT NULL CHECK (p50_wcet >= 0),
+  p90_wcet INTEGER NOT NULL CHECK (p90_wcet >= 0),
+  exp_agents INTEGER NOT NULL DEFAULT 1,
+  model TEXT,                       -- the model the script assigns to this phase
+  PRIMARY KEY (eid, phase_idx)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER estb_ro_u BEFORE UPDATE ON estimate_block BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER estb_ro_d BEFORE DELETE ON estimate_block BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
+CREATE TABLE request (              -- the atomic fact: one row per deduped API request
+  request_id TEXT PRIMARY KEY,      -- GLOBAL key (fork replays collapse here).
+                                    -- fallback: message.id, then uuid.
+                                    -- GATE G-FORK RAN 2026-07-29 (gates/G-FORK.md): the global PK
+                                    -- is CONFIRMED and must NOT be narrowed to
+                                    -- (session_id, request_id). Overlap REPLICATES far beyond the
+                                    -- single [J] pair: 5 independent file pairs, 643 duplicated
+                                    -- requestIds, 100% of them crossing a session boundary, and
+                                    -- 100% message.id agreement across all 643 — every duplicate
+                                    -- is provably the same billed call written twice, so
+                                    -- collapsing it is correct rather than lossy. Narrowing would
+                                    -- double-count 2.4% of corpus Work-CET and 12-100% of the
+                                    -- Work-CET of each affected session (one session is 100%
+                                    -- phantom). Three mechanisms produce them: rewind fork,
+                                    -- /compact continuation (tail replay), subagent symlink alias.
+  message_id TEXT,                  -- INDEXED and USED: ccusage's replay fallback (§5.2)
+  is_sidechain INTEGER NOT NULL DEFAULT 0,   -- ccusage collision tie-break input
+  session_id TEXT NOT NULL,         -- FIRST-SEEN owner; fork replays never re-attribute
+  prompt_id TEXT,                   -- turn key, propagated forward from user lines
+  origin TEXT NOT NULL CHECK (origin IN ('main','subagent','auxiliary')),
+                                    -- 'auxiliary' added in R2: OTEL's documented third
+                                    -- query_source (title generation, quota checks, background
+                                    -- cheap-model calls) — real money, previously would have
+                                    -- violated the CHECK or been dropped on Phase 2 ingest.
+  agent_id TEXT, run_id TEXT, wf_launch_id TEXT,   -- wf_launch_id discriminates relaunches
+  model TEXT NOT NULL, model_family TEXT NOT NULL,
+  attribution_agent TEXT, attribution_skill TEXT,  -- free per-request tags from transcript
+  ts TEXT NOT NULL,
+  -- Counters are non-negative BY CONSTRUCTION. The §5.2 dedup upsert is
+  -- MAX(existing, incoming) per counter, so a single negative slipping in from a
+  -- malformed usage block would be absorbed silently on the low side and then
+  -- pinned there for every later sweep. A CHECK turns that into a loud failure at
+  -- the row that caused it (§2) instead of an unexplained shortfall in Work-CET.
+  in_tok INTEGER NOT NULL DEFAULT 0 CHECK (in_tok  >= 0),
+  out_tok INTEGER NOT NULL DEFAULT 0 CHECK (out_tok >= 0),
+  cw_tok INTEGER NOT NULL DEFAULT 0 CHECK (cw_tok  >= 0),
+  cr_tok INTEGER NOT NULL DEFAULT 0 CHECK (cr_tok  >= 0),
+  duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+                                    -- OTEL only (Phase 2); transcripts lack it
+  tid TEXT REFERENCES task(tid),    -- NULL = unattributed: a counted state, never an error
+  attr TEXT NOT NULL DEFAULT 'none' CHECK (attr IN
+    ('none','exclusive','sticky','ambiguous','overhead','pre_task','replay'))
+                                    -- 'replay' added in R2: a sidechain re-emission of an
+                                    -- already-counted message under a NEW request_id. Kept as
+                                    -- a row for auditability; excluded from EVERY sum.
+) STRICT;
+CREATE INDEX ix_req_tid   ON request(tid);
+CREATE INDEX ix_req_turn  ON request(session_id, prompt_id);
+CREATE INDEX ix_req_agent ON request(agent_id);
+CREATE INDEX ix_req_msg   ON request(message_id) WHERE message_id IS NOT NULL;
+
+CREATE TABLE turn (                 -- + the only harness-written wall clock (turn_duration)
+  session_id TEXT NOT NULL, prompt_id TEXT NOT NULL,
+  started_at TEXT NOT NULL, duration_ms INTEGER,
+  pending_bg INTEGER, pending_wf INTEGER,   -- CONSUMED in R2: see §7.3 interval-union
+  tid TEXT REFERENCES task(tid),
+  PRIMARY KEY (session_id, prompt_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE workflow_run (         -- R2: workflow runs are first-class, from the STATIC plan
+  run_id TEXT NOT NULL, wf_launch_id TEXT NOT NULL,  -- runId reused across relaunches
+  session_id TEXT NOT NULL,
+  workflow_name TEXT, transcript_dir TEXT, default_model TEXT,
+  launch_prompt_id TEXT,
+  n_phases_planned INTEGER,
+  started_at TEXT, ended_at TEXT,   -- DERIVED from agent transcripts, never from wf_*.json
+  tid TEXT REFERENCES task(tid),
+  PRIMARY KEY (run_id, wf_launch_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE workflow_phase (       -- STATIC PLAN ONLY, read from wf_<runId>.json phases[]
+  run_id TEXT NOT NULL, wf_launch_id TEXT NOT NULL,
+  phase_idx INTEGER NOT NULL,
+  title TEXT NOT NULL, detail TEXT, model TEXT,
+  PRIMARY KEY (run_id, wf_launch_id, phase_idx),
+  FOREIGN KEY (run_id, wf_launch_id) REFERENCES workflow_run(run_id, wf_launch_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE agent_run (
+  agent_id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL,
+  run_id TEXT, wf_launch_id TEXT,   -- runId = dir key only; launch id from toolUseResult.taskId
+  agent_type TEXT, spawn_depth INTEGER NOT NULL DEFAULT 1,
+  launch_prompt_id TEXT,            -- attribution inherits from the LAUNCHING turn
+  transcript_path TEXT,             -- realpath-canonicalised
+  status TEXT,
+  label TEXT,                       -- R3: workflowProgress[].label (the agent() `label` opt).
+                                    -- NULL on a workflow agent => the §3.2 authoring rule was
+                                    -- violated; reported, not silently tolerated.
+  started_at TEXT, ended_at TEXT,   -- R3 SOURCE ORDER (changed): for workflow agents, primary =
+                                    -- workflowProgress[].startedAt (epoch ms) and startedAt +
+                                    -- durationMs — exact scheduler intervals, stronger than
+                                    -- transcript line timestamps. Fallback, and the rule for
+                                    -- non-workflow agents: first/last line `timestamp` in
+                                    -- agent-<id>.jsonl (journal.jsonl and meta.json carry none,
+                                    -- verified [R2]). These two columns underpin EVERY time
+                                    -- computation (§5.3, §7.3).
+  interval_src TEXT CHECK (interval_src IN ('workflow_progress','transcript','none')),  -- R3
+  queued_at TEXT,                   -- R3: workflowProgress[].queuedAt — queue latency is visible
+  attempt INTEGER,                  -- R3: workflowProgress[].attempt — retries are visible
+  reported_tokens INTEGER CHECK (reported_tokens IS NULL OR reported_tokens >= 0),
+                                    -- R3: workflowProgress[].tokens, STORED FOR AUDIT ONLY and
+                                    -- NEVER summed: measured at ~0.73x of true Work-CET for
+                                    -- one verified agent — it appears to track cache_creation
+                                    -- alone. Numbers always come from transcripts (§5.6).
+  phase_idx INTEGER,                -- R3: EXACT, from workflowProgress[].phaseIndex (§5.6)
+  phase_title TEXT,                 -- R3: workflowProgress[].phaseTitle, cross-checks phases[]
+  phase_conf TEXT CHECK (phase_conf IN ('exact','inferred','unmapped')),
+                                    -- R3 semantics: 'exact' = workflowProgress join;
+                                    -- 'inferred' = interval-clustering fallback; 'unmapped' = neither
+  tid TEXT REFERENCES task(tid)
+) STRICT;
+CREATE INDEX ix_agent_run ON agent_run(run_id, wf_launch_id);
+
+CREATE TABLE task_event (           -- lifecycle from transcript toolUseResult (§6.1)
+  ev INTEGER PRIMARY KEY,
+  tid TEXT REFERENCES task(tid),
+  session_id TEXT NOT NULL,
+  -- WHICH tool wrote the event. TaskCreate carries `toolUseResult.task={id,subject}`
+  -- and no statusChange; TaskUpdate carries `statusChange:{from,to}`. §5.4 defines a
+  -- turn as "touching" a task if it did EITHER, so an ingest that only kept
+  -- statusChange made every create invisible to attribution. Part of the dedup key:
+  -- a create and a transition can land on the same (task, ts, to_status) and are
+  -- still two different facts.
+  kind TEXT NOT NULL ON CONFLICT REPLACE DEFAULT 'status'
+       CHECK (kind IN ('create','status')),
+  -- SENTINEL, NOT NULL. SQLite treats NULLs as DISTINCT inside a UNIQUE index, so
+  -- with nullable task_num/to_status the dedup key below matched nothing and the
+  -- ingest `ON CONFLICT ... DO NOTHING` silently inserted a fresh duplicate row on
+  -- EVERY re-sweep of the same transcript — the one thing the sweeper is required
+  -- to be idempotent about (§5.8). `ON CONFLICT REPLACE` on the NOT NULL is the
+  -- coercion: SQLite substitutes the column DEFAULT when a NULL is bound, so the
+  -- writer keeps binding `null` for "no task number / no target status" and the
+  -- key still collapses. '' is unambiguous — a real taskId or status is non-empty.
+  task_num TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+  ts TEXT NOT NULL,
+  from_status TEXT,
+  to_status TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+  source TEXT NOT NULL CHECK (source IN ('transcript','cli','sweeper','pretooluse')),
+                                    -- 'pretooluse' = the restored delete-capture hook (§6.1)
+  UNIQUE (session_id, task_num, ts, to_status, kind)
+) STRICT;
+
+CREATE TABLE outcome (              -- APPEND-ONLY; current = MAX(revision). Reopen = new revision.
+  tid TEXT NOT NULL REFERENCES task(tid),
+  revision INTEGER NOT NULL,
+  finalized_at TEXT NOT NULL,
+  final_status TEXT NOT NULL CHECK (final_status IN
+    ('completed','abandoned','deleted','reopened')),
+  censored INTEGER NOT NULL DEFAULT 0,  -- abandoned => actual is a LOWER BOUND (right-censored)
+  eid_at_start INTEGER NOT NULL REFERENCES estimate(eid),  -- accuracy judged vs THIS, always
+  eid_final INTEGER NOT NULL REFERENCES estimate(eid),
+  -- Every roll-up below is non-negative by construction, for the same reason the
+  -- request counters are: a negative here is corrupt input, and a corrupt actual
+  -- is a poisoned reference-class row that quietly drags the multipliers down.
+  actual_wcet INTEGER NOT NULL CHECK (actual_wcet >= 0),
+  actual_wcet_at_epoch INTEGER CHECK (actual_wcet_at_epoch IS NULL
+                                      OR actual_wcet_at_epoch >= 0),
+                                    -- R2: recomputed under estimate.price_epoch — the ONLY
+                                    -- figure velocity may use (§4.4)
+  actual_scet INTEGER NOT NULL CHECK (actual_scet >= 0),
+  actual_in INTEGER NOT NULL CHECK (actual_in >= 0),
+  actual_out INTEGER NOT NULL CHECK (actual_out >= 0),
+  actual_cw INTEGER NOT NULL CHECK (actual_cw >= 0),
+  actual_cr INTEGER NOT NULL CHECK (actual_cr >= 0),
+  -- R2: the headline axis, finally split. exp_agents is committed at estimate time; without
+  -- this you can record that an estimate was 3x low but not which half caused it.
+  wcet_main INTEGER NOT NULL DEFAULT 0 CHECK (wcet_main >= 0),
+  wcet_sub  INTEGER NOT NULL DEFAULT 0 CHECK (wcet_sub  >= 0),
+  wcet_aux  INTEGER NOT NULL DEFAULT 0 CHECK (wcet_aux  >= 0),
+  n_req_main INTEGER NOT NULL DEFAULT 0 CHECK (n_req_main >= 0),
+  n_req_sub  INTEGER NOT NULL DEFAULT 0 CHECK (n_req_sub  >= 0),
+  n_req_aux  INTEGER NOT NULL DEFAULT 0 CHECK (n_req_aux  >= 0),
+  n_requests INTEGER NOT NULL CHECK (n_requests >= 0),
+  n_agents INTEGER NOT NULL CHECK (n_agents >= 0),
+  -- the three clocks, never blended (§7.3)
+  active_s INTEGER,                 -- UNION of turn+agent intervals (not a sum) — R2
+  busy_s INTEGER,                   -- SUM of those interval lengths
+  max_concurrency INTEGER,          -- R2: realized, per task, from the sweep line
+  parallelism_factor REAL,          -- R2: busy_s / active_s
+  compute_s INTEGER, wall_s INTEGER,
+  overhead_wcet INTEGER NOT NULL DEFAULT 0 CHECK (overhead_wcet >= 0),  -- ceremony's own cost
+  unattrib_share REAL, ambiguous_share REAL,     -- honesty columns: counted, not hidden
+  unpriced_share REAL NOT NULL DEFAULT 0,        -- R2: degrades the row, never blocks
+  price_provisional INTEGER NOT NULL DEFAULT 0,
+  dangling_agents INTEGER NOT NULL DEFAULT 0,
+  compactions INTEGER NOT NULL DEFAULT 0,
+  fork_replays INTEGER NOT NULL DEFAULT 0,
+  sidechain_replays INTEGER NOT NULL DEFAULT 0,  -- R2: ccusage message_id fallback hits
+  phase_unmapped_agents INTEGER NOT NULL DEFAULT 0,   -- R2: workflow-step coverage
+  tid_planted INTEGER,                           -- R2: NULL = no Task-tool task existed
+  scope_changed INTEGER NOT NULL DEFAULT 0,
+  scope_changed_at TEXT,                         -- R2: when, not just whether
+  scope_seq_at_start INTEGER,                    -- R2: reconstructable baseline
+  scope_seq_final INTEGER,
+  scope_declared INTEGER NOT NULL DEFAULT 0,     -- R2: 1 = Claude ran `est scope`;
+                                                 -- 0 with a hash diff = undeclared drift
+  velocity_raw REAL, velocity_cal REAL, in_band INTEGER,
+  PRIMARY KEY (tid, revision)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER out_ro_u BEFORE UPDATE ON outcome BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER out_ro_d BEFORE DELETE ON outcome BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
+CREATE TABLE refclass (      -- APPEND-ONLY snapshots: the reference-class table the retro
+                             -- writes back into. [FS][INFERRED] required this; R1 had no table.
+  as_of TEXT NOT NULL,       -- retro run timestamp; estimate.refclass_as_of points here
+  bucket TEXT NOT NULL REFERENCES bucket_def(bucket),
+  estimator_family TEXT NOT NULL,        -- '*' = pooled across model families
+  n INTEGER NOT NULL, n_eff REAL NOT NULL,   -- n_eff after half-life decay weighting
+  med_log_v REAL NOT NULL, iqr_log_v REAL NOT NULL,
+  shrink_w REAL NOT NULL, shrink_k REAL NOT NULL, half_life_days REAL NOT NULL,
+  mult_p50 REAL NOT NULL, mult_p90 REAL NOT NULL,
+  boot_lo_p50 REAL, boot_hi_p50 REAL,    -- bootstrap CI: PARAMETER uncertainty, which dominates
+  boot_lo_p90 REAL, boot_hi_p90 REAL,    -- at n~10 and which R1's plug-in argument discarded
+  method TEXT NOT NULL CHECK (method IN ('plugin','bootstrap')),
+  estimand TEXT NOT NULL, params_json TEXT NOT NULL,
+  PRIMARY KEY (as_of, bucket, estimator_family)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER rc_ro_u BEFORE UPDATE ON refclass BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER rc_ro_d BEFORE DELETE ON refclass BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
+CREATE TABLE calib_run (     -- retro provenance: what was tested, what won, what the floor was
+  as_of TEXT PRIMARY KEY,
+  n_outcomes INTEGER NOT NULL, estimand TEXT NOT NULL,
+  pinball_p50 REAL, pinball_p90 REAL, log_score REAL,
+  coverage_p50 REAL, coverage_p90 REAL, cov_lo REAL, cov_hi REAL,   -- Jeffreys interval
+  baseline_pinball REAL,     -- the [FS]-constants baseline the time model must beat (§7.3)
+  active_model_won TEXT,     -- 'baseline_req' | 'fanout_cond'
+  splits_json TEXT NOT NULL, -- candidate bucket splits + their CV pinball deltas
+  notes TEXT
+) STRICT;
+
+CREATE TABLE recon (         -- R2: our number vs an ANTHROPIC-computed number (§7.5)
+  as_of TEXT NOT NULL,
+  source TEXT NOT NULL CHECK (source IN ('otel_cost','cli_json','usage_cmd','sdk_result')),
+  window_start TEXT NOT NULL, window_end TEXT NOT NULL,
+  ours_usd REAL NOT NULL, theirs_usd REAL NOT NULL, delta_pct REAL NOT NULL,
+  note TEXT,
+  PRIMARY KEY (as_of, source)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE sweep_census (  -- R2: dispositions "something prunes even faster" (§5.8)
+  swept_at TEXT PRIMARY KEY,
+  n_files INTEGER NOT NULL, n_bytes INTEGER NOT NULL, n_sessions INTEGER NOT NULL,
+  oldest_mtime TEXT NOT NULL,
+  vanished_total INTEGER NOT NULL DEFAULT 0,
+  vanished_lt_60d INTEGER NOT NULL DEFAULT 0   -- >0 => an UNKNOWN pruner exists; anomaly + alert
+) STRICT;
+
+CREATE TABLE anomaly (              -- loud, queryable failure ledger
+  id INTEGER PRIMARY KEY, ts TEXT NOT NULL,
+  kind TEXT NOT NULL,               -- Deliberately NOT a CHECK list: a new failure mode must be
+                                    -- recordable the moment it is observed, never dropped because
+                                    -- the DDL had not heard of it. The catalogue below is the
+                                    -- documented vocabulary; keep it honest about who writes what.
+                                    --
+                                    -- WRITTEN TODAY by src/prices.ts:
+                                    --   unpriced_model|provisional_price
+                                    -- WRITTEN TODAY by src/discover.ts:
+                                    --   dangling_symlink|spawn_depth_gt1|wf_record_mismatch
+                                    --   |wf_state_unparseable|agent_meta_unparseable
+                                    --   |orphan_agent_transcript
+                                    -- WRITTEN TODAY by src/ingest.ts:
+                                    --   malformed_line|truncated_tail|unusable_usage_line
+                                    --   |sidechain_replay|rid_collision|phase_unmapped
+                                    --   |wf_record_mismatch
+                                    --   |read_error  -- a read that ABORTED: the file's
+                                    --      sweep_state watermark was deliberately withheld
+                                    --   |orphan_turn_duration -- a turn_duration record that
+                                    --      preceded every prompt in its file; the segmenter
+                                    --      cannot attribute it, so it is COUNTED, not dropped
+                                    --   |compaction_continuation -- /compact ends a session and
+                                    --      replays its TAIL into the child's head (undocumented in
+                                    --      R3; found by G-FORK §3.3). `compactionAnomalies`, off
+                                    --      `ingestMainTranscript`; BENIGN in src/cli.ts, because a
+                                    --      /compact boundary is a normal event Phase 1 needs fed.
+                                    -- WRITTEN TODAY by src/cli.ts (sweep-level — these three need
+                                    -- the WHOLE corpus in hand, so no per-file writer can raise them):
+                                    --   corpus_shrink|sweep_budget_exceeded|unpriced_model
+                                    --   |fork_replay     -- cross-session uuid overlap between
+                                    --      DISTINCT files; detail carries shape + shared count.
+                                    --      `detectForkReplays` (D3: one corpus-wide uuid -> file[]
+                                    --      pass, precision/recall 1.00). D1's leading-prefix test is
+                                    --      dead (36% recall) and was never wired.
+                                    --   |symlink_alias   -- one realpath claimed by two sessions;
+                                    --      `planCorpus` picks the link TARGET and logs the loser.
+                                    -- fork_replay and symlink_alias are BENIGN in src/cli.ts too:
+                                    -- both are structural facts of a forked corpus (46 of them on
+                                    -- the live tree), correctly handled by the global request PK.
+                                    -- STILL UNWRITTEN, reserved for later phases:
+                                    --   tid_unplanted|scope_undeclared|recon_mismatch
+                                    --   |gate_override
+  detail TEXT NOT NULL,
+  tid TEXT REFERENCES task(tid)     -- nullable: many anomalies are corpus-wide
+) STRICT;
+
+CREATE TABLE sweep_state (          -- performance only; losing it costs seconds, not correctness
+  path TEXT PRIMARY KEY, inode INTEGER NOT NULL, bytes_read INTEGER NOT NULL,
+  last_swept TEXT NOT NULL
+) STRICT;
+
+CREATE VIRTUAL TABLE task_fts USING fts5(tid UNINDEXED, subject, description);
+
+-- ---------------------------------------------------------------------------
+-- Views — the currency lives here so it can be redefined without migration.
+-- ---------------------------------------------------------------------------
+
+CREATE VIEW v_scope_current AS
+SELECT s.* FROM task_scope s
+WHERE s.seq = (SELECT MAX(seq) FROM task_scope WHERE tid = s.tid);
+
+-- Replays are excluded at the base of the stack, so no downstream sum can forget.
+CREATE VIEW v_request_live AS SELECT * FROM request WHERE attr <> 'replay';
+
+-- Which model_price row prices THIS request. Anthropic's long-context premium is a
+-- per-REQUEST property of the prompt size, not a property of the model id: a
+-- transcript records `claude-sonnet-4-5` whether the call carried 30k or 400k of
+-- context, and the `[1m]` suffix that `src/prices.ts` keys its bracketed families
+-- on never appears in one. So pricing every request at the standard tier silently
+-- undercharged every long-context call — the premium existed in the table (sync()
+-- has always written the `@above_200k` companion rows) and was read by nothing.
+--
+-- The tier is chosen from the counters we actually have: in + cache_write +
+-- cache_read is the prompt the API billed against (out_tok is the completion and
+-- is not part of the context that triggers the tier). Above the threshold, the
+-- companion family is used IF it exists at this request's vintage; otherwise the
+-- base row stands, which is the honest fallback for a family upstream publishes
+-- no >200k rate for.
+--
+-- A family that already carries a bracket suffix (`claude-sonnet-4-5[1m]`) MUST
+-- resolve to itself: sync() bakes the long-context rate INTO that row, so
+-- appending the companion would surcharge a rate that already carries the
+-- premium. `NOT LIKE '%]'` is that guard, and it is load-bearing rather than
+-- decorative — a bracketed family whose base was unpublished used to go down
+-- sync()'s tier-peer fallback, which copied the PEER's `@above_200k` companion
+-- under the bracketed name. History is append-only, so a later sync that
+-- published the real rate could not supersede that companion, and the view
+-- silently priced every >200k call at the stale guess (3x, and provisional=1,
+-- which keeps the whole task out of v_velocity forever). Both sides are fixed:
+-- sync() no longer writes a companion for a bracketed family, and the view no
+-- longer looks for one.
+--
+-- THE LITERALS BELOW ARE A CONTRACT with src/prices.ts: 200000 is
+-- LONG_CONTEXT_THRESHOLD and '@above_200k' is ABOVE_200K_SUFFIX, which is the
+-- string sync() actually writes the companion family under; `'%]'` is the shape
+-- `priceFamily()` gives a family with a context suffix. SQL cannot import them,
+-- so test/schema.test.ts asserts the two sides still agree.
+CREATE VIEW v_request_tiered AS
+SELECT r.*,
+  CASE WHEN (r.in_tok + r.cw_tok + r.cr_tok) > 200000
+        AND r.model_family NOT LIKE '%]'
+        AND EXISTS (SELECT 1 FROM model_price hi
+                     WHERE hi.family = r.model_family || '@above_200k'
+                       AND hi.effective_from <= r.ts)
+       THEN r.model_family || '@above_200k'
+       ELSE r.model_family END AS price_family
+FROM v_request_live r;
+
+-- INNER JOIN: an unpriced model can never silently zero a task (the LEFT-JOIN flaw is dead).
+-- Unpriced requests fall out here and are COUNTED by v_unpriced; they no longer block anything.
+CREATE VIEW v_priced AS
+SELECT r.*, p.usd_in, p.usd_out, p.usd_cw, p.usd_cr, p.provisional
+FROM v_request_tiered r
+JOIN model_price p ON p.family = r.price_family
+ AND p.effective_from = (SELECT MAX(effective_from) FROM model_price
+                         WHERE family = r.price_family AND effective_from <= r.ts);
+
+CREATE VIEW v_unpriced AS           -- sweep logs an anomaly and offers `est prices --sync`;
+SELECT * FROM v_request_live        -- finalization PROCEEDS, recording outcome.unpriced_share.
+WHERE model_family NOT IN (SELECT DISTINCT family FROM model_price);
+
+-- Self-consistent vintage: each request priced at ITS OWN ts (and its OWN context
+-- tier, via v_priced), ref-model normaliser at the SAME ts. The normaliser is
+-- deliberately the ref model's STANDARD-tier output price: it defines the unit
+-- (one ref-model output token), and a unit that moved with the prompt size of the
+-- request being measured would not be a unit at all.
+CREATE VIEW v_wcet AS
+SELECT v.*,
+  CAST((v.out_tok*v.usd_out + v.cw_tok*v.usd_cw) / v.ref_out AS INTEGER) AS wcet,
+  CAST((v.in_tok*v.usd_in + v.out_tok*v.usd_out
+        + v.cw_tok*v.usd_cw + v.cr_tok*v.usd_cr) / v.ref_out AS INTEGER) AS scet
+FROM (SELECT p.*,
+        (SELECT usd_out FROM model_price
+          WHERE family = (SELECT v FROM config WHERE k='ref_model')
+            AND effective_from <= p.ts
+          ORDER BY effective_from DESC LIMIT 1) AS ref_out
+      FROM v_priced p) v;
+
+-- The Spend-CET-style total: 'auxiliary' IS included in `wcet`/`scet` here, because
+-- this view answers "what did this task cost" and auxiliary calls are real money.
+-- Calibration must NOT read `wcet`; it reads wcet_task_effort (main+sub, §4.6) or
+-- v_task_actual_epoch, both of which exclude auxiliary by construction.
+CREATE VIEW v_task_actual AS
+SELECT tid,
+  SUM(CASE WHEN attr <> 'overhead' THEN wcet ELSE 0 END) AS wcet,
+  SUM(CASE WHEN attr <> 'overhead' AND origin IN ('main','subagent')
+           THEN wcet ELSE 0 END) AS wcet_task_effort,
+  SUM(CASE WHEN attr =  'overhead' THEN wcet ELSE 0 END) AS overhead_wcet,
+  SUM(scet) AS scet,
+  -- R2: the orchestrator/sub-agent/auxiliary split, exposed where it is actually readable
+  SUM(CASE WHEN origin='main'      AND attr<>'overhead' THEN wcet ELSE 0 END) AS wcet_main,
+  SUM(CASE WHEN origin='subagent'  AND attr<>'overhead' THEN wcet ELSE 0 END) AS wcet_sub,
+  SUM(CASE WHEN origin='auxiliary' AND attr<>'overhead' THEN wcet ELSE 0 END) AS wcet_aux,
+  SUM(CASE WHEN origin='main'      THEN 1 ELSE 0 END) AS n_req_main,
+  SUM(CASE WHEN origin='subagent'  THEN 1 ELSE 0 END) AS n_req_sub,
+  SUM(CASE WHEN origin='auxiliary' THEN 1 ELSE 0 END) AS n_req_aux,
+  SUM(in_tok) in_tok, SUM(out_tok) out_tok, SUM(cw_tok) cw_tok, SUM(cr_tok) cr_tok,
+  COUNT(*) n_req, COUNT(DISTINCT agent_id) n_agents,
+  MIN(ts) first_ts, MAX(ts) last_ts
+FROM v_wcet WHERE tid IS NOT NULL GROUP BY tid;
+
+-- R2: per-workflow-STEP rollup (REQ-3). phase_conf travels with the number so a caller can
+-- never mistake an inferred mapping for an exact one.
+CREATE VIEW v_phase_actual AS
+SELECT a.run_id, a.wf_launch_id, a.phase_idx, p.title, p.model AS planned_model,
+       a.tid, COUNT(DISTINCT a.agent_id) AS n_agents,
+       -- WORST-WINS. The three labels happen to sort 'exact' < 'inferred' < 'unmapped'
+       -- lexically, so MAX() is the CONSERVATIVE aggregate and MIN() was the
+       -- optimistic one: a phase whose agents were half exactly mapped and half
+       -- interval-clustered reported 'exact' and a caller had no way to tell.
+       -- A phase is only as trustworthy as its least-trustworthy agent.
+       MAX(a.phase_conf) AS phase_conf,
+       SUM(w.wcet) AS wcet, COUNT(w.request_id) AS n_req,
+       MIN(a.started_at) AS phase_started_at, MAX(a.ended_at) AS phase_ended_at
+FROM agent_run a
+LEFT JOIN workflow_phase p
+  ON p.run_id=a.run_id AND p.wf_launch_id=a.wf_launch_id AND p.phase_idx=a.phase_idx
+LEFT JOIN v_wcet w ON w.agent_id = a.agent_id
+WHERE a.run_id IS NOT NULL
+GROUP BY a.run_id, a.wf_launch_id, a.phase_idx;
+
+-- R3: block estimate vs block actual — the evidence for "smaller items estimate better" (§3.2, §7.4).
+CREATE VIEW v_block_accuracy AS
+SELECT b.eid, e.tid, b.phase_idx, b.title, b.p50_wcet, b.p90_wcet, b.exp_agents,
+       pa.wcet AS actual_wcet, pa.n_agents, pa.phase_conf
+FROM estimate_block b
+JOIN estimate e     ON e.eid = b.eid
+JOIN workflow_run r ON r.tid = e.tid
+LEFT JOIN v_phase_actual pa
+       ON pa.run_id = r.run_id AND pa.wf_launch_id = r.wf_launch_id
+      AND pa.phase_idx = b.phase_idx;
+
+-- R2: price_epoch ENFORCED. Every counter repriced at the vintage the estimate was issued under,
+-- normaliser included. This is the ONLY actual the velocity corpus is allowed to consume.
+--
+-- ORIGIN FILTER (§4.6). This view feeds CALIBRATION, and calibration measures TASK
+-- EFFORT: what the orchestrator and its sub-agents spent doing the work Craig
+-- asked for. 'auxiliary' is OTEL's third query_source — title generation, quota
+-- checks, background cheap-model calls — real money, but money the harness spends
+-- on its own behalf, uncorrelated with task size and unpredictable at `est open`.
+-- Folding it in would inflate every actual by a per-session constant and teach the
+-- multipliers a bias that no estimate could ever have anticipated. Auxiliary spend
+-- is NOT hidden: v_task_actual keeps wcet_aux / n_req_aux and SUM(scet), which are
+-- the Spend-CET totals reconciliation and cost reporting read.
+--
+-- The normaliser row is resolved via the ref_model IN FORCE NOW. Once `estimate`
+-- rows exist, prefer e.ref_model / e.estimand — the unit snapshotted at issue
+-- time — so a later `est config set ref_model` cannot restate historical actuals.
+CREATE VIEW v_task_actual_epoch AS
+SELECT r.tid,
+  SUM(CAST((r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw) / rf.usd_out AS INTEGER)) AS wcet_at_epoch,
+  e.price_epoch, e.eid AS eid_at_start
+FROM v_request_live r
+JOIN estimate e ON e.eid = (SELECT MIN(eid) FROM estimate WHERE tid = r.tid)
+-- Same per-request context tier as v_priced, but resolved AT THE EPOCH rather than
+-- at the request's own ts: reusing v_request_tiered here would pick a companion
+-- family that may not exist at price_epoch, and this INNER JOIN would then drop the
+-- request silently instead of pricing it. The `NOT LIKE '%]'` guard is the same
+-- one v_request_tiered carries and for the same reason: a bracketed family's own
+-- row already carries the long-context rate.
+JOIN model_price pe
+  ON pe.family = CASE WHEN (r.in_tok + r.cw_tok + r.cr_tok) > 200000
+                       AND r.model_family NOT LIKE '%]'
+                       AND EXISTS (SELECT 1 FROM model_price hi
+                                    WHERE hi.family = r.model_family || '@above_200k'
+                                      AND hi.effective_from <= e.price_epoch)
+                      THEN r.model_family || '@above_200k'
+                      ELSE r.model_family END
+ AND pe.effective_from = (SELECT MAX(effective_from) FROM model_price
+                          WHERE family = pe.family AND effective_from <= e.price_epoch)
+JOIN model_price rf ON rf.family = (SELECT v FROM config WHERE k='ref_model')
+ AND rf.effective_from = (SELECT MAX(effective_from) FROM model_price
+                          WHERE family = rf.family AND effective_from <= e.price_epoch)
+WHERE r.tid IS NOT NULL AND r.attr <> 'overhead'
+  AND r.origin IN ('main','subagent')   -- task effort only; 'auxiliary' excluded (§4.6)
+GROUP BY r.tid;
+
+CREATE VIEW v_outcome_current AS
+SELECT o.* FROM outcome o
+WHERE o.revision = (SELECT MAX(revision) FROM outcome WHERE tid = o.tid);
+
+CREATE VIEW v_missed_estimate AS    -- the T1/T2 backstop; T3/T4 are NOT representable here (§3.3)
+SELECT t.session_id, t.prompt_id, t.started_at,
+       SUM(CASE WHEN a.run_id IS NOT NULL THEN 1 ELSE 0 END) AS n_workflows,
+       COUNT(DISTINCT a.agent_id) AS n_agents
+FROM turn t JOIN agent_run a ON a.launch_prompt_id = t.prompt_id AND a.session_id = t.session_id
+WHERE t.tid IS NULL
+GROUP BY t.session_id, t.prompt_id
+HAVING n_workflows >= 1 OR n_agents >= 2;
+
+-- The calibration corpus. TWO comparability rules travel with every row, because
+-- both were silently violable before:
+--
+--   1. LIKE UNITS. e.ref_model / e.estimand name the unit the band was issued in
+--      (§4.1). `est config set ref_model` / `set estimand` are one-line changes
+--      that redenominate everything issued afterwards, and a velocity ratio built
+--      from two different denominations is a category error, not an outlier. Every
+--      consumer MUST filter or GROUP BY (ref_model, estimand) — the columns are
+--      projected here so there is no excuse for pooling across them.
+--   2. TASK EFFORT ONLY. wcet_task_effort = main + sub. 'auxiliary' spend (title
+--      generation, quota checks, background cheap-model calls) is harness
+--      overhead: real money, no relationship to task size, unknowable at `est
+--      open`. It stays visible as wcet_aux for Spend-CET reporting and is kept out
+--      of the ratio the multipliers are fitted to (§4.6).
+CREATE VIEW v_velocity AS
+SELECT e.bucket, e.estimator_model, e.price_epoch, e.refclass_as_of,
+       e.ref_model, e.estimand,                          -- the UNIT; never pool across these
+       o.velocity_raw, o.velocity_cal, o.finalized_at,
+       o.wcet_main, o.wcet_sub, o.wcet_aux,
+       o.wcet_main + o.wcet_sub AS wcet_task_effort,     -- calibrate on THIS, not on the total
+       e.exp_agents, o.n_agents
+FROM v_outcome_current o
+JOIN estimate e ON e.eid = o.eid_at_start
+WHERE o.scope_changed = 0 AND o.censored = 0 AND o.final_status = 'completed'
+  AND o.unpriced_share = 0 AND o.price_provisional = 0   -- R2: unpriced degrades the ROW
+  AND o.actual_wcet_at_epoch IS NOT NULL;                -- R2: epoch-consistent actuals only
+
+-- ---------------------------------------------------------------------------
+-- Seeds. Idempotent: re-running this file over an initialised DB adds nothing.
+-- Every calibration constant is a CONVENTION, not a measurement (§1.1) — the
+-- retro tunes these rows by cross-validation once n >= 20.
+-- ---------------------------------------------------------------------------
+
+INSERT OR IGNORE INTO config (k, v) VALUES
+  ('schema_version',          '4'),
+  -- Work-CET = price-weighted (output + cache_creation), normalised by the
+  -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
+  -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.
+  ('estimand',                'work_cet'),
+  -- PLACEHOLDER: the design does not pin the normaliser family. `est prices --sync`
+  -- must produce a model_price row for whatever family this names, or v_wcet yields
+  -- NULL wcet. Change with `est config set ref_model <family>`.
+  ('ref_model',               'claude-sonnet-4-5'),
+  ('quiesce_main_min',        '60'),
+  ('shrink_k',                '10'),
+  ('velocity_half_life_days', '30'),
+  ('split_min_pinball_gain',  '0.02'),
+  ('boot_resamples',          '200'),
+  ('coverage_prior',          'jeffreys');
+
+INSERT OR IGNORE INTO bucket_def (bucket, created_at, dims_json, parent_bucket, split_pinball_gain, active)
+VALUES ('global', strftime('%Y-%m-%dT%H:%M:%SZ','now'), '{}', NULL, NULL, 1);

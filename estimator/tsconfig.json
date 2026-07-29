@@ -1,0 +1,37 @@
+{
+  // Typecheck-only config: bun runs the TypeScript directly, so nothing here ever emits.
+  // `bun run typecheck` is the only consumer. Runtime dependencies stay at zero — the two
+  // packages this needs (`typescript`, `@types/bun`) are devDependencies, pinned by the
+  // committed bun.lock and materialised by `bun install`; see README ("Typechecking").
+  "compilerOptions": {
+    "target": "ESNext",
+    "lib": ["ESNext"],
+    "module": "Preserve",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+
+    // `@types/bun` is the ONLY ambient type package, and naming it explicitly is not
+    // optional: without it `bun:sqlite`/`bun:test`, `Bun.*`, `import.meta.dir`, `console`
+    // and every `process.*` fail to resolve and the run drowns in ~200 phantom errors that
+    // bury the real ones. It also transitively supplies the node types the `node:*` imports
+    // need, so there is deliberately no second entry here.
+    "types": ["bun"],
+
+    // Strict, plus the checks that catch the mistakes this codebase is actually exposed to:
+    // untagged switch fall-through in the ingest classifiers and silently-dead locals after
+    // a refactor. `noUncheckedIndexedAccess` is deliberately ON — every hot path here indexes
+    // into arrays parsed out of a corpus that is allowed to be malformed.
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noPropertyAccessFromIndexSignature": false,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true
+  },
+  "include": ["src", "test", "scripts", "gates"]
+}

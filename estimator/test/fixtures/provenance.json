@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "Provenance for the price fixtures in this directory (design R3 §4.3).",
+    "Read by nothing at runtime; it exists so a stale fixture is identifiable.",
+    "The filename prefixes matter: src/prices.ts picks the newest file starting",
+    "with 'litellm-snapshot' / 'modelsdev-snapshot'. This file matches neither."
+  ],
+  "litellm-snapshot.json": {
+    "url": "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json",
+    "fetched_at": "2026-07-28",
+    "git_blob_sha": "db28118d52bef4842af044b7033998b6e825954a",
+    "upstream_bytes": 1669466,
+    "upstream_keys": 2984,
+    "subset": "top-level keys matching /^claude/ (the 24 litellm_provider='anthropic' ids plus claude-sonnet-4-5-20250929-v1:0)",
+    "kept_fields": [
+      "litellm_provider",
+      "mode",
+      "max_input_tokens",
+      "max_output_tokens",
+      "input_cost_per_token",
+      "output_cost_per_token",
+      "cache_creation_input_token_cost",
+      "cache_read_input_token_cost",
+      "cache_creation_input_token_cost_above_1hr",
+      "input_cost_per_token_above_200k_tokens",
+      "output_cost_per_token_above_200k_tokens",
+      "cache_creation_input_token_cost_above_200k_tokens",
+      "cache_read_input_token_cost_above_200k_tokens"
+    ],
+    "fidelity": "EXACT. Fetched as raw bytes via the GitHub blob API (api.github.com is inside the bash sandbox allowlist), then subset with jq. Costs are verbatim upstream values, per TOKEN.",
+    "note": "A WebFetch of the same URL was also performed and returned a model-summarised digest that OMITTED claude-sonnet-4-5, claude-opus-4-5, claude-opus-4-1 and claude-haiku-4-5 and reported litellm_provider='bedrock' for anthropic-provider ids. That digest was discarded in favour of these raw bytes."
+  },
+  "modelsdev-snapshot.json": {
+    "url": "https://models.dev/api.json",
+    "fetched_at": "2026-07-28",
+    "subset": "providers.anthropic.models — id, cost, limit only",
+    "fidelity": "SUMMARISED. models.dev is outside the bash sandbox allowlist, so this was retrieved through the WebFetch tool, whose reader is a small model. Treat the model list as possibly incomplete; the four rates per model were spot-checked against litellm-snapshot.json and agree. Costs are per MILLION tokens (models.dev's own unit), unlike LiteLLM's per-token.",
+    "role": "SECONDARY source only (§4.3): consulted for families LiteLLM does not carry."
+  }
+}

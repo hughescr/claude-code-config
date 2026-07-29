@@ -51,6 +51,24 @@ Add this alias to your shell configuration:
 alias claude="claude --mcp-config ~/.claude/mcp.json"
 ```
 
+## estimator/
+
+`estimator/` is a self-contained TypeScript-on-bun tool (zero npm dependencies) that turns Claude
+Code's own transcripts into token-based **actuals** — API requests, turns, agent runs, workflow
+runs and phases, task lifecycle events — in a local sqlite database, and will grow into estimate
+bands, live burn tracking and calibration on top of them. Phase 0 (the collector) is built; the
+`est` verbs that record and score estimates are Phase 1.
+
+**Its source is committed here; its data never is.** The database and its WAL sidecars, the OTLP
+spool, the weekly backups, the sweep lock, and everything corpus-derived — the gate probes' raw
+dumps AND their `gates/*.md` reports, the specification (`estimator/DESIGN.md`) and the decision
+log (`estimator/DECISIONS.md`) — are all gitignored and stay on this machine: they quote private
+prompts and real usage data, and this repo is public.
+
+Nothing in it runs on a schedule or on a hook unless deliberately installed: the launchd job and
+the `SessionEnd` sweep ship inert, with their install steps in their own headers. See
+`estimator/README.md` for commands and where the local-only spec and decision log live.
+
 ## Submodule Management
 
 Some plugins are git submodules pointing to external repositories. See CLAUDE.md for update commands:
@@ -69,3 +87,4 @@ git submodule update --remote
 - `settings.json` - Permissions, hooks, model preferences, enabled marketplace plugins
 - `plugins/` - Plugin directory with agents, skills, hooks, and commands
 - `hooks/` - Global hook scripts
+- `estimator/` - Token-based estimation and tracking CLI (source committed, data gitignored)

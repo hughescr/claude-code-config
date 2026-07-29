@@ -1,0 +1,63 @@
+{
+  "runId": "wf_demo0001-abc",
+  "taskId": "wl_launch1",
+  "timestamp": "2026-07-28T10:04:10.000Z",
+  "workflowName": "demo-flow",
+  "transcriptDir": "subagents/workflows/wf_demo0001-abc",
+  "scriptPath": "workflows/scripts/demo.js",
+  "defaultModel": "claude-sonnet-5",
+  "phases": [
+    { "title": "Research", "detail": "one investigator" },
+    { "title": "Synthesize", "detail": "merge the findings" }
+  ],
+  "workflowProgress": [
+    { "type": "workflow_phase", "index": 1, "title": "Research" },
+    { "type": "workflow_phase", "index": 2, "title": "Synthesize" },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "research:one",
+      "phaseIndex": 1,
+      "phaseTitle": "Research",
+      "agentId": "a1111111111111111",
+      "agentType": "claude-code-guide",
+      "model": "claude-sonnet-5",
+      "state": "done",
+      "queuedAt": 1785232815000,
+      "startedAt": 1785232820000,
+      "attempt": 1,
+      "tokens": 26850,
+      "toolCalls": 4,
+      "durationMs": 100000,
+      "promptPreview": "investigate",
+      "resultPreview": "found things"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "synth:two",
+      "phaseIndex": 2,
+      "phaseTitle": "Synthesize",
+      "agentId": "a2222222222222222",
+      "agentType": "general-purpose",
+      "model": "claude-opus-5[1m]",
+      "state": "running",
+      "queuedAt": 1785232920000,
+      "startedAt": 1785232925000,
+      "attempt": 2,
+      "tokens": 12100,
+      "toolCalls": 2,
+      "durationMs": 120000,
+      "promptPreview": "synthesize",
+      "resultPreview": ""
+    }
+  ],
+  "agentCount": 99,
+  "status": "killed",
+  "totalTokens": 12345,
+  "totalToolCalls": 7,
+  "durationMs": 999,
+  "result": "BANNED — a run-level aggregate, measured 5.2x low on a live run",
+  "summary": "BANNED — never read",
+  "logs": ["BANNED — never read"]
+}
