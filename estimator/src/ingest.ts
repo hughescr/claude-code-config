@@ -206,6 +206,40 @@ export interface IngestAnomaly {
     // Phase 1, raised by src/spool.ts when the sweep drains the hook spool: a
     // matched `Task`/`Workflow` launch that no open estimate was bound to.
     | "missed_estimate"
+    // Phase 2 (P2.3/P2.4/P2.6), raised by src/otel.ts and src/recon.ts. Same reason
+    // the sweep-level kinds are named above: the ledger's vocabulary is open, the
+    // writer's parameter type is not, and casting them in one by one would just move
+    // the vocabulary out of the type.
+    | "otel_unjoined"
+    | "otel_counter_mismatch"
+    | "otel_prompt_mismatch"
+    | "otel_reject"
+    | "otel_receiver_down"
+    | "recon_mismatch"
+    // P2.5, raised by src/eta.ts when a re-cut RESTATES or REMOVES a terminal
+    // `run_segment` row. A closed segment is a corpus observation, so the fitting
+    // population moving is a fact the ledger has to carry — the alternative, freezing
+    // the row, left the table holding a stale partition and its successor at once.
+    | "segment_recut"
+    // P2.8, raised by src/promote.ts when a later sweep discovers an EARLIER
+    // attributed request than the one `started_at` already recorded (a fork/alias
+    // resolving after the fact). Reported, never suppressed: §5.4's monotone-earliest
+    // rule means this can fire long after a task looks finished.
+    | "promotion_backdated"
+    // P2.9, raised by src/jobs.ts: a `~/.claude/jobs/<id>` directory whose
+    // `sessionId`/`resumeSessionId` matches zero, or more than one, task_alias-bound
+    // tid. The reconcile never invents a binding, so this is the counted complement
+    // rather than a guess (§P2.9's "no match -> anomaly, no row").
+    | "job_unjoined"
+    // P2.7, raised by src/board-render.ts. Never alerting and never counted against
+    // `--strict` (BENIGN_ANOMALY_KINDS, src/cli.ts) — the board is a convenience and
+    // the sweep is the system; a bad render leaves the previous file intact.
+    | "board_render_failed"
+    // P2.12, raised by src/audit.ts: `est audit --fix` deleted one untraceable row from
+    // a derived/ledger table, and `detail` carries that row verbatim as JSON. Recorded
+    // because a cleanup that leaves no trace is the same class of thing as the rows it
+    // removes — the ledger has to be able to answer "what did the audit take?".
+    | "audit_removed"
     // Discovery-level, passed through unchanged by {@link toIngestAnomalies}.
     | AnomalyKind;
   detail: string;

@@ -76,6 +76,13 @@ const DRAINING_SUFFIX = ".draining";
  */
 export const MICROSWEEP_MARKER = ".microsweep";
 export const OVERRUN_MARKER_PREFIX = ".overrun-notified.";
+/**
+ * P2.7's board-regeneration throttle marker, declared here for the reason stated
+ * above: `pruneMarkers` has to recognise every name written into this directory, and a
+ * marker the pruner does not know is a file nothing ever reaps. `src/board-render.ts`
+ * writes and stats it; it re-exports this constant rather than declaring a second one.
+ */
+export const BOARD_MARKER = ".board";
 
 /** Filesystem-safe form of an id used inside a marker filename. */
 export function sanitizeForFilename(id: string): string {
@@ -413,6 +420,13 @@ export const MICROSWEEP_MARKER_TTL_MS = 60 * 60 * 1000;
  * deleting a live one re-arms a nudge Craig has already been shown.
  */
 export const OVERRUN_MARKER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/**
+ * The `.board` throttle marker is re-stamped by every regeneration, so one older than
+ * this belongs to a board nobody has rendered in a day — the estimator is not running,
+ * or the board was turned off. Reaping it costs exactly one un-throttled render on the
+ * next sweep, which is the cheapest possible way to be wrong.
+ */
+export const BOARD_MARKER_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Delete stale hook marker files. Called from `drainSpool`, so it runs on every sweep
@@ -436,6 +450,11 @@ export function pruneMarkers(dir: string = SPOOL_DIR, now: Date = new Date()): n
       ttl = MICROSWEEP_MARKER_TTL_MS; // `.microsweep.<sid>` = a pre-global-throttle leftover
     } else if (name.startsWith(OVERRUN_MARKER_PREFIX)) {
       ttl = OVERRUN_MARKER_TTL_MS;
+    } else if (name === BOARD_MARKER || name.startsWith(`${BOARD_MARKER}.tmp.`)) {
+      // P2.7 requires the pruner to learn this name "so it cannot leak". The `.tmp.`
+      // form is `writeAtomic`'s staging file for the marker itself, left behind only by
+      // a crash between the write and the rename.
+      ttl = BOARD_MARKER_TTL_MS;
     } else {
       continue;
     }

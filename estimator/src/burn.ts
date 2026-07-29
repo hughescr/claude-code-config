@@ -21,8 +21,17 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { getConfig, openDb } from "./db.ts";
+import { getConfig, openDb, unvalidatedRetired } from "./db.ts";
 import { isoNow, TERMINAL_TASK_STATUS } from "./tasks.ts";
+import {
+  buildEtaFit,
+  forecastSession,
+  formatEta,
+  type CheckBack,
+  type CheckBackSeconds,
+  type EtaFit,
+  type EtaModel,
+} from "./eta.ts";
 
 /** Default rolling window for the burn rate, minutes (ccusage's `blocks.rs`, 5 h). */
 export const DEFAULT_BURN_WINDOW_MIN = 300;
@@ -277,16 +286,95 @@ export function activeSeconds(db: Database, tid: string): number {
 }
 
 // ---------------------------------------------------------------------------
+// the compute clock (§7.3 clock 1) and the session the forecast belongs to
+// ---------------------------------------------------------------------------
+
+export interface ComputeClock {
+  /** `SUM(duration_ms)/1000` over the task's attributed requests. */
+  s: number;
+  /**
+   * Share of those requests that actually CARRY a duration.
+   *
+   * A compute figure without its coverage is a number whose denominator moved: the
+   * column is NULL on every request until OTEL fills it (P2.4), so an uncaveated sum
+   * over a 12%-covered corpus reads as "this task used 90 seconds of compute" when
+   * what it means is "the eighth of it we can see did".
+   */
+  coverage_pct: number;
+}
+
+export function computeClock(db: Database, tid: string): ComputeClock {
+  const row = db
+    .query<{ n: number; n_dur: number; tot_ms: number }, [string]>(
+      `SELECT COUNT(*) AS n,
+              SUM(CASE WHEN duration_ms IS NOT NULL THEN 1 ELSE 0 END) AS n_dur,
+              COALESCE(SUM(duration_ms), 0) AS tot_ms
+         FROM v_request_live WHERE tid = ?`,
+    )
+    .get(tid);
+  const n = row?.n ?? 0;
+  return {
+    s: Math.round((row?.tot_ms ?? 0) / 1000),
+    coverage_pct: n > 0 ? round1(((row?.n_dur ?? 0) / n) * 100) : 0,
+  };
+}
+
+/**
+ * Which SESSION the check-back forecast for this task is about.
+ *
+ * `burn_cache` is keyed by tid and the forecast is session-scoped (P2.1), so the two
+ * have to be joined somewhere. The rule: among the sessions bound to the task, prefer
+ * the most recently bound one that HAS an open segment; fall back to the most recently
+ * bound. In practice the statusline resolved this very tid FROM its own session, so
+ * the two coincide; the preference is what keeps a task bound to several sessions from
+ * reporting the ETA of a session that stopped hours ago.
+ */
+export function forecastSessionForTask(db: Database, tid: string): string | null {
+  const bound = db
+    .query<{ session_id: string }, [string]>(
+      "SELECT session_id FROM task_alias WHERE tid = ? ORDER BY first_seen DESC, session_id DESC",
+    )
+    .all(tid)
+    .map((r) => r.session_id);
+  if (bound.length === 0) return null;
+  for (const sid of bound) {
+    const open = db
+      .query<{ n: number }, [string]>(
+        "SELECT COUNT(*) AS n FROM run_segment WHERE session_id = ? AND terminator = 'open'",
+      )
+      .get(sid);
+    if ((open?.n ?? 0) > 0) return sid;
+  }
+  return bound[0]!;
+}
+
+/** The check-back forecast for a task, via its session. `null` is a valid answer. */
+export function checkBackForTask(
+  db: Database,
+  tid: string,
+  fit: EtaFit,
+  now: Date,
+): CheckBackSeconds | null {
+  const session = forecastSessionForTask(db, tid);
+  if (session === null) return null;
+  return forecastSession(db, session, fit, now);
+}
+
+// ---------------------------------------------------------------------------
 // the cache
 // ---------------------------------------------------------------------------
 
 const UPSERT_BURN_SQL = `
 INSERT INTO burn_cache (tid, as_of, consumed_wcet, wcet_main, wcet_sub, wcet_aux, usd, n_req,
                         n_agents_live, n_agents_total, n_provisional, n_unpriced,
-                        active_s, burn_wcet_per_min, proj_total_wcet)
+                        active_s, burn_wcet_per_min, proj_total_wcet,
+                        seg_started_at, seg_elapsed_s, check_back_p50_s, check_back_p90_s,
+                        eta_model, eta_probation, eta_n_seg, compute_s, compute_coverage_pct)
 VALUES ($tid, $as_of, $consumed_wcet, $wcet_main, $wcet_sub, $wcet_aux, $usd, $n_req,
         $n_agents_live, $n_agents_total, $n_provisional, $n_unpriced,
-        $active_s, $burn_wcet_per_min, $proj_total_wcet)
+        $active_s, $burn_wcet_per_min, $proj_total_wcet,
+        $seg_started_at, $seg_elapsed_s, $check_back_p50_s, $check_back_p90_s,
+        $eta_model, $eta_probation, $eta_n_seg, $compute_s, $compute_coverage_pct)
 ON CONFLICT(tid) DO UPDATE SET
   as_of = excluded.as_of, consumed_wcet = excluded.consumed_wcet,
   wcet_main = excluded.wcet_main, wcet_sub = excluded.wcet_sub, wcet_aux = excluded.wcet_aux,
@@ -294,7 +382,12 @@ ON CONFLICT(tid) DO UPDATE SET
   n_agents_total = excluded.n_agents_total, n_provisional = excluded.n_provisional,
   n_unpriced = excluded.n_unpriced,
   active_s = excluded.active_s, burn_wcet_per_min = excluded.burn_wcet_per_min,
-  proj_total_wcet = excluded.proj_total_wcet
+  proj_total_wcet = excluded.proj_total_wcet,
+  seg_started_at = excluded.seg_started_at, seg_elapsed_s = excluded.seg_elapsed_s,
+  check_back_p50_s = excluded.check_back_p50_s, check_back_p90_s = excluded.check_back_p90_s,
+  eta_model = excluded.eta_model, eta_probation = excluded.eta_probation,
+  eta_n_seg = excluded.eta_n_seg,
+  compute_s = excluded.compute_s, compute_coverage_pct = excluded.compute_coverage_pct
 `;
 
 /**
@@ -318,9 +411,16 @@ export function refreshBurnCache(db: Database, now: Date = new Date()): number {
     .all();
   const keep = new Set(open.map((r) => r.tid));
 
+  // ONE fit for the whole sweep. The KM curve is a property of the corpus, not of a
+  // task, and refitting it per open task would be the unbounded per-render work the
+  // cache exists to abolish, merely moved into the writer.
+  const fit = buildEtaFit(db);
+
   const stmt = db.prepare(UPSERT_BURN_SQL);
   for (const { tid } of open) {
     const agg = aggregateBurn(db, tid, now);
+    const cb = checkBackForTask(db, tid, fit, now);
+    const compute = computeClock(db, tid);
     stmt.run({
       $tid: tid,
       $as_of: asOf,
@@ -337,6 +437,19 @@ export function refreshBurnCache(db: Database, now: Date = new Date()): number {
       $active_s: agg.active_s,
       $burn_wcet_per_min: agg.burn_wcet_per_min,
       $proj_total_wcet: agg.proj_total_wcet,
+      $seg_started_at: cb?.seg_started_at ?? null,
+      $seg_elapsed_s: cb?.seg_elapsed_s ?? null,
+      $check_back_p50_s: cb?.p50_s ?? null,
+      $check_back_p90_s: cb?.p90_s ?? null,
+      $eta_model: cb?.eta_model ?? null,
+      $eta_probation: cb === null ? null : cb.probation ? 1 : 0,
+      // P1.9 again: `n_seg` is the LAST field of the payload that was still an
+      // aggregate at render time (`COUNT(*) FROM run_segment`, an unindexed scan on
+      // `gap_min`). `checkBackForTask` already has the number in hand here, so the
+      // write pays for it once per sweep instead of once per statusline refresh.
+      $eta_n_seg: cb?.n_seg ?? null,
+      $compute_s: compute.s,
+      $compute_coverage_pct: compute.coverage_pct,
     } as never);
   }
   const stale = db.query<{ tid: string }, []>("SELECT tid FROM burn_cache").all();
@@ -406,7 +519,38 @@ export interface BurnActive {
     price_epoch: string;
     refclass_as_of: string | null;
   };
-  unvalidated: true;
+  /**
+   * False iff `config.unvalidated_retired_at` is present — and `est recon --certify`
+   * is its only writer (P2.6). It stays TRUE by default and for as long as
+   * reconciliation has not run: the number is ours and unchecked against any
+   * Anthropic-computed total, and the statusline must say so.
+   *
+   * This is a boolean rather than the literal `true` it was in P1.9, which is an
+   * ADDITIVE change under P2.0's rule — no field removed, no field retyped from the
+   * consumer's point of view (`scripts/statusline-burn.ts` already reads it as a
+   * truthy test) — so `"schema"` stays 1.
+   */
+  unvalidated: boolean;
+  /**
+   * The check-back forecast (P2.1) — Claude-ACTIVE minutes to the next human-input
+   * boundary. **Session-scoped**, which is why it sits in its own object rather than
+   * inside `wcet` or `time`: every other number in this payload is about the task.
+   *
+   * `null`, with the field still present, in exactly these cases: the resolved session
+   * has no open segment, or fewer than `config.eta_min_fit` closed segments exist to
+   * fit. A `null` here is a well-formed answer at exit 0, on the same rule as every
+   * other empty result.
+   *
+   * ADDITIVE under P2.0's rule — no field removed, none retyped — so `"schema"` stays
+   * `1` and a tolerant consumer (the statusline) needs no re-verification.
+   */
+  check_back: CheckBack | null;
+  /**
+   * §7.3 clock 1. `s` is `SUM(request.duration_ms)/1000` over the task's attributed
+   * requests and `coverage_pct` is the share that carry one — see {@link ComputeClock}
+   * for why the second number is not optional.
+   */
+  compute: ComputeClock;
   warn: BurnWarn[];
 }
 
@@ -505,6 +649,26 @@ export function currentBand(db: Database, tid: string): BandRow | null {
   );
 }
 
+/**
+ * Drop the seconds-precision fields before the object reaches the payload.
+ *
+ * They exist for the `burn_cache` columns and nowhere else: a seconds-precision ETA
+ * from a model whose p90 is 30× its p50 is theatre, and the surest way for one to end
+ * up on screen is for the JSON contract to carry it "just in case".
+ */
+function stripSeconds(cb: CheckBackSeconds): CheckBack {
+  return {
+    p50_min: cb.p50_min,
+    p90_min: cb.p90_min,
+    seg_started_at: cb.seg_started_at,
+    seg_elapsed_min: cb.seg_elapsed_min,
+    eta_model: cb.eta_model,
+    n_seg: cb.n_seg,
+    probation: cb.probation,
+    basis: cb.basis,
+  };
+}
+
 export interface BurnJsonOptions {
   tid?: string | null;
   session?: string | null;
@@ -551,9 +715,17 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
   let perMin: number;
   let projTotal: number;
   let cacheAsOf: string;
+  let checkBack: CheckBack | null;
+  let compute: ComputeClock;
 
   if (opts.refresh === true) {
     const agg = aggregateBurn(db, tid, now);
+    // `--refresh` is the live path by contract: it refits the corpus rather than
+    // reading yesterday's columns. It is for humans and for tests; the statusline
+    // never passes it, and this is why.
+    const cb = checkBackForTask(db, tid, buildEtaFit(db), now);
+    checkBack = cb === null ? null : stripSeconds(cb);
+    compute = computeClock(db, tid);
     consumed = agg.consumed_wcet;
     main = agg.wcet_main;
     sub = agg.wcet_sub;
@@ -590,6 +762,15 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
           active_s: number | null;
           burn_wcet_per_min: number | null;
           proj_total_wcet: number | null;
+          seg_started_at: string | null;
+          seg_elapsed_s: number | null;
+          check_back_p50_s: number | null;
+          check_back_p90_s: number | null;
+          eta_model: string | null;
+          eta_probation: number | null;
+          eta_n_seg: number | null;
+          compute_s: number | null;
+          compute_coverage_pct: number | null;
         },
         [string]
       >("SELECT * FROM burn_cache WHERE tid = ?")
@@ -613,6 +794,33 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
     perMin = row.burn_wcet_per_min ?? 0;
     projTotal = row.proj_total_wcet ?? consumed;
     cacheAsOf = row.as_of;
+    // Straight out of the columns, with NO re-derivation against `now`. A conditional
+    // residual-life quantile is not a countdown — subtracting the staleness from it
+    // would be arithmetic on a number that was never a remaining-seconds counter — and
+    // the drift is bounded anyway: the segment blanks entirely once `stale` fires.
+    // Every column is NULL on a row written before the v7 -> v8 rebuild, which is one
+    // sweep away and reads as "no forecast yet", exactly like too thin a corpus.
+    checkBack =
+      row.seg_started_at === null || row.check_back_p50_s === null || row.eta_model === null
+        ? null
+        : {
+            p50_min: Math.round(row.check_back_p50_s / 60),
+            p90_min: Math.round((row.check_back_p90_s ?? row.check_back_p50_s) / 60),
+            seg_started_at: row.seg_started_at,
+            seg_elapsed_min: Math.round((row.seg_elapsed_s ?? 0) / 60),
+            eta_model: row.eta_model as EtaModel,
+            // OUT OF THE ROW, never `etaCorpusSize(db)`: that was a COUNT(*) over
+            // `run_segment` filtered on `gap_min`, which no index covers, so the one
+            // read path that promises to be bounded by the ROW was doing a table scan
+            // that grew with the corpus. NULL only on a pre-v8 row, which reads as
+            // "0 segments" for the one sweep it takes to fill in.
+            n_seg: row.eta_n_seg ?? 0,
+            // NULL reads as "on probation": the marker's default is ON, and a missing
+            // value is not evidence that a model earned its way off it.
+            probation: (row.eta_probation ?? 1) !== 0,
+            basis: "session",
+          };
+    compute = { s: row.compute_s ?? 0, coverage_pct: row.compute_coverage_pct ?? 0 };
   }
 
   const staleS = Math.max(0, Math.round((now.getTime() - Date.parse(cacheAsOf)) / 1000));
@@ -671,10 +879,14 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
       price_epoch: band.price_epoch,
       refclass_as_of: band.refclass_as_of,
     },
-    // Until weekly reconciliation lands (Phase 2, §7.5) the number is OURS and
-    // unchecked against any Anthropic-computed total, and the segment MUST render
-    // that marker.
-    unvalidated: true,
+    // The marker is retired ONLY by the presence of `config.unvalidated_retired_at`,
+    // which `est recon --certify` writes and any later breaching week removes (P2.6).
+    // Note what this does NOT do: it says nothing about `check_back`'s probation `?`.
+    // Money and time are validated by different evidence, and one certifying the other
+    // is how a system talks itself into trusting a number nobody checked.
+    unvalidated: !unvalidatedRetired(db),
+    check_back: checkBack,
+    compute,
     warn,
   };
 }
@@ -749,8 +961,43 @@ export function renderBurn(b: BurnJson): string {
       `${b.requests.n} req · ${b.agents.live}/${b.agents.total} agents live · active ${Math.round(b.time.active_s / 60)}m`,
     `burn ${b.burn.wcet_per_min.toFixed(1)} WCET/min ($${b.burn.usd_per_hour.toFixed(2)}/h over a ${b.burn.window_min}m window) · ` +
       `projection ${fmt(b.projection.total_wcet)} WCET — LINEAR AND CRUDE: it answers "will this blow the band in the next hour", not "when will this finish"`,
-    `unvalidated: this number is ours and is not yet reconciled against any Anthropic-computed total (§7.5, Phase 2)` +
-      (b.warn.length > 0 ? `  ·  warn: ${b.warn.join(", ")}` : ""),
   ];
+  // The check-back band, with BOTH quantiles — this is where p90 lives. The statusline
+  // shows p50 alone (one line of budget, and a two-number band stops being glanceable);
+  // a terminal has room to say how wide the band actually is, and the width is the
+  // honest part: p90 runs ~30× p50 on the corpus this was specified against.
+  if (b.check_back !== null) {
+    const cb = b.check_back;
+    lines.push(
+      `check back ${formatEta(cb.p50_min)}${cb.probation ? "?" : ""} (p90 ${formatEta(cb.p90_min)}) · ` +
+        `SESSION-scoped, Claude-ACTIVE time to the next human-input boundary — never token-derived · ` +
+        `segment running ${cb.seg_elapsed_min}m · model ${cb.eta_model} over ${cb.n_seg} closed segment(s)` +
+        (cb.probation
+          ? `\n  ? = ON PROBATION: this model has not yet beaten a constant-median predictor by enough, over enough segments, with p90 coverage that contains 0.90. The number is a hint, not a promise.`
+          : ""),
+    );
+  }
+  lines.push(
+    `compute ${Math.round(b.compute.s / 60)}m of API time over ${b.compute.coverage_pct}% of requests` +
+      (b.compute.coverage_pct < 100
+        ? ` — the rest carry no duration, so this is a floor, not a total`
+        : "") +
+      (b.warn.length > 0 ? `  ·  warn: ${b.warn.join(", ")}` : ""),
+  );
+  // GATED on the payload's own flag, exactly as `scripts/statusline-burn.ts` gates its
+  // `[unvalidated]` suffix. The two renderers read the SAME field for the same reason:
+  // once `est recon --certify` has written `config.unvalidated_retired_at` the marker
+  // is retired, and a terminal that kept printing the sentence would be telling Craig
+  // his numbers are unreconciled while the statusline and `--json` say they are — one
+  // reader of a fact is a fact, two readers that disagree is a bug on screen.
+  //
+  // The warn list moved ONTO the compute line above rather than staying attached to
+  // this sentence: it was concatenated onto a string that must now sometimes vanish,
+  // so gating alone would have taken the warnings with it.
+  if (b.unvalidated) {
+    lines.push(
+      `unvalidated: this number is ours and is not yet reconciled against any Anthropic-computed total (§7.5, Phase 2)`,
+    );
+  }
   return lines.join("\n");
 }

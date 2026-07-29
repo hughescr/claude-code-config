@@ -508,6 +508,101 @@ describe("the ccstatusline segment — P1.9", () => {
 });
 
 // ---------------------------------------------------------------------------
+// the [unvalidated] marker, in BOTH renderers
+// ---------------------------------------------------------------------------
+
+describe("the [unvalidated] marker — P2.6", () => {
+  /**
+   * The terminal renderer and the statusline segment must agree, because they are two
+   * views of ONE fact. `formatSegment` gated its `[unvalidated]` suffix on the payload
+   * flag from day one; `renderBurn` pushed its sentence unconditionally, so once `est
+   * recon --certify` had written `config.unvalidated_retired_at` the statusline and
+   * `--json` said certified while `est burn` went on saying the numbers were
+   * unreconciled. One reader of a fact is a fact; two that disagree is a bug on screen.
+   */
+  async function payload(now: Date): Promise<BurnActive> {
+    const tid = await taskWithSpend();
+    await h.cli("bind", tid, "--session", "s7");
+    refreshBurnCache(h.db, now);
+    return burnJson(h.db, { session: "s7", now }) as BurnActive;
+  }
+
+  const SENTENCE = "unvalidated: this number is ours and is not yet reconciled";
+  const now = new Date("2026-01-01T00:03:00Z");
+
+  test("the sentence is PRESENT while the marker stands", async () => {
+    const b = await payload(now);
+    expect(b.unvalidated).toBe(true);
+    expect(renderBurn(b)).toContain(SENTENCE);
+    expect(formatSegment(b)).toContain("[unvalidated]");
+  });
+
+  test("the sentence is ABSENT once the marker is retired", async () => {
+    const b = await payload(now);
+    const certified: BurnActive = { ...b, unvalidated: false };
+    expect(renderBurn(certified)).not.toContain(SENTENCE);
+    expect(formatSegment(certified)).not.toContain("[unvalidated]");
+  });
+
+  test("the warn list survives the gating — it was concatenated onto the sentence", async () => {
+    // The warnings used to be appended to the very string that now sometimes vanishes,
+    // so gating alone would have taken `over_p90` / `stale` / `unpriced` with it.
+    const b = await payload(now);
+    const warned: BurnActive = { ...b, unvalidated: false, warn: ["over_p90", "unpriced"] };
+    const text = renderBurn(warned);
+    expect(text).not.toContain(SENTENCE);
+    expect(text).toContain("warn: over_p90, unpriced");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// the cached read path is bounded by the ROW — every field of it
+// ---------------------------------------------------------------------------
+
+describe("check_back.n_seg comes out of burn_cache — P1.9", () => {
+  test("the cached answer reads the column, never a COUNT(*) over run_segment", async () => {
+    // The LAST field of the payload that was still an aggregate at render time:
+    // `COUNT(*) FROM run_segment WHERE gap_min = ?`, which no index covered, inside the
+    // one read path that promises to be bounded by the row. The proof is the same one
+    // the sibling test above uses for the agent and price counts — write a value into
+    // the row that disagrees with the table, and watch the render report the ROW.
+    const now = new Date("2026-01-01T00:03:00Z");
+    const tid = await taskWithSpend();
+    await h.cli("bind", tid, "--session", "s7");
+    refreshBurnCache(h.db, now);
+
+    h.db
+      .query(
+        `UPDATE burn_cache SET seg_started_at = ?, seg_elapsed_s = 60,
+            check_back_p50_s = 600, check_back_p90_s = 1800,
+            eta_model = 'residual_life', eta_probation = 1, eta_n_seg = 41
+          WHERE tid = ?`,
+      )
+      .run("2026-01-01T00:02:00Z", tid);
+    // The table says nothing at all; the row says 41.
+    expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM run_segment").get()?.n).toBe(0);
+
+    const b = burnJson(h.db, { session: "s7", now }) as BurnActive;
+    expect(b.check_back?.n_seg).toBe(41);
+    expect(renderBurn(b)).toContain("over 41 closed segment(s)");
+  });
+
+  test("a row written before the column existed reads as 0, not as a crash", async () => {
+    const now = new Date("2026-01-01T00:03:00Z");
+    const tid = await taskWithSpend();
+    await h.cli("bind", tid, "--session", "s7");
+    refreshBurnCache(h.db, now);
+    h.db
+      .query(
+        `UPDATE burn_cache SET seg_started_at = ?, check_back_p50_s = 600,
+            eta_model = 'residual_life', eta_n_seg = NULL WHERE tid = ?`,
+      )
+      .run("2026-01-01T00:02:00Z", tid);
+    expect((burnJson(h.db, { session: "s7", now }) as BurnActive).check_back?.n_seg).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // §7.3 — the interval union, which is what makes async fan-out visible
 // ---------------------------------------------------------------------------
 

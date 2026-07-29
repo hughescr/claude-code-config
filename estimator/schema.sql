@@ -486,8 +486,38 @@ CREATE TABLE anomaly (              -- loud, queryable failure ledger
                                     --   src/close.ts:  forced_close|scope_undeclared|tid_unplanted
                                     --   src/spool.ts:  missed_estimate -- a drained PostToolUse
                                     --      compliance record with no bound task (P1.10)
-                                    -- STILL UNWRITTEN, reserved for later phases:
-                                    --   recon_mismatch|gate_override
+                                    -- WRITTEN BY PHASE 2 (§Phase 2 interfaces):
+                                    --   src/otel.ts:   otel_unjoined -- an OTEL request no
+                                    --      transcript row matches; the join_pct complement
+                                    --      |otel_counter_mismatch -- a counter that DIFFERS
+                                    --      between OTEL and the transcript. NEVER merged: the
+                                    --      transcript is the token source of truth (§2), and a
+                                    --      second writer is how two sources disagree silently.
+                                    --      This is the independent audit of the dedup chain.
+                                    --      |otel_prompt_mismatch -- ours (propagated forward,
+                                    --      §5.3) vs the harness's stamp; a non-trivial rate means
+                                    --      turn segmentation is wrong somewhere
+                                    --      |otel_reject -- the receiver parked a body it could
+                                    --      not classify (it answers 200 so the exporter does not
+                                    --      retry a poison payload forever)
+                                    --   src/cli.ts:    otel_receiver_down -- telemetry configured
+                                    --      and nothing spooled for otel_stale_min; the receiver
+                                    --      cannot report its own death, so the sweeper does
+                                    --   src/recon.ts:  recon_mismatch -- an axis breached
+                                    --      recon_alert_pct (P2.6). No longer "still unwritten".
+                                    --   src/eta.ts:    segment_recut -- a re-cut RESTATED or
+                                    --      REMOVED a TERMINAL run_segment row. A closed segment
+                                    --      is a corpus observation, and a late OTEL duration can
+                                    --      still merge or move one, so the corpus is regenerable
+                                    --      rather than frozen -- but it may not move SILENTLY,
+                                    --      and this row is the audit trail. The detail carries
+                                    --      the CLASS of the change, never the values: the ledger
+                                    --      dedups on (kind, detail) and numbers in the key would
+                                    --      write a row per sweep.
+                                    -- STILL UNWRITTEN, reserved for the rest of Phase 2:
+                                    --   segment_open_too_long|job_unjoined|promotion_backdated
+                                    --   |board_render_failed|audit_removed
+                                    --   |corpus_shrink_expected (BENIGN, §5.8)|gate_override
   detail TEXT NOT NULL,
   tid TEXT REFERENCES task(tid)     -- nullable: many anomalies are corpus-wide
 ) STRICT;
@@ -530,7 +560,190 @@ CREATE TABLE burn_cache (
   n_unpriced INTEGER,               -- requests whose family has no price row  -> `unpriced`
   active_s INTEGER,                 -- §7.3 interval UNION, not a sum
   burn_wcet_per_min REAL,           -- over the current rolling window (config burn_window_min)
-  proj_total_wcet INTEGER           -- linear projection; CRUDE, and both output modes say so
+  proj_total_wcet INTEGER,          -- linear projection; CRUDE, and both output modes say so
+  -- v8 (P2.2): the check-back forecast and the compute clock. Every one is a COLUMN
+  -- for the P1.9 reason — a residual-life quantile computed per render is exactly the
+  -- unbounded per-render work this table exists to abolish. NULL until the next sweep.
+  seg_started_at TEXT,              -- the OPEN run_segment the forecast is issued against
+  seg_elapsed_s INTEGER,
+  check_back_p50_s INTEGER, check_back_p90_s INTEGER,
+  eta_model TEXT,                   -- which of the three models issued the number on screen
+  eta_probation INTEGER,            -- 1 => the statusline renders a trailing `?`
+  eta_n_seg INTEGER,                -- closed segments the shipped model was fitted on. A COLUMN
+                                    -- for the reason above and no other: reading it as
+                                    -- `COUNT(*) FROM run_segment WHERE gap_min = ?` per render is
+                                    -- a table scan (no index covers gap_min) inside the one path
+                                    -- that promises to be bounded by the ROW.
+  compute_s INTEGER,                -- SUM(request.duration_ms)/1000 over attributed requests
+  compute_coverage_pct REAL         -- share of those requests that actually carry one; a compute
+                                    -- figure without its coverage is a moved denominator
+) STRICT, WITHOUT ROWID;
+
+-- ---------------------------------------------------------------------------
+-- Phase 2 (P2.5) — the OTEL facts, the check-back corpus, the wider
+-- reconciliation and the jobs reconcile.
+-- ---------------------------------------------------------------------------
+
+-- ---- P2.4: the OTEL facts, kept SEPARATE from `request` on purpose -------------
+CREATE TABLE otel_request (         -- one row per api_request event; NOT a second `request`
+  request_id TEXT PRIMARY KEY,      -- the join key to `request`; same global-PK doctrine (§5.2)
+  session_id TEXT, prompt_id TEXT, message_uuid TEXT, client_request_id TEXT,
+  model TEXT, query_source TEXT,    -- 'main' | 'subagent' | 'auxiliary' -> request.origin
+  ts TEXT NOT NULL,                 -- event time, ISO, derived from timeUnixNano
+  received_at TEXT NOT NULL,        -- when the receiver spooled it; drift between the two is
+                                    -- export latency, and it is worth being able to see
+  duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  cost_usd_micros INTEGER CHECK (cost_usd_micros IS NULL OR cost_usd_micros >= 0),
+                                    -- INTEGER micros, not the float `cost_usd`: money summed
+                                    -- across 10^5 rows should not accumulate float error
+  in_tok  INTEGER CHECK (in_tok  IS NULL OR in_tok  >= 0),
+  out_tok INTEGER CHECK (out_tok IS NULL OR out_tok >= 0),
+  cw_tok  INTEGER CHECK (cw_tok  IS NULL OR cw_tok  >= 0),
+  cr_tok  INTEGER CHECK (cr_tok  IS NULL OR cr_tok  >= 0),
+  attempt INTEGER, speed TEXT, effort TEXT, status_code INTEGER,
+  workflow_run_id TEXT, workflow_name TEXT,
+  joined INTEGER NOT NULL DEFAULT 0 -- 1 once a matching `request` row was found; the complement
+                                    -- is `otel_unjoined`, and it is the recon join_pct denominator
+) STRICT;
+CREATE INDEX ix_otel_req_turn ON otel_request(session_id, prompt_id);
+CREATE INDEX ix_otel_req_ts   ON otel_request(ts);
+
+CREATE TABLE otel_metric (          -- cost.usage | token.usage | active_time.total
+  metric TEXT NOT NULL, ts TEXT NOT NULL,
+                                    -- `ts` is ISO SECONDS, because every window predicate in
+                                    -- this schema is a string compare on it. `ts_nanos` is the
+                                    -- sub-second half of the point's identity, kept as the
+                                    -- verbatim int64 STRING it arrived as (it exceeds 2^53).
+                                    -- Nothing aggregates over it; it exists so two points of
+                                    -- one series 250 ms apart cannot collapse into one row.
+  ts_nanos     TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+  -- NOT NULL SENTINELS, for the reason task_event documents: SQLite treats NULLs as
+  -- DISTINCT inside a UNIQUE/PRIMARY key, so nullable dimensions make the dedup key
+  -- match nothing and every re-drain inserts a duplicate.
+  session_id   TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+  model        TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+  query_source TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+  token_type   TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+                                    -- The four columns above are the ALLOWLISTED dimensions, and
+                                    -- an OTLP point carries dimensions the allowlist drops
+                                    -- (`tool`, `decision`, …). Two genuinely distinct series then
+                                    -- share every stored dimension and the DO UPDATE overwrites
+                                    -- one with the other -- silent ingest loss, not deduplication.
+                                    -- `dim_digest` is a one-way 64-bit digest of the FULL decoded
+                                    -- attribute set plus unit and stream start (src/otel.ts), so
+                                    -- the stored identity is as wide as the wire identity without
+                                    -- persisting a single unallowlisted VALUE.
+  dim_digest   TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+  value REAL NOT NULL, unit TEXT,
+  temporality TEXT NOT NULL CHECK (temporality IN ('delta','cumulative','unspecified')),
+                                    -- delta SUMs; cumulative must be DIFFERENCED per series.
+                                    -- Mixing them in one window is the §5.2 dedup mistake again.
+  received_at TEXT NOT NULL,
+  PRIMARY KEY (metric, ts, ts_nanos, session_id, model, query_source, token_type, dim_digest)
+) STRICT, WITHOUT ROWID;
+
+-- ---- P2.1: the check-back corpus ----------------------------------------------
+-- DERIVED but DURABLE, and the distinction from burn_cache is deliberate: a segment
+-- outlives the transcript that produced it (P2.10 prunes at 365 days), so this table
+-- is upserted per sweep and NEVER deleted. Mutable only while terminator='open';
+-- frozen once terminal. No append-only trigger: it is regenerable for as long as its
+-- inputs exist, and `est audit --fix` is allowed to clear it (P2.12).
+CREATE TABLE run_segment (
+  session_id TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT NOT NULL,
+  active_s INTEGER NOT NULL CHECK (active_s >= 0),
+  busy_s   INTEGER NOT NULL CHECK (busy_s   >= 0),
+  max_concurrency INTEGER NOT NULL CHECK (max_concurrency >= 0),
+  n_turns  INTEGER NOT NULL DEFAULT 0,
+  n_agents INTEGER NOT NULL DEFAULT 0,
+  gap_before_s INTEGER, gap_after_s INTEGER,   -- RECORDED, never predicted (§7.3 clock 3)
+  terminator TEXT NOT NULL CHECK (terminator IN
+    ('human_input','compaction','session_end','open')),
+  interval_src_mix TEXT,            -- e.g. 'turn+agent+otel'; a segment assembled from mixed
+                                    -- sources is visible as such, like agent_run.interval_src
+  gap_min REAL NOT NULL,            -- the segment_gap_min IN FORCE when this row was cut, so a
+                                    -- retuned threshold cannot silently restate old segments
+  tid TEXT REFERENCES task(tid),    -- the task owning the MAJORITY of active seconds; the
+                                    -- forecast itself is session-scoped (P2.1)
+  first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+  -- `gap_min` IS PART OF THE IDENTITY, and that is the whole point of the column. A
+  -- key of (session_id, started_at) alone made a retune of `segment_gap_min` a silent
+  -- no-op: the re-partition at the new threshold usually reuses a `started_at` that is
+  -- already present as a TERMINAL row, so the INSERT lost the PK conflict and the
+  -- `terminator = 'open'` freeze guard refused the UPDATE — the table came back
+  -- byte-identical while `refreshSegments` reported segments written. Downstream the
+  -- corpus at the new threshold was EMPTY, `n_closed < eta_min_fit`, and `check_back`
+  -- vanished from the statusline forever with no error anywhere.
+  --
+  -- With gap_min in the key a retune writes a fresh PARTITION alongside the old one.
+  -- That is also the honest data model: rows cut at 2 minutes and rows cut at 30 are
+  -- different observations of the same wall clock, never one corpus (the measured p50
+  -- moves ~10× across plausible thresholds), which is exactly why every reader — the
+  -- `v_eta_corpus` consumers, `v_segment_current` below, `forecastSession` — filters
+  -- on the threshold IN FORCE rather than on the table.
+  PRIMARY KEY (session_id, gap_min, started_at)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX ix_run_segment_tid ON run_segment(tid);
+CREATE INDEX ix_run_segment_end ON run_segment(ended_at);
+-- Covers the corpus-size count and the per-partition open-row sweep; without it both
+-- are full scans of a table that only ever grows.
+CREATE INDEX ix_run_segment_gap ON run_segment(gap_min, terminator);
+
+CREATE TABLE eta_run (              -- APPEND-ONLY: what the check-back model was fitted on, and
+  as_of TEXT NOT NULL,              -- what it had to beat. calib_run's sibling (§4.5).
+  eta_model TEXT NOT NULL CHECK (eta_model IN ('const_median','residual_life','fanout_cond')),
+  n_seg INTEGER NOT NULL, n_censored INTEGER NOT NULL DEFAULT 0,
+  gap_min REAL NOT NULL,
+  pinball_p50 REAL, pinball_p90 REAL,
+  baseline_pinball_p50 REAL NOT NULL,   -- const_median; the floor a model must clear
+  coverage_p90 REAL, cov_lo REAL, cov_hi REAL,   -- Jeffreys, as §7.4
+  won INTEGER NOT NULL DEFAULT 0,
+  probation INTEGER NOT NULL DEFAULT 1,
+  params_json TEXT NOT NULL,
+  PRIMARY KEY (as_of, eta_model)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER eta_ro_u BEFORE UPDATE ON eta_run BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER eta_ro_d BEFORE DELETE ON eta_run BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
+-- ---- P2.6: non-USD reconciliation --------------------------------------------
+-- `recon` (USD) is UNTOUCHED — widening its CHECK would mean rebuilding a WITHOUT
+-- ROWID table for no gain. Tokens, active seconds and request counts are different
+-- units and get their own table rather than being coerced into usd-named columns.
+CREATE TABLE recon_metric (
+  as_of TEXT NOT NULL,
+  metric TEXT NOT NULL CHECK (metric IN ('tokens','active_s','requests')),
+  source TEXT NOT NULL CHECK (source IN ('otel_tokens','otel_active','otel_request')),
+  window_start TEXT NOT NULL, window_end TEXT NOT NULL,
+  ours REAL NOT NULL, theirs REAL NOT NULL, delta_pct REAL NOT NULL,
+  join_pct REAL,                    -- share of OUR requests in the window OTEL also saw; a small
+                                    -- delta on a tiny join is agreement with nothing (P2.6)
+  unit TEXT NOT NULL, note TEXT,
+  PRIMARY KEY (as_of, metric, source)
+) STRICT, WITHOUT ROWID;
+
+-- ---- P2.9: jobs reconcile, RECONCILE-ONLY ------------------------------------
+CREATE TABLE job_run (
+  job_id TEXT PRIMARY KEY,          -- the ~/.claude/jobs/<id> directory name
+  session_id TEXT, resume_session_id TEXT,
+  name TEXT, state TEXT, backend TEXT, template TEXT,
+  created_at TEXT, updated_at TEXT, first_terminal_at TEXT,
+  reported_tokens INTEGER CHECK (reported_tokens IS NULL OR reported_tokens >= 0),
+                                    -- state.json.tokens: a HARNESS AGGREGATE. Stored for audit,
+                                    -- NEVER summed — same ban as wf_*.json totalTokens and
+                                    -- workflowProgress[].tokens (§1, §5.6).
+  n_items INTEGER NOT NULL DEFAULT 0,
+  n_items_started INTEGER NOT NULL DEFAULT 0,   -- fan[] entries with startedAt > 0; the item-grain
+                                                -- check stays dormant until this is populated
+  tid TEXT REFERENCES task(tid)
+) STRICT;
+
+CREATE TABLE job_item (
+  job_id TEXT NOT NULL REFERENCES job_run(job_id),
+  item_id TEXT NOT NULL,            -- fan[].id, e.g. 'todo:3'
+  kind TEXT, label TEXT,
+  started_at TEXT, done_at TEXT,    -- NULL where the harness wrote 0; 0 is 'unset', not epoch
+  PRIMARY KEY (job_id, item_id)
 ) STRICT, WITHOUT ROWID;
 
 CREATE VIRTUAL TABLE task_fts USING fts5(tid UNINDEXED, subject, description);
@@ -778,6 +991,69 @@ WHERE o.scope_changed = 0 AND o.censored = 0 AND o.final_status = 'completed'
   AND o.unpriced_share = 0 AND o.price_provisional = 0   -- R2: unpriced degrades the ROW
   AND o.actual_wcet_at_epoch IS NOT NULL;                -- R2: epoch-consistent actuals only
 
+-- Phase 2 views (P2.5). The board is a projection over views that already exist plus
+-- `run_segment`; it adds none of its own.
+
+-- The audit surface for the dedup chain (§5.2): ours vs theirs, per request, per
+-- counter. OTEL is FORBIDDEN from merging a counter (P2.4), so a disagreement is a
+-- finding rather than a correction — this view is where the finding is readable, and
+-- it is the only independent check the dedup chain has ever had.
+CREATE VIEW v_otel_join AS
+SELECT o.request_id, o.session_id, o.ts, o.model, o.query_source, o.attempt,
+       o.duration_ms, o.cost_usd_micros,
+       CASE WHEN r.request_id IS NULL THEN 0 ELSE 1 END AS joined,
+       o.prompt_id AS otel_prompt_id, r.prompt_id AS our_prompt_id,
+       o.in_tok AS otel_in, o.out_tok AS otel_out, o.cw_tok AS otel_cw, o.cr_tok AS otel_cr,
+       r.in_tok AS our_in, r.out_tok AS our_out, r.cw_tok AS our_cw, r.cr_tok AS our_cr,
+       o.in_tok  - r.in_tok  AS d_in,
+       o.out_tok - r.out_tok AS d_out,
+       o.cw_tok  - r.cw_tok  AS d_cw,
+       o.cr_tok  - r.cr_tok  AS d_cr
+FROM otel_request o LEFT JOIN v_request_live r ON r.request_id = o.request_id;
+
+-- The weekly rollup the retro line and the certification criterion both read. One row
+-- per ISO-ish week, carrying the LATEST recon in that week (SQLite's bare-column rule:
+-- MAX(as_of) fixes which row the other columns come from) plus the three non-USD axes
+-- and the join coverage that stops a week of missing data from certifying itself.
+CREATE VIEW v_recon_week AS
+SELECT strftime('%Y-W%W', c.window_start) AS week,
+       MAX(c.as_of) AS as_of,
+       c.window_start, c.window_end,
+       c.ours_usd, c.theirs_usd, c.delta_pct AS usd_delta_pct,
+       (SELECT m.delta_pct FROM recon_metric m
+         WHERE m.as_of = c.as_of AND m.metric = 'tokens')   AS tokens_delta_pct,
+       (SELECT m.delta_pct FROM recon_metric m
+         WHERE m.as_of = c.as_of AND m.metric = 'active_s') AS active_delta_pct,
+       (SELECT m.delta_pct FROM recon_metric m
+         WHERE m.as_of = c.as_of AND m.metric = 'requests') AS requests_delta_pct,
+       (SELECT m.join_pct  FROM recon_metric m
+         WHERE m.as_of = c.as_of AND m.metric = 'requests') AS join_pct
+FROM recon c WHERE c.source = 'otel_cost'
+GROUP BY week;
+
+-- The check-back fitting corpus. Open segments are RIGHT-CENSORED observations, not
+-- omissions: dropping the long-running ones biases the estimator short exactly when it
+-- matters (P2.1), which is the same censoring treatment §6.2 gives abandoned tasks.
+CREATE VIEW v_eta_corpus AS
+SELECT s.session_id, s.started_at, s.ended_at, s.active_s, s.busy_s, s.terminator,
+       s.gap_min, s.tid, s.n_turns, s.n_agents, s.max_concurrency,
+       CAST((julianday(s.ended_at) - julianday(s.started_at)) * 86400 AS INTEGER) AS span_s,
+       CASE WHEN s.terminator = 'open' THEN 1 ELSE 0 END AS censored
+FROM run_segment s;
+
+-- The open segment per session — what burn_cache reads when it writes the forecast.
+-- SCOPED TO THE THRESHOLD IN FORCE, like every other reader of `run_segment`: after a
+-- `segment_gap_min` retune the retired partition still holds this session's old open
+-- row, and it starts at a DIFFERENT instant, so an unscoped MAX(started_at) would issue
+-- the forecast against a segment cut to a rule nobody is using any more.
+CREATE VIEW v_segment_current AS
+SELECT s.* FROM run_segment s
+WHERE s.terminator = 'open'
+  AND s.gap_min = (SELECT CAST(v AS REAL) FROM config WHERE k = 'segment_gap_min')
+  AND s.started_at = (SELECT MAX(started_at) FROM run_segment
+                       WHERE session_id = s.session_id AND terminator = 'open'
+                         AND gap_min = s.gap_min);
+
 -- ---------------------------------------------------------------------------
 -- Seeds. Idempotent: re-running this file over an initialised DB adds nothing.
 -- Every calibration constant is a CONVENTION, not a measurement (§1.1) — the
@@ -785,7 +1061,7 @@ WHERE o.scope_changed = 0 AND o.censored = 0 AND o.final_status = 'completed'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '7'),
+  ('schema_version',          '8'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.
@@ -811,7 +1087,35 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   ('velocity_half_life_days', '30'),
   ('split_min_pinball_gain',  '0.02'),
   ('boot_resamples',          '200'),
-  ('coverage_prior',          'jeffreys');
+  ('coverage_prior',          'jeffreys'),
+  -- v8 / P2.0. Every one of these is a CONVENTION, not a measurement (§1.1).
+  -- `segment_gap_min` in particular moves the estimand by ~10x across plausible
+  -- values, which is exactly why it is a row and not a literal: `est segments --gap`
+  -- shows its effect without persisting anything, and the retro fits it by pinball
+  -- loss like every other constant here.
+  ('segment_gap_min',           '5'),
+  ('eta_min_segments',          '30'),   -- closed segments before probation can end
+  ('eta_min_fit',               '5'),    -- below this, NO forecast is issued at all
+  ('eta_min_pinball_gain',      '0.05'), -- p50 gain over const_median required to graduate
+  ('recon_alert_pct',           '5'),    -- |delta_pct| above which `est recon` alerts
+  ('unvalidated_max_delta_pct', '2'),    -- per-week USD tolerance in the retirement criterion
+  ('unvalidated_weeks',         '4'),    -- consecutive clean weeks required
+  -- The clause that stops the trivially-passing case: a week in which the receiver was
+  -- down for six days produces a tiny delta on a tiny base, and without a join floor the
+  -- system would certify itself on the strength of MISSING DATA (§5.4's 82.8% failure).
+  ('unvalidated_min_join_pct',  '95'),
+  -- `unvalidated_retired_at` is deliberately ABSENT: it is written only by
+  -- `est recon --certify`, and its PRESENCE is what flips `"unvalidated": false`.
+  ('board_min_interval_s',      '30'),
+  ('job_item_min_pop',          '0.5'),  -- fan[].startedAt population below which item grain sleeps
+  ('otel_max_body_mb',          '8'),    -- receiver request-body cap
+  ('otel_stale_min',            '15'),   -- minutes of silence before otel_receiver_down
+  -- The reject and raw-dump spools are written by the receiver and read by a HUMAN, so
+  -- neither can be claim-and-deleted the way logs and metrics are: the bytes we could
+  -- not classify are the artefact. Their ROTATED files are reaped at this age instead
+  -- (src/otel.ts pruneOtelSpool); the live file is bounded by rotation and is never
+  -- unlinked out from under the receiver's open handle.
+  ('otel_spool_retention_days', '14');
 
 INSERT OR IGNORE INTO bucket_def (bucket, created_at, dims_json, parent_bucket, split_pinball_gain, active)
 VALUES ('global', strftime('%Y-%m-%dT%H:%M:%SZ','now'), '{}', NULL, NULL, 1);

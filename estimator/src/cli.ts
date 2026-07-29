@@ -15,7 +15,9 @@
  *   est scope                   append a scope revision (the `scope_change` precondition)
  *   est burn                    consumption against the band; --json is the statusline contract
  *   est close                   finalize by arithmetic — no flag accepts a token count
- *   est board                   the terminal/JSON read model
+ *   est board                   the terminal/JSON read model, or --html/--md the file renderer
+ *   est recon                   our number vs an Anthropic-computed one, on four axes
+ *   est segments                the check-back corpus, and the knob that shapes it
  *   est retro                   weekly calibration + the write-back that makes it non-inert
  *
  * Three properties this file is responsible for (§2):
@@ -49,9 +51,10 @@
 
 import type { Database } from "bun:sqlite";
 import { mkdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DB_PATH, ROOT, SCHEMA_VERSION, getConfig, openDb, setConfig } from "./db.ts";
 import { PROJECTS_ROOT, discoverCorpus, sessionFiles, type Corpus } from "./discover.ts";
+import { applyFix, auditReport, renderAudit, type AuditReport } from "./audit.ts";
 import {
   INSERT_ANOMALY_SQL,
   detectForkReplays,
@@ -73,7 +76,32 @@ import { attributeTasks } from "./attribute.ts";
 import { burnJson, burnRead, classifyOpenError, refreshBurnCache, renderBurn } from "./burn.ts";
 import { closeTask, type FinalStatus } from "./close.ts";
 import { board, retro, type RetroReport } from "./retro.ts";
-import { drainSpool, emptyDrain, ensureSpool, SPOOL_DIR } from "./spool.ts";
+import { DEFAULT_BOARD_LIMIT, regenerateBoardIfDue, renderBoardFiles } from "./board-render.ts";
+import { promoteStartedTasks } from "./promote.ts";
+import { emptyJobsResult, JOBS_ROOT, reconcileJobs } from "./jobs.ts";
+import { otelDump, otelPort, otelStatus, renderOtelDump, renderOtelStatus } from "./otel-status.ts";
+import { drainSpool, emptyDrain, ensureSpool, spoolDirFrom, SPOOL_DIR } from "./spool.ts";
+import {
+  DEFAULT_OTEL_SPOOL_RETENTION_DAYS,
+  drainOtel,
+  emptyOtelIngest,
+  receiverDownAnomaly,
+  telemetryConfigured,
+} from "./otel.ts";
+import {
+  refreshSegments,
+  scoreEtaModels,
+  segmentsReport,
+  writeEtaRuns,
+  type SegmentsReport,
+} from "./eta.ts";
+import {
+  computeRecon,
+  evaluateCertification,
+  renderRecon,
+  writeRecon,
+  type ReconAxis,
+} from "./recon.ts";
 import {
   addBlock,
   appendScope,
@@ -112,6 +140,11 @@ export const COMMANDS = [
   "close",
   "board",
   "retro",
+  // Phase 2 (§Phase 2 interfaces).
+  "recon",
+  "segments",
+  "otel",
+  "audit",
   "help",
   "version",
 ] as const;
@@ -164,8 +197,12 @@ export const COMMAND_FLAGS: Record<Command, FlagSpec> = {
   scope: { booleans: [], values: ["reason", "subject", "description", "dod"] },
   burn: { booleans: ["refresh"], values: ["session"] },
   close: { booleans: ["force"], values: ["status"] },
-  board: { booleans: [], values: ["status", "limit"] },
+  board: { booleans: ["html", "md"], values: ["status", "limit", "out"] },
   retro: { booleans: ["dry-run"], values: ["as-of"] },
+  recon: { booleans: ["certify", "dry-run"], values: ["window", "source"] },
+  segments: { booleans: [], values: ["session", "gap", "since", "limit"] },
+  audit: { booleans: ["fix"], values: ["root"] },
+  otel: { booleans: ["status"], values: ["dump", "port"] },
   help: { booleans: [], values: [] },
   version: { booleans: [], values: [] },
 };
@@ -237,7 +274,17 @@ export function parseArgs(argv: readonly string[]): Parsed {
       continue;
     }
 
-    if (ALL_VALUE_FLAGS.has(name)) {
+    // The value/boolean sets are a UNION over every verb, so one verb's value flag
+    // shadows another verb's boolean of the same name: `--status` takes a value for
+    // `est close` and `est board`, which made `est otel --status` swallow the next token
+    // (or fail with "--status requires a value" when there was none). The verb in hand
+    // breaks the tie when it declares the name as a boolean — and only then, so a flag
+    // belonging to some OTHER command still parses exactly as before and still gets the
+    // more useful "not valid for `est X`" message from the pass below.
+    const spec = out.command === null ? null : COMMAND_FLAGS[out.command];
+    const declaredBoolean = spec !== null && spec.booleans.includes(name);
+
+    if (!declaredBoolean && ALL_VALUE_FLAGS.has(name)) {
       if (inlineValue !== null) {
         out.flags[name] = inlineValue;
         continue;
@@ -350,6 +397,17 @@ export const BENIGN_ANOMALY_KINDS: ReadonlySet<string> = new Set([
   // backfill of the live tree and once per fork forever after.
   "symlink_alias",
   "fork_replay",
+  // P2.8: a later sweep discovering an EARLIER attributed request than the
+  // `started_at` already on file — a fork/alias resolving after the fact, same
+  // shape as the two above. Reported because it is evidence (`est retro`'s
+  // `never_started_share`-style honesty), not because moving a timestamp backwards
+  // to a truer value is damage.
+  "promotion_backdated",
+  // NOTE: `board_render_failed` (P2.7) is deliberately ABSENT from this set — it
+  // does not go through `report.anomalies` at all (see the sweep's board-regen
+  // step). The design's "never fails the sweep" is unconditional: `--strict`
+  // promotes every kind IN this set, which a benign-but-still-counted board
+  // failure would defeat.
 ]);
 
 /**
@@ -393,6 +451,8 @@ export function insertAnomalies(db: Database, rows: readonly IngestAnomaly[], no
 export interface SweepOptions {
   /** Corpus root. Defaults to {@link PROJECTS_ROOT}. */
   root?: string;
+  /** P2.9: `~/.claude/jobs`. Defaults to {@link JOBS_ROOT}. */
+  jobsRoot?: string;
   /** Wall-clock budget; the sweep commits what it has and stops. Null = unlimited. */
   budgetMs?: number | null;
   /** Ignore `sweep_state` watermarks and re-read every file (`est backfill`). */
@@ -401,6 +461,41 @@ export interface SweepOptions {
   chunkSessions?: number;
   /** Injected clock. */
   now?: Date;
+  /**
+   * P2.7: where `board.html`/`board.md` land. Defaults to `dirname(db.filename)` —
+   * the same directory the database itself lives in, so a test opened against a
+   * harness's own tmp `estimator.db` writes its board there too, never into this
+   * checkout's real estimator dir.
+   */
+  boardDir?: string;
+  /**
+   * The hook / OTEL spool this sweep DRAINS, and the directory `.microsweep` and the
+   * overrun markers are pruned from. Defaults to `spoolDirFrom(process.env,
+   * dirname(db.filename))` — computed the SAME way as `SPOOL_DIR` but relative to THIS
+   * database's own directory rather than the frozen module-level constant.
+   *
+   * **That default is a data-safety property, not a tidiness one.** `drainSpool` and
+   * `drainOtel` both CONSUME what they read: they rename the jsonl to `.draining` and
+   * `rmSync` it after the commit, and the spool is the only copy of those records until
+   * a sweep turns them into rows. Passing the frozen `SPOOL_DIR` meant a sweep against
+   * ANY database — a test harness's throwaway one, a copy someone was poking at —
+   * drained the live spool into itself and deleted it, losing telemetry that had no
+   * second home. A spool now belongs to the database it is drained into.
+   */
+  spoolDir?: string;
+  /**
+   * P2.7's throttle marker directory — where `.board` is stamped and read.
+   *
+   * Defaults to `<dirname(db.filename)>/spool`, deliberately WITHOUT consulting the
+   * environment: `.board` is per-DATABASE render state (it throttles renders of THAT
+   * database's board), whereas the hook spool is per-INSTALLATION and therefore
+   * `EST_SPOOL_DIR`-overridable. In production the two resolve to the same directory —
+   * the database lives in the estimator dir whose `spool/` the hooks write to — so
+   * `pruneMarkers` still reaps the marker. They diverge only where an `EST_SPOOL_DIR`
+   * is set, and there the divergence is the point: two databases must not share one
+   * throttle.
+   */
+  boardSpoolDir?: string;
 }
 
 export interface SweepReport {
@@ -448,6 +543,39 @@ export interface SweepReport {
     /** Stale `.microsweep` / `.overrun-notified.*` marker files reaped this sweep. */
     markers_pruned: number;
   };
+  /**
+   * P2.3/P2.4: what the OTEL spool contributed. Every field is 0 when no receiver is
+   * running, which is the documented degrade-to-Phase-1 state and not a fault —
+   * nothing errors, nothing blocks, no verb changes its exit code.
+   */
+  otel: {
+    logs_read: number;
+    metrics_read: number;
+    requests_upserted: number;
+    metrics_inserted: number;
+    /** `request.duration_ms` filled — the ONE column OTEL may write (P2.4). */
+    durations_filled: number;
+    /** …and replaced, when a strictly higher `attempt` landed on a later drain. */
+    durations_refreshed: number;
+    /** `origin='auxiliary'` rows that have no transcript row by construction (§4.6). */
+    auxiliary_inserted: number;
+    /** Auxiliary rows this ingest superseded with a higher attempt's counters. */
+    auxiliary_superseded: number;
+    /** Auxiliary inserts suppressed by a row THIS INGEST DID NOT WRITE: the measured
+     *  version of "auxiliary requests never appear in transcripts". */
+    auxiliary_collisions: number;
+    unjoined: number;
+    /** True totals, not the size of the 50-row anomaly sample they drive. */
+    counter_mismatches: number;
+    prompt_mismatches: number;
+    malformed: number;
+    /** Bodies the receiver could not classify, still on disk awaiting a parser. */
+    rejects_read: number;
+    /** Trace summaries claimed and dropped — Phase 2 consumes no traces. */
+    traces_dropped: number;
+    /** Rotated reject/raw spool files reaped by `otel_spool_retention_days`. */
+    spool_pruned: number;
+  };
   /** §5.4: what the binding-driven attribution pass assigned. */
   attribution: {
     tasks: number;
@@ -458,6 +586,28 @@ export interface SweepReport {
   };
   /** P1.9: non-terminal tasks whose materialised burn row was rewritten. */
   burn_cache_rows: number;
+  /** P2.1: the check-back corpus — sessions revisited, segments cut, still open. */
+  segments: { sessions: number; segments: number; open: number };
+  /** P2.8: the sweeper's one status edge, and the `started_at` corrections beside it. */
+  promotion: { promoted: number; started_at_set: number; started_at_backdated: number };
+  /** P2.9: the `~/.claude/jobs` reconcile. Every field is 0 when `jobsRoot` does not
+   *  exist — the same degrade-to-Phase-1 shape as `otel` above; nothing errors,
+   *  nothing blocks, no verb changes its exit code because of this alone. */
+  jobs: {
+    dirs_read: number;
+    parsed: number;
+    malformed: number;
+    bound: number;
+    already_bound: number;
+    unjoined: number;
+    n_items: number;
+    n_items_started: number;
+  };
+  /** P2.7: what `board.html`/`board.md` did this sweep. `attempted: false` means the
+   *  throttle skipped it — not a failure, and the previous files are untouched either
+   *  way. A failed render is `ok: false` and lives in `anomaly`, NOT in this sweep's
+   *  exit code (the board is a convenience; the sweep is the system). */
+  board: { attempted: boolean; ok: boolean };
 }
 
 const SIXTY_DAYS_MS = 60 * 24 * 3600 * 1000;
@@ -575,10 +725,21 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
   const now = opts.now ?? new Date();
   const sweptAt = now.toISOString();
   const root = opts.root ?? PROJECTS_ROOT;
+  const jobsRoot = opts.jobsRoot ?? JOBS_ROOT;
   const budgetMs = opts.budgetMs ?? null;
   const full = opts.full ?? false;
   const chunkSessions = opts.chunkSessions ?? 25;
   const overBudget = (): boolean => budgetMs !== null && Date.now() - t0 > budgetMs;
+  // P2.7: both default off THIS database's own directory, never off the frozen
+  // module-level `ROOT`/`SPOOL_DIR` constants — see the doc comment on
+  // `SweepOptions.boardDir` for why that is what keeps a test harness's sweep from
+  // writing into this checkout's real estimator dir.
+  const dbDir = dirname(db.filename);
+  const boardDir = opts.boardDir ?? dbDir;
+  const sweepSpoolDir = opts.spoolDir ?? spoolDirFrom(process.env, dbDir);
+  // `{}`, not `process.env`: see SweepOptions.boardSpoolDir for why the marker is
+  // db-relative where the drained spool is environment-overridable.
+  const boardSpoolDir = opts.boardSpoolDir ?? spoolDirFrom({}, dbDir);
 
   const corpus: Corpus = discoverCorpus(root);
   // Corpus-wide before per-session: who owns a symlink-shared transcript, and
@@ -656,8 +817,39 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
       malformed: 0,
       markers_pruned: 0,
     },
+    otel: {
+      logs_read: 0,
+      metrics_read: 0,
+      requests_upserted: 0,
+      metrics_inserted: 0,
+      durations_filled: 0,
+      durations_refreshed: 0,
+      auxiliary_inserted: 0,
+      auxiliary_superseded: 0,
+      auxiliary_collisions: 0,
+      unjoined: 0,
+      counter_mismatches: 0,
+      prompt_mismatches: 0,
+      malformed: 0,
+      rejects_read: 0,
+      traces_dropped: 0,
+      spool_pruned: 0,
+    },
     attribution: { tasks: 0, turns: 0, agents: 0, requests: 0, by_attr: {} },
     burn_cache_rows: 0,
+    segments: { sessions: 0, segments: 0, open: 0 },
+    promotion: { promoted: 0, started_at_set: 0, started_at_backdated: 0 },
+    jobs: {
+      dirs_read: 0,
+      parsed: 0,
+      malformed: 0,
+      bound: 0,
+      already_bound: 0,
+      unjoined: 0,
+      n_items: 0,
+      n_items_started: 0,
+    },
+    board: { attempted: false, ok: true },
   };
 
   // --- buffered ingest, flushed in bounded chunks ---------------------------
@@ -834,7 +1026,7 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
   //     what makes the statusline live rather than session-stale.
   let spool = emptyDrain();
   db.transaction(() => {
-    spool = drainSpool(db, SPOOL_DIR);
+    spool = drainSpool(db, sweepSpoolDir);
   }).immediate();
   spool.cleanup();
   pendingAnomalies.push(...spool.anomalies);
@@ -848,6 +1040,53 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     markers_pruned: spool.markers_pruned,
   };
 
+  // 1b. **Drain the OTEL spool** (P2.3, P2.4), for the same reason and with the same
+  //     crash-safety: the receiver is a long-lived unattended process that must never
+  //     contend for the writer lock, so it appends lines and the sweeper — the single
+  //     writer — turns them into rows. It runs BEFORE attribution because the auxiliary
+  //     inserts it makes are `request` rows the attribution pass should see, and before
+  //     `refreshBurnCache` because `compute_s` is computed from `request.duration_ms`,
+  //     which is the one column this drain fills.
+  let otel = emptyOtelIngest();
+  // `otel_spool_retention_days` is read HERE, not in the drain: src/otel.ts is also the
+  // receiver's decoder, and the receiver must never open the database (P1.10/P1.11).
+  const otelRetentionDays = Number(
+    getConfig(db, "otel_spool_retention_days") ?? DEFAULT_OTEL_SPOOL_RETENTION_DAYS,
+  );
+  db.transaction(() => {
+    otel = drainOtel(db, sweepSpoolDir, { retentionDays: otelRetentionDays, now });
+  }).immediate();
+  otel.cleanup();
+  pendingAnomalies.push(...otel.anomalies);
+  report.otel = {
+    logs_read: otel.logs_read,
+    metrics_read: otel.metrics_read,
+    requests_upserted: otel.otel_requests_upserted,
+    metrics_inserted: otel.otel_metrics_inserted,
+    durations_filled: otel.durations_filled,
+    durations_refreshed: otel.durations_refreshed,
+    auxiliary_inserted: otel.auxiliary_inserted,
+    auxiliary_superseded: otel.auxiliary_superseded,
+    auxiliary_collisions: otel.auxiliary_collisions,
+    unjoined: otel.unjoined,
+    counter_mismatches: otel.counter_mismatches,
+    prompt_mismatches: otel.prompt_mismatches,
+    malformed: otel.malformed,
+    rejects_read: otel.rejects_read,
+    traces_dropped: otel.traces_dropped,
+    spool_pruned: otel.spool_pruned,
+  };
+  // The receiver cannot report its own death, and the sweeper is the component that
+  // already owns loud failures. Silence is only a fault when telemetry is CONFIGURED:
+  // with no `env` block the whole phase degrades to Phase 1 by design.
+  const down = receiverDownAnomaly(
+    db,
+    telemetryConfigured(),
+    Number(getConfig(db, "otel_stale_min") ?? 15),
+    now,
+  );
+  if (down !== null) pendingAnomalies.push(down);
+
   const attribution = attributeTasks(db);
   report.attribution = {
     tasks: attribution.tasks,
@@ -856,6 +1095,55 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     requests: attribution.requests_assigned,
     by_attr: attribution.by_attr,
   };
+
+  // P2.8: promote `estimating -> in_progress` on the task's FIRST attributed
+  // request, and correct `started_at` monotone-earliest. Runs immediately after
+  // attribution because it reads `request.tid`/`request.attr`, which that pass just
+  // wrote — the sweeper's ONE other status edge, never `pending_verification`,
+  // `completed`, `abandoned`, `deleted` or `reopened` (those are `est close`'s).
+  const promotion = promoteStartedTasks(db);
+  report.promotion = {
+    promoted: promotion.promoted,
+    started_at_set: promotion.started_at_set,
+    started_at_backdated: promotion.started_at_backdated,
+  };
+  pendingAnomalies.push(...promotion.anomalies);
+
+  // P2.9: reconcile `~/.claude/jobs` — RECONCILE-ONLY, never a source of truth for
+  // a token, a status or a task (§7.1). Runs after attribution (so `task_alias` is
+  // current) but has no ordering dependency on segments/burn_cache below; placed
+  // here to keep every `request`/`task_alias`-reading pass adjacent.
+  //
+  // Wrapped the way every sibling pass is wrapped, and for the reason `reconcileJobs`
+  // own doc comment states ("call INSIDE the sweep's transaction"): `runSweep` is not
+  // itself inside one, so a bare call ran the whole loop in autocommit — one commit per
+  // `task_alias` insert, per `job_run` upsert and per `job_item` upsert, and a crash
+  // between the alias insert and the item loop left a tid bound to a half-written job.
+  // The upserts are idempotent so the next sweep repaired it, but "repaired next time"
+  // is not the atomicity the contract claims.
+  let jobs = emptyJobsResult();
+  db.transaction(() => {
+    jobs = reconcileJobs(db, jobsRoot, sweptAt);
+  }).immediate();
+  report.jobs = {
+    dirs_read: jobs.dirs_read,
+    parsed: jobs.parsed,
+    malformed: jobs.malformed,
+    bound: jobs.bound,
+    already_bound: jobs.already_bound,
+    unjoined: jobs.unjoined,
+    n_items: jobs.n_items,
+    n_items_started: jobs.n_items_started,
+  };
+  pendingAnomalies.push(...jobs.anomalies);
+
+  // 4. **Cut the run segments** (P2.1), and do it BEFORE `refreshBurnCache`: the
+  //    check-back forecast the cache writes is issued against the OPEN segment this
+  //    step produces, so the other order would always publish a forecast one sweep
+  //    behind the activity it is about. `full` (backfill) rebuilds every session.
+  db.transaction(() => {
+    report.segments = refreshSegments(db, { now, all: full });
+  }).immediate();
 
   db.transaction(() => {
     report.burn_cache_rows = refreshBurnCache(db, now);
@@ -907,6 +1195,38 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
       $vanished_lt_60d: vanishedLt60d,
     } as never);
   }).immediate();
+
+  // P2.7: regenerate `board.html`/`board.md` at the end of a sweep "whose transaction
+  // changed a `task`, `estimate`, `outcome` or `burn_cache` row", throttled by
+  // `board_min_interval_s`.
+  //
+  // Those four tables have exactly two writers inside a sweep, and this reads both:
+  // status promotion (P2.8) is the sweeper's ONLY `task` edge, and `refreshBurnCache`
+  // (P1.9) reports the number of `burn_cache` rows it wrote. `estimate` and `outcome`
+  // are append-only and belong to `est open` / `est close`, which no sweep runs — a
+  // sweep cannot change them, so there is nothing here to read for them. When both
+  // report zero, the board would render byte-for-byte what is already on disk, and the
+  // render is skipped rather than paid for: `board()` is an unbounded read across half
+  // the view stack plus two fsync'd writes, and an idle machine on a cron sweep would
+  // otherwise pay it forever.
+  //
+  // Deliberately OUTSIDE `pendingAnomalies`/`writtenAnomalies`: a render failure
+  // must never fail the sweep — not even under `--strict`, which promotes every
+  // OTHER recorded anomaly — because the board is a convenience and the sweep is
+  // the system. It is still written to the ledger directly, so it stays queryable.
+  const boardDirty =
+    promotion.promoted > 0 ||
+    promotion.started_at_set > 0 ||
+    promotion.started_at_backdated > 0 ||
+    report.burn_cache_rows > 0;
+  const boardResult = regenerateBoardIfDue(db, {
+    boardDir,
+    spoolDir: boardSpoolDir,
+    now,
+    dirty: boardDirty,
+  });
+  report.board = { attempted: boardResult.attempted, ok: boardResult.ok };
+  if (boardResult.anomaly !== null) insertAnomalies(db, [boardResult.anomaly], sweptAt);
 
   for (const a of writtenAnomalies) {
     report.anomalies.by_kind[a.kind] = (report.anomalies.by_kind[a.kind] ?? 0) + 1;
@@ -1136,6 +1456,26 @@ function sweepSummary(r: SweepReport): string {
         `${num(r.attribution.requests)} request row(s) changed${split === "" ? "" : ` (${split})`}`,
     );
     lines.push(`burn    ${num(r.burn_cache_rows)} materialised burn_cache row(s) refreshed`);
+    lines.push(
+      `segs    ${num(r.segments.segments)} run segment(s) over ${num(r.segments.sessions)} session(s), ` +
+        `${num(r.segments.open)} still open — the check-back corpus (\`est segments\`)`,
+    );
+  }
+  if (r.jobs.dirs_read > 0) {
+    lines.push(
+      `jobs    ${num(r.jobs.parsed)}/${num(r.jobs.dirs_read)} job dir(s) read: ${num(r.jobs.bound)} newly bound, ` +
+        `${num(r.jobs.already_bound)} already bound, ${num(r.jobs.unjoined)} unjoined ` +
+        `(${num(r.jobs.n_items_started)}/${num(r.jobs.n_items)} fan items started) — reconcile-only, never a source of truth`,
+    );
+  }
+  if (r.promotion.promoted > 0 || r.promotion.started_at_set > 0 || r.promotion.started_at_backdated > 0) {
+    lines.push(
+      `promote ${num(r.promotion.promoted)} task(s) estimating->in_progress, ` +
+        `${num(r.promotion.started_at_set)} started_at set, ${num(r.promotion.started_at_backdated)} backdated`,
+    );
+  }
+  if (r.board.attempted) {
+    lines.push(`board   ${r.board.ok ? "regenerated" : "render FAILED (see anomaly; previous file left intact)"}`);
   }
   if (r.files_incomplete > 0) {
     lines.push(
@@ -1625,16 +1965,24 @@ async function cmdCensus(ctx: Ctx): Promise<number> {
  *    row no reader ever looks at and read back as "set";
  *  - `schema_version` is refused outright — it is migration state, and hand-editing it
  *    either re-runs a migration over migrated data or skips one entirely.
+ *
+ * **The two exit codes are not interchangeable.** P2.0 fixes the surface as `0` · `1`
+ * usage · `2` unknown or protected key · `4` lock busy, and the split is the whole point:
+ * a script has to be able to tell a typo'd KEY (2 — the closed key set rejected it) from
+ * a malformed COMMAND LINE (1 — missing key, missing value, unknown subcommand). Both
+ * arriving as 1 makes the closed key set unobservable from outside.
  */
 async function cmdConfig(ctx: Ctx): Promise<number> {
   const sub = positional(ctx, 0);
-  if (sub !== null && sub !== "get" && sub !== "set") {
+  if (sub !== null && sub !== "list" && sub !== "get" && sub !== "set") {
     throw new UsageError(
-      `est config: unknown subcommand: ${sub} (expected \`get <key>\`, \`set <key> <value>\`, or no argument to list)`,
+      `est config: unknown subcommand: ${sub} (expected \`list\`, \`get <key>\`, \`set <key> <value>\`, or no argument to list)`,
     );
   }
 
-  if (sub === null) {
+  // `list` and the bare form are the same command; P2.0 spells the surface with the
+  // explicit verb and the bare form has shipped, so both stay.
+  if (sub === null || sub === "list") {
     const db = openDb({ path: ctx.dbPath, readonly: true });
     try {
       const rows = db.query<{ k: string; v: string }, []>("SELECT k, v FROM config ORDER BY k").all();
@@ -1656,7 +2004,12 @@ async function cmdConfig(ctx: Ctx): Promise<number> {
     const db = openDb({ path: ctx.dbPath, readonly: true });
     try {
       const value = getConfig(db, key);
-      if (value === null) throw new UsageError(`est config get: unknown key: ${key}`);
+      if (value === null) {
+        throw new InvariantError(
+          `est config get: unknown key: ${key}`,
+          "run `est config list` for the seeded key set; every key is seeded by schema.sql",
+        );
+      }
       // Bare value on stdout, so `$(est config get shrink_k)` is the number itself.
       if (ctx.json) ctx.out(JSON.stringify({ schema: 1, key, value }));
       else if (!ctx.quiet) ctx.out(value);
@@ -1681,8 +2034,9 @@ async function cmdConfig(ctx: Ctx): Promise<number> {
         }
         const old = getConfig(db, key);
         if (old === null) {
-          throw new UsageError(
-            `est config set: unknown key: ${key}; every key is seeded by schema.sql — add it there (with a migration step) before tuning it`,
+          throw new InvariantError(
+            `est config set: unknown key: ${key}`,
+            "every key is seeded by schema.sql — add it there (with a migration step) before tuning it; `est config list` shows the set",
           );
         }
         setConfig(db, key, value);
@@ -2221,7 +2575,90 @@ function cmdRefclass(ctx: Ctx): number {
   }
 }
 
+/**
+ * Land one `anomaly(kind='board_render_failed')` for a MANUAL render failure, the same
+ * row `regenerateBoardIfDue` produces on the sweep path.
+ *
+ * Best-effort by construction, like `touchBoardMarker`: the render is read-only, so this
+ * needs its own writable handle, and the thing that just failed may well be the database
+ * itself. A failure to record the failure must not turn a `0` into a crash — the operator
+ * already has the message on stderr, and the next sweep re-renders. `insertAnomalies`
+ * de-duplicates on `(kind, detail)`, so a render that fails on every invocation writes
+ * one row rather than one per attempt.
+ */
+function recordBoardRenderFailure(ctx: Ctx, message: string, now: Date): void {
+  try {
+    const db = openDb({ path: ctx.dbPath });
+    try {
+      insertAnomalies(db, [{ kind: "board_render_failed", detail: `est board render failed: ${message}` }], isoNow(now));
+    } finally {
+      db.close();
+    }
+  } catch {
+    // best-effort; see doc comment above
+  }
+}
+
+/**
+ * `est board` — P1.8's terminal/JSON read model, plus P2.7's file renderer.
+ *
+ * `--html`/`--md` switch to the FILE mode: `--out <dir>` names the destination
+ * (default: the directory the database itself lives in — same rule `runSweep`
+ * applies automatically, see `SweepOptions.boardDir`), and this call is UNTHROTTLED
+ * — an explicit request bypasses the sweep's `board_min_interval_s` gate the same
+ * way a manual `est sweep` is never throttled while the hook-spawned micro-sweep is
+ * (P1.10's distinction, carried over here, §7.1/P2.7).
+ *
+ * **A render failure exits `0`, exactly as it does on the sweep path.** P2.7 fixes the
+ * contract as "`0` always (a render failure is an anomaly, not a failed command) · `1`
+ * usage", and the reason is the same in both directions: the board is a convenience and
+ * the failure belongs in the ledger the alerting reads, not only on one operator's
+ * terminal. Exiting `1` here made a manual render failure invisible to `anomaly`-based
+ * alerting AND indistinguishable from a mistyped flag. The message still goes to stderr
+ * — the person who just typed the command hears about it — and the previous good files
+ * are left intact by `writeAtomic`'s rename discipline.
+ */
 function cmdBoard(ctx: Ctx): number {
+  const p = ctx.parsed;
+  const wantHtml = flagBool(p, "html");
+  const wantMd = flagBool(p, "md");
+
+  if (wantHtml || wantMd) {
+    const dir = flagString(p, "out") ?? dirname(ctx.dbPath);
+    const now = new Date();
+    const written: { html?: string; md?: string } = {};
+    let failure: string | null = null;
+    // Read-only for the render itself: the happy path of a board render must not be
+    // able to write to the database it is reading.
+    const db = openDb({ path: ctx.dbPath, readonly: true });
+    try {
+      const r = renderBoardFiles(db, dir, {
+        limit: optInt(p, "limit", DEFAULT_BOARD_LIMIT),
+        now,
+        html: wantHtml,
+        md: wantMd,
+      });
+      if (r.html_path !== null) written.html = r.html_path;
+      if (r.md_path !== null) written.md = r.md_path;
+    } catch (e) {
+      failure = e instanceof Error ? e.message : String(e);
+    } finally {
+      db.close();
+    }
+
+    if (failure !== null) {
+      recordBoardRenderFailure(ctx, failure, now);
+      ctx.err(`est board: render/write failed: ${failure}`);
+      return 0;
+    }
+    if (ctx.json) {
+      ctx.out(JSON.stringify({ schema: 1, written }));
+    } else if (!ctx.quiet) {
+      for (const [kind, path] of Object.entries(written)) ctx.out(`wrote ${kind}: ${path}`);
+    }
+    return 0;
+  }
+
   const db = openDb({ path: ctx.dbPath, readonly: true });
   try {
     const r = board(db, {
@@ -2255,11 +2692,290 @@ function cmdBoard(ctx: Ctx): number {
       );
     }
     ctx.out("");
-    ctx.out("* = uncalibrated band (cold start). The HTML/markdown board is Phase 2 (§7.1); --html is the flag it will land under.");
+    ctx.out(
+      "* = uncalibrated band (cold start). `est board --html [--md] [--out <dir>]` writes the fuller kanban view to disk (P2.7).",
+    );
     return 0;
   } finally {
     db.close();
   }
+}
+
+/**
+ * `est recon` — weekly reconciliation (P2.6, §7.5 widened).
+ *
+ * Writes one `recon` row (USD) and one `recon_metric` row per other axis, raises
+ * `recon_mismatch` for any axis past `recon_alert_pct`, and — with `--certify` —
+ * evaluates the criterion that retires the statusline's `[unvalidated]` marker.
+ *
+ * Exit `0` · `1` usage · `3` an axis breached the alert threshold (so a cron leg can
+ * alert on it) · `4` lock busy. `--dry-run` never writes and never takes the lock,
+ * which is what makes this safe to run against a copy during a review.
+ */
+/**
+ * `est otel` — the operator's view of the OTLP receiver (P2.3).
+ *
+ * The ONE verb in this CLI that never opens the database, and that is the point rather
+ * than an omission: the receiver's whole contract is that it does not contend for the
+ * writer lock, so a diagnostic about it that took the lock would be reporting on a
+ * property it had just broken. It speaks HTTP to `127.0.0.1:<port>/healthz` and prints
+ * what it hears.
+ *
+ * Exit `0` when the receiver answered, `3` when it did not — the same code every other
+ * verb uses for "ran fine; what it found is bad news" — so a cron leg can alert on a
+ * dead receiver without parsing anything. `1` stays reserved for a mistyped command
+ * line, because "you typed it wrong" and "the receiver is down" are different problems
+ * and a script must be able to tell them apart.
+ */
+async function cmdOtel(ctx: Ctx): Promise<number> {
+  const p = ctx.parsed;
+  const dump = flagString(p, "dump");
+  const status = flagBool(p, "status") || dump === null;
+  if (dump !== null && flagBool(p, "status")) {
+    throw new UsageError("est otel: --status and --dump are separate actions; run one at a time");
+  }
+  const portFlag = flagString(p, "port");
+  if (portFlag !== null && !/^\d+$/.test(portFlag)) {
+    throw new UsageError(`est otel: --port must be a number, got: ${portFlag}`);
+  }
+  const port = otelPort(process.env, portFlag === null ? null : Number(portFlag));
+
+  if (!status) {
+    const seconds = Number(dump);
+    const r = await otelDump(port, seconds);
+    if (ctx.json) ctx.out(JSON.stringify(r));
+    else if (!ctx.quiet) ctx.out(renderOtelDump(r));
+    return r.ok ? 0 : 3;
+  }
+
+  const s = await otelStatus(port);
+  if (ctx.json) ctx.out(JSON.stringify(s));
+  else if (!ctx.quiet) ctx.out(renderOtelStatus(s));
+  return s.reachable ? 0 : 3;
+}
+
+async function cmdRecon(ctx: Ctx): Promise<number> {
+  const p = ctx.parsed;
+  const dryRun = flagBool(p, "dry-run");
+  const certify = flagBool(p, "certify");
+  if (dryRun && certify) {
+    throw new UsageError(
+      "est recon: --certify writes config.unvalidated_retired_at, so it cannot be combined with --dry-run; " +
+        "run `est recon --dry-run` to see the axes, then `est recon --certify` to act on them",
+    );
+  }
+  const axes = flagString(p, "source");
+  const wanted =
+    axes === null
+      ? undefined
+      : (axes
+          .split(",")
+          .map((a) => a.trim())
+          .filter((a) => a !== "") as ReconAxis[]);
+  if (wanted !== undefined) {
+    const legal: readonly string[] = ["usd", "tokens", "active_s", "requests"];
+    for (const a of wanted) {
+      if (!legal.includes(a)) {
+        throw new UsageError(`est recon: unknown --source axis: ${a} (expected ${legal.join(" | ")})`);
+      }
+    }
+  }
+  const windowSpec = flagString(p, "window");
+
+  const emit = (report: ReturnType<typeof computeRecon>): number => {
+    const alerting = report.axes.some((a) => a.alert);
+    if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...report }));
+    else if (!ctx.quiet) ctx.out(renderRecon(report));
+    // Exit 3 is "completed, but alerting anomalies were recorded" — the same code the
+    // sweep uses, so one cron leg can treat both the same way.
+    return alerting ? 3 : 0;
+  };
+
+  if (dryRun) {
+    const db = openDb({ path: ctx.dbPath, readonly: true });
+    try {
+      const report = computeRecon(db, { window: windowSpec, axes: wanted });
+      report.certification = evaluateCertification(db, { apply: false });
+      return emit(report);
+    } finally {
+      db.close();
+    }
+  }
+
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
+        const report = computeRecon(db, { window: windowSpec, axes: wanted });
+        const sweptAt = report.as_of;
+        db.transaction(() => {
+          writeRecon(db, report);
+          insertAnomalies(db, report.anomalies, sweptAt);
+          // Certification is evaluated on EVERY run, not only with --certify: writing
+          // the key needs the flag, but CLEARING it does not. Retirement is rolling,
+          // and a marker that could only ever be removed by the command that granted it
+          // would be a validation that cannot expire.
+          report.certification = evaluateCertification(db, { apply: true, now: new Date() });
+          if (!certify && report.certification.granted) {
+            // Without --certify this run must not GRANT retirement; undo the write and
+            // report that the criterion is met and awaiting the explicit command.
+            //
+            // The guard is `granted` — the flag evaluateCertification sets ONLY in its
+            // INSERT branch — and never `retired_at !== null`: the latter is also true
+            // of a retirement an earlier `--certify` legitimately made, so keying off it
+            // made the weekly cron's plain `est recon` revoke the marker it had just
+            // certified, on a week where nothing breached.
+            db.query("DELETE FROM config WHERE k = 'unvalidated_retired_at'").run();
+            report.certification.retired_at = null;
+            report.certification.granted = false;
+            report.certification.reason += " — run `est recon --certify` to retire the marker";
+          }
+        }).immediate();
+        report.wrote = true;
+        return emit(report);
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("recon") },
+  );
+}
+
+/**
+ * `est segments` — the check-back tuning surface (P2.1).
+ *
+ * Read-only; never writes, never locks, exits `0` always, INCLUDING no segments. The
+ * measured p50 moves ~10× across plausible `segment_gap_min` values, which is exactly
+ * why `--gap` exists: it recomputes the whole partition at another threshold and
+ * persists nothing, so the knob's effect is visible before anyone turns it.
+ */
+function cmdSegments(ctx: Ctx): number {
+  const p = ctx.parsed;
+  const gapRaw = flagString(p, "gap");
+  let gap: number | null = null;
+  if (gapRaw !== null) {
+    const n = Number(gapRaw);
+    if (!Number.isFinite(n) || n <= 0) throw new UsageError(`--gap: expected a positive number of minutes, got "${gapRaw}"`);
+    gap = n;
+  }
+  const sinceRaw = flagString(p, "since");
+  if (sinceRaw !== null && !Number.isFinite(Date.parse(sinceRaw))) {
+    throw new UsageError(`--since: expected an ISO instant, got "${sinceRaw}"`);
+  }
+  const db = openDb({ path: ctx.dbPath, readonly: true });
+  try {
+    const report = segmentsReport(db, {
+      session: flagString(p, "session"),
+      gap,
+      since: sinceRaw,
+      limit: flagInt(p, "limit", 50),
+      now: new Date(),
+    });
+    if (ctx.json) ctx.out(JSON.stringify(report));
+    else if (!ctx.quiet) ctx.out(renderSegments(report));
+    return 0;
+  } finally {
+    db.close();
+  }
+}
+
+function renderSegments(r: SegmentsReport): string {
+  const mins = (s: number | null): string => (s === null ? "—" : `${Math.round(s / 60)}m`);
+  const lines = [
+    `est segments  gap ${r.gap_min}m${r.recomputed ? "  [RECOMPUTED — nothing persisted]" : ""}  ·  ` +
+      `${r.n} segment(s)${r.n > r.segments.length ? `, newest ${r.segments.length} shown` : ""}`,
+  ];
+  if (r.segments.length === 0) {
+    lines.push(
+      "  (none — a session with no turn_duration records and no OTEL durations contributes no intervals, which is the hole the receiver fills, not a bug here)",
+    );
+    return lines.join("\n");
+  }
+  lines.push(
+    renderTable(
+      ["started", "active", "busy", "maxc", "turns", "agents", "gap before", "gap after", "terminator", "src", "tid"],
+      r.segments.map((s) => [
+        s.started_at.replace("T", " ").slice(0, 16),
+        mins(s.active_s),
+        mins(s.busy_s),
+        String(s.max_concurrency),
+        String(s.n_turns),
+        String(s.n_agents),
+        mins(s.gap_before_s),
+        mins(s.gap_after_s),
+        s.terminator,
+        s.interval_src_mix ?? "—",
+        s.tid === null ? "—" : s.tid.slice(0, 8),
+      ]),
+    ).replace(/^/gm, "  "),
+  );
+  lines.push(
+    "",
+    "terminator: human_input = the boundary the check-back forecast aims at · compaction = /compact ended the session ·",
+    "            session_end = nothing later and no live pid · open = still running (the only kind a forecast is issued against)",
+    "gap after is RECORDED, never predicted: the human-availability model is descoped, not deferred (§7.3 clock 3).",
+  );
+  return lines.join("\n");
+}
+
+/**
+ * `est audit` — P2.12's five checks over the ledger, made repeatable.
+ *
+ * Read-only by default and read-only in the overwhelming majority of runs: the report
+ * is the product. `--fix` is bounded by the doctrine, not by judgement — it deletes
+ * only from the five derived/ledger tables `src/audit.ts` names, records each removal
+ * as `anomaly('audit_removed')` carrying the deleted row verbatim, and REFUSES the
+ * append-only spine at exit `2` rather than silently doing less than it was asked.
+ *
+ * **Exit codes carry the whole result, because a cron leg reads them and not stdout:**
+ * `0` clean · `1` usage · `2` `--fix` refused on the append-only spine · `3` findings
+ * reported · `4` lock busy. `3` is the one that alerts; `0` means every row in the
+ * database traces to the corpus.
+ */
+async function cmdAudit(ctx: Ctx): Promise<number> {
+  const root = flagString(ctx.parsed, "root") ?? PROJECTS_ROOT;
+  const fix = flagBool(ctx.parsed, "fix");
+  const now = new Date();
+
+  const emit = (report: AuditReport): number => {
+    if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...report }));
+    else if (!ctx.quiet) ctx.out(renderAudit(report));
+    if (report.spine_refused) return 2;
+    return report.findings.length > 0 ? 3 : 0;
+  };
+
+  if (!fix) {
+    // No lock and no writable handle: an audit that could write is an audit that could
+    // be the thing a later audit finds.
+    const db = openDb({ path: ctx.dbPath, readonly: true });
+    try {
+      return emit(auditReport(db, { root, now }));
+    } finally {
+      db.close();
+    }
+  }
+
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
+        const report = auditReport(db, { root, now });
+        report.fixed = true;
+        // The refusal is evaluated on the report, BEFORE anything is deleted, but it
+        // does not cancel the bounded cleanup: the spine rows were never candidates,
+        // and refusing to tidy the ledger because a spine row also needs attention
+        // would leave both problems standing. The exit code still says `2`.
+        report.spine_refused = report.findings.some((f) => f.spine);
+        db.transaction(() => {
+          report.removed = applyFix(db, report, isoNow(now));
+        }).immediate();
+        return emit(report);
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("audit") },
+  );
 }
 
 async function cmdRetro(ctx: Ctx): Promise<number> {
@@ -2375,6 +3091,17 @@ function renderRetro(r: RetroReport): string {
       lines.push(`  ${sp.dimension}=${sp.level} n=${sp.n} pinball delta ${(sp.pinball_delta * 100).toFixed(1)}%`);
     }
   }
+  if (r.jobs_reconcile.length === 0) {
+    lines.push("", "jobs reconcile: no bound job — either none exist, or none are aliased to a tracked task yet");
+  } else {
+    lines.push("", "jobs reconcile (§P2.9 — reported, never corrected)");
+    for (const j of r.jobs_reconcile) {
+      const span = j.jobs_span_s === null ? "open" : `${j.jobs_span_s}s`;
+      const ours = j.our_active_s === null ? "n/a" : `${j.our_active_s}s`;
+      const delta = j.delta_span_s === null ? "" : ` · delta ${j.delta_span_s}s`;
+      lines.push(`  ${j.job_id} -> ${j.tid}: jobs span ${span} vs our active ${ours}${delta}`);
+    }
+  }
   if (r.alerts.length > 0) lines.push("", `ALERTS: ${r.alerts.join(" · ")}`);
   if (!r.dry_run) {
     lines.push("", `written: ${r.written.refclass} refclass snapshot(s), ${r.written.calib_run} calib_run row`);
@@ -2400,7 +3127,10 @@ commands:
   scope                   append a scope revision (the scope_change precondition)
   burn                    consumption against the band (--json is the statusline contract)
   close                   finalize by arithmetic
-  board                   terminal/JSON read model
+  board                   terminal/JSON read model, or --html/--md to render board.html/board.md
+  recon                   reconcile our numbers against Anthropic's, and certify [unvalidated]
+  segments                run segments — the check-back corpus, and the gap knob that cuts it
+  audit                   the five P2.12 checks over the ledger; --fix is bounded, never the spine
   retro                   weekly calibration + refclass write-back
   help, version
 
@@ -2435,10 +3165,20 @@ census:
   --limit <n>             sweep_census rows to show (default 10)
   --root <path>
 
+recon (P2.6 — our number vs an ANTHROPIC-computed one, on four independent axes):
+  --window 7d | <iso>/<iso>   default: the last 7 days
+  --source <axis>[,<axis>]    usd | tokens | active_s | requests (default: all four)
+  --certify                   evaluate the retirement criterion and, if met, retire
+                              [unvalidated]. Retirement is ROLLING: any later week that
+                              breaches the delta OR the join floor clears it again.
+  --dry-run                   compute and print; write nothing, take no lock
+
 config (the calibration constants — §1.1 keeps every tunable in the DB, not in code):
-  (no args)               list every key and value
+  list, (no args)         list every key and value
   get <key>               the value alone on stdout, so it substitutes into a shell var
   set <key> <value>       tune a SEEDED key; an unknown key and schema_version are refused
+                          The key set is CLOSED: an unknown or protected key exits 2, so a
+                          typo'd key is distinguishable from a malformed command line (1).
 
 refclass (read-only, takes no lock, ALWAYS exits 0 — an empty class is a valid answer):
   --text "<subject>"      what the work is about (FTS5 over completed tasks)
@@ -2466,7 +3206,34 @@ scope <tid>:              --reason <text> [--subject <t>] [--description <t>] [-
 burn [<tid>]:             [--session <sid>] [--refresh]      read-only; never writes; always exits 0
 close <tid>:              [--status completed|abandoned|deleted|reopened] [--force]
 board:                    [--status <column>] [--limit <n>]
+                          [--html] [--md] [--out <dir>]   P2.7 file renderer — writes
+                          board.html/board.md (default dir: alongside the database),
+                          untouched by the sweep's throttle since this is explicit
+audit (P2.12 — every row in the ledger has to trace to the corpus):
+  --root <path>           corpus root the "does this session exist" check reads
+  --fix                   delete the untraceable rows from the FIVE derived/ledger
+                          tables only (task_event, anomaly, burn_cache, sweep_state,
+                          run_segment), recording each removal as
+                          anomaly(audit_removed) with the deleted row as JSON.
+                          The append-only spine is REPORTED, never fixed: --fix with a
+                          spine finding still tidies the ledger and exits 2, because a
+                          wrong estimate is corrected by APPENDING a better one.
+  exits                   0 clean · 1 usage · 2 spine refused · 3 findings · 4 lock busy
+
+segments:                 [--session <sid>] [--gap <min>] [--since <iso>] [--limit <n>]
+                          Read-only, never writes, never locks. --gap RECOMPUTES at a
+                          different threshold WITHOUT persisting: that is how
+                          segment_gap_min gets fitted by evidence instead of by taste.
 retro:                    [--as-of <iso>] [--dry-run]
+
+otel:                     [--status] [--dump <seconds>] [--port <n>]
+                          The OTLP receiver, over HTTP — the ONE verb that never opens
+                          the database, because the receiver's contract is that it never
+                          contends for the writer lock. --status reads /healthz (up?
+                          which port? is the spool draining?); --dump arms raw-body
+                          parking on the RUNNING receiver for <seconds> (0 turns it off,
+                          3600 max) — those bodies contain PROMPT TEXT. Exit 3 when the
+                          receiver does not answer, so a cron leg can alert on it.
 
 exit codes: 0 ok (including a well-formed empty result) · 1 usage/fatal ·
             2 REJECTED BY AN INVARIANT (append-only; never retry, never work around) ·
@@ -2538,6 +3305,16 @@ export async function run(argv: readonly string[], io: RunOptions = {}): Promise
         return await verb(ctx, () => cmdClose(ctx));
       case "board":
         return await verb(ctx, () => cmdBoard(ctx));
+      case "recon":
+        return await verb(ctx, () => cmdRecon(ctx));
+      case "segments":
+        return await verb(ctx, () => cmdSegments(ctx));
+      case "audit":
+        return await verb(ctx, () => cmdAudit(ctx));
+      case "otel":
+        // NOT wrapped in `verb`: that helper is the database-opening path, and this is
+        // the one verb that must never open the database (see `cmdOtel`).
+        return await cmdOtel(ctx);
       case "retro":
         return await verb(ctx, () => cmdRetro(ctx));
       default:

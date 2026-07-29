@@ -44,6 +44,7 @@ import {
   type Harness,
 } from "./support.ts";
 import {
+  BOARD_MARKER,
   COMPLIANCE_FILE,
   MICROSWEEP_MARKER,
   TASK_EVENTS_FILE,
@@ -119,6 +120,51 @@ describe("spool location — the writer/reader seam", () => {
     expect(result.task_events.read).toBe(0);
     expect(result.compliance.read).toBe(0);
     expect(result.anomalies).toEqual([]);
+  });
+
+  test("a sweep drains ONLY the spool it was given — never the module-level SPOOL_DIR", async () => {
+    // The drains CONSUME what they read (rename to `.draining`, `rmSync` after the
+    // commit), and the spool is the only copy of those records until a sweep makes
+    // them rows. A sweep against a throwaway database that reached the frozen
+    // `SPOOL_DIR` therefore did not just read live state, it DELETED it — telemetry
+    // with no second home, gone, with a green suite on both sides.
+    const { runSweep } = await import("../src/cli.ts");
+    const emptyRoot = join(h.dir, "empty-projects");
+    mkdirSync(emptyRoot, { recursive: true });
+
+    // A spool that does NOT belong to this database. Nothing may touch it.
+    const foreign = join(h.dir, "foreign-spool");
+    mkdirSync(foreign, { recursive: true });
+    const foreignFile = join(foreign, TASK_EVENTS_FILE);
+    writeFileSync(
+      foreignFile,
+      `${JSON.stringify({
+        ts: LONG_AGO,
+        session_id: "s-foreign",
+        task_num: "9",
+        to_status: "deleted",
+        source: "pretooluse",
+      })}\n`,
+      "utf8",
+    );
+    writeFileSync(join(foreign, MICROSWEEP_MARKER), "1", "utf8");
+
+    appendLine(TASK_EVENTS_FILE, {
+      ts: LONG_AGO,
+      session_id: "s-mine",
+      task_num: "1",
+      to_status: "deleted",
+      source: "pretooluse",
+    });
+
+    const report = await runSweep(h.db, { root: emptyRoot, spoolDir: spool });
+    expect(report.spool.task_events_read).toBe(1);
+    // Ours was consumed…
+    expect(existsSync(join(spool, TASK_EVENTS_FILE))).toBe(false);
+    // …and the foreign spool is byte-for-byte untouched, marker included.
+    expect(existsSync(foreignFile)).toBe(true);
+    expect(readFileSync(foreignFile, "utf8")).toContain("s-foreign");
+    expect(existsSync(join(foreign, MICROSWEEP_MARKER))).toBe(true);
   });
 });
 
@@ -362,6 +408,21 @@ describe("pruneMarkers — nothing else enumerates the spool directory", () => {
     expect(pruneMarkers(spool)).toBe(1);
     expect(existsSync(join(spool, overrunMarkerFile("t-live")))).toBe(true);
     expect(existsSync(join(spool, overrunMarkerFile("t-forgotten")))).toBe(false);
+  });
+
+  test("the .board throttle marker is a name the pruner KNOWS, not an unreaped leak", () => {
+    // P2.7: "`pruneMarkers` learns the name so it cannot leak". Nothing else enumerates
+    // this directory, so a marker the pruner does not recognise is a file with no owner
+    // — and reaping a stale one costs exactly one un-throttled render.
+    touch(BOARD_MARKER, 25 * 60 * 60 * 1000);
+    touch(`${BOARD_MARKER}.tmp.999.1`, 25 * 60 * 60 * 1000); // writeAtomic residue
+    expect(pruneMarkers(spool)).toBe(2);
+    expect(readdirSync(spool)).toEqual([]);
+
+    // A marker inside the day-long horizon belongs to a live board and stays.
+    touch(BOARD_MARKER, 5 * 1000);
+    expect(pruneMarkers(spool)).toBe(0);
+    expect(existsSync(join(spool, BOARD_MARKER))).toBe(true);
   });
 
   test("the spool files themselves are never touched, however old", () => {

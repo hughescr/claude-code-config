@@ -85,9 +85,22 @@ describe("est close — P1.12 accepts no measured quantity", () => {
   test("the flag table has no token, cost or velocity input, and no --amend", () => {
     expect(COMMAND_FLAGS.close).toEqual({ booleans: ["force"], values: ["status"] });
     const everyFlag = Object.values(COMMAND_FLAGS).flatMap((s) => [...s.booleans, ...s.values]);
-    for (const forbidden of ["amend", "fix", "force-overwrite", "wcet", "actual", "tokens", "velocity", "cost"]) {
+    for (const forbidden of ["amend", "force-overwrite", "wcet", "actual", "tokens", "velocity", "cost"]) {
       expect(everyFlag).not.toContain(forbidden);
     }
+  });
+
+  test("`--fix` exists on exactly ONE verb, and that verb cannot touch the spine", async () => {
+    // P2.12's `est audit --fix` is the single sanctioned repair path in the whole CLI,
+    // and the guard here is that it stays single AND stays bounded. A `--fix` on any
+    // verb that writes the append-only spine would be `--amend` under another name.
+    const withFix = Object.entries(COMMAND_FLAGS)
+      .filter(([, spec]) => spec.booleans.includes("fix") || spec.values.includes("fix"))
+      .map(([verb]) => verb);
+    expect(withFix).toEqual(["audit"]);
+
+    const { FIXABLE, SPINE } = await import("../src/audit.ts");
+    for (const table of SPINE) expect(table in FIXABLE).toBe(false);
   });
 
   test("`est delete` does not exist anywhere in the verb surface", () => {

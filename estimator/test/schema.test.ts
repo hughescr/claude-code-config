@@ -783,4 +783,170 @@ describe("schema migration", () => {
       rmSync(freshDir, { recursive: true, force: true });
     }
   });
+
+  /**
+   * v7 -> v8 (P2.5). The `burn_cache` REBUILD is what makes this test mandatory rather
+   * than a formality: a migration that adds columns by dropping and recreating a table
+   * is one typo away from a shape a fresh database never has, and every consumer of the
+   * cache would then read NULLs it could not explain.
+   */
+  test("a v7 database migrates to exactly the shape schema.sql builds", () => {
+    // Downgrade in place: drop every v8 object and restore the v7 burn_cache, so the
+    // starting file is what a real v7 database looks like.
+    db.exec(`
+      DROP VIEW v_otel_join;
+      DROP VIEW v_recon_week;
+      DROP VIEW v_eta_corpus;
+      DROP VIEW v_segment_current;
+      DROP TABLE job_item;
+      DROP TABLE job_run;
+      DROP TABLE recon_metric;
+      DROP TRIGGER eta_ro_u;
+      DROP TRIGGER eta_ro_d;
+      DROP TABLE eta_run;
+      DROP TABLE run_segment;
+      DROP TABLE otel_metric;
+      DROP TABLE otel_request;
+      DROP TABLE burn_cache;
+      CREATE TABLE burn_cache (
+        tid TEXT PRIMARY KEY REFERENCES task(tid),
+        as_of TEXT NOT NULL,
+        consumed_wcet INTEGER,
+        wcet_main INTEGER, wcet_sub INTEGER, wcet_aux INTEGER,
+        usd REAL,
+        n_req INTEGER,
+        n_agents_live INTEGER,
+        n_agents_total INTEGER,
+        n_provisional INTEGER,
+        n_unpriced INTEGER,
+        active_s INTEGER,
+        burn_wcet_per_min REAL,
+        proj_total_wcet INTEGER
+      ) STRICT, WITHOUT ROWID;
+      DELETE FROM config WHERE k IN
+        ('segment_gap_min','eta_min_segments','eta_min_fit','eta_min_pinball_gain',
+         'recon_alert_pct','unvalidated_max_delta_pct','unvalidated_weeks',
+         'unvalidated_min_join_pct','board_min_interval_s','job_item_min_pop',
+         'otel_max_body_mb','otel_stale_min','otel_spool_retention_days');
+      UPDATE config SET v = '7' WHERE k = 'schema_version';
+    `);
+    // A tuned value must survive the step: the config seeds are INSERT OR IGNORE, and a
+    // migration that restated one would be rewriting a row Craig set on purpose.
+    db.query("UPDATE config SET v='999' WHERE k='shrink_k'").run();
+    // And a burn_cache ROW must survive it. P2.5: "existing rows are carried across
+    // column for column; the new columns are NULL until the next sweep". Dropping them
+    // empties the cache for every open task, and `burnJson`/`renderBurn` read ONLY this
+    // table — the statusline segment would vanish until the next full sweep.
+    task("T-burn");
+    db.query(
+      `INSERT INTO burn_cache (tid, as_of, consumed_wcet, wcet_main, wcet_sub, wcet_aux, usd,
+                               n_req, n_agents_live, n_agents_total, n_provisional, n_unpriced,
+                               active_s, burn_wcet_per_min, proj_total_wcet)
+       VALUES ('T-burn','2026-03-01T00:00:00Z',12345,10000,2345,0,1.5,7,1,2,0,0,600,42.5,20000)`,
+    ).run();
+    const path = join(dir, "estimator.db");
+    db.close();
+
+    db = openDb({ path }); // migrates on open
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(db.query<{ v: string }, []>("SELECT v FROM config WHERE k='shrink_k'").get()?.v).toBe("999");
+
+    // Carried across column for column, with the nine new columns NULL.
+    const carried = db
+      .query<
+        { tid: string; consumed_wcet: number; proj_total_wcet: number; check_back_p50_s: number | null },
+        []
+      >(
+        "SELECT tid, consumed_wcet, proj_total_wcet, check_back_p50_s FROM burn_cache",
+      )
+      .all();
+    expect(carried).toEqual([
+      { tid: "T-burn", consumed_wcet: 12345, proj_total_wcet: 20000, check_back_p50_s: null },
+    ]);
+    // The rebuild's scratch table is not left lying around.
+    expect(
+      db
+        .query<{ n: number }, []>(
+          "SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'burn_cache_pre_v8'",
+        )
+        .get()?.n,
+    ).toBe(0);
+
+    const freshDir = mkdtempSync(join(tmpdir(), "estimator-schema-v8-"));
+    const fresh = openDb({ path: join(freshDir, "estimator.db") });
+    try {
+      const objects = (d: Database): unknown =>
+        d
+          .query<unknown, []>(
+            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+          )
+          .all();
+      // The whole `sqlite_master` row, `sql` text included — SQLite strips
+      // `IF NOT EXISTS` before storing a definition, so the migration's idempotence
+      // guard costs nothing in fidelity and this stays an EXACT comparison.
+      expect(objects(db)).toEqual(objects(fresh));
+
+      for (const table of [
+        "burn_cache",
+        "otel_request",
+        "otel_metric",
+        "run_segment",
+        "eta_run",
+        "recon_metric",
+        "job_run",
+        "job_item",
+      ]) {
+        const shape = (d: Database): unknown =>
+          d
+            .query<unknown, []>(
+              `SELECT name, type, "notnull", pk FROM pragma_table_info('${table}') ORDER BY name`,
+            )
+            .all();
+        expect(shape(db)).toEqual(shape(fresh));
+      }
+
+      // The seeds landed, and the ONE key that must never be seeded still is not:
+      // `est recon --certify` is the only writer of `unvalidated_retired_at`, and its
+      // presence is what retires the [unvalidated] marker.
+      expect(
+        db.query<{ v: string }, []>("SELECT v FROM config WHERE k='segment_gap_min'").get()?.v,
+      ).toBe("5");
+      expect(
+        db.query<{ n: number }, []>(
+          "SELECT COUNT(*) AS n FROM config WHERE k='unvalidated_retired_at'",
+        ).get()?.n,
+      ).toBe(0);
+
+      // eta_run came back WITH its append-only triggers. A rebuild that silently
+      // dropped them would leave the fitting ledger rewritable.
+      db.query(
+        `INSERT INTO eta_run (as_of, eta_model, n_seg, n_censored, gap_min,
+                              baseline_pinball_p50, params_json)
+         VALUES ('2026-01-01T00:00:00Z','const_median',3,0,5,1.0,'{}')`,
+      ).run();
+      expect(() => db.query("UPDATE eta_run SET n_seg = 9").run()).toThrow(/append-only/);
+      expect(() => db.query("DELETE FROM eta_run").run()).toThrow(/append-only/);
+    } finally {
+      fresh.close();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * schema.sql's own header documents `sqlite3 estimator.db < schema.sql` as a way to
+   * build the file. Running that over a v7 database creates every v8 object while
+   * `INSERT OR IGNORE` leaves `schema_version` at 7 — so the migration has to be
+   * idempotent against objects that already exist, or the database is stuck a version
+   * behind forever with a confusing "table already exists" error.
+   */
+  test("the v8 step lands on a file that already has the shape and only lacks the marker", () => {
+    db.query("UPDATE config SET v='7' WHERE k='schema_version'").run();
+    const path = join(dir, "estimator.db");
+    db.close();
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(
+      db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM otel_request").get()?.n,
+    ).toBe(0);
+  });
 });

@@ -130,6 +130,69 @@ describe("est board — P1.8", () => {
     expect(body.columns[0]!.cards).toHaveLength(1);
   });
 
+  /**
+   * The limit is applied in SQL, per column, BEFORE anything priced is read — see
+   * `board()`'s two-step doc comment. This pins the two things that refactor could
+   * plausibly break: which cards survive (the newest, per column) and whether each
+   * surviving card still gets ITS OWN priced figures rather than a neighbour's.
+   *
+   * It matters beyond tidiness because P2.7 put this read at the tail of every sweep,
+   * including the PostToolUse micro-sweep: a board that priced every task ever recorded
+   * to display twenty cards would put P1.9's abolished 126 ms scan back on Craig's hot
+   * path, and it would grow.
+   */
+  test("--limit keeps the NEWEST cards per column and each keeps its own priced figures", async () => {
+    // Four completions, distinct wall-clock days and distinct actuals.
+    const t1 = await completedTask(1, { actualOut: 1111 });
+    const t2 = await completedTask(2, { actualOut: 2222 });
+    const t3 = await completedTask(3, { actualOut: 3333 });
+    await completedTask(4, { actualOut: 4444 });
+
+    const all = board(h.db, { now: NOW }).columns.find((c) => c.column === "Done (7d)")!.cards;
+    expect(all).toHaveLength(4);
+    // Newest first — `COALESCE(finalized_at, created_at) DESC`, unchanged.
+    const order = all.map((c) => c.tid);
+
+    const capped = board(h.db, { now: NOW, limit: 2 }).columns.find(
+      (c) => c.column === "Done (7d)",
+    )!.cards;
+    expect(capped.map((c) => c.tid)).toEqual(order.slice(0, 2));
+
+    // Each card carries the actual of ITS task. A step-two fetch that mismatched the
+    // tid map would show up here as one card wearing another's consumption.
+    const byTid = new Map(all.map((c) => [c.tid, c.consumed_wcet]));
+    expect(byTid.get(t1)).toBe(1111);
+    expect(byTid.get(t2)).toBe(2222);
+    expect(byTid.get(t3)).toBe(3333);
+    for (const c of all) expect(c.cal_p50).toBe(1000);
+  });
+
+  test("a task with no estimate row still renders, with a zeroed uncalibrated band", () => {
+    // The estimate join is a LEFT one for a reason: `est open` writes the task and the
+    // estimate in one transaction, but a task adopted by any other path may have none,
+    // and dropping the card would make it invisible rather than obviously unestimated.
+    h.db
+      .query(
+        `INSERT INTO task (tid, kind, status, created_at, anchor_session, anchor_prompt)
+         VALUES ('T-bare','implement','in_progress','2026-01-15T00:00:00Z','s-bare','p1')`,
+      )
+      .run();
+    h.db
+      .query(
+        `INSERT INTO task_scope (tid, seq, ts, subject, dod_json, scope_hash, source)
+         VALUES ('T-bare',1,'2026-01-15T00:00:00Z','bare task','[]','h','est_open')`,
+      )
+      .run();
+    const card = board(h.db, { now: NOW }).columns.find((c) => c.column === "In Progress")!
+      .cards[0]!;
+    expect(card.tid).toBe("T-bare");
+    expect(card.cal_p50).toBe(0);
+    expect(card.uncalibrated).toBe(true);
+    expect(card.consumed_wcet).toBe(0);
+    expect(card.phases).toEqual([]);
+    expect(card.phase_conf).toBeNull();
+  });
+
   test("board never writes and never takes the lock", async () => {
     await completedTask(7, { close: false });
     const before = h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM anomaly").get()!.n;
@@ -148,11 +211,18 @@ describe("est retro — P1.8", () => {
     await completedTask(1);
     const r = await h.cli("retro", "--dry-run", "--json");
     expect(r.code).toBe(0);
-    const body = r.json<{ dry_run: boolean; written: { refclass: number; calib_run: number } }>();
+    const body = r.json<{
+      dry_run: boolean;
+      written: { refclass: number; calib_run: number; eta_run: number };
+    }>();
     expect(body.dry_run).toBe(true);
-    expect(body.written).toEqual({ refclass: 0, calib_run: 0 });
+    // `eta_run` joined the ledger at P2.1 and obeys the same rule: a dry run scores the
+    // check-back models (that panel is the whole point of reading a dry run) and writes
+    // not one row of any of the three tables.
+    expect(body.written).toEqual({ refclass: 0, calib_run: 0, eta_run: 0 });
     expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM refclass").get()?.n).toBe(0);
     expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM calib_run").get()?.n).toBe(0);
+    expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM eta_run").get()?.n).toBe(0);
   });
 
   test("a real run writes one refclass snapshot per (bucket, estimator_family) and one calib_run", async () => {

@@ -62,19 +62,25 @@ function seenMs(ts: string | null | undefined): number {
   return Number.isFinite(t) ? t : Number.NEGATIVE_INFINITY;
 }
 
-/** Sessions with a live process, from `~/.claude/sessions/<pid>.json`. */
-export function livePidsForSessions(sessionIds: readonly string[], root = SESSIONS_ROOT): number[] {
-  if (sessionIds.length === 0) return [];
-  const wanted = new Set(sessionIds);
+/**
+ * ONE scan of `~/.claude/sessions/`, returning session id -> live pids.
+ *
+ * Both callers want the same directory read: §6.2's quiescence check asks about one
+ * task's bound sessions, and P2.1's segment terminator asks about every session in the
+ * corpus at once. A per-session `readdirSync` + `kill(0)` per file is the same answer
+ * recomputed N times, which is a measurable cost on a sweep that touches hundreds of
+ * sessions and no more correct.
+ */
+export function liveSessionPids(root = SESSIONS_ROOT): Map<string, number[]> {
+  const out = new Map<string, number[]>();
   let names: string[];
   try {
     names = readdirSync(root);
   } catch {
     // No sessions directory is not "no live sessions proven" — but it is the only
     // answer available, and the other four quiescence conditions are the teeth.
-    return [];
+    return out;
   }
-  const live: number[] = [];
   for (const name of names) {
     if (!name.endsWith(".json")) continue;
     const pid = Number.parseInt(name.slice(0, -5), 10);
@@ -93,13 +99,31 @@ export function livePidsForSessions(sessionIds: readonly string[], root = SESSIO
         : typeof o.session_id === "string"
           ? o.session_id
           : null;
-    if (sid === null || !wanted.has(sid)) continue;
+    if (sid === null) continue;
     try {
       process.kill(pid, 0);
-      live.push(pid);
+      const prev = out.get(sid);
+      if (prev === undefined) out.set(sid, [pid]);
+      else prev.push(pid);
     } catch {
       // ESRCH: an orphaned session file whose process is gone — §6.1's crash signal.
     }
+  }
+  return out;
+}
+
+/** The set of session ids with a live process — P2.1's `session_end` discriminator. */
+export function liveSessionIds(root = SESSIONS_ROOT): Set<string> {
+  return new Set(liveSessionPids(root).keys());
+}
+
+/** Sessions with a live process, from `~/.claude/sessions/<pid>.json`. */
+export function livePidsForSessions(sessionIds: readonly string[], root = SESSIONS_ROOT): number[] {
+  if (sessionIds.length === 0) return [];
+  const wanted = new Set(sessionIds);
+  const live: number[] = [];
+  for (const [sid, pids] of liveSessionPids(root)) {
+    if (wanted.has(sid)) live.push(...pids);
   }
   return live;
 }

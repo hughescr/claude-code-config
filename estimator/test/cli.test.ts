@@ -739,9 +739,23 @@ describe("est config", () => {
     db.close();
   });
 
-  test("an unseeded key is a usage error, not a silent upsert nobody reads", async () => {
+  test("`list` is a synonym for the bare form, not an unknown subcommand", async () => {
+    // P2.0 spells the surface `est config list [--json]`; the bare form shipped first
+    // and both have to work, because the documented invocation is the one a script
+    // written against the spec will use.
     await run(["init", ...base(), "-q"], io());
-    expect(await run(["config", "set", "attr_stale_turnz", "7", ...base()], io())).toBe(1);
+    stdout = [];
+    expect(await run(["config", "list", ...base(), "--json"], io())).toBe(0);
+    const listed = (JSON.parse(outText()) as { config: Record<string, string> }).config;
+    expect(listed.shrink_k).toBe("10");
+  });
+
+  test("an unseeded key exits 2 (closed key set), not 1 (bad command line)", async () => {
+    // The two codes carry different information and a script needs both: 2 says the
+    // KEY was rejected by the closed set, 1 says the COMMAND LINE was malformed.
+    // Collapsing them makes a typo'd key indistinguishable from a missing argument.
+    await run(["init", ...base(), "-q"], io());
+    expect(await run(["config", "set", "attr_stale_turnz", "7", ...base()], io())).toBe(2);
     expect(errText()).toContain("unknown key");
     const db = openDb({ path: dbPath, readonly: true });
     expect(db.query<{ n: number }, []>("SELECT COUNT(*) n FROM config WHERE k LIKE 'attr_stale_turn%'").get()!.n).toBe(1);
@@ -760,13 +774,18 @@ describe("est config", () => {
     db.close();
   });
 
-  test("`get` of an unknown key and an unknown subcommand both exit 1", async () => {
+  test("`get` of an unknown key exits 2; an unknown subcommand exits 1", async () => {
     await run(["init", ...base(), "-q"], io());
-    expect(await run(["config", "get", "nope", ...base()], io())).toBe(1);
+    expect(await run(["config", "get", "nope", ...base()], io())).toBe(2);
     expect(errText()).toContain("unknown key: nope");
     stderr = [];
     expect(await run(["config", "frob", ...base()], io())).toBe(1);
     expect(errText()).toContain("unknown subcommand");
+    stderr = [];
+    // A missing argument is a command-line error, so it stays 1 even though the
+    // neighbouring key failures are now 2.
+    expect(await run(["config", "set", "shrink_k", ...base()], io())).toBe(1);
+    expect(errText()).toContain("missing <value>");
   });
 
   test("listing and `get` never create a database — they open read-only", async () => {

@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.craig.estimator.otel — launchd job for scripts/otel-receiver.ts (design §P2.3).
+
+  ############################################################################
+  #  NOT INSTALLED. This file is the reviewable source; installing it is a    #
+  #  deliberate LAND-TIME step, not something a build does on Craig's         #
+  #  behalf. Nothing in Phase 2 depends on it running: with no receiver       #
+  #  there is no duration_ms, no reconciliation and no auxiliary spend, the   #
+  #  [unvalidated] marker simply stays, and every verb keeps its exit code.   #
+  #  Once installed, the copy under ~/Library/LaunchAgents is a SNAPSHOT of   #
+  #  this file — editing this one alone changes nothing.                      #
+  ############################################################################
+
+  This is a SECOND job, not a modification of com.craig.estimator: that one is a
+  03:30 calendar sweep and must stay a calendar job. `launchctl bootstrap`
+  refuses a duplicate Label, which is why the label differs.
+
+  Before installing, the settings.json env block (§P2.3) has to exist, or the
+  harness exports nothing and this process sits idle on a healthy socket:
+
+      "env": {
+        "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+        "OTEL_METRICS_EXPORTER": "otlp",
+        "OTEL_LOGS_EXPORTER": "otlp",
+        "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
+        "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "delta",
+        "OTEL_METRIC_EXPORT_INTERVAL": "60000",
+        "OTEL_LOGS_EXPORT_INTERVAL": "5000",
+        "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
+        "OTEL_METRICS_INCLUDE_VERSION": "true",
+        "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "false"
+      }
+
+  Note the endpoint carries NO path suffix: the generic variable has /v1/logs,
+  /v1/metrics and /v1/traces appended by the exporter, so `…:4318/v1/logs` here
+  produces requests to `…/v1/logs/v1/logs`, which this receiver answers 404 and
+  which looks exactly like a receiver that is not running.
+
+  To install (first time):
+
+      cp ~/.claude/estimator/scripts/com.craig.estimator.otel.plist \
+         ~/Library/LaunchAgents/com.craig.estimator.otel.plist
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.craig.estimator.otel.plist
+      launchctl enable gui/$(id -u)/com.craig.estimator.otel
+
+  To re-install after editing this file (bootstrap refuses an already-loaded
+  label, so bootout first — in-flight telemetry is lost, which is one export
+  interval of data):
+
+      launchctl bootout gui/$(id -u)/com.craig.estimator.otel
+      cp ~/.claude/estimator/scripts/com.craig.estimator.otel.plist \
+         ~/Library/LaunchAgents/com.craig.estimator.otel.plist
+      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.craig.estimator.otel.plist
+
+  To check on it / remove it:
+
+      curl -s http://127.0.0.1:4318/healthz | jq .
+      launchctl print gui/$(id -u)/com.craig.estimator.otel
+      launchctl bootout gui/$(id -u)/com.craig.estimator.otel
+
+  Notes, and each one differs deliberately from the calendar job:
+    * RunAtLoad is TRUE — the opposite of the cron job. A receiver that starts at
+      the next login loses everything before it.
+    * KeepAlive SuccessfulExit=false restarts a CRASH but not a clean shutdown,
+      so `launchctl bootout` does not fight a respawn loop.
+    * ThrottleInterval 30 stops a port conflict becoming a spin: the receiver
+      exits non-zero on a bind failure, deliberately, and without a throttle
+      launchd would restart it as fast as it can fail.
+    * PATH is set explicitly (launchd inherits no login PATH) and bun is invoked
+      by absolute path with a fallback, matching est-lib.sh's probe order.
+    * EST_OTEL_MAX_BODY_MB mirrors the `otel_max_body_mb` config row: the
+      receiver never opens the database (it must never contend for the writer
+      lock), so its one tunable arrives through the environment.
+    * Logs go to ~/Library/Logs — outside the dotfiles repo, so nothing here ever
+      shows up in `git status`.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.craig.estimator.otel</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>exec "$(command -v bun || echo /opt/homebrew/bin/bun)" run /Users/craig/.claude/estimator/scripts/otel-receiver.ts</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/Users/craig/.bun/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/craig</string>
+        <key>EST_HOME</key>
+        <string>/Users/craig/.claude/estimator</string>
+        <key>EST_OTEL_PORT</key>
+        <string>4318</string>
+        <key>EST_OTEL_MAX_BODY_MB</key>
+        <string>8</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/craig/.claude/estimator</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>Nice</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/craig/Library/Logs/com.craig.estimator.otel.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/craig/Library/Logs/com.craig.estimator.otel.log</string>
+</dict>
+</plist>

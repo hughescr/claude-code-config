@@ -19,16 +19,24 @@
  *     this file — degrades to an EMPTY segment (empty stdout, exit 0), never a stack trace or a
  *     stale number in Craig's prompt (P1.9: "a statusline that shows a wrong number is worse
  *     than one that shows nothing").
- *  3. **No clock ETA; the `unvalidated` marker is mandatory.** Per Craig's 2026-07-28 decision,
- *     the segment shows percent-of-band consumption only — `time.p50_s`/`p90_s` are never
- *     rendered even once populated — and `[unvalidated]` is appended whenever the payload says
- *     so (today, always; reconciliation lands in Phase 2, §7.5, at which point this line
- *     becomes conditional rather than constant).
+ *  3. **No token-derived clock ETA; the `unvalidated` marker is mandatory.** Per Craig's
+ *     2026-07-28 decision, the consumption part of the segment shows percent-of-band only —
+ *     `time.p50_s`/`p90_s` are never rendered even once populated — and `[unvalidated]` is
+ *     appended whenever the payload says so.
+ *
+ *     **`check back ~Nm` (P2.2) is not an exception to that rule; it is a different quantity.**
+ *     It is the Claude-ACTIVE time to the next human-input boundary, forecast from run-segment
+ *     intervals and never from tokens, and it carries its OWN honesty marker: a trailing `?`
+ *     for as long as the model is on probation. The two markers are separate and neither
+ *     retires the other — `unvalidated` is about money and is retired by reconciliation, `?` is
+ *     about time and is retired by pinball loss. Collapsing them would let a cost check certify
+ *     a time model.
  */
 
 import { readFileSync } from "node:fs";
 import { DB_PATH } from "../src/db.ts";
 import { burnRead, type BurnJson } from "../src/burn.ts";
+import { formatEta } from "../src/eta.ts";
 
 function fmtNum(n: number): string {
   return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n);
@@ -56,9 +64,20 @@ export function formatSegment(b: BurnJson): string {
   if (b.agents.live > 0) {
     bits.push(`${b.agents.live} agent${b.agents.live === 1 ? "" : "s"}`);
   }
+  // The check-back ETA (P2.2). Rendered ONLY when the payload carries one — `null` is a
+  // well-formed answer meaning "no open segment, or too thin a corpus to fit" — and only
+  // past the two refusals above: a guessed target with a confident ETA is worse than no
+  // ETA at all. p50 alone; p90 lives in `est burn` and on the board, because one line of
+  // budget is where a two-number band stops being glanceable.
+  if (b.check_back !== null && b.check_back !== undefined) {
+    bits.push(`check back ${formatEta(b.check_back.p50_min)}${b.check_back.probation ? "?" : ""}`);
+  }
   let text = `task ${bits.join(" · ")}`;
-  // `unvalidated` is a literal `true` in the current schema (Phase 2 reconciliation hasn't
-  // landed) — the `if` stays so this keeps degrading correctly once that literal loosens.
+  // `unvalidated` is now a REAL flag, not a literal: `burnJson` computes it as
+  // `!unvalidatedRetired(db)`, so `est recon --certify` writing `unvalidated_retired_at`
+  // drops the marker here and a later breaching week brings it back (P2.6). `est burn`'s
+  // human renderer gates the same field the same way — two renderers that disagree about
+  // whether the numbers are reconciled is a bug on screen.
   if (b.unvalidated) text += " [unvalidated]";
   if (b.warn.includes("over_p90")) text += " ⚠p90";
   else if (b.warn.includes("over_p50")) text += " ⚠p50";

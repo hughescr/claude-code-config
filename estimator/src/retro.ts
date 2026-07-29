@@ -45,6 +45,8 @@ import {
 import { getConfig } from "./db.ts";
 import { COLD_START_N, InvariantError, isoNow } from "./tasks.ts";
 import { priceFamily } from "./prices.ts";
+import { scoreEtaModels, writeEtaRuns, type EtaScore } from "./eta.ts";
+import { JOBS_ROOT, jobsRetroPanel, type JobsPanelRow } from "./jobs.ts";
 
 /** The G-ATTR bar. Below this, the historical corpus is not calibration-grade. */
 export const ATTR_COVERAGE_GATE = 0.7;
@@ -146,7 +148,19 @@ export interface RetroReport {
   quality: DataQualityPanel;
   splits: Array<{ dimension: string; level: string; n: number; pinball_delta: number }>;
   alerts: string[];
-  written: { refclass: number; calib_run: number };
+  /**
+   * P2.1: the check-back models, scored against each other and against the floor.
+   * `null` when the corpus is too thin to fit — an honest gap, not a zero.
+   */
+  eta: EtaScore[];
+  /**
+   * P2.9: the `~/.claude/jobs` reconcile, over every BOUND job — jobs-reported
+   * span and timeline transitions beside our `run_segment`/`task.started_at`
+   * derivation for the SAME task. Reported, never corrected (§7.1): nothing here
+   * writes back to `task`, `run_segment` or `job_run`. `[]` when no job is bound.
+   */
+  jobs_reconcile: JobsPanelRow[];
+  written: { refclass: number; calib_run: number; eta_run: number };
 }
 
 interface VelocityRow {
@@ -181,8 +195,9 @@ function ratio(part: number, whole: number): number | null {
  */
 export function retro(
   db: Database,
-  opts: { asOf?: Date; dryRun?: boolean } = {},
+  opts: { asOf?: Date; dryRun?: boolean; jobsRoot?: string } = {},
 ): RetroReport {
+  const jobsRoot = opts.jobsRoot ?? JOBS_ROOT;
   const now = opts.asOf ?? new Date();
   const asOf = isoNow(now);
   const dryRun = opts.dryRun === true;
@@ -284,10 +299,30 @@ export function retro(
     alerts.push(`${quality.corpus_shrink_events} corpus_shrink event(s) — §5.8 expects ZERO`);
   }
 
-  let written = { refclass: 0, calib_run: 0 };
-  if (!dryRun) {
-    written = writeBack(db, asOf, buckets, scoring, splits, estimand, alerts);
+  // The check-back panel. Scored on EVERY retro, dry-run included: the comparison is
+  // what licenses the shipped model to keep issuing bands, and a `--dry-run` that
+  // skipped it would hide the one number that says whether the `?` is coming off.
+  const eta = scoreEtaModels(db, { asOf: new Date(asOf) });
+  const shippedEta = eta.find((e) => e.eta_model === "residual_life");
+  if (shippedEta !== undefined && shippedEta.n_seg > 0 && !shippedEta.won) {
+    alerts.push(
+      `check-back model residual_life has not beaten const_median over ${shippedEta.n_seg} closed segment(s) — the ETA stays on probation and keeps its \`?\``,
+    );
   }
+
+  let written = { refclass: 0, calib_run: 0, eta_run: 0 };
+  if (!dryRun) {
+    written = { ...writeBack(db, asOf, buckets, scoring, splits, estimand, alerts), eta_run: 0 };
+    db.transaction(() => {
+      written.eta_run = writeEtaRuns(db, eta, new Date(asOf));
+    }).immediate();
+  }
+
+  // P2.9: the jobs reconcile panel. Read-only against `job_run`/`run_segment`/
+  // `task` and the bound jobs' own `timeline.jsonl` — nothing here is written
+  // back, dry-run or not, because "reported, never corrected" (§7.1) applies to
+  // every retro, not just the ones that skip the write-back above.
+  const jobsReconcile = jobsRetroPanel(db, jobsRoot);
 
   return {
     as_of: asOf,
@@ -300,6 +335,8 @@ export function retro(
     quality,
     splits,
     alerts,
+    eta,
+    jobs_reconcile: jobsReconcile,
     written,
   };
 }
@@ -807,6 +844,39 @@ export const BOARD_COLUMNS = [
 ] as const;
 export type BoardColumn = (typeof BOARD_COLUMNS)[number];
 
+/**
+ * One entry of a workflow task's per-phase strip (P2.7, §7.1). `v_phase_actual`
+ * supplies the EXECUTION side (which agents actually ran, how much they cost, and
+ * the worst-wins `phase_conf` badge); `v_block_accuracy` supplies the ESTIMATE side
+ * (the per-block band from `est block`, if one was declared). A phase can appear
+ * from either source alone — an agent ran with no declared block, or a block was
+ * declared for a phase nothing has reached yet — so both are optional and merged by
+ * `phase_idx`.
+ */
+export interface BoardPhase {
+  phase_idx: number;
+  title: string;
+  /** Worst-wins across the phase's agents; null = no agent has run yet. */
+  phase_conf: "exact" | "inferred" | "unmapped" | null;
+  actual_wcet: number | null;
+  n_agents: number;
+  /** From `est block`, if one was declared for this phase; null otherwise. */
+  block_p50: number | null;
+  block_p90: number | null;
+  block_exp_agents: number | null;
+}
+
+/** P2.2's check-back forecast, carried on In Progress cards only (§7.1's one exception
+ *  to "the statusline is where check-back lives" — the board has room for the p90). */
+export interface BoardCheckBack {
+  p50_s: number;
+  p90_s: number;
+  eta_model: string | null;
+  /** True while the model has not yet cleared `eta_min_pinball_gain` (§7.3) — the
+   *  board's `?` marker, same rule as the statusline's. */
+  probation: boolean;
+}
+
 export interface BoardCard {
   tid: string;
   subject: string;
@@ -820,6 +890,21 @@ export interface BoardCard {
   wcet_sub: number;
   phase_conf: string | null;
   finalized_at: string | null;
+  started_at: string | null;
+  /** UNION-derived active seconds (§7.3 clock 2): `outcome.active_s` once finalized,
+   *  `burn_cache.active_s` while open, null when neither has a figure yet. */
+  active_s: number | null;
+  /** Elapsed wall-clock seconds: `outcome.wall_s` once finalized, `now - started_at`
+   *  while open (null before the task has started). Never blended with `active_s`
+   *  (§7.3's "three clocks, never blended"). */
+  wall_s: number | null;
+  /** `burn_cache.proj_total_wcet` — the crude ccusage-pattern linear projection.
+   *  Null once a task leaves `burn_cache` (terminal) or before the first sweep. */
+  proj_total_wcet: number | null;
+  /** Populated ONLY for `status === 'in_progress'` cards with a fitted forecast. */
+  check_back: BoardCheckBack | null;
+  /** Empty for a non-workflow task. Ordered by `phase_idx`. */
+  phases: BoardPhase[];
 }
 
 export interface BoardReport {
@@ -827,11 +912,235 @@ export interface BoardReport {
   columns: Array<{ column: BoardColumn; cards: BoardCard[] }>;
 }
 
+function placeholders(n: number): string {
+  return new Array(n).fill("?").join(",");
+}
+
+interface PhaseActualRow {
+  tid: string;
+  phase_idx: number;
+  title: string | null;
+  phase_conf: "exact" | "inferred" | "unmapped" | null;
+  wcet: number | null;
+  n_agents: number;
+}
+
+interface BlockAccuracyRow {
+  tid: string;
+  phase_idx: number;
+  title: string;
+  p50_wcet: number;
+  p90_wcet: number;
+  exp_agents: number;
+}
+
 /**
- * The Phase 1 board: terminal/JSON read model only. The `board.html`/`board.md`
- * renderer stays in Phase 2 as decided (§7.1, §10 Q9); `--html` is the flag it will
- * land under. This verb is a projection over views that already exist, which is why
- * it costs almost nothing to ship with the read path it shares with `est burn`.
+ * Bound on the tids bound into one `IN (...)`. See {@link phaseStrips}.
+ *
+ * Comfortably under every ceiling in the stack — SQLite's own
+ * `SQLITE_MAX_VARIABLE_NUMBER` (32,766 on a modern build) and the higher limit
+ * bun:sqlite enforces — because the point is not to sit just inside the limit but to
+ * make the query's cost independent of how many tasks the corpus has accumulated.
+ */
+const PHASE_STRIP_CHUNK = 500;
+
+/**
+ * Batched, NOT per-card: one query each for `v_phase_actual` and `v_block_accuracy`
+ * over every tid the board is about to render, merged by `(tid, phase_idx)` in JS. A
+ * per-card query here would be an N+1 over a view stack several joins deep — cheap
+ * once, not cheap 20-200 times per render (P2.7's throttle exists for the render as a
+ * whole, not to license doing this the expensive way inside it).
+ *
+ * **Batched in CHUNKS, though, not in one unbounded `IN (...)`.** The tid list is the
+ * board's pre-limit row set — `opts.limit` is applied later, per column, at card
+ * assembly — so it grows with the corpus rather than with what is rendered. One
+ * parameter per tid means that at some corpus size both queries start THROWING, and
+ * the failure mode is not a slow board: it is every render turning into
+ * `board_render_failed`, permanently, the moment the corpus crosses a line nothing
+ * warns about.
+ */
+function phaseStrips(db: Database, tids: readonly string[]): Map<string, BoardPhase[]> {
+  const out = new Map<string, BoardPhase[]>();
+  if (tids.length === 0) return out;
+
+  const byTid = new Map<string, Map<number, BoardPhase>>();
+  const get = (tid: string, idx: number): BoardPhase => {
+    let forTid = byTid.get(tid);
+    if (forTid === undefined) {
+      forTid = new Map();
+      byTid.set(tid, forTid);
+    }
+    let entry = forTid.get(idx);
+    if (entry === undefined) {
+      entry = {
+        phase_idx: idx,
+        title: `phase ${idx}`,
+        phase_conf: null,
+        actual_wcet: null,
+        n_agents: 0,
+        block_p50: null,
+        block_p90: null,
+        block_exp_agents: null,
+      };
+      forTid.set(idx, entry);
+    }
+    return entry;
+  };
+
+  for (let i = 0; i < tids.length; i += PHASE_STRIP_CHUNK) {
+    const chunk = tids.slice(i, i + PHASE_STRIP_CHUNK);
+    for (const r of db
+      .query<PhaseActualRow, string[]>(
+        `SELECT tid, phase_idx, title, phase_conf, wcet, n_agents
+           FROM v_phase_actual WHERE tid IN (${placeholders(chunk.length)})`,
+      )
+      .all(...chunk)) {
+      if (r.tid === null) continue;
+      const p = get(r.tid, r.phase_idx);
+      if (r.title !== null) p.title = r.title;
+      // WORST-WINS on collision, not last-wins. `v_phase_actual` groups by
+      // `(run_id, wf_launch_id, phase_idx)`, so a task that launched the SAME workflow
+      // twice contributes two rows for one `phase_idx` and they merge here. The view's
+      // own aggregate is `MAX(phase_conf)` for the stated reason — "a phase is only as
+      // trustworthy as its least-trustworthy agent" — and an overwrite would let the
+      // second run's `exact` erase the first's `unmapped`. The card's `phase_conf` is
+      // read off this strip, so the two can never disagree either.
+      if (r.phase_conf !== null && (p.phase_conf === null || r.phase_conf > p.phase_conf)) {
+        p.phase_conf = r.phase_conf;
+      }
+      p.actual_wcet = r.wcet;
+      p.n_agents = r.n_agents;
+    }
+
+    for (const r of db
+      .query<BlockAccuracyRow, string[]>(
+        `SELECT tid, phase_idx, title, p50_wcet, p90_wcet, exp_agents
+           FROM v_block_accuracy WHERE tid IN (${placeholders(chunk.length)})`,
+      )
+      .all(...chunk)) {
+      const p = get(r.tid, r.phase_idx);
+      // A declared block's title is the authored one; prefer it only when execution
+      // hasn't already supplied `workflow_phase.title` (the two should agree, but the
+      // authored title is available even before any agent for this phase has run).
+      if (p.actual_wcet === null && p.n_agents === 0) p.title = r.title;
+      p.block_p50 = r.p50_wcet;
+      p.block_p90 = r.p90_wcet;
+      p.block_exp_agents = r.exp_agents;
+    }
+  }
+
+  for (const [tid, forTid] of byTid) {
+    out.set(
+      tid,
+      [...forTid.values()].sort((a, b) => a.phase_idx - b.phase_idx),
+    );
+  }
+  return out;
+}
+
+/** Step one of the board read: identity, placement and the two clocks that live on
+ *  `task`/`outcome`. Everything priced or aggregated arrives in step two, for the
+ *  bounded tid set only — see {@link board}. */
+interface PlacedRow {
+  tid: string;
+  subject: string;
+  kind: string;
+  status: string;
+  column_name: BoardColumn;
+  finalized_at: string | null;
+  started_at: string | null;
+  outcome_active_s: number | null;
+  outcome_wall_s: number | null;
+}
+
+interface EstimateRow {
+  tid: string;
+  cal_p50: number;
+  cal_p90: number;
+  uncalibrated: number;
+}
+
+interface ActualRow {
+  tid: string;
+  consumed_wcet: number;
+  wcet_main: number;
+  wcet_sub: number;
+}
+
+interface BurnRow {
+  tid: string;
+  live_active_s: number | null;
+  proj_total_wcet: number | null;
+  check_back_p50_s: number | null;
+  check_back_p90_s: number | null;
+  eta_model: string | null;
+  eta_probation: number | null;
+}
+
+/**
+ * Placement and ranking, over `task` + `task_scope` + `outcome` and NOTHING ELSE.
+ *
+ * The column rule lives HERE rather than in TypeScript because it is what bounds the
+ * query: `ROW_NUMBER()` can only cut each column at `limit` if it knows which column a
+ * task is in, and cutting before the expensive joins is the entire point. It is the
+ * same rule the previous JS pass applied, expressed once — a status a column does not
+ * name yields NULL and drops out, exactly as `col === null` used to.
+ *
+ * `Done (7d)` is the only column with a recency clause. `Abandoned` deliberately keeps
+ * none: it shows the `limit` most recent abandonments however old they are, and adding
+ * a seven-day filter there would silently empty a column that is supposed to be a
+ * standing record.
+ */
+function boardCardsSql(nColumns: number): string {
+  return `
+WITH placed AS (
+  SELECT t.tid AS tid, s.subject AS subject, t.kind AS kind, t.status AS status,
+         t.started_at AS started_at, o.finalized_at AS finalized_at,
+         o.active_s AS outcome_active_s, o.wall_s AS outcome_wall_s,
+         CASE
+           WHEN t.status = 'completed' AND o.finalized_at >= ?  THEN 'Done (7d)'
+           WHEN t.status IN ('abandoned','deleted')             THEN 'Abandoned'
+           WHEN t.status = 'pending_verification'               THEN 'Pending Verification'
+           WHEN t.status = 'in_progress'                        THEN 'In Progress'
+           WHEN t.status = 'estimating'                         THEN 'Estimating'
+         END AS column_name,
+         COALESCE(o.finalized_at, t.created_at) AS sort_key
+    FROM task t
+    JOIN v_scope_current s ON s.tid = t.tid
+    LEFT JOIN v_outcome_current o ON o.tid = t.tid
+)
+SELECT tid, subject, kind, status, column_name, finalized_at, started_at,
+       outcome_active_s, outcome_wall_s
+  FROM (SELECT placed.*,
+               ROW_NUMBER() OVER (PARTITION BY column_name
+                                  ORDER BY sort_key DESC, tid DESC) AS rn
+          FROM placed
+         WHERE column_name IS NOT NULL
+           AND column_name IN (${placeholders(nColumns)}))
+ WHERE rn <= ?
+ ORDER BY sort_key DESC, tid DESC`;
+}
+
+/**
+ * The Phase 1 board: terminal/JSON read model (P1.8), extended in Phase 2 (P2.7)
+ * with everything `board.html`/`board.md` render — the per-phase strip, the
+ * block-vs-actual figures and the check-back forecast — so that `--json` prints
+ * EXACTLY the view model the file renderer draws from (P2.7: "which is what makes
+ * the renderer testable without parsing HTML"). Every field added here is additive;
+ * no P1.8 field changed shape, so existing `--json` consumers see only new keys.
+ *
+ * **BOUNDED FIRST, then priced.** The read runs in two steps and the order is the whole
+ * performance story. Step one places and ranks every task over `task` + `task_scope` +
+ * `outcome` alone and cuts each column at `limit` in SQL; step two fetches the priced
+ * and aggregated columns — `v_task_actual` (a GROUP BY over the priced request join),
+ * `v_phase_actual`, `estimate`, `burn_cache` — for the ≤ `limit` × 5 tids that survived.
+ *
+ * The other order was what P1.9 measured at 126 ms and created `burn_cache` to abolish,
+ * reintroduced on the WRITER side: since P2.7 this runs at the tail of every sweep,
+ * including the PostToolUse micro-sweep, so its cost is paid on Craig's hot path at
+ * whatever the corpus has grown to — and it was linear in every request ever recorded,
+ * for a page that displays a few dozen cards. The bounded form is linear in TASKS over
+ * three small tables and constant in the aggregates.
  */
 export function board(
   db: Database,
@@ -841,44 +1150,124 @@ export function board(
   const limit = opts.limit ?? 20;
   const sevenDaysAgo = isoNow(new Date(now.getTime() - 7 * 86_400_000));
 
-  const cards = db
-    .query<BoardCard & { outcome_status: string | null }, []>(
-      `SELECT t.tid AS tid, s.subject AS subject, t.kind AS kind, t.status AS status,
-              COALESCE(e.cal_p50_wcet, 0) AS cal_p50, COALESCE(e.cal_p90_wcet, 0) AS cal_p90,
-              CASE WHEN e.refclass_as_of IS NULL THEN 1 ELSE 0 END AS uncalibrated,
-              COALESCE(a.wcet, 0) AS consumed_wcet,
-              COALESCE(a.wcet_main, 0) AS wcet_main, COALESCE(a.wcet_sub, 0) AS wcet_sub,
-              (SELECT MAX(phase_conf) FROM v_phase_actual p WHERE p.tid = t.tid) AS phase_conf,
-              o.finalized_at AS finalized_at, o.final_status AS outcome_status
-         FROM task t
-         JOIN v_scope_current s ON s.tid = t.tid
-         LEFT JOIN estimate e ON e.eid = (SELECT MAX(eid) FROM estimate WHERE tid = t.tid)
-         LEFT JOIN v_task_actual a ON a.tid = t.tid
-         LEFT JOIN v_outcome_current o ON o.tid = t.tid
-        ORDER BY COALESCE(o.finalized_at, t.created_at) DESC`,
-    )
-    .all()
-    .map((c) => ({ ...c, uncalibrated: Boolean(c.uncalibrated) }));
-
-  const byColumn = new Map<BoardColumn, BoardCard[]>();
-  for (const col of BOARD_COLUMNS) byColumn.set(col, []);
-  for (const c of cards) {
-    let col: BoardColumn | null = null;
-    if (c.status === "completed") {
-      col = c.finalized_at !== null && c.finalized_at >= sevenDaysAgo ? "Done (7d)" : null;
-    } else if (c.status === "abandoned" || c.status === "deleted") col = "Abandoned";
-    else if (c.status === "pending_verification") col = "Pending Verification";
-    else if (c.status === "in_progress") col = "In Progress";
-    else if (c.status === "estimating") col = "Estimating";
-    if (col === null) continue;
-    const list = byColumn.get(col)!;
-    if (list.length < limit) list.push(c);
-  }
-
+  // The column filter is pushed into SQL rather than applied to the finished report:
+  // `est board --column "In Progress"` should not rank, fetch and price the other four.
   const wanted = opts.column ?? null;
   const columns = BOARD_COLUMNS.filter(
     (c) => wanted === null || c.toLowerCase().startsWith(wanted.toLowerCase()),
-  ).map((column) => ({ column, cards: byColumn.get(column)! }));
+  );
+  if (columns.length === 0) return { as_of: isoNow(now), columns: [] };
 
-  return { as_of: isoNow(now), columns };
+  const rows = db
+    .query<PlacedRow, (string | number)[]>(boardCardsSql(columns.length))
+    .all(sevenDaysAgo, ...columns, limit);
+
+  const tids = rows.map((r) => r.tid);
+  const strips = phaseStrips(db, tids);
+  const estimates = new Map<string, EstimateRow>();
+  const actuals = new Map<string, ActualRow>();
+  const burns = new Map<string, BurnRow>();
+  for (const chunk of chunked(tids, PHASE_STRIP_CHUNK)) {
+    const q = placeholders(chunk.length);
+    for (const r of db
+      .query<EstimateRow, string[]>(
+        `SELECT tid,
+                COALESCE(cal_p50_wcet, 0) AS cal_p50, COALESCE(cal_p90_wcet, 0) AS cal_p90,
+                CASE WHEN refclass_as_of IS NULL THEN 1 ELSE 0 END AS uncalibrated
+           FROM estimate
+          WHERE eid IN (SELECT MAX(eid) FROM estimate WHERE tid IN (${q}) GROUP BY tid)`,
+      )
+      .all(...chunk)) {
+      estimates.set(r.tid, r);
+    }
+    for (const r of db
+      .query<ActualRow, string[]>(
+        `SELECT tid, COALESCE(wcet, 0) AS consumed_wcet,
+                COALESCE(wcet_main, 0) AS wcet_main, COALESCE(wcet_sub, 0) AS wcet_sub
+           FROM v_task_actual WHERE tid IN (${q})`,
+      )
+      .all(...chunk)) {
+      actuals.set(r.tid, r);
+    }
+    for (const r of db
+      .query<BurnRow, string[]>(
+        `SELECT tid, active_s AS live_active_s, proj_total_wcet,
+                check_back_p50_s, check_back_p90_s, eta_model, eta_probation
+           FROM burn_cache WHERE tid IN (${q})`,
+      )
+      .all(...chunk)) {
+      burns.set(r.tid, r);
+    }
+  }
+
+  const byColumn = new Map<BoardColumn, BoardCard[]>();
+  for (const col of columns) byColumn.set(col, []);
+  for (const r of rows) {
+    const burn = burns.get(r.tid);
+    const est = estimates.get(r.tid);
+    const actual = actuals.get(r.tid);
+    const phases = strips.get(r.tid) ?? [];
+    const activeS = r.outcome_active_s ?? burn?.live_active_s ?? null;
+    let wallS: number | null = r.outcome_wall_s ?? null;
+    if (wallS === null && r.started_at !== null) {
+      const started = Date.parse(r.started_at);
+      if (Number.isFinite(started)) wallS = Math.max(0, Math.round((now.getTime() - started) / 1000));
+    }
+    const checkBack: BoardCheckBack | null =
+      r.status === "in_progress" &&
+      burn !== undefined &&
+      burn.check_back_p50_s !== null &&
+      burn.check_back_p90_s !== null
+        ? {
+            p50_s: burn.check_back_p50_s,
+            p90_s: burn.check_back_p90_s,
+            eta_model: burn.eta_model,
+            probation: burn.eta_probation !== 0,
+          }
+        : null;
+    byColumn.get(r.column_name)!.push({
+      tid: r.tid,
+      subject: r.subject,
+      kind: r.kind,
+      status: r.status,
+      cal_p50: est?.cal_p50 ?? 0,
+      cal_p90: est?.cal_p90 ?? 0,
+      uncalibrated: est === undefined || Boolean(est.uncalibrated),
+      consumed_wcet: actual?.consumed_wcet ?? 0,
+      wcet_main: actual?.wcet_main ?? 0,
+      wcet_sub: actual?.wcet_sub ?? 0,
+      // Worst-wins across the task's phases, read off the strip that was just fetched
+      // rather than from a correlated `MAX(phase_conf)` per task. Same aggregate, same
+      // source view, one query instead of one per card — and it cannot drift from what
+      // the chips render, because it IS what the chips render.
+      phase_conf: worstPhaseConf(phases),
+      finalized_at: r.finalized_at,
+      started_at: r.started_at,
+      active_s: activeS,
+      wall_s: wallS,
+      proj_total_wcet: burn?.proj_total_wcet ?? null,
+      check_back: checkBack,
+      phases,
+    });
+  }
+
+  return {
+    as_of: isoNow(now),
+    columns: columns.map((column) => ({ column, cards: byColumn.get(column)! })),
+  };
+}
+
+/** `MAX(phase_conf)` over a task's phases: the three labels sort 'exact' < 'inferred' <
+ *  'unmapped', so the lexical maximum is the CONSERVATIVE one (see `v_phase_actual`). */
+function worstPhaseConf(phases: readonly BoardPhase[]): string | null {
+  let worst: string | null = null;
+  for (const p of phases) {
+    if (p.phase_conf === null) continue;
+    if (worst === null || p.phase_conf > worst) worst = p.phase_conf;
+  }
+  return worst;
+}
+
+function* chunked<T>(items: readonly T[], size: number): Generator<T[]> {
+  for (let i = 0; i < items.length; i += size) yield items.slice(i, i + size);
 }

@@ -28,12 +28,19 @@ const EXPECTED_TABLES = [
   "config",
   "estimate",
   "estimate_block",
+  "eta_run",
+  "job_item",
+  "job_run",
   "model_price",
+  "otel_metric",
+  "otel_request",
   "outcome",
   "price_sync",
   "recon",
+  "recon_metric",
   "refclass",
   "request",
+  "run_segment",
   "sweep_census",
   "sweep_state",
   "task",
@@ -48,13 +55,17 @@ const EXPECTED_TABLES = [
 
 const EXPECTED_VIEWS = [
   "v_block_accuracy",
+  "v_eta_corpus",
   "v_missed_estimate",
+  "v_otel_join",
   "v_outcome_current",
   "v_phase_actual",
   "v_priced",
+  "v_recon_week",
   "v_request_live",
   "v_request_tiered",
   "v_scope_current",
+  "v_segment_current",
   "v_task_actual",
   "v_task_actual_epoch",
   "v_unpriced",
@@ -67,6 +78,8 @@ const EXPECTED_TRIGGERS = [
   "est_ro_u",
   "estb_ro_d",
   "estb_ro_u",
+  "eta_ro_d",
+  "eta_ro_u",
   "out_ro_d",
   "out_ro_u",
   "rc_ro_d",
@@ -78,16 +91,36 @@ const EXPECTED_TRIGGERS = [
 const EXPECTED_CONFIG_KEYS = [
   "attr_stale_minutes",
   "attr_stale_turns",
+  "board_min_interval_s",
   "boot_resamples",
   "coverage_prior",
   "estimand",
+  "eta_min_fit",
+  "eta_min_pinball_gain",
+  "eta_min_segments",
+  "job_item_min_pop",
+  "otel_max_body_mb",
+  "otel_spool_retention_days",
+  "otel_stale_min",
   "quiesce_main_min",
+  "recon_alert_pct",
   "ref_model",
   "schema_version",
+  "segment_gap_min",
   "shrink_k",
   "split_min_pinball_gain",
+  "unvalidated_max_delta_pct",
+  "unvalidated_min_join_pct",
+  "unvalidated_weeks",
   "velocity_half_life_days",
 ];
+
+/**
+ * `unvalidated_retired_at` is the one config key that must NOT be seeded: `est recon
+ * --certify` is its only writer and its PRESENCE is what retires the statusline's
+ * `[unvalidated]` marker (P2.6). A seed here would certify the system on day one.
+ */
+const FORBIDDEN_CONFIG_KEYS = ["unvalidated_retired_at"];
 
 const failures: string[] = [];
 
@@ -141,6 +174,9 @@ try {
     .all()
     .map((r) => r.k);
   for (const k of EXPECTED_CONFIG_KEYS) check(configKeys.includes(k), `missing config key: ${k}`);
+  for (const k of FORBIDDEN_CONFIG_KEYS) {
+    check(!configKeys.includes(k), `config key ${k} is SEEDED; only \`est recon --certify\` may write it`);
+  }
   const version = db.query<{ v: string }, []>("SELECT v FROM config WHERE k='schema_version'").get();
   check(version?.v === SCHEMA_VERSION, `schema_version seed is ${version?.v}, expected ${SCHEMA_VERSION}`);
   const estimand = db.query<{ v: string }, []>("SELECT v FROM config WHERE k='estimand'").get();

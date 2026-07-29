@@ -1,0 +1,63 @@
+{
+  "name": "basic",
+  "note": "One session, three segments: turn+agent overlap, a human-input boundary detected from the next turn, and a session that is over. Pins the union (240s active from 270s busy at concurrency 2) against the sum a naive implementation would report.",
+  "session": "s-fx-basic",
+  "now": "2026-03-01T12:00:00.000Z",
+  "live": false,
+  "turns": [
+    { "prompt": "p1", "at": "2026-03-01T10:00:00.000Z", "duration_ms": 60000 },
+    { "prompt": "p2", "at": "2026-03-01T10:10:00.000Z", "duration_ms": 120000 },
+    { "prompt": "p3", "at": "2026-03-01T11:00:00.000Z", "duration_ms": 60000 }
+  ],
+  "agents": [
+    { "id": "a1", "started_at": "2026-03-01T10:00:30Z", "ended_at": "2026-03-01T10:04:00Z" }
+  ],
+  "requests": [],
+  "compactions": [],
+  "cases": [
+    {
+      "gap_min": 5,
+      "segments": [
+        {
+          "started_at": "2026-03-01T10:00:00Z",
+          "ended_at": "2026-03-01T10:04:00Z",
+          "active_s": 240,
+          "busy_s": 270,
+          "max_concurrency": 2,
+          "n_turns": 1,
+          "n_agents": 1,
+          "gap_before_s": null,
+          "gap_after_s": 360,
+          "terminator": "human_input",
+          "interval_src_mix": "turn+agent"
+        },
+        {
+          "started_at": "2026-03-01T10:10:00Z",
+          "ended_at": "2026-03-01T10:12:00Z",
+          "active_s": 120,
+          "busy_s": 120,
+          "max_concurrency": 1,
+          "n_turns": 1,
+          "n_agents": 0,
+          "gap_before_s": 360,
+          "gap_after_s": 2880,
+          "terminator": "human_input",
+          "interval_src_mix": "turn"
+        },
+        {
+          "started_at": "2026-03-01T11:00:00Z",
+          "ended_at": "2026-03-01T11:01:00Z",
+          "active_s": 60,
+          "busy_s": 60,
+          "max_concurrency": 1,
+          "n_turns": 1,
+          "n_agents": 0,
+          "gap_before_s": 2880,
+          "gap_after_s": null,
+          "terminator": "session_end",
+          "interval_src_mix": "turn"
+        }
+      ]
+    }
+  ]
+}

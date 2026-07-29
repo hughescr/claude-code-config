@@ -32,6 +32,21 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
 /**
  * Must match the config.schema_version seed in schema.sql.
  *
+ * 8 — Phase 2 (§Phase 2 interfaces P2.5). The OTEL facts arrive as their OWN tables
+ *     (`otel_request`, `otel_metric`) rather than as columns of `request`, because the
+ *     transcript is the token source of truth (§2) and a second writer for the same
+ *     counter is how two sources disagree silently and neither is discoverable as
+ *     wrong. OTEL fills exactly one column of `request` — `duration_ms`, and only
+ *     where it is NULL — and a counter that DIFFERS writes an anomaly instead of a
+ *     merge. `otel_metric` carries `temporality` per row because delta points sum and
+ *     cumulative points must be differenced, and a window that mixes them is the §5.2
+ *     dedup mistake in a new costume. Alongside them: `run_segment` + `eta_run` (the
+ *     check-back corpus and its append-only fitting ledger), `recon_metric` (the three
+ *     non-USD reconciliation axes — `recon` stays USD-only rather than having its CHECK
+ *     widened, which would mean rebuilding a WITHOUT ROWID table for no gain), and
+ *     `job_run` / `job_item` (the reconcile-only jobs feed). `burn_cache` is rebuilt to
+ *     gain the forecast and compute columns — the same dance v7 performed on it, and
+ *     legitimate for the one table in the schema that is explicitly a cache.
  * 7 — the statusline read path becomes a BOUNDED read. `est burn`'s cached path was
  *     nine statements per render, three of which walked history: a `task_alias`
  *     lookup by session (the PK starts with `id_kind`, so it SCANNED), a
@@ -77,7 +92,7 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
  *     `v_phase_actual.phase_conf`, auxiliary origin excluded from calibration.
  * 1 — initial R3 §4.2 shape.
  */
-export const SCHEMA_VERSION = "7";
+export const SCHEMA_VERSION = "8";
 
 /**
  * Forward-only, additive migrations, applied by {@link openDb} on a WRITABLE
@@ -268,6 +283,337 @@ CREATE INDEX IF NOT EXISTS ix_agent_run_tid ON agent_run(tid);
 CREATE INDEX IF NOT EXISTS ix_alias_session ON task_alias(session_id);
 `,
   },
+  {
+    from: "7",
+    to: "8",
+    // Phase 2 (P2.5). ADDITIVE, except the one rebuild: `burn_cache` gains nine
+    // columns and is rebuilt rather than ALTERed, exactly as 6 -> 7 did and for the
+    // same two reasons — it is the single table schema.sql declares droppable (it
+    // holds no evidence; the next sweep writes every row back), and SQLite has no
+    // `ADD COLUMN IF NOT EXISTS`, so a rebuild is what makes this step land cleanly on
+    // a file that already has the shape and only lacks the marker.
+    //
+    // The rebuild CARRIES THE ROWS ACROSS, which the 6 -> 7 step did not have to: P2.5
+    // states "existing rows are carried across column for column; the new columns are
+    // NULL until the next sweep", and the difference is visible on Craig's screen.
+    // Dropping them empties `burn_cache` for every open task, and `burnJson`/`renderBurn`
+    // read ONLY that table — so the statusline segment disappears from the moment of the
+    // migration until the next full sweep writes the rows back. "Costs one sweep and
+    // nothing else" is true of the DATA and false of the experience.
+    //
+    // The dance is: rename the old table out of the way, create the new one under its
+    // real name with schema.sql's exact text, copy the fifteen v7 columns, drop the
+    // rename. It is NOT `CREATE burn_cache_v8 … ALTER RENAME TO burn_cache`, because
+    // SQLite rewrites a renamed table's stored DDL (quoting the new name), and
+    // `test/schema.test.ts` compares `sqlite_master.sql` BYTE FOR BYTE against a fresh
+    // database. Renaming the table being discarded has no such consequence.
+    //
+    // Everything else here is a CREATE of an object that did not exist at v7, so rule
+    // 2 (no migration drops or rewrites a ROW) is met by construction: nothing in the
+    // append-only spine is touched, and the config seeds are `INSERT OR IGNORE`, which
+    // cannot restate a value Craig has already tuned.
+    //
+    // The DDL text below is the SAME TEXT as schema.sql's, with `IF NOT EXISTS` added
+    // to every CREATE — the same guard 6 -> 7 put on its two indexes, and for the same
+    // reason: schema.sql's own header documents `sqlite3 estimator.db < schema.sql` as a
+    // supported way to build the file, and running that over a v7 database creates every
+    // v8 object while `INSERT OR IGNORE` leaves `schema_version` at 7. Without the guard
+    // this step would then die on "table otel_request already exists" and the database
+    // would be stuck one version behind forever.
+    //
+    // The guard costs nothing in fidelity: SQLite STRIPS `IF NOT EXISTS` before storing
+    // a definition in `sqlite_master`, so a migrated database and a fresh one hold
+    // byte-identical DDL text for every object here — which is what makes the
+    // migration-vs-schema.sql diff in `test/schema.test.ts` an exact comparison rather
+    // than a shape approximation.
+    sql: `
+DROP TABLE IF EXISTS burn_cache_pre_v8;   -- residue of a step that died mid-rebuild
+ALTER TABLE burn_cache RENAME TO burn_cache_pre_v8;
+CREATE TABLE burn_cache (
+  tid TEXT PRIMARY KEY REFERENCES task(tid),
+  as_of TEXT NOT NULL,              -- when the sweep that wrote this row ran; \`stale_s\` derives
+  consumed_wcet INTEGER,
+  wcet_main INTEGER, wcet_sub INTEGER, wcet_aux INTEGER,
+  usd REAL,                         -- overhead-EXCLUSIVE, like consumed_wcet: the two are divided
+  n_req INTEGER,
+  n_agents_live INTEGER,            -- bound agent_runs with no ended_at
+  n_agents_total INTEGER,           -- bound agent_runs, live or finished
+  n_provisional INTEGER,            -- requests priced from a provisional rate -> \`provisional_price\`
+  n_unpriced INTEGER,               -- requests whose family has no price row  -> \`unpriced\`
+  active_s INTEGER,                 -- §7.3 interval UNION, not a sum
+  burn_wcet_per_min REAL,           -- over the current rolling window (config burn_window_min)
+  proj_total_wcet INTEGER,          -- linear projection; CRUDE, and both output modes say so
+  -- v8 (P2.2): the check-back forecast and the compute clock. Every one is a COLUMN
+  -- for the P1.9 reason — a residual-life quantile computed per render is exactly the
+  -- unbounded per-render work this table exists to abolish. NULL until the next sweep.
+  seg_started_at TEXT,              -- the OPEN run_segment the forecast is issued against
+  seg_elapsed_s INTEGER,
+  check_back_p50_s INTEGER, check_back_p90_s INTEGER,
+  eta_model TEXT,                   -- which of the three models issued the number on screen
+  eta_probation INTEGER,            -- 1 => the statusline renders a trailing \`?\`
+  eta_n_seg INTEGER,                -- closed segments the shipped model was fitted on. A COLUMN
+                                    -- for the reason above and no other: reading it as
+                                    -- \`COUNT(*) FROM run_segment WHERE gap_min = ?\` per render is
+                                    -- a table scan (no index covers gap_min) inside the one path
+                                    -- that promises to be bounded by the ROW.
+  compute_s INTEGER,                -- SUM(request.duration_ms)/1000 over attributed requests
+  compute_coverage_pct REAL         -- share of those requests that actually carry one; a compute
+                                    -- figure without its coverage is a moved denominator
+) STRICT, WITHOUT ROWID;
+-- Column for column, exactly as P2.5 says. The nine v8 columns stay NULL until the next
+-- sweep; every v7 figure the statusline reads is on screen the whole way through.
+INSERT INTO burn_cache (tid, as_of, consumed_wcet, wcet_main, wcet_sub, wcet_aux, usd,
+                        n_req, n_agents_live, n_agents_total, n_provisional, n_unpriced,
+                        active_s, burn_wcet_per_min, proj_total_wcet)
+  SELECT tid, as_of, consumed_wcet, wcet_main, wcet_sub, wcet_aux, usd,
+         n_req, n_agents_live, n_agents_total, n_provisional, n_unpriced,
+         active_s, burn_wcet_per_min, proj_total_wcet
+    FROM burn_cache_pre_v8;
+DROP TABLE burn_cache_pre_v8;
+
+-- ---- P2.4: the OTEL facts, kept SEPARATE from \`request\` on purpose -------------
+CREATE TABLE IF NOT EXISTS otel_request (         -- one row per api_request event; NOT a second \`request\`
+  request_id TEXT PRIMARY KEY,      -- the join key to \`request\`; same global-PK doctrine (§5.2)
+  session_id TEXT, prompt_id TEXT, message_uuid TEXT, client_request_id TEXT,
+  model TEXT, query_source TEXT,    -- 'main' | 'subagent' | 'auxiliary' -> request.origin
+  ts TEXT NOT NULL,                 -- event time, ISO, derived from timeUnixNano
+  received_at TEXT NOT NULL,        -- when the receiver spooled it; drift between the two is
+                                    -- export latency, and it is worth being able to see
+  duration_ms INTEGER CHECK (duration_ms IS NULL OR duration_ms >= 0),
+  cost_usd_micros INTEGER CHECK (cost_usd_micros IS NULL OR cost_usd_micros >= 0),
+                                    -- INTEGER micros, not the float \`cost_usd\`: money summed
+                                    -- across 10^5 rows should not accumulate float error
+  in_tok  INTEGER CHECK (in_tok  IS NULL OR in_tok  >= 0),
+  out_tok INTEGER CHECK (out_tok IS NULL OR out_tok >= 0),
+  cw_tok  INTEGER CHECK (cw_tok  IS NULL OR cw_tok  >= 0),
+  cr_tok  INTEGER CHECK (cr_tok  IS NULL OR cr_tok  >= 0),
+  attempt INTEGER, speed TEXT, effort TEXT, status_code INTEGER,
+  workflow_run_id TEXT, workflow_name TEXT,
+  joined INTEGER NOT NULL DEFAULT 0 -- 1 once a matching \`request\` row was found; the complement
+                                    -- is \`otel_unjoined\`, and it is the recon join_pct denominator
+) STRICT;
+CREATE INDEX IF NOT EXISTS ix_otel_req_turn ON otel_request(session_id, prompt_id);
+CREATE INDEX IF NOT EXISTS ix_otel_req_ts   ON otel_request(ts);
+
+CREATE TABLE IF NOT EXISTS otel_metric (          -- cost.usage | token.usage | active_time.total
+  metric TEXT NOT NULL, ts TEXT NOT NULL,
+                                    -- \`ts\` is ISO SECONDS, because every window predicate in
+                                    -- this schema is a string compare on it. \`ts_nanos\` is the
+                                    -- sub-second half of the point's identity, kept as the
+                                    -- verbatim int64 STRING it arrived as (it exceeds 2^53).
+                                    -- Nothing aggregates over it; it exists so two points of
+                                    -- one series 250 ms apart cannot collapse into one row.
+  ts_nanos     TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+  -- NOT NULL SENTINELS, for the reason task_event documents: SQLite treats NULLs as
+  -- DISTINCT inside a UNIQUE/PRIMARY key, so nullable dimensions make the dedup key
+  -- match nothing and every re-drain inserts a duplicate.
+  session_id   TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+  model        TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+  query_source TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+  token_type   TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+                                    -- The four columns above are the ALLOWLISTED dimensions, and
+                                    -- an OTLP point carries dimensions the allowlist drops
+                                    -- (\`tool\`, \`decision\`, …). Two genuinely distinct series then
+                                    -- share every stored dimension and the DO UPDATE overwrites
+                                    -- one with the other -- silent ingest loss, not deduplication.
+                                    -- \`dim_digest\` is a one-way 64-bit digest of the FULL decoded
+                                    -- attribute set plus unit and stream start (src/otel.ts), so
+                                    -- the stored identity is as wide as the wire identity without
+                                    -- persisting a single unallowlisted VALUE.
+  dim_digest   TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '',
+  value REAL NOT NULL, unit TEXT,
+  temporality TEXT NOT NULL CHECK (temporality IN ('delta','cumulative','unspecified')),
+                                    -- delta SUMs; cumulative must be DIFFERENCED per series.
+                                    -- Mixing them in one window is the §5.2 dedup mistake again.
+  received_at TEXT NOT NULL,
+  PRIMARY KEY (metric, ts, ts_nanos, session_id, model, query_source, token_type, dim_digest)
+) STRICT, WITHOUT ROWID;
+
+-- ---- P2.1: the check-back corpus ----------------------------------------------
+-- DERIVED but DURABLE, and the distinction from burn_cache is deliberate: a segment
+-- outlives the transcript that produced it (P2.10 prunes at 365 days), so this table
+-- is upserted per sweep and NEVER deleted. Mutable only while terminator='open';
+-- frozen once terminal. No append-only trigger: it is regenerable for as long as its
+-- inputs exist, and \`est audit --fix\` is allowed to clear it (P2.12).
+CREATE TABLE IF NOT EXISTS run_segment (
+  session_id TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT NOT NULL,
+  active_s INTEGER NOT NULL CHECK (active_s >= 0),
+  busy_s   INTEGER NOT NULL CHECK (busy_s   >= 0),
+  max_concurrency INTEGER NOT NULL CHECK (max_concurrency >= 0),
+  n_turns  INTEGER NOT NULL DEFAULT 0,
+  n_agents INTEGER NOT NULL DEFAULT 0,
+  gap_before_s INTEGER, gap_after_s INTEGER,   -- RECORDED, never predicted (§7.3 clock 3)
+  terminator TEXT NOT NULL CHECK (terminator IN
+    ('human_input','compaction','session_end','open')),
+  interval_src_mix TEXT,            -- e.g. 'turn+agent+otel'; a segment assembled from mixed
+                                    -- sources is visible as such, like agent_run.interval_src
+  gap_min REAL NOT NULL,            -- the segment_gap_min IN FORCE when this row was cut, so a
+                                    -- retuned threshold cannot silently restate old segments
+  tid TEXT REFERENCES task(tid),    -- the task owning the MAJORITY of active seconds; the
+                                    -- forecast itself is session-scoped (P2.1)
+  first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
+  -- \`gap_min\` IS PART OF THE IDENTITY, and that is the whole point of the column. A
+  -- key of (session_id, started_at) alone made a retune of \`segment_gap_min\` a silent
+  -- no-op: the re-partition at the new threshold usually reuses a \`started_at\` that is
+  -- already present as a TERMINAL row, so the INSERT lost the PK conflict and the
+  -- \`terminator = 'open'\` freeze guard refused the UPDATE — the table came back
+  -- byte-identical while \`refreshSegments\` reported segments written. Downstream the
+  -- corpus at the new threshold was EMPTY, \`n_closed < eta_min_fit\`, and \`check_back\`
+  -- vanished from the statusline forever with no error anywhere.
+  --
+  -- With gap_min in the key a retune writes a fresh PARTITION alongside the old one.
+  -- That is also the honest data model: rows cut at 2 minutes and rows cut at 30 are
+  -- different observations of the same wall clock, never one corpus (the measured p50
+  -- moves ~10× across plausible thresholds), which is exactly why every reader — the
+  -- \`v_eta_corpus\` consumers, \`v_segment_current\` below, \`forecastSession\` — filters
+  -- on the threshold IN FORCE rather than on the table.
+  PRIMARY KEY (session_id, gap_min, started_at)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS ix_run_segment_tid ON run_segment(tid);
+CREATE INDEX IF NOT EXISTS ix_run_segment_end ON run_segment(ended_at);
+-- Covers the corpus-size count and the per-partition open-row sweep; without it both
+-- are full scans of a table that only ever grows.
+CREATE INDEX IF NOT EXISTS ix_run_segment_gap ON run_segment(gap_min, terminator);
+
+CREATE TABLE IF NOT EXISTS eta_run (              -- APPEND-ONLY: what the check-back model was fitted on, and
+  as_of TEXT NOT NULL,              -- what it had to beat. calib_run's sibling (§4.5).
+  eta_model TEXT NOT NULL CHECK (eta_model IN ('const_median','residual_life','fanout_cond')),
+  n_seg INTEGER NOT NULL, n_censored INTEGER NOT NULL DEFAULT 0,
+  gap_min REAL NOT NULL,
+  pinball_p50 REAL, pinball_p90 REAL,
+  baseline_pinball_p50 REAL NOT NULL,   -- const_median; the floor a model must clear
+  coverage_p90 REAL, cov_lo REAL, cov_hi REAL,   -- Jeffreys, as §7.4
+  won INTEGER NOT NULL DEFAULT 0,
+  probation INTEGER NOT NULL DEFAULT 1,
+  params_json TEXT NOT NULL,
+  PRIMARY KEY (as_of, eta_model)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS eta_ro_u BEFORE UPDATE ON eta_run BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS eta_ro_d BEFORE DELETE ON eta_run BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
+-- ---- P2.6: non-USD reconciliation --------------------------------------------
+-- \`recon\` (USD) is UNTOUCHED — widening its CHECK would mean rebuilding a WITHOUT
+-- ROWID table for no gain. Tokens, active seconds and request counts are different
+-- units and get their own table rather than being coerced into usd-named columns.
+CREATE TABLE IF NOT EXISTS recon_metric (
+  as_of TEXT NOT NULL,
+  metric TEXT NOT NULL CHECK (metric IN ('tokens','active_s','requests')),
+  source TEXT NOT NULL CHECK (source IN ('otel_tokens','otel_active','otel_request')),
+  window_start TEXT NOT NULL, window_end TEXT NOT NULL,
+  ours REAL NOT NULL, theirs REAL NOT NULL, delta_pct REAL NOT NULL,
+  join_pct REAL,                    -- share of OUR requests in the window OTEL also saw; a small
+                                    -- delta on a tiny join is agreement with nothing (P2.6)
+  unit TEXT NOT NULL, note TEXT,
+  PRIMARY KEY (as_of, metric, source)
+) STRICT, WITHOUT ROWID;
+
+-- ---- P2.9: jobs reconcile, RECONCILE-ONLY ------------------------------------
+CREATE TABLE IF NOT EXISTS job_run (
+  job_id TEXT PRIMARY KEY,          -- the ~/.claude/jobs/<id> directory name
+  session_id TEXT, resume_session_id TEXT,
+  name TEXT, state TEXT, backend TEXT, template TEXT,
+  created_at TEXT, updated_at TEXT, first_terminal_at TEXT,
+  reported_tokens INTEGER CHECK (reported_tokens IS NULL OR reported_tokens >= 0),
+                                    -- state.json.tokens: a HARNESS AGGREGATE. Stored for audit,
+                                    -- NEVER summed — same ban as wf_*.json totalTokens and
+                                    -- workflowProgress[].tokens (§1, §5.6).
+  n_items INTEGER NOT NULL DEFAULT 0,
+  n_items_started INTEGER NOT NULL DEFAULT 0,   -- fan[] entries with startedAt > 0; the item-grain
+                                                -- check stays dormant until this is populated
+  tid TEXT REFERENCES task(tid)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS job_item (
+  job_id TEXT NOT NULL REFERENCES job_run(job_id),
+  item_id TEXT NOT NULL,            -- fan[].id, e.g. 'todo:3'
+  kind TEXT, label TEXT,
+  started_at TEXT, done_at TEXT,    -- NULL where the harness wrote 0; 0 is 'unset', not epoch
+  PRIMARY KEY (job_id, item_id)
+) STRICT, WITHOUT ROWID;
+
+-- Phase 2 views (P2.5). The board is a projection over views that already exist plus
+-- \`run_segment\`; it adds none of its own.
+
+-- The audit surface for the dedup chain (§5.2): ours vs theirs, per request, per
+-- counter. OTEL is FORBIDDEN from merging a counter (P2.4), so a disagreement is a
+-- finding rather than a correction — this view is where the finding is readable, and
+-- it is the only independent check the dedup chain has ever had.
+CREATE VIEW IF NOT EXISTS v_otel_join AS
+SELECT o.request_id, o.session_id, o.ts, o.model, o.query_source, o.attempt,
+       o.duration_ms, o.cost_usd_micros,
+       CASE WHEN r.request_id IS NULL THEN 0 ELSE 1 END AS joined,
+       o.prompt_id AS otel_prompt_id, r.prompt_id AS our_prompt_id,
+       o.in_tok AS otel_in, o.out_tok AS otel_out, o.cw_tok AS otel_cw, o.cr_tok AS otel_cr,
+       r.in_tok AS our_in, r.out_tok AS our_out, r.cw_tok AS our_cw, r.cr_tok AS our_cr,
+       o.in_tok  - r.in_tok  AS d_in,
+       o.out_tok - r.out_tok AS d_out,
+       o.cw_tok  - r.cw_tok  AS d_cw,
+       o.cr_tok  - r.cr_tok  AS d_cr
+FROM otel_request o LEFT JOIN v_request_live r ON r.request_id = o.request_id;
+
+-- The weekly rollup the retro line and the certification criterion both read. One row
+-- per ISO-ish week, carrying the LATEST recon in that week (SQLite's bare-column rule:
+-- MAX(as_of) fixes which row the other columns come from) plus the three non-USD axes
+-- and the join coverage that stops a week of missing data from certifying itself.
+CREATE VIEW IF NOT EXISTS v_recon_week AS
+SELECT strftime('%Y-W%W', c.window_start) AS week,
+       MAX(c.as_of) AS as_of,
+       c.window_start, c.window_end,
+       c.ours_usd, c.theirs_usd, c.delta_pct AS usd_delta_pct,
+       (SELECT m.delta_pct FROM recon_metric m
+         WHERE m.as_of = c.as_of AND m.metric = 'tokens')   AS tokens_delta_pct,
+       (SELECT m.delta_pct FROM recon_metric m
+         WHERE m.as_of = c.as_of AND m.metric = 'active_s') AS active_delta_pct,
+       (SELECT m.delta_pct FROM recon_metric m
+         WHERE m.as_of = c.as_of AND m.metric = 'requests') AS requests_delta_pct,
+       (SELECT m.join_pct  FROM recon_metric m
+         WHERE m.as_of = c.as_of AND m.metric = 'requests') AS join_pct
+FROM recon c WHERE c.source = 'otel_cost'
+GROUP BY week;
+
+-- The check-back fitting corpus. Open segments are RIGHT-CENSORED observations, not
+-- omissions: dropping the long-running ones biases the estimator short exactly when it
+-- matters (P2.1), which is the same censoring treatment §6.2 gives abandoned tasks.
+CREATE VIEW IF NOT EXISTS v_eta_corpus AS
+SELECT s.session_id, s.started_at, s.ended_at, s.active_s, s.busy_s, s.terminator,
+       s.gap_min, s.tid, s.n_turns, s.n_agents, s.max_concurrency,
+       CAST((julianday(s.ended_at) - julianday(s.started_at)) * 86400 AS INTEGER) AS span_s,
+       CASE WHEN s.terminator = 'open' THEN 1 ELSE 0 END AS censored
+FROM run_segment s;
+
+-- The open segment per session — what burn_cache reads when it writes the forecast.
+-- SCOPED TO THE THRESHOLD IN FORCE, like every other reader of \`run_segment\`: after a
+-- \`segment_gap_min\` retune the retired partition still holds this session's old open
+-- row, and it starts at a DIFFERENT instant, so an unscoped MAX(started_at) would issue
+-- the forecast against a segment cut to a rule nobody is using any more.
+CREATE VIEW IF NOT EXISTS v_segment_current AS
+SELECT s.* FROM run_segment s
+WHERE s.terminator = 'open'
+  AND s.gap_min = (SELECT CAST(v AS REAL) FROM config WHERE k = 'segment_gap_min')
+  AND s.started_at = (SELECT MAX(started_at) FROM run_segment
+                       WHERE session_id = s.session_id AND terminator = 'open'
+                         AND gap_min = s.gap_min);
+
+-- One key is deliberately absent, \`unvalidated_retired_at\`: \`est recon --certify\` is its
+-- only writer and its PRESENCE is the certification.
+INSERT OR IGNORE INTO config (k, v) VALUES
+  ('segment_gap_min',           '5'),
+  ('eta_min_segments',          '30'),
+  ('eta_min_fit',               '5'),
+  ('eta_min_pinball_gain',      '0.05'),
+  ('recon_alert_pct',           '5'),
+  ('unvalidated_max_delta_pct', '2'),
+  ('unvalidated_weeks',         '4'),
+  ('unvalidated_min_join_pct',  '95'),
+  ('board_min_interval_s',      '30'),
+  ('job_item_min_pop',          '0.5'),
+  ('otel_max_body_mb',          '8'),
+  ('otel_stale_min',            '15'),
+  ('otel_spool_retention_days', '14');
+`,
+  },
 ];
 
 export interface OpenOptions {
@@ -441,6 +787,23 @@ export function migrate(db: Database, version: string): string {
 export function getConfig(db: Database, key: string): string | null {
   const row = db.query<{ v: string }, [string]>("SELECT v FROM config WHERE k=?").get(key);
   return row?.v ?? null;
+}
+
+/**
+ * The one config key `schema.sql` deliberately does NOT seed: its PRESENCE is what
+ * retires the statusline's `[unvalidated]` marker (P2.6), and `est recon --certify` is
+ * its only writer.
+ *
+ * It lives here rather than in `src/recon.ts` for a mechanical reason: `src/burn.ts`
+ * reads it and `src/recon.ts` reads `src/burn.ts`'s interval union, so declaring it in
+ * either of those makes an import cycle between the read path and the writer. `db.ts`
+ * already owns every config accessor and depends on nothing.
+ */
+export const UNVALIDATED_RETIRED_KEY = "unvalidated_retired_at";
+
+/** Is the `[unvalidated]` marker retired? See {@link UNVALIDATED_RETIRED_KEY}. */
+export function unvalidatedRetired(db: Database): boolean {
+  return getConfig(db, UNVALIDATED_RETIRED_KEY) !== null;
 }
 
 /** Write a config value (upsert). Config is the home of every tunable (§1.1). */
