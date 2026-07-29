@@ -177,6 +177,61 @@ CREATE TABLE estimate_block (       -- R3: per-block (per-phase) workflow estima
 CREATE TRIGGER estb_ro_u BEFORE UPDATE ON estimate_block BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER estb_ro_d BEFORE DELETE ON estimate_block BEGIN SELECT RAISE(ABORT,'append-only'); END;
 
+-- v10: the live identity of an interactive session, as the statusline saw it.
+--
+-- The ONE mutable identity source, and deliberately so: every other leg of
+-- `resolveEstimatorIdentity` (src/identity.ts) reads `request`, which is populated by
+-- the SWEEP and therefore lags `est open` by design — the anchoring turn's own rows
+-- are not on disk yet, and a brand-new session has none at all. This table is written
+-- by the statusline shim, which receives the harness payload naming the model
+-- answering THIS session, so it is fresh within one status-line render.
+--
+-- Mutable because it is not evidence: it is a cache of "who is at the keyboard now",
+-- superseded on every render and never read for anything historical. The append-only
+-- spine (§4.2) covers estimates, scopes, outcomes and repairs — not this.
+--
+-- NOTE (v10 gate): the harness statusline payload's `model.id` field is NOT a
+-- documented contract, so `scripts/statusline-burn.ts` only writes here when
+-- EST_SESSION_MODEL_CAPTURE=1. Absence degrades to the transcript legs; it never
+-- degrades to a wrong answer.
+CREATE TABLE session_model (
+  session_id TEXT PRIMARY KEY,
+  model TEXT NOT NULL,
+  model_family TEXT NOT NULL,
+  seen_at TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
+
+-- v10: the APPEND-ONLY correction ledger for `estimate.estimator_model`.
+--
+-- `estimate` is append-only and `outcome.eid_at_start` is MIN(eid) per task, so a
+-- mis-derived estimator identity CANNOT be corrected by appending a better estimate:
+-- every calibration consumer joins on the FIRST estimate, and a v2 row with the right
+-- family would look like a fix while changing nothing downstream (v_velocity,
+-- v_task_actual_epoch, retro's velocity join, close.ts's first-estimate-wins rule).
+--
+-- So the correction lives BESIDE the row instead of in it. The ledger row is never
+-- touched; `v_estimate_identity` projects the effective value (MAX(seq) wins) and
+-- `v_velocity` reads through it. `SELECT estimator_model FROM estimate` still returns
+-- what was believed at the time, which is the whole point of the spine.
+--
+-- `evidence` is JSON and is mandatory: a correction with no stated basis is an
+-- assertion, and this ledger is exactly where an assertion must not be able to hide.
+CREATE TABLE estimate_identity_repair (
+  eid INTEGER NOT NULL REFERENCES estimate(eid),
+  seq INTEGER NOT NULL,
+  repaired_at TEXT NOT NULL,
+  estimator_model TEXT NOT NULL,
+  method TEXT NOT NULL CHECK (method IN
+    ('anchor_prompt','at_created','statusline','manual')),
+  evidence TEXT NOT NULL,
+  note TEXT,
+  PRIMARY KEY (eid, seq)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER eir_ro_u BEFORE UPDATE ON estimate_identity_repair
+  BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER eir_ro_d BEFORE DELETE ON estimate_identity_repair
+  BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
 CREATE TABLE request (              -- the atomic fact: one row per deduped API request
   request_id TEXT PRIMARY KEY,      -- GLOBAL key (fork replays collapse here).
                                     -- fallback: message.id, then uuid.
@@ -452,6 +507,14 @@ CREATE TABLE anomaly (              -- loud, queryable failure ledger
                                     --   dangling_symlink|spawn_depth_gt1|wf_record_mismatch
                                     --   |wf_state_unparseable|agent_meta_unparseable
                                     --   |orphan_agent_transcript
+                                    --   |main_transcript_missing -- a session-id-shaped artefact
+                                    --      dir (agents/workflows/states) exists with ZERO
+                                    --      `<sid>.jsonl` anywhere in the corpus. Computed
+                                    --      CORPUS-WIDE (a session's four possible munged project
+                                    --      dirs are merged before this check), never per-dir — a
+                                    --      per-dir test false-positives on a session whose main
+                                    --      lives under a DIFFERENT project dir than this artefact
+                                    --      set. Feeds `corpus_loss` (D2, src/census.ts).
                                     -- WRITTEN TODAY by src/ingest.ts:
                                     --   malformed_line|truncated_tail|unusable_usage_line
                                     --   |sidechain_replay|rid_collision|phase_unmapped
@@ -466,9 +529,43 @@ CREATE TABLE anomaly (              -- loud, queryable failure ledger
                                     --      R3; found by G-FORK §3.3). `compactionAnomalies`, off
                                     --      `ingestMainTranscript`; BENIGN in src/cli.ts, because a
                                     --      /compact boundary is a normal event Phase 1 needs fed.
+                                    --   |agent_never_returned|wf_relaunch_orphan
+                                    --   |wf_relaunch_detected -- §5.6 [R4] promotion condition (ii):
+                                    --      the three CLASSIFIED reasons a workflow agent has no
+                                    --      workflowProgress[] record, all BENIGN in src/cli.ts.
+                                    --      never_returned = the run terminated and journal.jsonl has
+                                    --      no `result` for it; relaunch_orphan = it started before
+                                    --      the earliest recorded record, so it belongs to an earlier
+                                    --      launch whose progress the harness overwrote when it
+                                    --      rewrote wf_<runId>.json; relaunch_detected = that reuse
+                                    --      itself. A fourth reason, `in_flight` (no state file yet),
+                                    --      raises NOTHING — there is no state file until the run
+                                    --      completes, so it is the normal case, not a failure. Only
+                                    --      the residual keeps the ALERTING `phase_unmapped`. Every
+                                    --      detail here is free of a count that moves between sweeps:
+                                    --      the old `phase_unmapped` interpolated a wave count and so
+                                    --      never deduped on (kind, detail).
+                                    --      `agent_never_returned` is ALSO written by src/discover.ts
+                                    --      for the population ingest cannot see — an agent the
+                                    --      journal started that left no transcript at all.
                                     -- WRITTEN TODAY by src/cli.ts (sweep-level — these three need
                                     -- the WHOLE corpus in hand, so no per-file writer can raise them):
                                     --   corpus_shrink|sweep_budget_exceeded|unpriced_model
+                                    --   |corpus_shrink_expected -- BENIGN (§5.8, P2.10 delta-9): a
+                                    --      `corpus_loss` row whose age is >= config.retention_days.
+                                    --      A daily cron sweep after the built-in `cleanupPeriodDays`
+                                    --      first reaps must not exit 3 on expected retention; a loss
+                                    --      inside `vanish_alarm_days` (or of unknown age) still raises
+                                    --      the ALERTING `corpus_shrink`. See BENIGN_ANOMALY_KINDS.
+                                    --   |census_collapse -- the D2/D3 sanity guard tripped: discovery
+                                    --      found `census_collapse_pct`% fewer sessions than the
+                                    --      previous `sweep_census` row (never on this database's
+                                    --      first-ever sweep, or a corpus that has always been
+                                    --      empty — there is nothing to have dropped FROM). A
+                                    --      discovery outage (bad --root, unmounted volume, wrong
+                                    --      EST_PROJECTS) must not be laundered into hundreds of
+                                    --      durable `corpus_loss` rows — D2/D3 are SKIPPED and this
+                                    --      fires instead. ALWAYS alerting.
                                     --   |fork_replay     -- cross-session uuid overlap between
                                     --      DISTINCT files; detail carries shape + shared count.
                                     --      `detectForkReplays` (D3: one corpus-wide uuid -> file[]
@@ -514,17 +611,66 @@ CREATE TABLE anomaly (              -- loud, queryable failure ledger
                                     --      the CLASS of the change, never the values: the ledger
                                     --      dedups on (kind, detail) and numbers in the key would
                                     --      write a row per sweep.
+                                    --   src/identity.ts (v10):
+                                    --      estimator_identity_repaired -- an estimate whose
+                                    --      EFFECTIVE estimator family was 'unknown' now resolves
+                                    --      to a concrete one; one `estimate_identity_repair` row
+                                    --      was appended beside (never into) the ledger row. Exactly
+                                    --      one per eid, ever: the row stops being a candidate.
+                                    --      |estimator_identity_ambiguous -- the window examined
+                                    --      held MORE THAN ONE main-chain family, so the pass
+                                    --      REFUSED and left 'unknown' standing. Written at most
+                                    --      once per eid (the writer checks first), because a
+                                    --      per-sweep repeat would make the ledger less readable,
+                                    --      not more. NOT an alert: 'unknown' is a legitimate
+                                    --      terminal state for a ceremony whose turn is not
+                                    --      recoverable from the corpus.
                                     -- STILL UNWRITTEN, reserved for the rest of Phase 2:
                                     --   segment_open_too_long|job_unjoined|promotion_backdated
-                                    --   |board_render_failed|audit_removed
-                                    --   |corpus_shrink_expected (BENIGN, §5.8)|gate_override
+                                    --   |board_render_failed|audit_removed|gate_override
   detail TEXT NOT NULL,
   tid TEXT REFERENCES task(tid)     -- nullable: many anomalies are corpus-wide
 ) STRICT;
 
 CREATE TABLE sweep_state (          -- performance only; losing it costs seconds, not correctness
   path TEXT PRIMARY KEY, inode INTEGER NOT NULL, bytes_read INTEGER NOT NULL,
-  last_swept TEXT NOT NULL
+  last_swept TEXT NOT NULL,
+  mtime TEXT                        -- v9: the file's own mtime at last read. NULL until
+                                    -- `est backfill --full` rewrites it; D1's vanish-age split
+                                    -- falls back to `last_swept` (a lower bound; §5.8) until then.
+) STRICT;
+
+CREATE TABLE corpus_loss (          -- v9: durable record of a transcript that stopped existing
+                                    -- (§5.8 root cause: `sweep_state` alone cannot represent a
+                                    -- loss that happened before a path was ever watermarked).
+                                    -- Append-only in spirit: a false positive is retracted via
+                                    -- `resolved_at`, never a DELETE — see src/census.ts.
+                                    --
+                                    -- ONE ROW PER PATH, DESCRIBING ITS CURRENT EPISODE. The PK is
+                                    -- the path, so a path cannot hold two rows; what it CAN do is
+                                    -- be lost, restored (`resolved_at` set) and lost again, and
+                                    -- the writer's `ON CONFLICT(path) DO UPDATE ... resolved_at =
+                                    -- NULL WHERE corpus_loss.resolved_at IS NOT NULL` re-opens
+                                    -- the row with the new episode's evidence. `DO NOTHING` — the
+                                    -- original clause — made that second loss UNREPRESENTABLE:
+                                    -- the row went on reading "resolved" while the file was gone,
+                                    -- and `est retro`'s `WHERE resolved_at IS NULL` count agreed
+                                    -- with the ledger rather than with the disk. History of the
+                                    -- superseded episode is deliberately not kept here: the
+                                    -- `anomaly` ledger already carries one dated `corpus_shrink`
+                                    -- row per episode, which is where "when did this happen" is
+                                    -- meant to be read.
+  path TEXT PRIMARY KEY,
+  session_id TEXT,                 -- nullable: not every lost path resolves to one session
+  kind TEXT NOT NULL CHECK (kind IN ('main','agent','state','unknown')),
+  detected_by TEXT NOT NULL CHECK (detected_by IN
+    ('watermark_diff','discovery_probe','ledger_probe')),
+  first_missing_at TEXT NOT NULL,
+  last_seen_at TEXT,
+  mtime TEXT,
+  age_source TEXT NOT NULL CHECK (age_source IN ('mtime','last_swept','ledger_ts','unknown')),
+  expected INTEGER NOT NULL DEFAULT 0,  -- 1 => age >= config.retention_days at detection time
+  resolved_at TEXT                 -- set when a LATER sweep finds the file back on disk
 ) STRICT;
 
 -- Phase 1 (P1.9): the statusline's read path, and the ONLY reason `est burn --json`
@@ -978,8 +1124,26 @@ HAVING n_workflows >= 1 OR n_agents >= 2;
 --      overhead: real money, no relationship to task size, unknowable at `est
 --      open`. It stays visible as wcet_aux for Spend-CET reporting and is kept out
 --      of the ratio the multipliers are fitted to (§4.6).
+-- v10: the EFFECTIVE estimator identity of every estimate — the recorded value with
+-- the newest `estimate_identity_repair` row laid over it. One row per estimate, always
+-- (the join is LEFT), so a consumer may INNER JOIN it without losing rows.
+--
+-- Read this, never `estimate.estimator_model`, anywhere the value is used as a
+-- CALIBRATION KEY. `estimator_model_recorded` stays projected beside it so an audit can
+-- see both, which is what makes the correction reviewable rather than merely applied.
+CREATE VIEW v_estimate_identity AS
+SELECT e.eid, e.tid,
+       e.estimator_model AS estimator_model_recorded,
+       COALESCE(r.estimator_model, e.estimator_model) AS estimator_model,
+       r.method AS repair_method,
+       r.repaired_at
+FROM estimate e
+LEFT JOIN estimate_identity_repair r
+  ON r.eid = e.eid
+ AND r.seq = (SELECT MAX(seq) FROM estimate_identity_repair WHERE eid = e.eid);
+
 CREATE VIEW v_velocity AS
-SELECT e.bucket, e.estimator_model, e.price_epoch, e.refclass_as_of,
+SELECT e.bucket, i.estimator_model, e.price_epoch, e.refclass_as_of,
        e.ref_model, e.estimand,                          -- the UNIT; never pool across these
        o.velocity_raw, o.velocity_cal, o.finalized_at,
        o.wcet_main, o.wcet_sub, o.wcet_aux,
@@ -987,6 +1151,7 @@ SELECT e.bucket, e.estimator_model, e.price_epoch, e.refclass_as_of,
        e.exp_agents, o.n_agents
 FROM v_outcome_current o
 JOIN estimate e ON e.eid = o.eid_at_start
+JOIN v_estimate_identity i ON i.eid = e.eid              -- v10: the EFFECTIVE identity, not e.*
 WHERE o.scope_changed = 0 AND o.censored = 0 AND o.final_status = 'completed'
   AND o.unpriced_share = 0 AND o.price_provisional = 0   -- R2: unpriced degrades the ROW
   AND o.actual_wcet_at_epoch IS NOT NULL;                -- R2: epoch-consistent actuals only
@@ -1061,7 +1226,7 @@ WHERE s.terminator = 'open'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '8'),
+  ('schema_version',          '10'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.
@@ -1115,7 +1280,22 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   -- not classify are the artefact. Their ROTATED files are reaped at this age instead
   -- (src/otel.ts pruneOtelSpool); the live file is bounded by rotation and is never
   -- unlinked out from under the receiver's open handle.
-  ('otel_spool_retention_days', '14');
+  ('otel_spool_retention_days', '14'),
+  -- v9 / §5.8 fix: the vanish-detector's second and third eyes (src/census.ts D2/D3)
+  -- and the benign/alerting split (`corpus_shrink` vs `corpus_shrink_expected`).
+  -- `retention_days` MUST mirror `~/.claude/settings.json`'s `cleanupPeriodDays` — the
+  -- build does not edit that file (Phase 0 rule), so the two are coupled BY HAND;
+  -- `est census` prints the pair so a divergence is visible rather than silent.
+  ('retention_days',           '365'),
+  -- Below this age, a `corpus_loss` row is the ALARMING bucket (`corpus_shrink`,
+  -- exit 3) — the same conservative 60-day line the pre-fix code used, now a config
+  -- row instead of the literal `SIXTY_DAYS_MS`.
+  ('vanish_alarm_days',        '60'),
+  -- D2/D3 sanity guard: if discovery finds this many fewer sessions than the
+  -- previous `sweep_census` row, that is a discovery OUTAGE, not a corpus that
+  -- shrank — raise `census_collapse` and skip D2/D3 rather than durably recording
+  -- hundreds of false losses.
+  ('census_collapse_pct',      '20');
 
 INSERT OR IGNORE INTO bucket_def (bucket, created_at, dims_json, parent_bucket, split_pinball_gain, active)
 VALUES ('global', strftime('%Y-%m-%dT%H:%M:%SZ','now'), '{}', NULL, NULL, 1);

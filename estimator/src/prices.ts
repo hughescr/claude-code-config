@@ -86,8 +86,13 @@ export const LONG_CONTEXT_THRESHOLD = 200_000;
  * Model ids that are not API models and must not raise `unpriced_model`.
  * `<synthetic>` is Claude Code's marker for locally generated assistant
  * messages: they carry no usage block and never reach the API.
+ *
+ * Exported because these are also the strings that must never be adopted as an
+ * IDENTITY: `request.model_family` really does carry `'unknown'` for such a line,
+ * and src/identity.ts treats reading one back as "still pending" rather than as an
+ * answer (see `isModelIdentity`).
  */
-const NON_API_MODELS = new Set(["", "<synthetic>", "synthetic", "unknown"]);
+export const NON_API_MODELS: ReadonlySet<string> = new Set(["", "<synthetic>", "synthetic", "unknown"]);
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 

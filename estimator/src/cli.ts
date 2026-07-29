@@ -19,6 +19,7 @@
  *   est recon                   our number vs an Anthropic-computed one, on four axes
  *   est segments                the check-back corpus, and the knob that shapes it
  *   est retro                   weekly calibration + the write-back that makes it non-inert
+ *   est repair-identity         append-only correction of a still-'unknown' estimator identity
  *
  * Three properties this file is responsible for (§2):
  *
@@ -53,7 +54,24 @@ import type { Database } from "bun:sqlite";
 import { mkdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DB_PATH, ROOT, SCHEMA_VERSION, getConfig, openDb, setConfig } from "./db.ts";
-import { PROJECTS_ROOT, discoverCorpus, sessionFiles, type Corpus } from "./discover.ts";
+import {
+  PROJECTS_ROOT,
+  discoverCorpus,
+  sessionFiles,
+  sessionIdFromPath,
+  type Corpus,
+} from "./discover.ts";
+import {
+  ageDaysFrom,
+  checkCensusCollapse,
+  classifyPathKind,
+  isExpected,
+  readCensusConfig,
+  runCorpusLossProbe,
+  writeCorpusLoss,
+  type ClassifiedLoss,
+  type CorpusLossProbeResult,
+} from "./census.ts";
 import { applyFix, auditReport, renderAudit, type AuditReport } from "./audit.ts";
 import {
   INSERT_ANOMALY_SQL,
@@ -102,6 +120,7 @@ import {
   writeRecon,
   type ReconAxis,
 } from "./recon.ts";
+import { repairEstimatorIdentity, type RepairReport } from "./identity.ts";
 import {
   addBlock,
   appendScope,
@@ -140,6 +159,8 @@ export const COMMANDS = [
   "close",
   "board",
   "retro",
+  // v10: the append-only correction path for `estimate.estimator_model` (src/identity.ts).
+  "repair-identity",
   // Phase 2 (§Phase 2 interfaces).
   "recon",
   "segments",
@@ -170,7 +191,13 @@ export const COMMAND_FLAGS: Record<Command, FlagSpec> = {
   prices: { booleans: ["sync", "show"], values: ["source", "set", "in", "out", "cw", "cr", "at"] },
   census: { booleans: [], values: ["limit", "root"] },
   config: { booleans: [], values: [] },
-  refclass: { booleans: ["full"], values: ["kind", "fanout", "text", "limit"] },
+  refclass: {
+    booleans: ["full"],
+    // `session`/`prompt` are not a nicety: they are how step 1 of the ceremony is
+    // pinned to the SAME anchor step 7 will use (src/identity.ts).
+    values: ["kind", "fanout", "text", "limit", "session", "prompt"],
+  },
+  "repair-identity": { booleans: ["apply", "dry-run"], values: [] },
   open: {
     booleans: [],
     values: [
@@ -403,6 +430,41 @@ export const BENIGN_ANOMALY_KINDS: ReadonlySet<string> = new Set([
   // `never_started_share`-style honesty), not because moving a timestamp backwards
   // to a truer value is damage.
   "promotion_backdated",
+  // §5.6 [R4]: the three shapes a corpus of BACKGROUND workflow agents has, decided
+  // the same way and for the same reason as the two fork shapes above.
+  // `agent_never_returned` is an agent the journal started and no `result` ever came
+  // back for; `wf_relaunch_orphan` is an agent from an earlier launch under a runId
+  // the harness reused, whose progress the state file overwrote;
+  // `wf_relaunch_detected` is that reuse itself. None is damage: they are what
+  // relaunching and killing agents LOOKS like, and the design's own promotion
+  // condition (ii) is that these populations be "classified rather than counted as
+  // join failures". Before this, they were 83% of the live ledger and made every
+  // sweep exit 3 — the exact "must not cry wolf" failure §4.2 warns about.
+  // `phase_unmapped` and `wf_record_mismatch` stay ALERTING: post-classifier they
+  // fire only on a real plan or authoring mismatch, which is the whole point.
+  "agent_never_returned",
+  "wf_relaunch_orphan",
+  "wf_relaunch_detected",
+  // §5.8 v9 / P2.10 delta-9 (the split that never landed before this fix): a
+  // `corpus_loss` row whose age is >= config.retention_days is an EXPECTED reap —
+  // the built-in cleanup or the hook GC doing its job — not damage. Without this,
+  // the first cron sweep after `cleanupPeriodDays` first reaps would exit 3 daily
+  // forever, training the watchdog to be ignored (the exact failure this note's
+  // sibling kinds above were added to avoid). A loss inside `vanish_alarm_days`,
+  // or of unknown age, still raises the ALERTING `corpus_shrink` — see
+  // src/census.ts and the `runSweep` block that classifies `newLosses`.
+  "corpus_shrink_expected",
+  // §5.8 v9, the other half of that split. `main_transcript_missing` is raised by
+  // DISCOVERY (src/discover.ts), which sees only "no <sid>.jsonl under any project
+  // dir" and has no age evidence at all. D2 then classifies the SAME loss with the
+  // ledger's `last_seen` bound and splits it into `corpus_shrink` (alerting) vs
+  // `corpus_shrink_expected` (benign). Leaving discovery's kind alerting defeated
+  // that split for exactly the population it was built for: a transcript reaped past
+  // `retention_days` produced `corpus_shrink_expected` AND `main_transcript_missing`,
+  // and the sweep exited 3 anyway. The alerting decision for a missing main belongs
+  // to D2, which has the evidence; this row stays recorded and reported, and
+  // `--strict` still promotes it.
+  "main_transcript_missing",
   // NOTE: `board_render_failed` (P2.7) is deliberately ABSENT from this set — it
   // does not go through `report.anomalies` at all (see the sweep's board-regen
   // step). The design's "never fails the sweep" is unconditional: `--strict`
@@ -530,7 +592,24 @@ export interface SweepReport {
   /** §5.2 second dedup pass: rows demoted to `attr='replay'` this sweep. */
   sidechain_replays: number;
   anomalies: { recorded: number; alerting: number; by_kind: Record<string, number> };
-  vanished: { total: number; lt_60d: number; paths: string[] };
+  /**
+   * §5.8 v9: `total`/`lt_60d`/`paths` are D1 (the watermark diff) alone, preserved
+   * byte-for-byte for the existing JSON contract. `sessions_lost` and `expected`
+   * add D2 (src/census.ts's discovery-side probe) ON TOP: a session whose main
+   * transcript vanished before it was ever watermarked has no `sweep_state` row to
+   * diff, so D1 cannot see it and it would never appear in `total`/`paths` at all —
+   * see src/census.ts's module doc for why a second detector is necessary.
+   */
+  vanished: {
+    total: number;
+    lt_60d: number;
+    paths: string[];
+    /** Session ids D2 recorded as newly lost THIS sweep (not previously known to `corpus_loss`). */
+    sessions_lost: string[];
+    /** Of every loss newly recorded this sweep (D1 + D2), how many are `expected`
+     *  (age >= config.retention_days) — the P2.10 benign/alerting split. */
+    expected: number;
+  };
   /** P1.10/P1.11: what the hook spool contributed to this sweep. */
   spool: {
     task_events_read: number;
@@ -581,6 +660,8 @@ export interface SweepReport {
     tasks: number;
     turns: number;
     agents: number;
+    /** `workflow_run` rows that resolved a tid. Was structurally 0 before the F3 fix. */
+    runs: number;
     requests: number;
     by_attr: Record<string, number>;
   };
@@ -590,6 +671,13 @@ export interface SweepReport {
   segments: { sessions: number; segments: number; open: number };
   /** P2.8: the sweeper's one status edge, and the `started_at` corrections beside it. */
   promotion: { promoted: number; started_at_set: number; started_at_backdated: number };
+  /**
+   * v10: estimator-identity repairs APPENDED beside the append-only ledger. `repaired`
+   * is a one-way count — an eid stops being a candidate the moment it is repaired — so
+   * a steady non-zero value across sweeps means the resolver is flip-flopping and is a
+   * bug, not a workload.
+   */
+  identity_repair: { candidates: number; repaired: number; ambiguous: number; pending: number };
   /** P2.9: the `~/.claude/jobs` reconcile. Every field is 0 when `jobsRoot` does not
    *  exist — the same degrade-to-Phase-1 shape as `otel` above; nothing errors,
    *  nothing blocks, no verb changes its exit code because of this alone. */
@@ -610,18 +698,19 @@ export interface SweepReport {
   board: { attempted: boolean; ok: boolean };
 }
 
-const SIXTY_DAYS_MS = 60 * 24 * 3600 * 1000;
-
 export interface FileFingerprint {
   path: string;
   inode: number;
   bytes: number;
+  /** ISO mtime at the moment of this stat. v9: written into `sweep_state.mtime` so
+   *  a later vanish-age computation is exact rather than `last_swept`-inferred. */
+  mtime: string;
 }
 
 function fingerprint(path: string): FileFingerprint | null {
   try {
     const st = statSync(path);
-    return { path, inode: Number(st.ino), bytes: st.size };
+    return { path, inode: Number(st.ino), bytes: st.size, mtime: st.mtime.toISOString() };
   } catch {
     return null; // vanished between discovery and ingest (GC race, §3.4)
   }
@@ -688,10 +777,11 @@ function mergeBatch(into: IngestBatch, from: IngestBatch): void {
 }
 
 const UPSERT_SWEEP_STATE_SQL = `
-INSERT INTO sweep_state (path, inode, bytes_read, last_swept)
-VALUES ($path, $inode, $bytes_read, $last_swept)
+INSERT INTO sweep_state (path, inode, bytes_read, last_swept, mtime)
+VALUES ($path, $inode, $bytes_read, $last_swept, $mtime)
 ON CONFLICT(path) DO UPDATE SET
-  inode = excluded.inode, bytes_read = excluded.bytes_read, last_swept = excluded.last_swept
+  inode = excluded.inode, bytes_read = excluded.bytes_read, last_swept = excluded.last_swept,
+  mtime = excluded.mtime
 `;
 
 const UPSERT_CENSUS_SQL = `
@@ -751,34 +841,80 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
   // A test corpus and the real one share one database only by accident, but the
   // vanished-file diff must never read one root's absence as the other's loss.
   const prefix = realRoot(root);
-  const prior = new Map<string, { inode: number; bytes: number; lastSwept: string }>();
+  const prior = new Map<string, { inode: number; bytes: number; lastSwept: string; mtime: string | null }>();
   for (const row of db
-    .query<{ path: string; inode: number; bytes_read: number; last_swept: string }, []>(
-      "SELECT path, inode, bytes_read, last_swept FROM sweep_state",
-    )
+    .query<
+      { path: string; inode: number; bytes_read: number; last_swept: string; mtime: string | null },
+      []
+    >("SELECT path, inode, bytes_read, last_swept, mtime FROM sweep_state")
     .all()) {
     if (!row.path.startsWith(prefix)) continue;
-    prior.set(row.path, { inode: row.inode, bytes: row.bytes_read, lastSwept: row.last_swept });
+    prior.set(row.path, {
+      inode: row.inode,
+      bytes: row.bytes_read,
+      lastSwept: row.last_swept,
+      mtime: row.mtime,
+    });
   }
 
   const onDisk = new Set<string>();
   for (const s of corpus.sessions) for (const p of sessionFiles(s)) onDisk.add(p);
 
-  // --- §5.8 corpus shrinkage ------------------------------------------------
-  // KNOWN IMPRECISION, stated rather than hidden: `sweep_state` has no column for
-  // the file's own mtime, so a vanished file's AGE is unknowable after the fact.
-  // `last_swept` only bounds it from below (age >= now - last_swept). The split is
-  // therefore computed conservatively — anything last seen alive inside the 60-day
-  // window counts as `lt_60d`, the alarming bucket — so the failure mode is a false
-  // alarm, never a missed one. Add `sweep_state.mtime` to make it exact.
+  // --- §5.8 corpus shrinkage: D1, the watermark diff -------------------------
+  // KNOWN IMPRECISION, stated rather than hidden: pre-v9 `sweep_state` carried no
+  // column for the file's own mtime, so a vanished file's AGE was unknowable after
+  // the fact and `last_swept` only bounded it from below. v9 adds `sweep_state.mtime`
+  // (backfilled by `est backfill --full`); until a path has one, the age falls back
+  // to `last_swept` — still a lower bound, so the failure mode stays a false ALARM,
+  // never a missed one (`age_source` on the `corpus_loss` row says which was used).
+  //
+  // NOTE — this is D1 ALONE, and by construction: a path this database never
+  // watermarked (deleted before its first sweep) is not in `prior` and cannot be
+  // diffed here at all. That is the §5.8 root cause; D2 (src/census.ts,
+  // `runCorpusLossProbe`, below) closes it from the discovery side.
+  const censusCfg = readCensusConfig(db);
+  // §5.8 risk #1, evaluated ONCE and BEFORE anything is classified, because it has
+  // to gate BOTH detectors. It used to live inside `runCorpusLossProbe`, which runs
+  // after `writeCorpusLoss(db, d1Losses)` — so a discovery outage (unmounted volume,
+  // bad `EST_PROJECTS`, a project subtree moved aside while `--root` survives) was
+  // laundered into exactly the durable `corpus_loss` rows the guard's own docstring
+  // says must not exist: D2 was skipped and `census_collapse` raised, while D1 had
+  // already written one `watermark_diff` row per watermarked path, reported them all
+  // as `vanished`, and then DELETEd every `sweep_state` row so the next sweep had to
+  // re-read the whole corpus. Those rows were also irrecoverable, since retraction
+  // only ever covered `discovery_probe` (now fixed too, src/census.ts).
+  //
+  // `checkCensusCollapse` reads only `sweep_census` (this sweep's own row is written
+  // at the very end) and `corpus.census`, so it is answerable here.
+  const collapseGuard = checkCensusCollapse(db, corpus, censusCfg);
+  const vanishAlarmMs = censusCfg.vanishAlarmDays * 24 * 3600 * 1000;
   const vanished: string[] = [];
   let vanishedLt60d = 0;
-  for (const [path, st] of prior) {
-    if (onDisk.has(path)) continue;
-    if (fingerprint(path) !== null) continue; // present but not discovered: not a loss
-    vanished.push(path);
-    const seenAgo = now.getTime() - Date.parse(st.lastSwept);
-    if (!Number.isFinite(seenAgo) || seenAgo < SIXTY_DAYS_MS) vanishedLt60d += 1;
+  const d1Losses: ClassifiedLoss[] = [];
+  // A collapsed census means discovery is not a trustworthy witness to ABSENCE this
+  // sweep, so D1 does not run at all: `vanished` stays empty, no `corpus_loss` row is
+  // written, and — just as important — the `DELETE FROM sweep_state` at the end of
+  // the sweep finds nothing to delete, which is what keeps recovery incremental.
+  if (!collapseGuard.collapsed) {
+    for (const [path, st] of prior) {
+      if (onDisk.has(path)) continue;
+      if (fingerprint(path) !== null) continue; // present but not discovered: not a loss
+      vanished.push(path);
+      const seenAgo = now.getTime() - Date.parse(st.lastSwept);
+      if (!Number.isFinite(seenAgo) || seenAgo < vanishAlarmMs) vanishedLt60d += 1;
+      const ageDays = ageDaysFrom(st.mtime ?? st.lastSwept, now);
+      d1Losses.push({
+        path,
+        sessionId: sessionIdFromPath(path),
+        kind: classifyPathKind(path),
+        detectedBy: "watermark_diff",
+        firstMissingAt: sweptAt,
+        lastSeenAt: st.lastSwept,
+        mtime: st.mtime,
+        ageSource: st.mtime !== null ? "mtime" : "last_swept",
+        expected: isExpected(ageDays, censusCfg),
+      });
+    }
   }
 
   const report: SweepReport = {
@@ -807,7 +943,15 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     files_incomplete: 0,
     sidechain_replays: 0,
     anomalies: { recorded: 0, alerting: 0, by_kind: {} },
-    vanished: { total: vanished.length, lt_60d: vanishedLt60d, paths: vanished },
+    // `sessions_lost`/`expected` are filled in once the D2 probe (below) runs —
+    // placeholders here so `report` has its final shape from construction.
+    vanished: {
+      total: vanished.length,
+      lt_60d: vanishedLt60d,
+      paths: vanished,
+      sessions_lost: [],
+      expected: 0,
+    },
     spool: {
       task_events_read: 0,
       task_events_inserted: 0,
@@ -835,10 +979,11 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
       traces_dropped: 0,
       spool_pruned: 0,
     },
-    attribution: { tasks: 0, turns: 0, agents: 0, requests: 0, by_attr: {} },
+    attribution: { tasks: 0, turns: 0, agents: 0, runs: 0, requests: 0, by_attr: {} },
     burn_cache_rows: 0,
     segments: { sessions: 0, segments: 0, open: 0 },
     promotion: { promoted: 0, started_at_set: 0, started_at_backdated: 0 },
+    identity_repair: { candidates: 0, repaired: 0, ambiguous: 0, pending: 0 },
     jobs: {
       dirs_read: 0,
       parsed: 0,
@@ -900,6 +1045,13 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
           $inode: f.inode,
           $bytes_read: f.bytes,
           $last_swept: sweptAt,
+          // v9. NOT optional, and bun:sqlite will not tell you if you forget it: a
+          // named parameter that is never bound is silently NULL rather than an
+          // error, so omitting this left `sweep_state.mtime` NULL on every row
+          // forever and D1's exact retention-age split (`ageSource: 'mtime'`) could
+          // never engage — every `corpus_loss` row fell back to the `last_swept`
+          // lower bound. `test/census.test.ts` pins `mtime IS NULL` at zero.
+          $mtime: f.mtime,
         } as never);
       }
     }).immediate();
@@ -947,7 +1099,7 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
       continue;
     }
 
-    const ingested = await ingestSession(session, plan);
+    const ingested = await ingestSession(session, plan, now);
     mergeBatch(buffer, ingested);
     forkFiles.push(...ingested.files);
     // Two reasons a fingerprint must not become a watermark, and they are the same
@@ -967,15 +1119,84 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     }
   }
 
-  // §5.8: shrinkage is loud, and the stale rows are dropped so the NEXT census
-  // reports the delta rather than re-reporting the same loss forever.
-  if (vanished.length > 0) {
-    pendingAnomalies.push({
-      kind: "corpus_shrink",
-      detail: `${vanished.length} previously-swept file(s) vanished (${vanishedLt60d} last seen inside 60d): ${vanished
-        .slice(0, 20)
-        .join(", ")}${vanished.length > 20 ? ` … +${vanished.length - 20} more` : ""}`,
+  // §5.8 v9: D2 (src/census.ts) closes the gap D1 structurally cannot see — a
+  // transcript deleted before it was EVER watermarked. Both write to
+  // `corpus_loss` (durable, insert-once) inside one transaction, and the anomaly
+  // raised depends on what is newly lost this sweep:
+  //   `corpus_shrink`          — alerting; ANY new loss is younger than
+  //                              `vanish_alarm_days`, or its age is unknown.
+  //   `corpus_shrink_expected` — BENIGN (P2.10's delta-9 split, never landed
+  //                              before v9); every new loss is at or past
+  //                              `retention_days` — an expected reap, not damage.
+  //   `census_collapse`        — the D2 sanity guard tripped (§5.8 risk #1): a
+  //                              discovery outage must not be laundered into
+  //                              hundreds of durable `corpus_loss` rows, so D2 is
+  //                              skipped entirely and this fires instead.
+  //
+  // NOTE for whoever next touches `src/ingest.ts`'s `IngestAnomaly.kind` union:
+  // "corpus_shrink_expected" and "census_collapse" belong in it alongside
+  // "corpus_shrink" (this file owns adding sweep-level kinds there per its own
+  // comment); they are cast here rather than added to that union because this
+  // change does not touch src/ingest.ts.
+  let lossProbe: CorpusLossProbeResult = {
+    newLosses: [],
+    insertedCount: 0,
+    resolvedCount: 0,
+    collapsed: false,
+    collapseDetail: null,
+  };
+  db.transaction(() => {
+    // `d1Losses` is empty when the guard tripped (see the D1 block above), so this
+    // is unconditional in form and gated in fact — one verdict, both detectors.
+    writeCorpusLoss(db, d1Losses);
+    lossProbe = runCorpusLossProbe(db, corpus, sweptAt, now, {
+      onDisk,
+      guard: collapseGuard,
     });
+  }).immediate();
+
+  const newLosses: ClassifiedLoss[] = [...d1Losses, ...lossProbe.newLosses];
+  const lt60dOf = (l: ClassifiedLoss): boolean => {
+    const days = ageDaysFrom(l.mtime ?? l.lastSeenAt, now);
+    return days === null || days < censusCfg.vanishAlarmDays;
+  };
+  // `total`/`lt_60d`/`paths` now cover D1 + D2 combined — the whole point of the
+  // fix is that "vanished" stops meaning "vanished, but only the subset D1's
+  // watermark diff could see". Every scenario the pre-fix JSON contract was
+  // tested against had D2 finding nothing, so this is additive in practice.
+  report.vanished.total = newLosses.length;
+  report.vanished.lt_60d = newLosses.filter(lt60dOf).length;
+  report.vanished.paths = newLosses.map((l) => l.path);
+  report.vanished.sessions_lost = lossProbe.newLosses
+    .map((l) => l.sessionId)
+    .filter((s): s is string => s !== null);
+  report.vanished.expected = newLosses.filter((l) => l.expected).length;
+
+  if (lossProbe.collapsed) {
+    pendingAnomalies.push({
+      kind: "census_collapse",
+      detail:
+        lossProbe.collapseDetail ?? "discovery collapse guard tripped; D1 and D2 skipped this sweep",
+    } as unknown as IngestAnomaly);
+  }
+  // A plain `if`, NOT an `else if`. Chained to the collapse branch, a sweep that
+  // recorded real losses AND tripped the guard reported the collapse and stayed
+  // silent about the losses it had nevertheless persisted. The guard now empties
+  // both detectors, so the two branches are disjoint by construction — and saying so
+  // with an unchained `if` means a future change to one cannot silence the other.
+  if (newLosses.length > 0) {
+    const alarming = newLosses.some((l) => !l.expected);
+    const preview = newLosses.slice(0, 20).map((l) => l.path);
+    const detail =
+      `${newLosses.length} transcript(s)/session(s) newly recorded lost this sweep ` +
+      `(D1 watermark diff: ${vanished.length}, ${vanishedLt60d} within ${censusCfg.vanishAlarmDays}d; ` +
+      `D2 discovery probe: ${lossProbe.newLosses.length}; ${report.vanished.expected} at/beyond ` +
+      `retention_days=${censusCfg.retentionDays}): ${preview.join(", ")}` +
+      (newLosses.length > 20 ? ` … +${newLosses.length - 20} more` : "");
+    pendingAnomalies.push({
+      kind: alarming ? "corpus_shrink" : "corpus_shrink_expected",
+      detail,
+    } as unknown as IngestAnomaly);
   }
   if (report.budget_exceeded) {
     pendingAnomalies.push({
@@ -1092,8 +1313,37 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     tasks: attribution.tasks,
     turns: attribution.turns_assigned,
     agents: attribution.agents_assigned,
+    runs: attribution.runs_assigned,
     requests: attribution.requests_assigned,
     by_attr: attribution.by_attr,
+  };
+
+  // v10: give estimates whose EFFECTIVE estimator family is still the repairable
+  // `'unknown'` sentinel a concrete one, by APPENDING to `estimate_identity_repair`.
+  // Here rather than in a verb because the reason a row is 'unknown' is ingest lag —
+  // `est open` runs before the sweep has seen the anchoring turn — so the moment the
+  // repair becomes possible is precisely the moment ingest lands the turn, which is
+  // now. Conservative by construction: it only ever touches the sentinel, refuses on
+  // an ambiguous window, and writes nothing on a second run.
+  //
+  // Wrapped, for the reason `reconcileJobs` documents: `runSweep` is not itself inside
+  // a transaction, so a bare call would autocommit once per repair row and once per
+  // anomaly, and a crash between the two would leave a correction with no audit trail.
+  let identityRepair: RepairReport = {
+    candidates: 0,
+    proposals: [],
+    applied: 0,
+    ambiguous: 0,
+    pending: 0,
+  };
+  db.transaction(() => {
+    identityRepair = repairEstimatorIdentity(db, { now, apply: true });
+  }).immediate();
+  report.identity_repair = {
+    candidates: identityRepair.candidates,
+    repaired: identityRepair.applied,
+    ambiguous: identityRepair.ambiguous,
+    pending: identityRepair.pending,
   };
 
   // P2.8: promote `estimating -> in_progress` on the task's FIRST attributed
@@ -1178,6 +1428,10 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
   if (pendingAnomalies.length > 0) flush();
 
   db.transaction(() => {
+    // Gated by the same verdict as everything else D1 does: `vanished` is empty when
+    // the collapse guard tripped, so an outage cannot drop the watermarks — which are
+    // precisely what lets the sweep AFTER the outage stay incremental instead of
+    // re-reading the whole corpus.
     if (vanished.length > 0) {
       const del = db.prepare("DELETE FROM sweep_state WHERE path = ?");
       for (const p of vanished) del.run(p);
@@ -1191,8 +1445,9 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
       // truthful degenerate answer ("nothing older than now") and keeps MIN()
       // over the census history meaningful.
       $oldest_mtime: corpus.census.oldestMtime ?? sweptAt,
-      $vanished_total: vanished.length,
-      $vanished_lt_60d: vanishedLt60d,
+      // Combined D1 + D2, per the same reasoning as `report.vanished` above.
+      $vanished_total: report.vanished.total,
+      $vanished_lt_60d: report.vanished.lt_60d,
     } as never);
   }).immediate();
 
@@ -1453,7 +1708,7 @@ function sweepSummary(r: SweepReport): string {
       .join(" ");
     lines.push(
       `attrib  ${num(r.attribution.tasks)} task(s): ${num(r.attribution.turns)} turn, ${num(r.attribution.agents)} agent, ` +
-        `${num(r.attribution.requests)} request row(s) changed${split === "" ? "" : ` (${split})`}`,
+        `${num(r.attribution.runs)} run, ${num(r.attribution.requests)} request row(s) changed${split === "" ? "" : ` (${split})`}`,
     );
     lines.push(`burn    ${num(r.burn_cache_rows)} materialised burn_cache row(s) refreshed`);
     lines.push(
@@ -1491,7 +1746,7 @@ function sweepSummary(r: SweepReport): string {
   }
   if (r.vanished.total > 0) {
     lines.push(
-      `SHRINK  ${r.vanished.total} previously-swept file(s) vanished, ${r.vanished.lt_60d} seen alive inside 60d — §5.8 expects ZERO`,
+      `SHRINK  ${r.vanished.total} transcript(s)/session(s) newly lost (D1+D2), ${r.vanished.lt_60d} in the alarming window, ${r.vanished.expected} at/beyond retention — §5.8 expects ZERO`,
     );
   }
   if (r.budget_exceeded) {
@@ -2042,6 +2297,19 @@ async function cmdConfig(ctx: Ctx): Promise<number> {
         setConfig(db, key, value);
         if (ctx.json) ctx.out(JSON.stringify({ schema: 1, key, old, value }));
         else if (!ctx.quiet) ctx.out(`${key}: ${old} → ${value}`);
+        // `estimator_model` is not a tunable, it is an ESCAPE HATCH, and it sits ABOVE
+        // the per-session derivation in the resolution order (src/identity.ts). Pinning
+        // it is machine-wide and permanent: every band from every session lands under
+        // one family regardless of which model actually issued it, and nothing on
+        // screen would ever say so. It is not refused — an operator may genuinely need
+        // it — but it does not get to be quiet.
+        if (key === "estimator_model" && !ctx.quiet) {
+          ctx.err(
+            "warning: config.estimator_model PINS the estimator identity for every session on this machine, " +
+              "overriding the per-session derivation. Unset it (or use EST_ESTIMATOR_MODEL for one run) unless you " +
+              "really do run exactly one model everywhere.",
+          );
+        }
         return 0;
       } finally {
         db.close();
@@ -2258,6 +2526,13 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
               estimand: result.estimand,
               price_epoch: result.priceEpoch,
               refclass_as_of: result.refclassAsOf,
+              // WHO estimated, and which leg of the resolution order said so. Projected
+              // because the calibration bucket this band joins is keyed on it, and
+              // `'unknown'`/`pending` means the band is filed under a repairable
+              // sentinel rather than under a model — a fact a consumer should be able
+              // to see without querying the ledger.
+              estimator_model: result.estimatorModel,
+              estimator_method: result.estimatorMethod,
               anchor: { session: result.anchor.sessionId, prompt: result.anchor.promptId },
             }),
           );
@@ -2277,6 +2552,16 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
               ? `      UNCALIBRATED — bucket "${result.bucket}" has ${result.bucketN} comparable completed task(s); calibration starts at 10. This is your raw band, unchanged.`
               : `      calibrated from refclass ${result.refclassAsOf} (bucket ${result.bucket}, n=${result.bucketN}); raw was ${num(result.raw.p50)} / ${num(result.raw.p90)}`,
           );
+          // Said out loud only when it is the sentinel. A band filed under 'unknown' is
+          // in its own reference class of one until the next sweep ingests the anchoring
+          // turn and `repairEstimatorIdentity` resolves it — which is a fact worth
+          // seeing, and a silence worth not keeping.
+          if (result.estimatorMethod === "pending") {
+            ctx.out(
+              "      estimator: unknown (this session's turn has not been swept yet) — the band is filed under the " +
+                "repairable 'unknown' key; the next sweep resolves it, or `est repair-identity`",
+            );
+          }
           ctx.out(`${PLANT_MARKER} ${result.plant.call}`);
         }
         return 0;
@@ -2500,6 +2785,11 @@ function cmdRefclass(ctx: Ctx): number {
       fanout,
       text,
       limit: optInt(p, "limit", 5),
+      // Forwarded so step 1 and step 7 of the ceremony resolve the SAME estimator
+      // identity. `est open --session X` beside a bare `est refclass` used to print one
+      // family's calibration and stamp another's.
+      session: flagString(p, "session"),
+      prompt: flagString(p, "prompt"),
     });
     if (ctx.json) {
       ctx.out(JSON.stringify({ schema: 1, ...r }));
@@ -3019,6 +3309,88 @@ async function cmdRetro(ctx: Ctx): Promise<number> {
   );
 }
 
+/**
+ * `est repair-identity` — give estimates whose EFFECTIVE estimator family is still the
+ * repairable `'unknown'` sentinel a concrete one, WITHOUT touching a ledger row.
+ *
+ * **Dry run is the default.** `--apply` is required to write, because this verb writes
+ * into the calibration key and the honest response to "did it propose the right thing?"
+ * is to look first. It is also what the land step runs: dry run, eyeball the proposal
+ * list, then apply.
+ *
+ * Nothing here can restate an estimate: the correction is one INSERT into
+ * `estimate_identity_repair`, which carries the same `RAISE(ABORT,'append-only')` pair
+ * every other evidence table carries. `SELECT estimator_model FROM estimate` is
+ * unchanged afterwards, and that is the property to check.
+ */
+async function cmdRepairIdentity(ctx: Ctx): Promise<number> {
+  const p = ctx.parsed;
+  const apply = flagBool(p, "apply");
+  if (apply && flagBool(p, "dry-run")) {
+    throw new UsageError("est repair-identity: --apply and --dry-run are mutually exclusive");
+  }
+
+  const emit = (r: RepairReport): number => {
+    if (ctx.json) {
+      // `dry_run`, not `applied`: `RepairReport.applied` is the COUNT of rows written,
+      // and two fields one letter apart meaning different things is how a consumer
+      // reads "1" as "yes" forever.
+      ctx.out(JSON.stringify({ schema: 1, dry_run: !apply, ...r }));
+      return 0;
+    }
+    if (ctx.quiet) return 0;
+    const lines: string[] = [
+      `est repair-identity${apply ? "" : "  [DRY RUN — nothing written; --apply to write]"}`,
+      `candidates: ${r.candidates} estimate(s) whose effective estimator family is 'unknown'`,
+    ];
+    for (const q of r.proposals) {
+      lines.push(
+        `  eid ${q.eid}  ${q.from} -> ${q.to}  method=${q.method}`,
+        `    evidence: main_requests=${q.evidence.n_main} families=[${q.evidence.families.join(", ")}] n_families=${q.evidence.families.length}`,
+      );
+    }
+    if (r.ambiguous > 0) {
+      lines.push(
+        `  ${r.ambiguous} refused as AMBIGUOUS (the window examined spans more than one main-chain family) — left 'unknown', which is the correct answer, not a failure`,
+      );
+    }
+    if (r.pending > 0) {
+      lines.push(
+        `  ${r.pending} still PENDING (no origin='main' request ingested for that anchor yet) — retried on the next sweep`,
+      );
+    }
+    if (r.proposals.length === 0 && r.ambiguous === 0 && r.pending === 0) {
+      lines.push("  nothing to repair");
+    }
+    ctx.out(lines.join("\n"));
+    return 0;
+  };
+
+  if (!apply) {
+    const db = openDb({ path: ctx.dbPath, readonly: true });
+    try {
+      return emit(repairEstimatorIdentity(db, { apply: false }));
+    } finally {
+      db.close();
+    }
+  }
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
+        let r: RepairReport = { candidates: 0, proposals: [], applied: 0, ambiguous: 0, pending: 0 };
+        db.transaction(() => {
+          r = repairEstimatorIdentity(db, { apply: true });
+        }).immediate();
+        return emit(r);
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 30_000, note: lockNote("repair-identity") },
+  );
+}
+
 function pct(v: number | null): string {
   return v === null ? "n/a" : `${(v * 100).toFixed(1)}%`;
 }
@@ -3132,6 +3504,7 @@ commands:
   segments                run segments — the check-back corpus, and the gap knob that cuts it
   audit                   the five P2.12 checks over the ledger; --fix is bounded, never the spine
   retro                   weekly calibration + refclass write-back
+  repair-identity         resolve estimates still filed under the 'unknown' estimator
   help, version
 
 global flags:
@@ -3186,7 +3559,17 @@ refclass (read-only, takes no lock, ALWAYS exits 0 — an empty class is a valid
   --fanout <n>            comparable agent fan-out: a TOLERANCE band (half to double,
                           minimum ±2), not equality. If nothing in the corpus ran at a
                           comparable fan-out the unfiltered class is shown and says so.
+  --session <sid> --prompt <pid>
+                          the anchor. Pass the SAME pair you will pass to est open, so
+                          the calibration shown here is the one the band is stamped with.
   --full                  write the unbudgeted form to spool/ and print its path
+
+repair-identity (the append-only correction path for the estimator identity):
+  (no flags)              DRY RUN — print what would be corrected, write nothing
+  --apply                 append one estimate_identity_repair row per proposal. Never
+                          touches the estimate row; only ever changes an EFFECTIVE 'unknown'.
+                          The sweep runs this automatically; the verb is for the land
+                          step and for looking before writing.
 
 open:
   --kind <research|design|implement|refactor|debug|review|ops>
@@ -3317,6 +3700,8 @@ export async function run(argv: readonly string[], io: RunOptions = {}): Promise
         return await cmdOtel(ctx);
       case "retro":
         return await verb(ctx, () => cmdRetro(ctx));
+      case "repair-identity":
+        return await verb(ctx, () => cmdRepairIdentity(ctx));
       default:
         out(HELP);
         return 1;

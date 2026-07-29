@@ -127,6 +127,14 @@ export interface DataQualityPanel {
   compactions: number;
   censored_outcomes: number;
   corpus_shrink_events: number;
+  /** §5.8 v9: the cumulative `corpus_loss` ledger, which survives past whatever
+   *  window `sweep_census --limit N` happens to scroll to. `_total` unresolved
+   *  rows; `_unexplained` is the subset that is neither `expected` (past
+   *  `retention_days`) nor `resolved_at` (the file came back) — the durable
+   *  count `corpus_shrink_events` (a per-anomaly-row count that dedups on
+   *  (kind, detail) and can therefore UNDERcount real losses) does not carry. */
+  corpus_loss_total: number;
+  corpus_loss_unexplained: number;
   /** Over COMPLETED runs only — folding in-flight runs in makes this a function of
    *  when the retro ran rather than of the data (§7.4 R4 correction ii). */
   wf_progress_completeness: number | null;
@@ -618,6 +626,11 @@ function qualityPanel(db: Database): DataQualityPanel {
     compactions: anomalyCount("compaction_continuation"),
     censored_outcomes: num(db, "SELECT COUNT(*) AS v FROM v_outcome_current WHERE censored = 1"),
     corpus_shrink_events: anomalyCount("corpus_shrink"),
+    corpus_loss_total: num(db, "SELECT COUNT(*) AS v FROM corpus_loss WHERE resolved_at IS NULL"),
+    corpus_loss_unexplained: num(
+      db,
+      "SELECT COUNT(*) AS v FROM corpus_loss WHERE resolved_at IS NULL AND expected = 0",
+    ),
     wf_progress_completeness: ratio(wfCompleted?.exact ?? 0, wfCompleted?.total ?? 0),
     wf_in_flight_agents: wfInFlight,
     unlabeled_wf_agents: num(

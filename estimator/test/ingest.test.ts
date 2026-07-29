@@ -721,7 +721,7 @@ describe("agent_run assembly (§5.3, §5.6)", () => {
     ]);
   });
 
-  test("reports a workflow agent with no label — the §3.2 authoring rule", () => {
+  test("reports a workflow agent whose progress RECORD omits the label — the §3.2 authoring rule", () => {
     const { state } = readWorkflowState(
       join(SESSION_DIR, "workflows", "wf_demo0001-abc.json"),
     );
@@ -737,9 +737,193 @@ describe("agent_run assembly (§5.3, §5.6)", () => {
     });
     expect(
       anomalies.some(
-        (a) => a.kind === "wf_record_mismatch" && a.detail.includes("has no label"),
+        (a) => a.kind === "wf_record_mismatch" && a.detail.includes("has a workflowProgress record with no label"),
       ),
     ).toBe(true);
+  });
+
+  /**
+   * The inversion of the test above, and the defect it guards. An agent with NO
+   * progress record was reported as an authoring violation — a message that was
+   * false in 100% of the live corpus's 194 instances, because not one
+   * `workflowProgress` record on the machine has a null label. "No record" and
+   * "record without a label" are different facts with different causes.
+   */
+  test("an agent with NO progress record is never reported as an authoring violation", () => {
+    const { state } = readWorkflowState(
+      join(SESSION_DIR, "workflows", "wf_demo0001-abc.json"),
+    );
+    state!.progressAgents = state!.progressAgents.filter(
+      (p) => p.agentId !== "a2222222222222222",
+    );
+    const s = session();
+    const { anomalies, unmappedReasons } = buildAgentRuns({
+      sessionId: SESSION,
+      agents: s.workflows[0]!.agents,
+      intervals: new Map(),
+      state,
+      runId: "wf_demo0001-abc",
+      wfLaunchId: "wl_launch1",
+      journalResultAgentIds: s.workflows[0]!.journalResultAgentIds,
+      now: new Date("2026-07-28T11:00:00.000Z"),
+    });
+    expect(anomalies.some((a) => a.detail.includes("no label"))).toBe(false);
+    // The journal has a `result` for a1 only, so a2 is a killed agent, not an
+    // orphan of an earlier launch.
+    expect(unmappedReasons.get("a2222222222222222")).toBe("never_returned");
+    expect(anomalies.some((a) => a.kind === "agent_never_returned")).toBe(true);
+    expect(anomalies.some((a) => a.kind === "phase_unmapped")).toBe(false);
+  });
+
+  test("no state file yet: an agent mid-run is `in_flight` and raises NOTHING (§5.6 [R4])", () => {
+    const s = session();
+    const { anomalies, unmappedReasons } = buildAgentRuns({
+      sessionId: SESSION,
+      agents: s.workflows[0]!.agents,
+      intervals: new Map(),
+      state: null,
+      runId: "wf_demo0001-abc",
+      wfLaunchId: "wl_launch1",
+      now: new Date("2026-07-28T10:30:00.000Z"),
+    });
+    expect([...unmappedReasons.values()]).toEqual(["in_flight", "in_flight"]);
+    expect(anomalies).toEqual([]);
+  });
+
+  test("`in_flight` is bounded: a run with no state file and a day-old last line is abandoned, not live", () => {
+    const s = session();
+    const { anomalies, unmappedReasons } = buildAgentRuns({
+      sessionId: SESSION,
+      agents: s.workflows[0]!.agents,
+      intervals: new Map([
+        [
+          "a1111111111111111",
+          { agentId: "a1111111111111111", firstTs: "2026-07-28T10:00:00.000Z", lastTs: "2026-07-28T10:02:00.000Z" },
+        ],
+        [
+          "a2222222222222222",
+          { agentId: "a2222222222222222", firstTs: "2026-07-28T10:02:00.000Z", lastTs: "2026-07-28T10:04:00.000Z" },
+        ],
+      ]),
+      state: null,
+      runId: "wf_demo0001-abc",
+      wfLaunchId: "wl_launch1",
+      now: new Date("2026-07-30T10:30:00.000Z"),
+    });
+    expect([...unmappedReasons.values()]).toEqual(["never_returned", "never_returned"]);
+    expect(anomalies.every((a) => a.kind === "agent_never_returned")).toBe(true);
+  });
+
+  /**
+   * The relaunch mechanism, which DESIGN §5.6 [R4] did not model: the harness
+   * overwrites `wf_<runId>.json` on every launch, so `workflowProgress[]` describes
+   * only the LAST launch while the transcript directory and journal accumulate
+   * every launch. An agent that started before the earliest recorded record is an
+   * orphan of an earlier one — a corpus fact, not a join failure.
+   */
+  test("an agent predating every progress record is a relaunch orphan, not a failure", () => {
+    const { state } = readWorkflowState(
+      join(SESSION_DIR, "workflows", "wf_demo0001-abc.json"),
+    );
+    // Keep only the LATER agent's record and push its start after the earlier one,
+    // exactly as a relaunch's rewrite would leave the file.
+    state!.progressAgents = state!.progressAgents.filter(
+      (p) => p.agentId === "a2222222222222222",
+    );
+    // One declared phase against two waves, so the interval-clustering fallback
+    // cannot rescue the orphan and the classifier is the thing under test.
+    state!.phases = state!.phases.slice(0, 1);
+    const s = session();
+    const { anomalies, unmappedReasons } = buildAgentRuns({
+      sessionId: SESSION,
+      agents: s.workflows[0]!.agents,
+      intervals: new Map([
+        [
+          "a1111111111111111",
+          { agentId: "a1111111111111111", firstTs: "2026-07-28T09:00:00.000Z", lastTs: "2026-07-28T09:02:00.000Z" },
+        ],
+      ]),
+      state,
+      runId: "wf_demo0001-abc",
+      wfLaunchId: "wl_launch1",
+      // a1 DID return — so this is not a killed agent.
+      journalResultAgentIds: ["a1111111111111111", "a2222222222222222"],
+      now: new Date("2026-07-28T11:00:00.000Z"),
+    });
+    expect(unmappedReasons.get("a1111111111111111")).toBe("relaunch_orphan");
+    expect(anomalies.some((a) => a.kind === "wf_relaunch_orphan")).toBe(true);
+    expect(anomalies.some((a) => a.kind === "phase_unmapped")).toBe(false);
+  });
+
+  /**
+   * The same fixture with NO JOURNAL AT ALL. `undefined` means "no journal was read"
+   * and must suppress the never-returned branch (`returned === null`); `[]` means
+   * "read it, nobody returned" and asserts the opposite about every agent.
+   *
+   * Discovery used to substitute `[]` for a missing or unreadable journal.jsonl, so
+   * the documented `undefined` affordance was UNREACHABLE in production and the
+   * classifier's first branch — true for every agent against an empty set — swallowed
+   * the relaunch and unexplained branches whole. `agent_never_returned` is benign and
+   * `phase_unmapped` is the family's one alerting member, so a missing file silenced
+   * the alert. This pins the semantic; test/discover.test.ts pins the producer.
+   */
+  test("with NO journal, the same agent is still a relaunch orphan", () => {
+    const { state } = readWorkflowState(
+      join(SESSION_DIR, "workflows", "wf_demo0001-abc.json"),
+    );
+    state!.progressAgents = state!.progressAgents.filter(
+      (p) => p.agentId === "a2222222222222222",
+    );
+    state!.phases = state!.phases.slice(0, 1);
+    const s = session();
+    const { anomalies, unmappedReasons } = buildAgentRuns({
+      sessionId: SESSION,
+      agents: s.workflows[0]!.agents,
+      intervals: new Map([
+        [
+          "a1111111111111111",
+          { agentId: "a1111111111111111", firstTs: "2026-07-28T09:00:00.000Z", lastTs: "2026-07-28T09:02:00.000Z" },
+        ],
+      ]),
+      state,
+      runId: "wf_demo0001-abc",
+      wfLaunchId: "wl_launch1",
+      journalResultAgentIds: undefined,
+      now: new Date("2026-07-28T11:00:00.000Z"),
+    });
+    expect(unmappedReasons.get("a1111111111111111")).toBe("relaunch_orphan");
+    expect(anomalies.some((a) => a.kind === "agent_never_returned")).toBe(false);
+  });
+
+  /**
+   * The D3 guard. `insertAnomalies` dedups on (kind, detail); the old detail
+   * interpolated a wave count that moved as agents landed, so the same agent was
+   * re-logged up to four times (238 rows over 204 distinct agents on the live
+   * corpus). Nothing in a detail may vary with how far along a run is.
+   */
+  test("anomaly details carry no count that moves between sweeps", () => {
+    const { state } = readWorkflowState(
+      join(SESSION_DIR, "workflows", "wf_demo0001-abc.json"),
+    );
+    state!.progressAgents = [];
+    const s = session();
+    const run = (agents: typeof s.workflows[0]["agents"]) =>
+      buildAgentRuns({
+        sessionId: SESSION,
+        agents,
+        intervals: new Map(),
+        state,
+        runId: "wf_demo0001-abc",
+        wfLaunchId: "wl_launch1",
+        journalResultAgentIds: ["a1111111111111111", "a2222222222222222"],
+        now: new Date("2026-07-28T11:00:00.000Z"),
+      }).anomalies;
+    // One agent on disk, then two: the row for the FIRST agent must be identical.
+    const partial = run(s.workflows[0]!.agents.slice(0, 1));
+    const complete = run(s.workflows[0]!.agents);
+    const forA1 = (rows: typeof partial) => rows.filter((a) => a.detail.includes("a1111111111111111"));
+    expect(forA1(partial)).toEqual(forA1(complete));
+    expect(forA1(partial)).toHaveLength(1);
   });
 });
 

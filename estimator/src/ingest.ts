@@ -190,6 +190,15 @@ export interface IngestAnomaly {
     | "unusable_usage_line"
     | "wf_record_mismatch"
     | "phase_unmapped"
+    // §5.6 [R4] promotion condition (ii): the in-flight and never-returned
+    // populations are CLASSIFIED, not counted as join failures. All three are
+    // benign (src/cli.ts `BENIGN_ANOMALY_KINDS`) — they are what a corpus of
+    // relaunched and killed workflow agents LOOKS like, not damage taken by one —
+    // and every one of their details is free of a count that moves between sweeps,
+    // so `insertAnomalies`' (kind, detail) dedup actually holds.
+    | "agent_never_returned"
+    | "wf_relaunch_orphan"
+    | "wf_relaunch_detected"
     | "orphan_turn_duration"
     // The three duplicate-producing mechanisms G-FORK found on disk (§7 recs 2,4,5).
     | "fork_replay"
@@ -927,15 +936,61 @@ export interface BuildAgentRunsInput {
   launchPromptId?: string | null;
   /** meta.toolUseId -> promptId, from the main transcript (Agent-tool agents). */
   toolUsePrompts?: Map<string, string>;
+  /**
+   * agentIds with a `type:"result"` record in the run's `journal.jsonl` — the
+   * agents that RETURNED. Undefined means "no journal was read", which suppresses
+   * the never-returned branch of the classifier rather than guessing with it.
+   */
+  journalResultAgentIds?: readonly string[];
+  /** Injected clock, for the in-flight age guard. Defaults to now. */
+  now?: Date;
 }
 
-export function buildAgentRuns(
-  input: BuildAgentRunsInput,
-): { rows: AgentRunRow[]; anomalies: IngestAnomaly[] } {
+/**
+ * Why a workflow agent has no `workflowProgress[]` record. §5.6 `[R4]`.
+ *
+ * Three of the four are structural facts about the corpus and carry no blame; only
+ * `unexplained` is the residual an operator should look at, and it is the only one
+ * that still raises an alerting anomaly.
+ */
+export type UnmappedReason = "in_flight" | "never_returned" | "relaunch_orphan" | "unexplained";
+
+/**
+ * How long an agent in a run with NO state file may stay `in_flight` before it is
+ * reclassified as never-returned.
+ *
+ * Without a bound, `in_flight` is a silent drain: a workflow abandoned mid-run
+ * leaves a directory, agents and a journal on disk and never writes a state file,
+ * so it would produce no anomaly at all, forever. A day is comfortably longer than
+ * any observed run and short enough that an abandonment surfaces the next day.
+ */
+const IN_FLIGHT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+export interface BuildAgentRunsResult {
+  rows: AgentRunRow[];
+  anomalies: IngestAnomaly[];
+  /** agentId -> why it is `phase_conf='unmapped'`. Only unmapped agents appear. */
+  unmappedReasons: Map<string, UnmappedReason>;
+}
+
+export function buildAgentRuns(input: BuildAgentRunsInput): BuildAgentRunsResult {
   const anomalies: IngestAnomaly[] = [];
   const state = input.state ?? null;
   const progress = new Map(state?.progressAgents.map((p) => [p.agentId, p]) ?? []);
   const nPlanned = state?.phases.length ?? 0;
+  const nowMs = (input.now ?? new Date()).getTime();
+  const returned = input.journalResultAgentIds === undefined
+    ? null
+    : new Set(input.journalResultAgentIds);
+  // The earliest startedAt the state file knows about. An agent on disk that
+  // started BEFORE it cannot belong to the launch this file describes.
+  let firstProgressStart: string | null = null;
+  for (const p of state?.progressAgents ?? []) {
+    if (p.startedAt === null) continue;
+    if (firstProgressStart === null || p.startedAt < firstProgressStart) firstProgressStart = p.startedAt;
+  }
+  /** Agents whose `workflowProgress[]` record exists but omits `label` (§3.2). */
+  const labelViolations: string[] = [];
 
   const rows: AgentRunRow[] = input.agents.map((agent) => {
     const p = progress.get(agent.agentId) ?? null;
@@ -977,7 +1032,11 @@ export function buildAgentRuns(
       transcript_path: agent.transcriptPath,
       status: p?.state ?? null,
       // NULL label on a workflow agent means the §3.2 authoring rule (every
-      // agent() carries label + phase) was violated. Reported, not tolerated.
+      // agent() carries label + phase) was violated — but ONLY when a progress
+      // record exists and omits it. "No record at all" is a different fact with a
+      // different cause, and reporting it as an authoring violation was false in
+      // 100% of the live corpus's 194 such rows: not one `workflowProgress` record
+      // on the machine had a null label.
       label: p?.label ?? null,
       started_at: started,
       ended_at: ended,
@@ -991,6 +1050,10 @@ export function buildAgentRuns(
       phase_conf: p !== null && p.phaseIdx !== null ? "exact" : "unmapped",
     };
   });
+  for (const agent of input.agents) {
+    const p = progress.get(agent.agentId) ?? null;
+    if (p !== null && p.label === null) labelViolations.push(agent.agentId);
+  }
 
   // ---- fallback: interval clustering for anything not mapped exactly --------
   const unmapped = rows.filter((r) => r.phase_conf !== "exact");
@@ -1009,26 +1072,86 @@ export function buildAgentRuns(
         row.phase_conf = "inferred";
       }
     }
-    for (const row of rows) {
-      if (row.phase_conf === "unmapped" && row.run_id !== null) {
-        anomalies.push({
-          kind: "phase_unmapped",
-          detail: `run ${row.run_id}: agent ${row.agent_id} has no workflowProgress record and clustering produced ${waves.length} waves against ${nPlanned} planned phases`,
-        });
-      }
-    }
   }
 
+  // ---- classify, do not blame ------------------------------------------------
+  // §5.6 [R4] promotion condition (ii). An agent with no `workflowProgress[]`
+  // record used to raise up to THREE anomaly rows — a `phase_unmapped` carrying a
+  // wave count that changed between sweeps (so the (kind, detail) dedup never
+  // matched and the same agent was re-logged up to four times), a
+  // `wf_record_mismatch` claiming an authoring violation that had not happened, and
+  // a second `wf_record_mismatch` from the discovery cross-check naming the same
+  // agent again. On the live corpus that produced 609 rows, of which 14 were real.
+  //
+  // The reason a record is missing is knowable, and each reason has a different
+  // remedy — or none:
+  //
+  //   in_flight       the run has not written a state file yet. There IS no state
+  //                   file until the run completes (§5.6 [R4]); the statusline's
+  //                   own live path depends on this being normal. No anomaly.
+  //   never_returned  the run terminated and the journal has no `result` for this
+  //                   agent: killed, or crashed. Benign, counted.
+  //   relaunch_orphan the agent started before the earliest record in the state
+  //                   file — it belongs to an EARLIER launch under the same runId,
+  //                   which the harness overwrote when it rewrote wf_<runId>.json.
+  //                   Benign, counted. (On the live corpus, of 21 runs with both
+  //                   mapped and unmapped agents, 16 have every unmapped agent
+  //                   strictly preceding every mapped one.)
+  //   unexplained     none of the above. THIS is the residual worth an alert, and
+  //                   the only one of the four that still raises one.
+  const unmappedReasons = new Map<string, UnmappedReason>();
   for (const row of rows) {
-    if (row.run_id !== null && row.label === null) {
+    if (row.phase_conf !== "unmapped" || row.run_id === null) continue;
+    const lastSeen = Date.parse(row.ended_at ?? row.started_at ?? "");
+    let reason: UnmappedReason;
+    if (state === null) {
+      reason =
+        Number.isFinite(lastSeen) && nowMs - lastSeen > IN_FLIGHT_MAX_AGE_MS
+          ? "never_returned"
+          : "in_flight";
+    } else if (returned !== null && !returned.has(row.agent_id)) {
+      reason = "never_returned";
+    } else if (
+      row.started_at !== null &&
+      firstProgressStart !== null &&
+      row.started_at < firstProgressStart
+    ) {
+      reason = "relaunch_orphan";
+    } else {
+      reason = "unexplained";
+    }
+    unmappedReasons.set(row.agent_id, reason);
+
+    if (reason === "in_flight") continue;
+    if (reason === "never_returned") {
       anomalies.push({
-        kind: "wf_record_mismatch",
-        detail: `run ${row.run_id}: workflow agent ${row.agent_id} has no label — the §3.2 authoring rule (label + phase on every agent()) was not followed`,
+        kind: "agent_never_returned",
+        detail: `run ${row.run_id}: agent ${row.agent_id} never returned — no result record in journal.jsonl; its tokens are counted, its phase is not`,
+      });
+    } else if (reason === "relaunch_orphan") {
+      anomalies.push({
+        kind: "wf_relaunch_orphan",
+        detail: `run ${row.run_id}: agent ${row.agent_id} started before the earliest workflowProgress[] record — it belongs to an earlier launch under the same runId, whose progress the state file overwrote`,
+      });
+    } else {
+      // Deliberately free of the wave count: it moves as agents land, which is
+      // exactly what defeated `insertAnomalies`' dedup. `nPlanned` comes from the
+      // static plan and does not.
+      anomalies.push({
+        kind: "phase_unmapped",
+        detail: `run ${row.run_id}: agent ${row.agent_id} has no workflowProgress record and no relaunch or never-returned explanation (${nPlanned} planned phase(s))`,
       });
     }
   }
 
-  return { rows, anomalies };
+  for (const agentId of labelViolations) {
+    anomalies.push({
+      kind: "wf_record_mismatch",
+      detail: `run ${input.runId ?? "?"}: workflow agent ${agentId} has a workflowProgress record with no label — the §3.2 authoring rule (label + phase on every agent()) was not followed`,
+    });
+  }
+
+  return { rows, anomalies, unmappedReasons };
 }
 
 export function buildWorkflowPhases(
@@ -1365,6 +1488,8 @@ export function detectForkReplays(files: readonly TranscriptIndexEntry[]): Inges
 export async function ingestSession(
   session: SessionCorpus,
   plan?: CorpusPlan,
+  /** Injected clock — only the §5.6 in-flight age guard reads it. Defaults to now. */
+  now?: Date,
 ): Promise<IngestBatch> {
   const batch: IngestBatch = {
     requests: [],
@@ -1448,9 +1573,15 @@ export async function ingestSession(
     const latest = launches.at(-1) ?? null;
     const wfLaunchId = state?.taskId ?? latest?.wf_launch_id ?? wf.runId;
     if (launches.length > 1) {
+      // A relaunch under one runId is a FACT about how workflows are driven, not a
+      // record mismatch, and it is what makes `wf_relaunch_orphan` possible below.
+      // The detail deliberately names neither the launch count nor the winning
+      // wf_launch_id: both move between sweeps, and a detail that moves defeats the
+      // (kind, detail) dedup that keeps a nightly cron from growing the ledger —
+      // which is how 25 rows accumulated for 22 runs.
       batch.anomalies.push({
-        kind: "wf_record_mismatch",
-        detail: `run ${wf.runId}: ${launches.length} launches share this runId; all agents attribute to wf_launch_id=${wfLaunchId}`,
+        kind: "wf_relaunch_detected",
+        detail: `run ${wf.runId}: relaunched under the same runId; wf_<runId>.json describes only the last launch, so earlier agents cannot be told apart`,
       });
     }
 
@@ -1483,6 +1614,8 @@ export async function ingestSession(
       wfLaunchId,
       launchPromptId: latest?.prompt_id ?? null,
       toolUsePrompts,
+      journalResultAgentIds: wf.journalResultAgentIds,
+      now,
     });
     batch.agentRuns.push(...built.rows);
     batch.anomalies.push(...built.anomalies);

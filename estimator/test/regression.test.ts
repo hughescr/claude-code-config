@@ -1391,9 +1391,9 @@ describe("unreadable-transcript re-ingest (the watermark trap §5.2 forbids)", (
 
   test("C3: an unread file never becomes a watermark", () => {
     const prints = [
-      { path: "/corpus/main.jsonl", inode: 11, bytes: 500 },
-      { path: "/corpus/agent-1.jsonl", inode: 22, bytes: 9000 },
-      { path: "/corpus/agent-2.jsonl", inode: 33, bytes: 40 },
+      { path: "/corpus/main.jsonl", inode: 11, bytes: 500, mtime: "2026-01-01T00:00:00.000Z" },
+      { path: "/corpus/agent-1.jsonl", inode: 22, bytes: 9000, mtime: "2026-01-01T00:00:00.000Z" },
+      { path: "/corpus/agent-2.jsonl", inode: 33, bytes: 40, mtime: "2026-01-01T00:00:00.000Z" },
     ];
     // Nothing vetoed: every file is watermarked, exactly as before the fix.
     expect(watermarkable(prints, [])).toEqual(prints);

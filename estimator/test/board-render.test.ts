@@ -127,15 +127,31 @@ async function openTask(subject: string, extra: string[] = []): Promise<string> 
   return r.json<{ tid: string }>().tid;
 }
 
+/**
+ * The task's OWN anchor session. `openTask` names it after the subject, not after
+ * the tid, and seeding a workflow into a `s-<tid>` session instead left the run and
+ * its agent in a session no `task_alias` covered: `attributeTasks` could not derive
+ * their tids, and only the pre-repair SET-only writer made the hand-written ones
+ * survive the pass. Attribution is the sole writer of `agent_run.tid` /
+ * `workflow_run.tid` and recomputes every claim from scratch, so a fixture has to be
+ * DERIVABLE, not merely written down.
+ */
+function anchorSession(tid: string): string {
+  return h.db
+    .query<{ anchor_session: string }, [string]>("SELECT anchor_session FROM task WHERE tid = ?")
+    .get(tid)!.anchor_session;
+}
+
 /** One phase-0 agent + one declared block for phase 1, on a fresh workflow task. */
 function seedWorkflow(tid: string): void {
+  const session = anchorSession(tid);
   h.db
     .query(
       `INSERT INTO workflow_run (run_id, wf_launch_id, session_id, workflow_name, transcript_dir,
                                  default_model, launch_prompt_id, n_phases_planned, started_at, ended_at, tid)
        VALUES ('wf-1','launch-1',?,'demo',NULL,NULL,'p1',2,'2026-02-01T00:00:00Z',NULL,?)`,
     )
-    .run(`s-${tid}`, tid);
+    .run(session, tid);
   for (const [idx, title] of [[0, "survey"], [1, "build"]] as const) {
     h.db
       .query(
@@ -151,7 +167,7 @@ function seedWorkflow(tid: string): void {
        VALUES ('a1', ?, 'wf-1', 'launch-1', 'general-purpose', 1, 'p1', 'completed', 'demo',
                '2026-02-01T00:01:00Z', '2026-02-01T00:05:00Z', 'transcript', 0, 'exact', ?)`,
     )
-    .run(`s-${tid}`, tid);
+    .run(session, tid);
 }
 
 describe("board() — P2.7 per-phase strip", () => {
@@ -160,7 +176,7 @@ describe("board() — P2.7 per-phase strip", () => {
     seedWorkflow(tid);
     expect((await h.cli("block", tid, "--phase", "0", "--title", "survey", "--p50", "100", "--p90", "300")).code).toBe(0);
     expect((await h.cli("block", tid, "--phase", "1", "--title", "build", "--p50", "400", "--p90", "900")).code).toBe(0);
-    request(h.db, "rq-1", { session: `s-${tid}`, agent: "a1", origin: "subagent", out: 500 });
+    request(h.db, "rq-1", { session: anchorSession(tid), agent: "a1", origin: "subagent", out: 500 });
     attributeTasks(h.db);
 
     const r = board(h.db, { now: new Date("2026-02-01T00:10:00Z") });

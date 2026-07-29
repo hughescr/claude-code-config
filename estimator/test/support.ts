@@ -132,6 +132,8 @@ export interface RequestSpec {
   origin?: "main" | "subagent" | "auxiliary";
   agent?: string | null;
   run?: string | null;
+  /** The relaunch discriminator, as `request.wf_launch_id` carries it. */
+  launchId?: string | null;
   out?: number;
   cw?: number;
   in?: number;
@@ -151,7 +153,7 @@ export function request(db: Database, id: string, spec: RequestSpec = {}): void 
                           agent_id, run_id, wf_launch_id, model, model_family,
                           attribution_agent, attribution_skill, ts,
                           in_tok, out_tok, cw_tok, cr_tok, duration_ms, tid, attr)
-     VALUES (?, ?, 0, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+     VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
   ).run(
     id,
     `msg-${id}`,
@@ -160,6 +162,7 @@ export function request(db: Database, id: string, spec: RequestSpec = {}): void 
     spec.origin ?? "main",
     spec.agent ?? null,
     spec.run ?? null,
+    spec.launchId ?? null,
     family,
     family,
     spec.skill ?? null,
@@ -179,6 +182,8 @@ export interface AgentSpec {
   startedAt?: string | null;
   endedAt?: string | null;
   runId?: string | null;
+  /** The relaunch discriminator. Default NULL — pass it to build a multi-launch run. */
+  launchId?: string | null;
   phaseIdx?: number | null;
   phaseConf?: "exact" | "inferred" | "unmapped" | null;
 }
@@ -189,12 +194,13 @@ export function agentRun(db: Database, agentId: string, spec: AgentSpec = {}): v
                             launch_prompt_id, transcript_path, status, label,
                             started_at, ended_at, interval_src, queued_at, attempt,
                             reported_tokens, phase_idx, phase_title, phase_conf, tid)
-     VALUES (?, ?, ?, NULL, 'general-purpose', 1, ?, NULL, 'completed', 'demo',
+     VALUES (?, ?, ?, ?, 'general-purpose', 1, ?, NULL, 'completed', 'demo',
              ?, ?, 'transcript', NULL, NULL, NULL, ?, NULL, ?, NULL)`,
   ).run(
     agentId,
     spec.session ?? "s1",
     spec.runId ?? null,
+    spec.launchId ?? null,
     spec.launchPrompt === undefined ? "p1" : spec.launchPrompt,
     spec.startedAt === undefined ? "2026-01-01T00:00:00Z" : spec.startedAt,
     spec.endedAt === undefined ? "2026-01-01T00:10:00Z" : spec.endedAt,

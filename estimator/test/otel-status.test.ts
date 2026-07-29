@@ -28,7 +28,7 @@ import { run } from "../src/cli.ts";
 
 let dir: string;
 let receiver: Receiver;
-let server: { stop: (closeActive?: boolean) => void; port: number };
+let server: { stop: (closeActive?: boolean) => Promise<void>; port: number };
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "estimator-otel-status-"));
@@ -37,7 +37,7 @@ beforeEach(() => {
     hostname: "127.0.0.1",
     port: 0, // the kernel picks; nothing here may depend on 4318 being free
     fetch: (req) => receiver.handle(req),
-  }) as unknown as { stop: (closeActive?: boolean) => void; port: number };
+  }) as unknown as { stop: (closeActive?: boolean) => Promise<void>; port: number };
   receiver.boundPort = server.port;
 });
 
@@ -104,8 +104,14 @@ describe("est otel --status", () => {
    * on it without parsing anything. `1` stays "you typed it wrong".
    */
   test("a dead receiver is a diagnosis at exit 3, not a stack trace at exit 1", async () => {
-    server.stop(true);
-    const r = await cli("otel", "--status", "--port", String(server.port));
+    // The port is READ FIRST and the stop is AWAITED, and both matter. `server.port`
+    // reads back as `0` once the server is stopped, and `otelPort` rejects 0 as
+    // out of range and falls through to `EST_OTEL_PORT`/`DEFAULT_PORT` — so on any
+    // machine actually running the receiver on 4318 this probed the REAL one, found
+    // it healthy, and exited 0. The assertion this test exists to make never ran.
+    const port = server.port;
+    await server.stop(true);
+    const r = await cli("otel", "--status", "--port", String(port));
     expect(r.code).toBe(3);
     expect(r.out).toContain("DOWN");
     expect(r.out).toContain("com.craig.estimator.otel");

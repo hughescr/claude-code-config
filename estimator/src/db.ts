@@ -32,6 +32,33 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
 /**
  * Must match the config.schema_version seed in schema.sql.
  *
+ * 10 — the estimator identity becomes DETERMINISTIC and CORRECTABLE. Root cause: the
+ *     only writer of `estimate.estimator_model` derived it from
+ *     `SELECT model_family FROM request WHERE session_id=? AND origin='main'
+ *      ORDER BY ts DESC LIMIT 1` — a query whose answer moves. `request` is populated
+ *     by the SWEEP, so at `est open` (start of the anchoring turn) the turn's own rows
+ *     are not on disk and a fresh session has none at all; and `ORDER BY ts DESC` with
+ *     no upper bound means a later `/model` switch retroactively changes what the same
+ *     open would have recorded. `est refclass` resolved the session by a THIRD rule, so
+ *     step 1 and step 7 of one ceremony could disagree. Three objects fix it:
+ *     `session_model` (the live, ingest-independent identity of an interactive session,
+ *     written by the statusline shim behind EST_SESSION_MODEL_CAPTURE=1),
+ *     `estimate_identity_repair` (APPEND-ONLY corrections beside an append-only ledger —
+ *     `outcome.eid_at_start` is MIN(eid), so a corrected estimate REVISION would change
+ *     nothing downstream), and `v_estimate_identity` (the effective value). `v_velocity`
+ *     is repointed at it in the same step: a half-repoint would have `est retro` fitting
+ *     on one key while `est open` looks up on another. See src/identity.ts.
+ * 9 — §5.8 vanish-detector fix (root cause: `runSweep`'s watermark diff can only
+ *     miss a transcript this database had already read once — a file gone before
+ *     its first sweep leaves no `sweep_state` row to diff against, so the loss was
+ *     UNREPRESENTABLE, not merely unreported). Additive: `sweep_state.mtime`
+ *     (nullable; makes the vanish-age split exact instead of `last_swept`-inferred)
+ *     and `corpus_loss` (durable per-path loss ledger, `INSERT OR IGNORE` idempotent,
+ *     `resolved_at` instead of DELETE so a false positive is retracted by appending a
+ *     fact). Three config seeds: `retention_days` (mirrors `cleanupPeriodDays` BY
+ *     HAND — the build does not edit settings.json), `vanish_alarm_days` (replaces
+ *     the literal `SIXTY_DAYS_MS`), `census_collapse_pct` (the D2/D3 sanity guard
+ *     against a discovery outage). See src/census.ts.
  * 8 — Phase 2 (§Phase 2 interfaces P2.5). The OTEL facts arrive as their OWN tables
  *     (`otel_request`, `otel_metric`) rather than as columns of `request`, because the
  *     transcript is the token source of truth (§2) and a second writer for the same
@@ -92,7 +119,7 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
  *     `v_phase_actual.phase_conf`, auxiliary origin excluded from calibration.
  * 1 — initial R3 §4.2 shape.
  */
-export const SCHEMA_VERSION = "8";
+export const SCHEMA_VERSION = "10";
 
 /**
  * Forward-only, additive migrations, applied by {@link openDb} on a WRITABLE
@@ -612,6 +639,131 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   ('otel_max_body_mb',          '8'),
   ('otel_stale_min',            '15'),
   ('otel_spool_retention_days', '14');
+`,
+  },
+  {
+    from: "8",
+    to: "9",
+    // §5.8 vanish-detector fix (see the SCHEMA_VERSION doc comment above). Purely
+    // additive in effect — one nullable column, one new table, three config seeds —
+    // but `sweep_state` gains its column via the SAME rebuild dance v6->v7 and
+    // v7->v8 used for `refclass`/`burn_cache`, and for the reason those steps give:
+    // SQLite has no `ADD COLUMN IF NOT EXISTS`. A plain `ALTER TABLE ADD COLUMN`
+    // would work exactly once; it duplicate-column-errors the moment this step runs
+    // against a database `schema.sql` already built fresh WITH `mtime` (any
+    // migration test that downgrades an EARLIER version without also downgrading
+    // `sweep_state`'s shape hits this immediately). The rebuild sidesteps it by
+    // construction: the copy only ever SELECTs the four columns that existed at
+    // every prior version, so it is correct whether or not the source already
+    // happens to carry `mtime`. No row in the append-only spine is touched —
+    // `sweep_state` is explicitly a performance-only watermark table, not evidence.
+    sql: `
+DROP TABLE IF EXISTS sweep_state_pre_v9;   -- residue of a step that died mid-rebuild
+ALTER TABLE sweep_state RENAME TO sweep_state_pre_v9;
+CREATE TABLE sweep_state (          -- performance only; losing it costs seconds, not correctness
+  path TEXT PRIMARY KEY, inode INTEGER NOT NULL, bytes_read INTEGER NOT NULL,
+  last_swept TEXT NOT NULL,
+  mtime TEXT                        -- v9: the file's own mtime at last read. NULL until
+                                    -- \`est backfill --full\` rewrites it; D1's vanish-age split
+                                    -- falls back to \`last_swept\` (a lower bound; §5.8) until then.
+) STRICT;
+INSERT INTO sweep_state (path, inode, bytes_read, last_swept)
+  SELECT path, inode, bytes_read, last_swept FROM sweep_state_pre_v9;
+DROP TABLE sweep_state_pre_v9;
+
+CREATE TABLE IF NOT EXISTS corpus_loss (          -- v9: durable record of a transcript that stopped existing
+                                    -- (§5.8 root cause: \`sweep_state\` alone cannot represent a
+                                    -- loss that happened before a path was ever watermarked).
+                                    -- Append-only in spirit: a false positive is retracted via
+                                    -- \`resolved_at\`, never a DELETE — see src/census.ts.
+  path TEXT PRIMARY KEY,
+  session_id TEXT,                 -- nullable: not every lost path resolves to one session
+  kind TEXT NOT NULL CHECK (kind IN ('main','agent','state','unknown')),
+  detected_by TEXT NOT NULL CHECK (detected_by IN
+    ('watermark_diff','discovery_probe','ledger_probe')),
+  first_missing_at TEXT NOT NULL,
+  last_seen_at TEXT,
+  mtime TEXT,
+  age_source TEXT NOT NULL CHECK (age_source IN ('mtime','last_swept','ledger_ts','unknown')),
+  expected INTEGER NOT NULL DEFAULT 0,  -- 1 => age >= config.retention_days at detection time
+  resolved_at TEXT                 -- set when a LATER sweep finds the file back on disk
+) STRICT;
+
+INSERT OR IGNORE INTO config (k, v) VALUES
+  ('retention_days',      '365'),
+  ('vanish_alarm_days',   '60'),
+  ('census_collapse_pct', '20');
+`,
+  },
+  {
+    from: "9",
+    to: "10",
+    // The estimator-identity repair path (see the SCHEMA_VERSION doc comment above).
+    //
+    // Additive except for ONE view replacement, and a view holds no rows: `v_velocity`
+    // is repointed at `v_estimate_identity` so the calibration corpus groups on the
+    // EFFECTIVE estimator family. That repoint has to happen in the SAME step as the
+    // repair table, because a half-repoint is a worse version of the bug it fixes —
+    // `est retro` fitting on the repaired key while `est open` looks up on the recorded
+    // key would make every band silently miss its own calibration bucket.
+    //
+    // Rule 2 (no migration drops or rewrites a ROW) is met by construction: two new
+    // tables, two new triggers, one new view, one view replacement. Nothing in the
+    // append-only spine is touched — which is the entire point of this step, since the
+    // thing being corrected LIVES in that spine and may not be edited.
+    //
+    // The DDL text below is schema.sql's exact text plus `IF NOT EXISTS`, which SQLite
+    // strips before storing, so a migrated database and a fresh one hold byte-identical
+    // definitions and `test/schema.test.ts` stays an exact comparison.
+    sql: `
+CREATE TABLE IF NOT EXISTS session_model (
+  session_id TEXT PRIMARY KEY,
+  model TEXT NOT NULL,
+  model_family TEXT NOT NULL,
+  seen_at TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS estimate_identity_repair (
+  eid INTEGER NOT NULL REFERENCES estimate(eid),
+  seq INTEGER NOT NULL,
+  repaired_at TEXT NOT NULL,
+  estimator_model TEXT NOT NULL,
+  method TEXT NOT NULL CHECK (method IN
+    ('anchor_prompt','at_created','statusline','manual')),
+  evidence TEXT NOT NULL,
+  note TEXT,
+  PRIMARY KEY (eid, seq)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS eir_ro_u BEFORE UPDATE ON estimate_identity_repair
+  BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS eir_ro_d BEFORE DELETE ON estimate_identity_repair
+  BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
+CREATE VIEW IF NOT EXISTS v_estimate_identity AS
+SELECT e.eid, e.tid,
+       e.estimator_model AS estimator_model_recorded,
+       COALESCE(r.estimator_model, e.estimator_model) AS estimator_model,
+       r.method AS repair_method,
+       r.repaired_at
+FROM estimate e
+LEFT JOIN estimate_identity_repair r
+  ON r.eid = e.eid
+ AND r.seq = (SELECT MAX(seq) FROM estimate_identity_repair WHERE eid = e.eid);
+
+DROP VIEW IF EXISTS v_velocity;
+CREATE VIEW IF NOT EXISTS v_velocity AS
+SELECT e.bucket, i.estimator_model, e.price_epoch, e.refclass_as_of,
+       e.ref_model, e.estimand,                          -- the UNIT; never pool across these
+       o.velocity_raw, o.velocity_cal, o.finalized_at,
+       o.wcet_main, o.wcet_sub, o.wcet_aux,
+       o.wcet_main + o.wcet_sub AS wcet_task_effort,     -- calibrate on THIS, not on the total
+       e.exp_agents, o.n_agents
+FROM v_outcome_current o
+JOIN estimate e ON e.eid = o.eid_at_start
+JOIN v_estimate_identity i ON i.eid = e.eid              -- v10: the EFFECTIVE identity, not e.*
+WHERE o.scope_changed = 0 AND o.censored = 0 AND o.final_status = 'completed'
+  AND o.unpriced_share = 0 AND o.price_provisional = 0   -- R2: unpriced degrades the ROW
+  AND o.actual_wcet_at_epoch IS NOT NULL;                -- R2: epoch-consistent actuals only
 `,
   },
 ];

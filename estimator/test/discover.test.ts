@@ -10,6 +10,7 @@ import {
   discoverCorpus,
   NEVER_SUMMED_WF_AGENT_FIELDS,
   readJournalAgentIds,
+  readJournalAgents,
   readWorkflowState,
   sessionFiles,
   sessionIdFromPath,
@@ -245,6 +246,33 @@ describe("symlinked directories (§5.1 — `Dirent.isDirectory()` lies about lin
     expect(s.workflows[0]!.journalAgentIds).toHaveLength(3);
   });
 
+  /**
+   * A run directory with NO journal.jsonl. `journalResultAgentIds` must come back
+   * `undefined` — "no journal was read" — and NOT `[]`, which asserts that every
+   * agent in the run failed to return. src/ingest.ts turns on exactly that
+   * difference (`returned === null` suppresses the never-returned branch), so `[]`
+   * here made the documented affordance unreachable in production and turned every
+   * unmapped agent into the benign `agent_never_returned`, silencing the alerting
+   * `phase_unmapped` for any run whose journal was missing or unreadable.
+   */
+  test("a run with NO journal reports undefined results, not an empty list", () => {
+    const root = newRoot();
+    const runDir = join(root, "-p", SESSION_B, "subagents", "workflows", RUN_ID);
+    mkdirSync(runDir, { recursive: true });
+    // One agent transcript, no journal.jsonl beside it.
+    writeFileSync(
+      join(runDir, "agent-a1111111111111111.jsonl"),
+      readFileSync(join(SESSION_DIR, "subagents", "workflows", RUN_ID, "agent-a1111111111111111.jsonl")),
+    );
+
+    const wf = discoverCorpus(root).sessions[0]!.workflows[0]!;
+    expect(wf.runId).toBe(RUN_ID);
+    expect(wf.journalResultAgentIds).toBeUndefined();
+    // The cross-check list a missing file genuinely contributes nothing to still
+    // degrades to empty — the two fields answer different questions.
+    expect(wf.journalAgentIds).toEqual([]);
+  });
+
   test("a DANGLING run-directory link is loud, never silent (§2)", () => {
     const root = newRoot();
     const wfRoot = join(root, "-p", SESSION_B, "subagents", "workflows");
@@ -294,12 +322,58 @@ describe("journal cross-check (§5.1 — the journal wins)", () => {
     ]);
   });
 
-  test("an agent in the journal but missing from workflowProgress is reported", () => {
-    const corpus = discoverCorpus(CORPUS);
-    const mismatch = corpus.anomalies.find(
-      (a) => a.kind === "wf_record_mismatch" && a.detail.includes("a3333333333333333"),
+  test("splits started from returned — the terminality signal §5.6 [R4] needs", () => {
+    const journal = readJournalAgents(
+      join(SESSION_DIR, "subagents", "workflows", "wf_demo0001-abc", "journal.jsonl"),
     );
-    expect(mismatch).toBeDefined();
-    expect(mismatch!.detail).toContain("journal wins");
+    expect(journal).not.toBeNull();
+    expect(journal!.started.sort()).toEqual([
+      "a1111111111111111",
+      "a2222222222222222",
+      "a3333333333333333",
+    ]);
+    // Only a1 has a `type:"result"` record: the other two started and never came back.
+    expect(journal!.result).toEqual(["a1111111111111111"]);
+  });
+
+  /**
+   * The `null` is the whole point of the return type: "there was no journal" and "the
+   * journal recorded no returns" are OPPOSITE evidence about every agent in the run,
+   * and `[]` for both told the classifier that every agent failed to return on the
+   * strength of a file that does not exist (src/ingest.ts, `returned === null`).
+   */
+  test("an unreadable journal is null, NOT an empty pair", () => {
+    expect(
+      readJournalAgents(join(SESSION_DIR, "subagents", "workflows", "wf_demo0001-abc", "nope.jsonl")),
+    ).toBeNull();
+  });
+
+  /**
+   * An agent the journal STARTED, `workflowProgress[]` never recorded, and that left
+   * no transcript on disk. Ingest cannot see it — there is no file to ingest — so
+   * this is the one place it can be recorded, and it is a real fact rather than the
+   * duplicate the old journal-vs-progress check produced.
+   */
+  test("a journal agent with no progress record AND no transcript is `agent_never_returned`", () => {
+    const corpus = discoverCorpus(CORPUS);
+    const rows = corpus.anomalies.filter((a) => a.detail.includes("a3333333333333333"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.kind).toBe("agent_never_returned");
+  });
+
+  /**
+   * The duplication this cross-check used to produce. `a2222222222222222` HAS a
+   * transcript on disk, so `buildAgentRuns` sees it, has the terminality signal to
+   * classify it, and says so once. Naming it here again is what made 138 of the live
+   * ledger's 371 `wf_record_mismatch` rows a second copy of a fact already recorded.
+   */
+  test("an agent WITH a transcript is left entirely to the ingest classifier", () => {
+    const corpus = discoverCorpus(CORPUS);
+    expect(
+      corpus.anomalies.some(
+        (a) => a.kind === "wf_record_mismatch" && a.detail.includes("in journal.jsonl but absent"),
+      ),
+    ).toBe(false);
+    expect(corpus.anomalies.some((a) => a.detail.includes("a2222222222222222"))).toBe(false);
   });
 });

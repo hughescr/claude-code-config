@@ -25,6 +25,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { getConfig } from "./db.ts";
 import { priceFamily } from "./prices.ts";
+import { resolveEstimatorIdentity, type EstimatorIdentity } from "./identity.ts";
 import {
   bootstrapQuantileCI,
   multipliers,
@@ -473,6 +474,13 @@ export interface OpenResult {
   refModel: string;
   estimand: string;
   estimatorModel: string;
+  /**
+   * WHICH leg of the resolution order named the estimator (src/identity.ts). Projected
+   * because a `config`-pinned identity and a transcript-derived one are very different
+   * claims, and `'pending'` says out loud that the band is filed under the repairable
+   * `'unknown'` sentinel rather than under a model.
+   */
+  estimatorMethod: string;
   priceEpoch: string;
   refclassAsOf: string | null;
   anchor: Anchor;
@@ -482,47 +490,29 @@ export interface OpenResult {
 export const PLANT_MARKER = "EST_PLANT:";
 
 /**
- * The estimator model family velocity history is keyed by.
+ * The estimator model family velocity history is keyed by, for ONE ceremony.
  *
- * There is no documented harness variable that names the model answering the
- * current turn, so the identity is taken from the two explicit overrides first —
- * `EST_ESTIMATOR_MODEL` (a hook or the skill may set it), then
- * `config.estimator_model` — and otherwise DERIVED FROM DATA THIS DATABASE ALREADY
- * HOLDS: the newest `origin='main'` request of the anchor session, whose
- * `model_family` is the orchestrator that is doing the estimating. Nothing in this
- * repo has ever written either override, so before the derivation every band from
- * every family landed under one `'unknown'` key and `est retro` pooled them all
- * into a single calibration bucket (retro.ts keys on `priceFamily(estimator_model)`).
+ * Thin wrapper over {@link resolveEstimatorIdentity}, which owns the documented
+ * resolution order (src/identity.ts). It exists so `est open` (step 7) and
+ * `est refclass` (step 1) provably resolve the SAME identity from the SAME anchor:
+ * both call this, both pass the anchor they resolved, and there is no second
+ * derivation anywhere for the two to drift apart in.
  *
- * `'unknown'` survives as the last resort — a brand-new session no sweep has seen
- * yet has no main request to read — and it is not a failure: it is one more bucket
- * key, and it keeps every band comparable to the other bands issued under the same
- * not-known-model. What it must not be is the ONLY key.
- *
- * `session` is the anchor session; callers with no anchor fall back to the same
- * environment variables `resolveAnchor` reads.
+ * `at` is the estimate's own `created_at`, which bounds the fallback leg above. An
+ * unbounded "newest main request" — what this used to be — is a function of the clock
+ * rather than of the row, so a `/model` switch after the ceremony retroactively
+ * changed what the same `est open` would have recorded.
  */
-export function estimatorModel(db: Database, session?: string | null): string {
-  const env = process.env.EST_ESTIMATOR_MODEL;
-  if (env !== undefined && env.trim() !== "") return env.trim();
-  const cfg = getConfig(db, "estimator_model");
-  if (cfg !== null && cfg.trim() !== "") return cfg.trim();
-
-  const sid =
-    session ?? process.env.EST_SESSION_ID ?? process.env.CLAUDE_SESSION_ID ?? null;
-  if (sid !== null && sid.trim() !== "") {
-    // 'main' only: a subagent request names the model the ORCHESTRATOR delegated to,
-    // which is exactly the identity this key must not collect.
-    const row = db
-      .query<{ model_family: string }, [string]>(
-        "SELECT model_family FROM request WHERE session_id = ? AND origin = 'main' ORDER BY ts DESC LIMIT 1",
-      )
-      .get(sid.trim());
-    if (row !== null && row !== undefined && row.model_family.trim() !== "") {
-      return row.model_family.trim();
-    }
-  }
-  return "unknown";
+export function estimatorIdentity(
+  db: Database,
+  opts: { session?: string | null; prompt?: string | null; at?: string | null } = {},
+): EstimatorIdentity {
+  return resolveEstimatorIdentity(db, {
+    session:
+      opts.session ?? process.env.EST_SESSION_ID ?? process.env.CLAUDE_SESSION_ID ?? null,
+    promptId: opts.prompt ?? process.env.EST_PROMPT_ID ?? null,
+    at: opts.at ?? null,
+  });
 }
 
 /** The newest successful price sync — the vintage this band is denominated in. */
@@ -735,10 +725,17 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
     };
   }
 
-  // Resolved from the anchor, so the identity is the model that actually answered
-  // this session's turns rather than an environment variable nobody sets.
-  const estModel = estimatorModel(db, anchor.sessionId);
-  const estFamily = priceFamily(estModel);
+  // Resolved from the ANCHOR — session AND prompt — and bounded above by this
+  // estimate's own timestamp, so the answer is a function of the row rather than of
+  // when the question is asked. `est refclass` resolves it the same way from the same
+  // anchor, which is what makes step 1 and step 7 of the ceremony agree.
+  const identity = estimatorIdentity(db, {
+    session: anchor.sessionId,
+    prompt: anchor.promptId,
+    at: ts,
+  });
+  const estModel = identity.model;
+  const estFamily = identity.family;
 
   const bucket = "global";
   const liveN = liveBucketN(db, bucket, refModel, estimand);
@@ -875,6 +872,7 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
     refModel,
     estimand,
     estimatorModel: estModel,
+    estimatorMethod: identity.method,
     priceEpoch,
     refclassAsOf: cal.refclassAsOf,
     anchor,
@@ -1308,6 +1306,14 @@ export interface RefclassResult {
   cold_distribution: { n: number; p10: number | null; p50: number | null; p90: number | null } | null;
   ref_model: string;
   estimand: string;
+  /**
+   * The estimator identity this bucket line was looked up under, and WHICH leg of the
+   * resolution order produced it. `est open` a moment later must report the same pair —
+   * a test pins exactly that, because the two disagreeing is the failure this whole
+   * mechanism exists to make impossible.
+   */
+  estimator_model: string;
+  estimator_method: string;
 }
 
 /** P1.4's hard budget: 8,000 chars against the 10,000-char hook cap. */
@@ -1365,28 +1371,58 @@ export function ftsQuery(text: string): string | null {
  */
 export function refclass(
   db: Database,
-  opts: { kind?: string | null; fanout?: number | null; text: string; limit?: number },
+  opts: {
+    kind?: string | null;
+    fanout?: number | null;
+    text: string;
+    limit?: number;
+    /** The anchor `est open` will use. Pass the SAME `--session`/`--prompt`. */
+    session?: string | null;
+    prompt?: string | null;
+  },
 ): RefclassResult {
   const refModel = getConfig(db, "ref_model") ?? "claude-sonnet-4-5";
   const estimand = getConfig(db, "estimand") ?? "work_cet";
-  // The SAME identity `est open` will stamp on the band a moment later: step 1 and
-  // step 7 of the ceremony have to agree about whose history is on screen, or the
-  // bucket line shown before the number is a different family's calibration. The
-  // session is resolved leniently — newest turn, no ambiguity check — because
-  // `est refclass` never fails, and an unresolved session simply reads 'unknown'.
-  const estFamily = priceFamily(
-    estimatorModel(
-      db,
-      process.env.EST_SESSION_ID ??
-        process.env.CLAUDE_SESSION_ID ??
-        db
-          .query<{ session_id: string }, []>(
-            "SELECT session_id FROM turn ORDER BY started_at DESC LIMIT 1",
+  // The SAME identity `est open` will stamp on the band a moment later, resolved by
+  // the SAME function from the SAME anchor: step 1 and step 7 of the ceremony have to
+  // agree about whose history is on screen, or the bucket line shown before the number
+  // is a different family's calibration.
+  //
+  // This used to resolve the session by its own rule (env, else the newest turn in the
+  // whole database) while `openTask` used `resolveAnchor` — so `est open --session X`
+  // with a bare `est refclass` genuinely printed one family's history and stamped
+  // another's. The session/prompt now come from the caller; `cmdRefclass` forwards
+  // `--session`/`--prompt`, and the fallbacks below are `resolveAnchor`'s own, minus
+  // its refusals: `est refclass` never fails, and an unresolved anchor simply reads
+  // the repairable 'unknown' sentinel.
+  const session =
+    opts.session ??
+    process.env.EST_SESSION_ID ??
+    process.env.CLAUDE_SESSION_ID ??
+    db
+      .query<{ session_id: string }, []>(
+        "SELECT session_id FROM turn ORDER BY started_at DESC LIMIT 1",
+      )
+      .get()?.session_id ??
+    null;
+  const prompt =
+    opts.prompt ??
+    process.env.EST_PROMPT_ID ??
+    (session === null
+      ? null
+      : (db
+          .query<{ prompt_id: string }, [string]>(
+            "SELECT prompt_id FROM turn WHERE session_id = ? ORDER BY started_at DESC LIMIT 1",
           )
-          .get()?.session_id ??
-        null,
-    ),
-  );
+          .get(session)?.prompt_id ?? null));
+  const identity = resolveEstimatorIdentity(db, {
+    session,
+    promptId: prompt,
+    // Bounded above by NOW, exactly as `openTask` bounds it by the estimate's
+    // `created_at`. The two calls are seconds apart, so the same window is examined.
+    at: isoNow(new Date()),
+  });
+  const estFamily = identity.family;
   const bucket = "global";
   const limit = opts.limit ?? 5;
 
@@ -1510,6 +1546,8 @@ export function refclass(
     cold_distribution: cold,
     ref_model: refModel,
     estimand,
+    estimator_model: identity.model,
+    estimator_method: identity.method,
   };
 }
 

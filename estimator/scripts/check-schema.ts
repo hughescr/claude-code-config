@@ -26,8 +26,10 @@ const EXPECTED_TABLES = [
   "burn_cache",
   "calib_run",
   "config",
+  "corpus_loss",
   "estimate",
   "estimate_block",
+  "estimate_identity_repair",
   "eta_run",
   "job_item",
   "job_run",
@@ -41,6 +43,7 @@ const EXPECTED_TABLES = [
   "refclass",
   "request",
   "run_segment",
+  "session_model",
   "sweep_census",
   "sweep_state",
   "task",
@@ -55,6 +58,7 @@ const EXPECTED_TABLES = [
 
 const EXPECTED_VIEWS = [
   "v_block_accuracy",
+  "v_estimate_identity",
   "v_eta_corpus",
   "v_missed_estimate",
   "v_otel_join",
@@ -74,6 +78,8 @@ const EXPECTED_VIEWS = [
 ];
 
 const EXPECTED_TRIGGERS = [
+  "eir_ro_d",
+  "eir_ro_u",
   "est_ro_d",
   "est_ro_u",
   "estb_ro_d",

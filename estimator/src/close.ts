@@ -489,10 +489,33 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
         "SELECT COUNT(*) AS n FROM agent_run WHERE tid = ? AND started_at IS NOT NULL AND ended_at IS NULL",
       )
       .get(input.tid)?.n ?? 0;
+  // The COUNT stays honest and unfiltered — `outcome.phase_unmapped_agents` records
+  // how many of this task's workflow agents never joined a phase, whatever the
+  // reason, and a closed task's row should not quietly shrink because the reason was
+  // benign.
   const phaseUnmapped =
     db
       .query<{ n: number }, [string]>(
         "SELECT COUNT(*) AS n FROM agent_run WHERE tid = ? AND run_id IS NOT NULL AND (phase_conf IS NULL OR phase_conf = 'unmapped')",
+      )
+      .get(input.tid)?.n ?? 0;
+  // The ALERT does not. §5.6 [R4]: an agent orphaned by a relaunch, or one that was
+  // killed, is a classified fact about the corpus, not something the operator can
+  // act on at close time — warning about it is the same cry-wolf failure that made
+  // 83% of the anomaly ledger noise. Only the residual (`phase_unmapped`, the kind
+  // the classifier reserves for "no explanation") is worth a line on the close
+  // report. Read from the ledger rather than an `agent_run` column so this needs no
+  // schema change; the classifier's per-agent detail strings are the join.
+  const phaseUnmappedUnexplained =
+    db
+      .query<{ n: number }, [string]>(
+        `SELECT COUNT(*) AS n FROM agent_run ar
+          WHERE ar.tid = ? AND ar.run_id IS NOT NULL
+            AND (ar.phase_conf IS NULL OR ar.phase_conf = 'unmapped')
+            AND NOT EXISTS (
+              SELECT 1 FROM anomaly a
+               WHERE a.kind IN ('wf_relaunch_orphan','agent_never_returned')
+                 AND a.detail LIKE '%agent ' || ar.agent_id || '%')`,
       )
       .get(input.tid)?.n ?? 0;
   const sidechainReplays =
@@ -644,7 +667,9 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
   const alerts: string[] = [];
   if (unpricedShare > 0) alerts.push(`unpriced_share=${(unpricedShare * 100).toFixed(1)}%`);
   if (danglingAgents > 0) alerts.push(`dangling_agents=${danglingAgents}`);
-  if (phaseUnmapped > 0) alerts.push(`phase_unmapped_agents=${phaseUnmapped}`);
+  if (phaseUnmappedUnexplained > 0) {
+    alerts.push(`phase_unmapped_agents=${phaseUnmappedUnexplained}`);
+  }
 
   return {
     tid: input.tid,

@@ -323,7 +323,12 @@ describe("symlink_alias — one physical transcript, one owner (G-FORK §3.4, §
       plan,
     );
     expect(loser.skippedFiles).toEqual([real]);
-    expect(watermarkable([{ path: real, inode: 1, bytes: 10 }], loser.skippedFiles)).toEqual([]);
+    expect(
+      watermarkable(
+        [{ path: real, inode: 1, bytes: 10, mtime: "2026-01-01T00:00:00.000Z" }],
+        loser.skippedFiles,
+      ),
+    ).toEqual([]);
   });
 
   test("a sweep books ONE agent_run, to the launcher, and records the alias", async () => {

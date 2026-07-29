@@ -34,9 +34,10 @@
  */
 
 import { readFileSync } from "node:fs";
-import { DB_PATH } from "../src/db.ts";
+import { DB_PATH, openDb } from "../src/db.ts";
 import { burnRead, type BurnJson } from "../src/burn.ts";
 import { formatEta } from "../src/eta.ts";
+import { recordSessionModel } from "../src/identity.ts";
 
 function fmtNum(n: number): string {
   return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n);
@@ -84,15 +85,64 @@ export function formatSegment(b: BurnJson): string {
   return text;
 }
 
-function readSessionId(): string | null {
+interface StatuslinePayload {
+  session_id: string | null;
+  model: string | null;
+}
+
+function readPayload(): StatuslinePayload {
   const raw = readFileSync(0, "utf8");
-  const payload = JSON.parse(raw) as { session_id?: unknown };
-  return typeof payload.session_id === "string" && payload.session_id !== "" ? payload.session_id : null;
+  const p = JSON.parse(raw) as { session_id?: unknown; model?: unknown };
+  const session = typeof p.session_id === "string" && p.session_id !== "" ? p.session_id : null;
+  // `model.id` is what the harness statusline payload is BELIEVED to carry, and belief
+  // is why the write below is gated. Read defensively: a shape change here must cost a
+  // null, never a throw (file header rule 2).
+  let model: string | null = null;
+  const m = p.model;
+  if (typeof m === "string" && m !== "") model = m;
+  else if (m !== null && typeof m === "object") {
+    const id = (m as { id?: unknown }).id;
+    if (typeof id === "string" && id !== "") model = id;
+  }
+  return { session_id: session, model };
+}
+
+/**
+ * The `session_model` upsert — the ONE ingest-independent leg of the estimator-identity
+ * resolver (src/identity.ts), and the only reason this script ever opens a writable
+ * connection.
+ *
+ * **Gated on `EST_SESSION_MODEL_CAPTURE=1`, and off by default.** Two reasons, both
+ * about this file's stated rules rather than about the resolver:
+ *
+ *  1. `model.id` is not a documented harness contract. Dump one real payload and
+ *     confirm the field before turning this on. Its absence costs nothing — the
+ *     resolver falls through to the transcript legs.
+ *  2. Rule 1 of this file is the bounded read path (P1.9: one indexed row read per
+ *     render). A write takes the WAL write lock, which the sweeper also wants, and a
+ *     status line is not worth contending for it until the payload is known good.
+ *
+ * Everything is swallowed. A statusline that throws is worse than a mislabelled bucket.
+ */
+function captureSessionModel(p: StatuslinePayload): void {
+  if (process.env.EST_SESSION_MODEL_CAPTURE !== "1") return;
+  if (p.session_id === null || p.model === null) return;
+  try {
+    const db = openDb({ path: DB_PATH, noMigrate: true });
+    try {
+      recordSessionModel(db, p.session_id, p.model);
+    } finally {
+      db.close();
+    }
+  } catch {
+    // Busy database, missing file, unexpected schema — none of it is worth a render.
+  }
 }
 
 function main(): string {
-  const session = readSessionId();
-  const burn = burnRead(DB_PATH, { session });
+  const payload = readPayload();
+  captureSessionModel(payload);
+  const burn = burnRead(DB_PATH, { session: payload.session_id });
   return formatSegment(burn);
 }
 

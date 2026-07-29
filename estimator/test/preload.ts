@@ -53,3 +53,28 @@ process.env.EST_SESSIONS ??= join(tmpdir(), `est-test-no-sessions-${process.pid}
  * `spoolDir` to `runSweep`, either of which wins over this default.
  */
 process.env.EST_SPOOL_DIR ??= join(tmpdir(), `est-test-no-spool-${process.pid}-${Date.now()}`);
+
+/**
+ * Same argument once more, for `~/.claude/settings.json` (`telemetryConfigured`,
+ * `EST_SETTINGS_JSON` override).
+ *
+ * `receiverDownAnomaly` (src/otel.ts) asks that file whether telemetry is configured,
+ * because the answer decides whether SILENCE from the receiver is a fault. On a machine
+ * where the developer has actually deployed the receiver — i.e. every machine this
+ * project is developed on — the answer is "yes", every test sweep therefore raises the
+ * ALERTING `otel_receiver_down` (no test spools an OTEL record), and every test that
+ * asserts a clean sweep exits 0 fails. It failed 8 of them, in 5 files, none of which is
+ * about telemetry: the sweep-exit-code assertions in test/regression.test.ts,
+ * test/ingest.test.ts, test/board-render.test.ts, test/otel.test.ts and
+ * test/census.test.ts.
+ *
+ * Pointed at a path guaranteed not to exist, so `telemetryConfigured` takes its
+ * documented conservative branch ("unreadable or absent reads as NOT configured") and
+ * the suite measures the code rather than the developer's launchd state. A test that
+ * wants telemetry configured passes an explicit `settingsPath` to
+ * `telemetryConfigured`, or sets the variable itself — both win over this default.
+ */
+process.env.EST_SETTINGS_JSON ??= join(
+  tmpdir(),
+  `est-test-no-settings-${process.pid}-${Date.now()}.json`,
+);
