@@ -48,3 +48,18 @@ Never pick Python because it's the easy default — for Craig it's a last resort
 ## Installed CLI Tools (beyond defaults)
 
 jq, httpie, gh, bat, diff-so-fancy, hyperfine, tree, watch, ag, parallel, awscli, csvkit (csvcut/csvjoin/csvstat), imagemagick, optipng, webp, ffmpeg
+
+---
+
+## Token estimation
+
+Estimate substantial work before starting it. Substantial = ANY of: **T1** a `Workflow` launch;
+**T2** ≥2 `Task`/agent launches; **T3** ≥3 orchestrator turns toward one goal; **T4** I asked for
+an estimate or budget. Exempt: one background agent on an errand, lookups, single-file edits.
+
+Invoke the **estimating** skill at the start of the anchoring turn — prompt read, plan formed,
+nothing launched. It runs `est refclass`, then `est open`, which prints the band and the exact
+`TaskUpdate` call that plants `est_tid`; issue that verbatim when a Task-tool task exists. For a
+`Workflow`, run `est block` per declared `meta.phases` entry before launching, and give every
+`agent()` call a `label` and a `phase` (0-based). Re-estimate by appending: `est open --reason
+refinement`, or `est scope` then `--reason scope_change` if the goal moved. Never self-report tokens.
