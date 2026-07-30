@@ -465,6 +465,19 @@ export const BENIGN_ANOMALY_KINDS: ReadonlySet<string> = new Set([
   // to D2, which has the evidence; this row stays recorded and reported, and
   // `--strict` still promotes it.
   "main_transcript_missing",
+  // P2.1: a terminal `run_segment` restated or removed by a later re-cut. It is EVIDENCE
+  // that the check-back fitting corpus moved — which the design insists must never happen
+  // silently — and not damage, decided the same way and for the same reason as
+  // `promotion_backdated` above: the recompute moved a number to a truer value. Two
+  // populations produce it in normal life, one steady and one one-off. Steadily: the P2.4
+  // OTEL drain fills `request.duration_ms` where there was none, and a filled gap either
+  // merges two segments or moves a start earlier. Once: the 2026-07-30 boundary rule
+  // re-cut the whole corpus, which is precisely the event this ledger row exists to
+  // record. Alerting on either would exit 3 on every backfill and on every sweep that
+  // drains a late duration — the "must not cry wolf" failure this set exists to prevent.
+  // `insertAnomalies` dedups on (kind, detail) and the detail carries the CLASS rather
+  // than the values, so a segment contributes at most two rows for its whole life.
+  "segment_recut",
   // NOTE: `board_render_failed` (P2.7) is deliberately ABSENT from this set — it
   // does not go through `report.anomalies` at all (see the sweep's board-regen
   // step). The design's "never fails the sweep" is unconditional: `--strict`
@@ -1392,7 +1405,16 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
   //    step produces, so the other order would always publish a forecast one sweep
   //    behind the activity it is about. `full` (backfill) rebuilds every session.
   db.transaction(() => {
-    report.segments = refreshSegments(db, { now, all: full });
+    const cut = refreshSegments(db, { now, all: full });
+    report.segments = { sessions: cut.sessions, segments: cut.segments, open: cut.open };
+    // `segment_recut` findings, written INSIDE the same transaction that moved the rows
+    // they are about. This call is not decoration and it was MISSING: `refreshSegments`
+    // has always returned its findings and every earlier flush of `pendingAnomalies`
+    // happens in the ingest loop far above, so the audit trail P2.1 promises — "the
+    // corpus may not move SILENTLY" — was computed and then dropped on the floor. The
+    // 2026-07-30 boundary rule made that visible by re-cutting the whole corpus at once,
+    // which is exactly the event the ledger exists to record.
+    writtenAnomalies.push(...insertAnomalies(db, cut.anomalies, sweptAt));
   }).immediate();
 
   db.transaction(() => {

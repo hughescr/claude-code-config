@@ -27,6 +27,7 @@ import { join } from "node:path";
 import type { Database } from "bun:sqlite";
 import { makeHarness, openArgs, seedPrices, type Harness } from "./support.ts";
 import { compactionAnomalies, INSERT_ANOMALY_SQL } from "../src/ingest.ts";
+import { BENIGN_ANOMALY_KINDS } from "../src/cli.ts";
 import {
   buildEtaFit,
   buildSessionSegments,
@@ -284,6 +285,33 @@ describe("run_segment persistence — P2.5", () => {
     // The detail carries the CLASS of the change, never the values: `insertAnomalies`
     // dedups on (kind, detail), and numbers in the key would write a row per sweep.
     expect(r.anomalies[0]!.detail).not.toContain("999999");
+    // BENIGN, and it has to be: two populations restate segments in normal life — the
+    // P2.4 drain filling a late duration, and the 2026-07-30 corpus re-cut — so alerting
+    // would exit 3 on every backfill and train the watchdog to be ignored.
+    expect(BENIGN_ANOMALY_KINDS.has("segment_recut")).toBe(true);
+  });
+
+  test("`est sweep` WRITES the segment_recut findings, rather than computing and dropping them", async () => {
+    // The gap this test exists for: `refreshSegments` has always RETURNED its findings,
+    // but the sweep's only `insertAnomalies` flush runs inside the ingest loop, long
+    // before segments are cut — so P2.1's "the corpus may not move SILENTLY" was a
+    // promise with no writer behind it. The 2026-07-30 re-cut is what made that visible.
+    const fx = loadFixtures().find((f) => f.name === "basic")!;
+    loadFixture(h.db, fx);
+    refreshSegments(h.db, { now: new Date(fx.now), all: true });
+    h.db.query("UPDATE run_segment SET ended_at = '2026-03-01T10:09:00Z' WHERE terminator <> 'open'").run();
+    expect(
+      h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM anomaly WHERE kind='segment_recut'").get()?.n,
+    ).toBe(0);
+
+    // `--root` at an empty directory: the sweep finds no transcripts, which is the point —
+    // the rows under test were inserted directly, and pointing the corpus walk at the real
+    // ~/.claude would make this test read Craig's actual sessions.
+    const r = await h.cli("backfill", "--root", h.dir, "-q");
+    expect(r.code).toBe(0);
+    expect(
+      h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM anomaly WHERE kind='segment_recut'").get()?.n,
+    ).toBeGreaterThan(0);
   });
 
   test("a late OTEL duration MERGES two segments: one row survives, not two overlapping ones", () => {

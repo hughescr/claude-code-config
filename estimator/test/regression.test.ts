@@ -1135,9 +1135,18 @@ describe("truncated-transcript re-ingest (§5.2 mandated regression)", () => {
       expect(third.anomalies.recorded).toBe(0);
       expect(snapshot(b.incremental)).toEqual(incrementalSnap);
 
-      // The only anomaly either sweep of this corpus could raise is the torn
-      // tail the incremental database read and the fresh one never saw.
-      expect(anomalyKinds(b.incremental)).toEqual(["truncated_tail"]);
+      // The torn tail the incremental database read and the fresh one never saw —
+      // PLUS the `segment_recut` rows that tear produced downstream, which are the
+      // point of the ledger rather than noise in it. Sweep 1 cut the check-back
+      // corpus over a transcript missing its last lines; sweep 2 saw the structure
+      // land and re-cut, so a closed segment — a corpus observation — moved. P2.1
+      // allows that (a segment is regenerable) on the condition that it never moves
+      // SILENTLY, and these two rows are the audit trail of it happening.
+      expect(anomalyKinds(b.incremental).filter((k) => k !== "segment_recut")).toEqual([
+        "truncated_tail",
+      ]);
+      expect(anomalyKinds(b.incremental).filter((k) => k === "segment_recut").length).toBeGreaterThan(0);
+      // The fresh database read the whole file once, so nothing moved for it.
       expect(anomalyKinds(b.fresh)).toEqual([]);
     } finally {
       rmSync(b.dir, { recursive: true, force: true });
