@@ -83,6 +83,17 @@ export const OVERRUN_MARKER_PREFIX = ".overrun-notified.";
  * writes and stats it; it re-exports this constant rather than declaring a second one.
  */
 export const BOARD_MARKER = ".board";
+/**
+ * P1.7's sweeper close-pass throttle marker (Craig 2026-07-30), declared here for the
+ * same reason `.board` is: `pruneMarkers` has to recognise every name written into this
+ * directory. `src/autoclose.ts` writes and stats it; it re-exports this constant rather
+ * than declaring a second one.
+ *
+ * ONE file, like `.microsweep` and for the same reason: every hook fire in the machine
+ * spawns the SAME `est sweep`, so a per-session window would let N sessions run N close
+ * passes inside one interval — the fan-out the throttle exists to collapse.
+ */
+export const CLOSE_PASS_MARKER = ".closepass";
 
 /** Filesystem-safe form of an id used inside a marker filename. */
 export function sanitizeForFilename(id: string): string {
@@ -427,6 +438,14 @@ export const OVERRUN_MARKER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
  * next sweep, which is the cheapest possible way to be wrong.
  */
 export const BOARD_MARKER_TTL_MS = 24 * 60 * 60 * 1000;
+/**
+ * The `.closepass` marker is re-stamped by every close pass that actually ran, so one
+ * older than this belongs to an estimator nobody has swept in a day. Reaping it costs
+ * exactly one un-throttled candidate query on the next sweep — the same "cheapest
+ * possible way to be wrong" the board marker is reaped by, and the query is one indexed
+ * read per open task.
+ */
+export const CLOSE_PASS_MARKER_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Delete stale hook marker files. Called from `drainSpool`, so it runs on every sweep
@@ -455,6 +474,11 @@ export function pruneMarkers(dir: string = SPOOL_DIR, now: Date = new Date()): n
       // form is `writeAtomic`'s staging file for the marker itself, left behind only by
       // a crash between the write and the rename.
       ttl = BOARD_MARKER_TTL_MS;
+    } else if (name === CLOSE_PASS_MARKER) {
+      // Same contract as `.board` above: the pruner learns the name so the marker
+      // cannot leak. No `.tmp.` sibling — only the mtime is ever read, so the writer
+      // is a plain `writeFileSync` and there is no staging file to reap.
+      ttl = CLOSE_PASS_MARKER_TTL_MS;
     } else {
       continue;
     }

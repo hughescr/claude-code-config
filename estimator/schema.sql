@@ -388,6 +388,17 @@ CREATE TABLE task_event (           -- lifecycle from transcript toolUseResult (
 -- planner can actually use this.
 CREATE INDEX ix_task_event_unlinked ON task_event(session_id, task_num)
   WHERE tid IS NULL AND task_num <> '';
+-- v14: the mirror image of the index above, for the SWEEPER CLOSE PASS (src/autoclose.ts).
+-- Its candidate filter asks, once per open task, "is there a LINKED completion signal for
+-- this tid" -- and `tid` had no index at all, so the answer cost a scan of the whole
+-- lifecycle table per open task, on the micro-sweep's path. PARTIAL over exactly the rows
+-- that can ever answer yes: linked, and `to_status='completed'`. That is a handful of rows
+-- per finished task rather than every transition ever recorded, and it GROWS only with
+-- completions (where ix_task_event_unlinked shrinks with them). CLOSE_PASS_CANDIDATE_SQL
+-- repeats both predicates verbatim so the planner can use it; test/schema.test.ts asserts
+-- the plan rather than the prose.
+CREATE INDEX ix_task_event_completed ON task_event(tid)
+  WHERE tid IS NOT NULL AND to_status = 'completed';
 
 CREATE TABLE outcome (              -- APPEND-ONLY; current = MAX(revision). Reopen = new revision.
   tid TEXT NOT NULL REFERENCES task(tid),
@@ -600,6 +611,19 @@ CREATE TABLE anomaly (              -- loud, queryable failure ledger
                                     --      because nobody is named behind it, and this row exists
                                     --      to name someone. `est retro` reports both plus the
                                     --      share of closed tasks that came through either.
+                                    --   src/autoclose.ts: swept_close -- the SWEEPER close pass
+                                    --      (v14, Craig 2026-07-30) finalized a task nobody ran
+                                    --      `est close` on: either on a linked
+                                    --      task_event(to_status='completed'), closing it
+                                    --      `completed`, or after STALE_CLOSE_HOURS of silence,
+                                    --      closing it `abandoned` (censored). The full §6.2
+                                    --      quiescence gate was met either way -- this pass has no
+                                    --      bypass -- so the row is PROVENANCE, not an override:
+                                    --      `outcome` has no "who closed this" column, and this
+                                    --      ledger is where `forced_close`/`accepted_close` already
+                                    --      answer that question. BENIGN in src/cli.ts: the sweeper
+                                    --      doing its documented job on every cron leg must not
+                                    --      exit 3, or the watchdog learns to be ignored.
                                     --   src/ingest.ts: plant_unlinked -- a planted est_tid that
                                     --      could not become a session_task alias: either it named
                                     --      a tid with no task row, or its tool_result never
@@ -1260,7 +1284,7 @@ WHERE s.terminator = 'open'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '13'),
+  ('schema_version',          '14'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.
@@ -1316,6 +1340,13 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   -- `unvalidated_retired_at` is deliberately ABSENT: it is written only by
   -- `est recon --certify`, and its PRESENCE is what flips `"unvalidated": false`.
   ('board_min_interval_s',      '30'),
+  -- v14 (2026-07-30): minutes between SWEEPER CLOSE PASSES (src/autoclose.ts). Every hook
+  -- fire in the machine spawns the same `est sweep`, so without a window a burst of
+  -- micro-sweeps would run the candidate query -- and the full five-arm quiescence gate
+  -- for every hit -- several times a minute. 10 costs nothing in latency: a candidate has
+  -- already been silent for `quiesce_main_min` (60) before the gate lets it through, so
+  -- the pass adds at most a rounding error to when a quiet task is finalized.
+  ('close_pass_min_interval_min', '10'),
   ('job_item_min_pop',          '0.5'),  -- fan[].startedAt population below which item grain sleeps
   ('otel_max_body_mb',          '8'),    -- receiver request-body cap
   ('otel_stale_min',            '15'),   -- minutes of silence before otel_receiver_down

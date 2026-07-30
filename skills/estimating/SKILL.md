@@ -201,6 +201,11 @@ report. Do not offer a number; you do not have one.
 the quiet window, no open turn, no live session, every bound agent terminal). If it exits `2` it
 names the failing condition — wait for quiescence and close again, or leave it for the sweeper.
 
+**Leaving it for the sweeper is now a real instruction rather than a hope** (2026-07-30): every
+sweep finalizes tasks that have gone quiet, closing them `completed` on a linked completion signal
+and `abandoned` after 48 h of silence, with the full gate met either way — so doing nothing after
+an exit `2` is usually the right answer.
+
 **`--accept` is the one bypass you may use, and only on explicit human consent.** The user does not
 know this CLI exists; what they do is say the work is done.
 

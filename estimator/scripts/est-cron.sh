@@ -2,6 +2,7 @@
 # scripts/est-cron.sh — the scheduled maintenance leg of the estimator (design R3 §2, §8).
 #
 #   daily   est sweep --blocking --budget 300s
+#           est recon                   (P2.6 reconciliation point; no --certify)
 #   weekly  est prices --sync           (refresh model_price from upstream)
 #           bun scripts/backup.ts       (VACUUM INTO backups/ + wal_checkpoint(TRUNCATE))
 #
@@ -53,6 +54,38 @@ case "$sweep_rc" in
   3) log "sweep recorded anomalies or hit its budget (exit 3) — expected, see \`est census\`" ;;
   4) log "sweep lock held by a live session (exit 4) — skipped, the next run finishes the job" ;;
   *) log "sweep FAILED (exit $sweep_rc)"; rc=$sweep_rc ;;
+esac
+
+# --- daily: recon ------------------------------------------------------------
+# P2.6, DAILY rather than weekly (Craig, 2026-07-30). `est recon` compares our numbers
+# against Anthropic-computed ones on four axes and writes `recon`/`recon_metric` rows;
+# the retirement criterion needs consecutive CLEAN WEEKS, and a weekly cadence gives it
+# exactly one sample per week — so a receiver outage, a price-table drift or a join
+# collapse sat undetected for up to seven days and then poisoned the whole week's
+# certification with one bad point. A daily row makes the breach visible the next
+# morning and gives the weekly aggregate something to be an aggregate OF.
+#
+# Runs AFTER the sweep, unconditionally: recon reads what the sweep just ingested, and a
+# sweep that stepped aside for a live session (exit 4) still leaves yesterday's corpus
+# worth reconciling.
+#
+# NO `--certify`. Retirement of the [unvalidated] marker is a deliberate human act; the
+# plain verb still EVALUATES the criterion (and still clears a marker that no longer
+# holds, which is the rolling half), it simply never grants it. NO `--dry-run` either:
+# the whole point is to persist the daily point.
+#
+# Exit-code discipline mirrors the sweep step above, because `cmdRecon` deliberately
+# reuses the same codes: 3 = "completed, an axis breached recon_alert_pct" (recorded as
+# anomaly(recon_mismatch) — `est census` is where it is read), 4 = the writer lock was
+# held. Neither is a cron failure. Anything else is.
+log "recon (daily)"
+est_run recon
+recon_rc=$?
+case "$recon_rc" in
+  0) log "recon ok" ;;
+  3) log "recon recorded an axis breach (exit 3) — expected while [unvalidated] stands, see \`est recon --dry-run\`" ;;
+  4) log "recon lock held by a live session (exit 4) — skipped, tomorrow's run takes the point" ;;
+  *) log "recon FAILED (exit $recon_rc)"; rc=$recon_rc ;;
 esac
 
 # --- weekly: is it due? -----------------------------------------------------

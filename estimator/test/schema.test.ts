@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb, SCHEMA_VERSION, schemaVersion } from "../src/db.ts";
 import { BACKFILL_TASK_EVENT_TID_SQL, INSERT_TASK_EVENT_SQL } from "../src/ingest.ts";
+import { CLOSE_PASS_CANDIDATE_SQL } from "../src/autoclose.ts";
 import { ABOVE_200K_SUFFIX, LONG_CONTEXT_THRESHOLD } from "../src/prices.ts";
 
 let dir: string;
@@ -986,6 +987,73 @@ describe("schema migration", () => {
     // the steady state, nothing. What must never come back is the bare table scan.
     expect(plan).toContain("ix_task_event_unlinked");
     expect(plan).not.toMatch(/SCAN task_event(?! USING)/);
+  });
+
+  /**
+   * v13 -> v14 (P1.7/§6.2): the sweeper close pass. One partial index
+   * (`ix_task_event_completed`) and one config seed (`close_pass_min_interval_min`);
+   * the same two obligations as every step above — a migrated file is byte-identical to
+   * a fresh one, and the statement the index exists for actually uses it — plus the one
+   * a config-seeding step carries: the key must land where `est config set` can see it,
+   * and a value Craig has already tuned must survive the migration untouched.
+   */
+  test("a v13 database gains the close-pass index and seed, and matches a fresh file exactly", () => {
+    db.exec(`
+      DROP INDEX ix_task_event_completed;
+      DELETE FROM config WHERE k = 'close_pass_min_interval_min';
+      UPDATE config SET v = '13' WHERE k = 'schema_version';
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+
+    db = openDb({ path }); // migrates on open
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(
+      db.query<{ v: string }, []>("SELECT v FROM config WHERE k='close_pass_min_interval_min'").get()?.v,
+    ).toBe("10");
+
+    const freshDir = mkdtempSync(join(tmpdir(), "estimator-schema-v14-"));
+    const fresh = openDb({ path: join(freshDir, "estimator.db") });
+    try {
+      const objects = (d: Database): unknown =>
+        d
+          .query<unknown, []>(
+            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+          )
+          .all();
+      expect(objects(db)).toEqual(objects(fresh));
+    } finally {
+      fresh.close();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+
+    // The candidate filter's completion-signal probe, asserted against the planner: the
+    // index's predicate and CLOSE_PASS_CANDIDATE_SQL's have to stay verbatim identical,
+    // and a lifecycle-table scan per open task is the regression this step prevents.
+    const plan = db
+      .query<{ detail: string }, []>(`EXPLAIN QUERY PLAN ${CLOSE_PASS_CANDIDATE_SQL}`)
+      .all()
+      .map((r) => r.detail)
+      .join(" | ");
+    expect(plan).toContain("ix_task_event_completed");
+    expect(plan).not.toMatch(/SCAN task_event(?! USING)/);
+  });
+
+  test("migration rule 2: a tuned close_pass_min_interval_min survives the v14 step", () => {
+    db.exec(`
+      DROP INDEX ix_task_event_completed;
+      UPDATE config SET v = '90' WHERE k = 'close_pass_min_interval_min';
+      UPDATE config SET v = '13' WHERE k = 'schema_version';
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    // `INSERT OR IGNORE`, not `INSERT OR REPLACE`: a migration never restates a value a
+    // human has already set.
+    expect(
+      db.query<{ v: string }, []>("SELECT v FROM config WHERE k='close_pass_min_interval_min'").get()?.v,
+    ).toBe("90");
   });
 
   test("the v8 step lands on a file that already has the shape and only lacks the marker", () => {

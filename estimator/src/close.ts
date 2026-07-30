@@ -509,6 +509,21 @@ export interface CloseInput {
    * be told about.
    */
   heal?: boolean;
+  /**
+   * SWEEPER ONLY: the caller has just run `attributeTasks` over the WHOLE corpus and
+   * nothing has been ingested since, so this close may skip its own pass.
+   *
+   * Not a shortcut and not reachable from the CLI: it changes no arithmetic, it removes
+   * a repeat of arithmetic the caller provably already did. `src/autoclose.ts` closes a
+   * batch of candidates inside one sweep, immediately after `runSweep`'s attribution
+   * step; without this every candidate re-attributes the entire corpus, which is
+   * O(candidates x corpus) for an answer that cannot have changed between them.
+   *
+   * The `heal` path skips attribution for exactly this reason already — see the call
+   * site below. This is the same claim made by a different caller, so it is the same
+   * flag family rather than a second mechanism.
+   */
+  attributed?: boolean;
 }
 
 export interface CloseResult {
@@ -665,10 +680,10 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
     }
   }
 
-  // Skipped on the heal path alone: `runSweep` has just run this pass over the whole
-  // corpus, and re-running it once per healed task is O(corpus) work for an answer that
-  // cannot have changed since.
-  if (input.heal !== true) attributeTasks(db);
+  // Skipped on the two SWEEPER paths alone (`heal`, and the close pass's `attributed`):
+  // `runSweep` has just run this pass over the whole corpus, and re-running it once per
+  // healed or swept task is O(corpus) work for an answer that cannot have changed since.
+  if (input.heal !== true && input.attributed !== true) attributeTasks(db);
 
   const gate = quiescence(db, input.tid, now);
   // The acceptance bypasses EVERY arm, the open-turn one included, and that is the

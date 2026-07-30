@@ -30,7 +30,15 @@ import {
   turn,
   type Harness,
 } from "./support.ts";
-import { ftsQuery, parseDod, scopeHash, PLANT_MARKER, COLD_START_N } from "../src/tasks.ts";
+import {
+  ftsQuery,
+  parseDod,
+  scopeHash,
+  subjectOverlap,
+  subjectTokens,
+  PLANT_MARKER,
+  COLD_START_N,
+} from "../src/tasks.ts";
 import { attributeTasks } from "../src/attribute.ts";
 
 let h: Harness;
@@ -873,6 +881,97 @@ describe("est refclass — P1.4", () => {
 // ---------------------------------------------------------------------------
 // P1.0 — the cross-cutting contracts, over every Phase 1 verb at once
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// P1.0 — the near-duplicate warning at mint (Craig 2026-07-30)
+// ---------------------------------------------------------------------------
+
+/**
+ * Two real incidents on 2026-07-30, both silent, both producing the same damage: a
+ * session RE-OPENED for work it was already tracking, and a sub-agent minting its own
+ * tid for work its orchestrator had already estimated. Two tasks then share one session,
+ * §5.4's staleness closure splits that session's spend between them, and BOTH actuals
+ * are wrong with nothing about either task looking broken afterwards.
+ *
+ * The fix is a WARNING and nothing more (observe-first). The tests below therefore pin
+ * three things in equal measure: that it fires, that it names the two legitimate paths,
+ * and that it never blocks, never changes the exit code, and never fires on the
+ * ordinary sequential case schema v6 exists to support.
+ */
+describe("est open — the near-duplicate warning", () => {
+  test("an overlapping subject in the same session warns, and the task still opens", async () => {
+    const first = await open();
+    const r = await h.cli(
+      ...openArgs({ subject: "widget pipeline rewrite, second half" }),
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+
+    // Never blocks: exit 0, a real tid, and a parseable single-object stdout.
+    expect(r.code).toBe(0);
+    const doc = r.json<{ tid: string; near_duplicates: { tid: string; overlap: number }[] }>();
+    expect(doc.tid).not.toBe(first);
+    expect(
+      h.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM task WHERE tid = ?").get(doc.tid)?.n,
+    ).toBe(1);
+
+    // The warning names the existing tid, on stderr and in the JSON contract.
+    expect(doc.near_duplicates.map((d) => d.tid)).toEqual([first]);
+    expect(doc.near_duplicates[0]!.overlap).toBeGreaterThanOrEqual(0.5);
+    expect(r.err).toContain(first);
+    // …and points at BOTH legitimate paths, which is the whole remedial content.
+    expect(r.err).toContain(`est open --tid ${first} --reason refinement`);
+    expect(r.err).toContain(`est bind ${first}`);
+  });
+
+  test("a disjoint subject in the same session does NOT warn", async () => {
+    await open();
+    const r = await h.cli(
+      ...openArgs({ subject: "nightly backup retention audit" }),
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(r.code).toBe(0);
+    expect(r.json<{ near_duplicates: unknown[] }>().near_duplicates).toEqual([]);
+    expect(r.err).toBe("");
+  });
+
+  test("a CLOSED task with the same subject does not warn — only OPEN tasks compete", async () => {
+    const first = await open();
+    expect((await h.cli("close", first, "--force")).code).toBeLessThanOrEqual(3);
+    const r = await h.cli(...openArgs(), "--session", "s1", "--prompt", "p1", "--json");
+    expect(r.json<{ near_duplicates: unknown[] }>().near_duplicates).toEqual([]);
+  });
+
+  test("the same subject in a DIFFERENT session does not warn", async () => {
+    await open();
+    turn(h.db, { session: "s2", prompt: "p1", at: "2026-01-01T00:00:00Z" });
+    const r = await h.cli(...openArgs(), "--session", "s2", "--prompt", "p1", "--json");
+    expect(r.json<{ near_duplicates: unknown[] }>().near_duplicates).toEqual([]);
+  });
+
+  test("a re-estimate never warns: appending is the thing the warning asks for", async () => {
+    const tid = await open();
+    const r = await h.cli(
+      ...openArgs(), "--tid", tid, "--reason", "refinement", "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(r.code).toBe(0);
+    expect(r.json<{ near_duplicates: unknown[] }>().near_duplicates).toEqual([]);
+    expect(r.err).toBe("");
+  });
+
+  test("the overlap rule is the overlap COEFFICIENT, not Jaccard", () => {
+    // The incident shape: a short goal restated as a longer one. Jaccard scores this
+    // ~0.3 and slips under any threshold worth having; min-normalised overlap sees it.
+    const short = subjectTokens("sweeper close pass");
+    const long = subjectTokens(
+      "sweeper close pass, daily cron recon, SessionStart hook and the near-duplicate warning",
+    );
+    expect(subjectOverlap(short, long)).toBe(1);
+    expect(subjectOverlap(short, subjectTokens("nightly backup retention audit"))).toBe(0);
+    // Stopwords and short fragments are not evidence: two subjects sharing only "the"
+    // and "a" must not score at all.
+    expect(subjectOverlap(subjectTokens("the a of"), subjectTokens("the a of"))).toBe(0);
+  });
+});
 
 describe("P1.0 — cross-cutting", () => {
   test("every Phase 1 verb's --json is exactly one object carrying schema: 1", async () => {
