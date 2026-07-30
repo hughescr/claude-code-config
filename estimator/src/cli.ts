@@ -94,7 +94,7 @@ import { isoSeconds, setManualPrice, showPrices, sync, type SyncResult } from ".
 import { attributeTasks } from "./attribute.ts";
 import { burnJson, burnRead, classifyOpenError, refreshBurnCache, renderBurn } from "./burn.ts";
 import { closeTask, healClosedOutcomes, type FinalStatus } from "./close.ts";
-import { runClosePass } from "./autoclose.ts";
+import { closePassMarkerFile, runClosePass } from "./autoclose.ts";
 import { board, retro, type RetroReport } from "./retro.ts";
 import { DEFAULT_BOARD_LIMIT, regenerateBoardIfDue, renderBoardFiles } from "./board-render.ts";
 import { promoteStartedTasks } from "./promote.ts";
@@ -491,12 +491,31 @@ export const BENIGN_ANOMALY_KINDS: ReadonlySet<string> = new Set([
   // watchdog to be ignored, which is what this whole set exists to prevent.
   "accepted_close",
   // Craig, 2026-07-30: the sweeper close pass (src/autoclose.ts) finalized a task nobody
-  // ran `est close` on. Same reading as `accepted_close` above, one step further: the row
-  // is PROVENANCE for a close, not a report of an override, because the pass has no
-  // bypass — every arm of §6.2's gate was met. It fires on the ORDINARY path (a task
-  // going quiet is the normal end of work, not an incident) and it fires from the daily
-  // cron, so alerting on it would exit 3 on a routine leg forever.
+  // ran `est close` on, on the strength of a terminal `task_event` the gate observed.
+  // Same reading as `accepted_close` above, one step further: the row is PROVENANCE for a
+  // close, not a report of an override, because the pass has no bypass — every arm of
+  // §6.2's gate was met. It fires on the ORDINARY path (a task going quiet with its work
+  // signalled done is the normal end of work, not an incident) and it fires from the
+  // daily cron, so alerting on it would exit 3 on a routine leg forever.
+  //
+  // Its sibling `swept_abandon` is deliberately NOT in this set. The two rows record
+  // opposite epistemic situations: `swept_close` says the corpus gained a measurement,
+  // `swept_abandon` says it gained a right-censored lower bound and a task's attribution
+  // window was permanently sealed on no evidence either way. That is worth an exit 3, and
+  // it cannot cry wolf because it takes `close_abandon_after_h` (a week) of silence to
+  // fire. `close_failed` is alerting for the same reason: a task that cannot be finalized
+  // never enters the corpus at all, and nothing else in the system would ever say so.
   "swept_close",
+  // The bookkeeping half of `close_failed` — one bounded breadcrumb per failed attempt,
+  // capped at `close_fail_alert_after` rows per tid. Benign because a single failed
+  // attempt is genuinely transient (a busy snapshot, a row another writer is mid-way
+  // through); the ALERTING row is what the third one raises.
+  "close_attempt_failed",
+  // A candidate the gate has refused for over `close_blocked_after_h`. The gate refusing
+  // is the gate WORKING, so this is evidence rather than damage — same reading as
+  // `plant_unlinked` below. It exists so a refusal that has stopped being temporary is
+  // visible; the ledger's (kind, detail, tid) dedup holds it to one row per failing arm.
+  "close_blocked",
   // §3.2 step 6: a planted `est_tid` naming a tid with no `task` row. The alias is
   // correctly REFUSED (a transcript is untrusted input), so the row is evidence rather
   // than damage — same reading as `promotion_backdated` above. It is still worth a
@@ -726,11 +745,16 @@ export interface SweepReport {
    */
   close_pass: {
     attempted: boolean;
+    /** Why it did not run: `"throttled"`, `"incomplete_sweep"`, or `null` when it did. */
+    skipped: "throttled" | "incomplete_sweep" | null;
     candidates: number;
     completed: number;
     abandoned: number;
+    deleted: number;
     blocked: number;
     failed: number;
+    /** Gate-eligible, but inside the `close_abandon_after_h` safety margin. */
+    awaiting_abandon: number;
   };
   /** P2.1: the check-back corpus — sessions revisited, segments cut, still open. */
   segments: { sessions: number; segments: number; open: number };
@@ -1051,7 +1075,17 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     attribution: { tasks: 0, turns: 0, agents: 0, runs: 0, requests: 0, by_attr: {} },
     burn_cache_rows: 0,
     outcomes_healed: 0,
-    close_pass: { attempted: false, candidates: 0, completed: 0, abandoned: 0, blocked: 0, failed: 0 },
+    close_pass: {
+      attempted: false,
+      skipped: null,
+      candidates: 0,
+      completed: 0,
+      abandoned: 0,
+      deleted: 0,
+      blocked: 0,
+      failed: 0,
+      awaiting_abandon: 0,
+    },
     segments: { sessions: 0, segments: 0, open: 0 },
     promotion: { promoted: 0, started_at_set: 0, started_at_backdated: 0 },
     identity_repair: { candidates: 0, repaired: 0, ambiguous: 0, pending: 0 },
@@ -1495,25 +1529,35 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
   //     Not wrapped in a transaction here: `runClosePass` opens one PER CANDIDATE, so a
   //     task that fails the gate cannot roll back the closes that succeeded before it.
   //
-  //     `markerDir: boardSpoolDir` — the PER-DATABASE directory, never the
-  //     environment-overridable hook spool. A throttle shared between two databases
-  //     would let a test harness's sweep silence the live database's close pass; see
-  //     `ClosePassOptions.markerDir`. `spoolDir` stays the hook spool, because that is
-  //     where the overrun marker each closed task disarms actually lives.
+  //     `markerPath` is the PER-DATABASE marker, in the per-database spool directory and
+  //     named after `db.filename` (`closePassMarkerFile`). Neither half is optional: a
+  //     throttle shared between two databases lets a sweep of a throwaway copy silence
+  //     the live database's close pass for the whole window. `spoolDir` stays the HOOK
+  //     spool, because that is where the overrun marker each closed task disarms lives.
+  //
+  //     `sweepIncomplete` SKIPS the pass outright when this sweep could not read its
+  //     corpus — budget expiry or an aborted file read. The unread rows are exactly the
+  //     ones that would have moved `MAX(request.ts)`, so a live task can look quiet and
+  //     be closed on a partial corpus, and `healClosedOutcomes` cannot repair it later
+  //     (it only re-checks spend POSTDATING `finalized_at`, and those rows predate it).
   const closePass = runClosePass(db, {
     now,
-    markerDir: boardSpoolDir,
+    markerPath: join(boardSpoolDir, closePassMarkerFile(db.filename)),
     spoolDir: sweepSpoolDir,
     attributed: true,
+    sweepIncomplete: report.budget_exceeded || report.files_incomplete > 0,
     ...(full ? { force: true } : {}),
   });
   report.close_pass = {
     attempted: closePass.attempted,
+    skipped: closePass.skipped,
     candidates: closePass.candidates,
     completed: closePass.completed,
     abandoned: closePass.abandoned,
+    deleted: closePass.deleted,
     blocked: closePass.blocked,
     failed: closePass.failed,
+    awaiting_abandon: closePass.awaiting_abandon,
   };
 
   // 3b. **Heal closed outcomes whose actual has since moved** (§6.2, Craig 2026-07-30).
@@ -1877,15 +1921,25 @@ function sweepSummary(r: SweepReport): string {
         `(${num(r.jobs.n_items_started)}/${num(r.jobs.n_items)} fan items started) — reconcile-only, never a source of truth`,
     );
   }
-  // Printed only when the pass CLOSED something or refused something it looked at: a
-  // due pass that found no candidates is the steady state, and a throttled one did not
-  // even query. Neither is news.
-  if (r.close_pass.completed > 0 || r.close_pass.abandoned > 0 || r.close_pass.failed > 0) {
+  // Printed when the pass CLOSED something, could not, or was skipped because the sweep
+  // itself was incomplete. A due pass that found no candidates is the steady state and a
+  // THROTTLED one did not even query; neither is news. A pass skipped for an incomplete
+  // read IS news — it is the sweep declining to close on a corpus it could not finish.
+  const cp = r.close_pass;
+  if (cp.skipped === "incomplete_sweep") {
     lines.push(
-      `close   ${num(r.close_pass.completed)} completed, ${num(r.close_pass.abandoned)} abandoned ` +
-        `of ${num(r.close_pass.candidates)} candidate(s) — the §6.2 gate was met in full for each` +
-        (r.close_pass.blocked > 0 ? `; ${num(r.close_pass.blocked)} still live, retried next pass` : "") +
-        (r.close_pass.failed > 0 ? `; ${num(r.close_pass.failed)} could not be finalized` : ""),
+      "close   SKIPPED — this sweep did not read its corpus completely, and a truncated read makes a live " +
+        "task look quiet; no task is finalized on partial evidence. The next complete sweep runs it.",
+    );
+  } else if (cp.completed > 0 || cp.abandoned > 0 || cp.deleted > 0 || cp.failed > 0) {
+    lines.push(
+      `close   ${num(cp.completed)} completed, ${num(cp.deleted)} deleted, ${num(cp.abandoned)} abandoned ` +
+        `of ${num(cp.candidates)} candidate(s) — the §6.2 gate was met in full for each` +
+        (cp.blocked > 0 ? `; ${num(cp.blocked)} still live, retried next pass` : "") +
+        (cp.awaiting_abandon > 0
+          ? `; ${num(cp.awaiting_abandon)} silent but inside the abandon safety margin`
+          : "") +
+        (cp.failed > 0 ? `; ${num(cp.failed)} could not be finalized` : ""),
     );
   }
   if (r.promotion.promoted > 0 || r.promotion.started_at_set > 0 || r.promotion.started_at_backdated > 0) {
@@ -3672,7 +3726,12 @@ function renderRetro(r: RetroReport): string {
     // decides what enters the calibration corpus has to be self-reporting: a climbing
     // share is evidence about the QUIESCENCE gate (it is finalizing less of the corpus
     // on its own), which is exactly the kind of drift nobody goes looking for.
-    `  closes bypassing the gate ${pct(q.bypass_share)} of closed tasks — ${q.accepted_closes} on recorded human consent (--accept), ${q.forced_closes} forced`,
+    `  closes not made by a human at a quiet task: ${pct(q.bypass_share)} of closed tasks — ${q.accepted_closes} on recorded human consent (--accept), ${q.forced_closes} forced, ${q.swept_closes} swept on a completion signal, ${q.swept_abandons} swept as ABANDONED`,
+    // The abandoned SHARE is DECISIONS §12's own re-open trigger, so it is printed as a
+    // share rather than left to be divided by eye: past roughly half, the finding is
+    // about the harness's terminal `task_event` not reaching the tasks it should, not
+    // about any one close.
+    `    of the swept ones, ${pct(q.swept_closes + q.swept_abandons > 0 ? q.swept_abandons / (q.swept_closes + q.swept_abandons) : null)} were abandoned (right-censored: a lower bound, never a measurement)`,
     `  unpriced ${pct(q.unpriced_share)} · provisional ${pct(q.provisional_share)} · cross-epoch tasks ${q.cross_epoch_tasks}`,
     `  fork replays ${q.fork_replays} · sidechain replays ${q.sidechain_replays} · compactions ${q.compactions} · spawn_depth>1 ${q.spawn_depth_gt1}`,
     `  dangling agents ${q.dangling_agents} · phase-unmapped ${q.phase_unmapped_agents} · unlabelled workflow agents ${q.unlabeled_wf_agents}`,

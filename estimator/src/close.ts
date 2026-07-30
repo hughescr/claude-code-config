@@ -27,6 +27,7 @@ import { attributeTasks } from "./attribute.ts";
 import { intervalUnion, taskIntervals } from "./burn.ts";
 import { getConfig } from "./db.ts";
 import { PROJECTS_ROOT } from "./discover.ts";
+import { countLiveAgents, liveAgentMaxMin } from "./liveness.ts";
 import { clearOverrunMarker, SPOOL_DIR } from "./spool.ts";
 import { InvariantError, isoNow, TERMINAL_TASK_STATUS } from "./tasks.ts";
 
@@ -257,11 +258,42 @@ export function acceptanceInTranscript(
 
 export type FinalStatus = "completed" | "abandoned" | "deleted" | "reopened";
 
+/**
+ * The gate refused this close — exit `2`, same as its parent, but IDENTIFIABLE.
+ *
+ * A distinct class rather than a `message` a caller matches on. `src/autoclose.ts` has to
+ * tell "the gate said no" (the DESIGNED outcome for a candidate whose session is still
+ * live — counted `blocked`, retried next pass) from "something is actually wrong with
+ * this task" (counted `failed`, and after three attempts alerting). A regex over the
+ * message made that discrimination hostage to the wording of an error string, which is
+ * exactly the kind of coupling that breaks silently the day someone improves the prose.
+ */
+export class QuiescenceError extends InvariantError {
+  constructor(
+    message: string,
+    remedy: string,
+    readonly report: QuiescenceReport,
+  ) {
+    super(message, remedy);
+  }
+}
+
 export interface QuiescenceReport {
   ok: boolean;
   /** Human-readable conditions that FAILED. Empty when `ok`. */
   failing: string[];
   completion_signal: boolean;
+  /**
+   * WHICH terminal status the observed completion signal names, or `null` when there is
+   * none. `'deleted'` is not a synonym for `'completed'`: P1.11's whole point is that a
+   * `TaskUpdate status:"deleted"` is captured because a deleted task must be recorded as
+   * such, and a close pass that folded it into `completed` would launder the one signal
+   * the delete-capture hook exists to preserve into its opposite.
+   *
+   * `'completed'` wins a tie: a task that was completed and later deleted was still
+   * completed, and the actual is a measurement either way.
+   */
+  completion_kind: "completed" | "deleted" | null;
   stale_hours: number | null;
   quiet_minutes: number | null;
   open_turns: number;
@@ -361,7 +393,25 @@ export function livePidsForSessions(sessionIds: readonly string[], root = SESSIO
  * protects a 20.9-hour turn by construction. The quiet period survives as a secondary
  * guard between turns of an ongoing cluster.
  */
-export function quiescence(db: Database, tid: string, now: Date = new Date()): QuiescenceReport {
+export interface QuiescenceOptions {
+  /**
+   * A live-session map computed ONCE by the caller (`liveSessionPids`).
+   *
+   * Condition 4 asks "does any bound session still have a process". Answering it means
+   * a `readdir` of `~/.claude/sessions/` plus a `JSON.parse` and a `kill(0)` per file —
+   * and `src/autoclose.ts` evaluates this gate once per candidate, so an unshared map is
+   * the same directory walk repeated N times per sweep. That is a per-item call in a hot
+   * path, which is a defect rather than a style choice. Absent, the gate reads the
+   * directory itself, so every existing caller is unchanged.
+   */
+  livePids?: Map<string, number[]>;
+}
+export function quiescence(
+  db: Database,
+  tid: string,
+  now: Date = new Date(),
+  opts: QuiescenceOptions = {},
+): QuiescenceReport {
   const failing: string[] = [];
   const quietMin = Number.parseInt(getConfig(db, "quiesce_main_min") ?? "60", 10);
   const quiesceMin = Number.isFinite(quietMin) ? quietMin : 60;
@@ -384,20 +434,67 @@ export function quiescence(db: Database, tid: string, now: Date = new Date()): Q
   if (!sessions.includes(task.anchor_session)) sessions.push(task.anchor_session);
 
   // 1. completion signal OR stale > 48 h.
+  //
+  // **Every signal is bounded below by the latest REOPEN** (Craig, 2026-07-30). A reopen
+  // says the work restarted, and `task_event` is append-only: without the floor, the
+  // event that justified the FIRST close still satisfies arm 1 forever, so a reopened
+  // task became closeable again the moment it went quiet — re-closed by the sweeper on
+  // evidence about a run that had already been finalized once. The floor is
+  // `MAX(finalized_at)` over `final_status='reopened'` revisions; a task that has never
+  // been reopened has no floor and behaves exactly as before.
+  const reopenedAt = db
+    .query<{ ts: string | null }, [string]>(
+      "SELECT MAX(finalized_at) AS ts FROM outcome WHERE tid = ? AND final_status = 'reopened'",
+    )
+    .get(tid)?.ts ?? null;
   const boundTaskNums = db
     .query<{ session_id: string; local_id: string }, [string]>(
       "SELECT session_id, local_id FROM task_alias WHERE tid = ? AND id_kind = 'session_task'",
     )
     .all(tid);
-  let completionSignal = task.status === "pending_verification" || task.status === "completed";
+  // `pending_verification`/`completed` are STATUSES, not events, so they carry no
+  // timestamp to bound — but `est close --status reopened` moves the status back to
+  // `in_progress`, so a reopened task cannot be sitting in either of them anyway.
+  let completionKind: "completed" | "deleted" | null =
+    task.status === "pending_verification" || task.status === "completed" ? "completed" : null;
+  const seenKind = (kind: string): void => {
+    // 'completed' wins a tie: a task completed and later deleted was still completed.
+    if (kind === "completed") completionKind = "completed";
+    else if (completionKind === null && kind === "deleted") completionKind = "deleted";
+  };
+  // Both alias shapes, not one. The `session_task` alias is how a planted `est_tid`
+  // links, and `task_event.tid` is how §3.2 step 6's backfill links the same event once
+  // the alias exists — a task can carry either, and reading only one of them made the
+  // gate's answer depend on which path happened to fire first.
+  //
+  // `julianday()` on both sides of the reopen floor, never a lexicographic compare.
+  // `task_event.ts` comes from a transcript and carries milliseconds; `outcome.finalized_at`
+  // is `isoNow`, seconds. At index 19 `'.' < 'Z'`, so a string compare would read an event
+  // 500 ms AFTER the reopen as being before it — the exact scar src/eta.ts carries for
+  // `run_segment.ended_at`. `COALESCE(…, 0)` is the never-reopened case: `julianday('')` is
+  // NULL, and a NULL comparison would silently exclude every event instead of none.
+  const REOPEN_FLOOR = "julianday(e.ts) > COALESCE(julianday(?), 0)";
   for (const b of boundTaskNums) {
     const ev = db
-      .query<{ n: number }, [string, string]>(
-        "SELECT COUNT(*) AS n FROM task_event WHERE session_id = ? AND task_num = ? AND to_status IN ('completed','deleted')",
+      .query<{ kind: string }, [string, string, string | null]>(
+        `SELECT e.to_status AS kind FROM task_event e
+          WHERE e.session_id = ? AND e.task_num = ? AND e.to_status IN ('completed','deleted')
+            AND ${REOPEN_FLOOR}
+          ORDER BY CASE e.to_status WHEN 'completed' THEN 0 ELSE 1 END LIMIT 1`,
       )
-      .get(b.session_id, b.local_id);
-    if ((ev?.n ?? 0) > 0) completionSignal = true;
+      .get(b.session_id, b.local_id, reopenedAt);
+    if (ev !== null && ev !== undefined) seenKind(ev.kind);
   }
+  const linked = db
+    .query<{ kind: string }, [string, string | null]>(
+      `SELECT e.to_status AS kind FROM task_event e
+        WHERE e.tid = ? AND e.tid IS NOT NULL AND e.to_status IN ('completed','deleted')
+          AND ${REOPEN_FLOOR}
+        ORDER BY CASE e.to_status WHEN 'completed' THEN 0 ELSE 1 END LIMIT 1`,
+    )
+    .get(tid, reopenedAt);
+  if (linked !== null && linked !== undefined) seenKind(linked.kind);
+  const completionSignal = completionKind !== null;
   const lastActivity = db
     .query<{ ts: string | null }, [string]>("SELECT MAX(ts) AS ts FROM request WHERE tid = ?")
     .get(tid)?.ts ?? null;
@@ -448,23 +545,32 @@ export function quiescence(db: Database, tid: string, now: Date = new Date()): Q
     );
   }
 
-  // 4. no live pid among bound sessions.
-  const livePids = livePidsForSessions(sessions);
+  // 4. no live pid among bound sessions. `opts.livePids` lets a batch caller pay for the
+  //    directory walk once instead of once per task — see `QuiescenceOptions`.
+  const livePids =
+    opts.livePids === undefined
+      ? livePidsForSessions(sessions)
+      : sessions.flatMap((s) => opts.livePids?.get(s) ?? []);
   if (livePids.length > 0) failing.push(`live session process(es): ${livePids.join(", ")}`);
 
-  // 5. every bound agent_run terminal.
-  const nonterminal =
-    db
-      .query<{ n: number }, [string]>(
-        "SELECT COUNT(*) AS n FROM agent_run WHERE tid = ? AND started_at IS NOT NULL AND ended_at IS NULL",
-      )
-      .get(tid)?.n ?? 0;
-  if (nonterminal > 0) failing.push(`${nonterminal} bound agent_run(s) have not ended`);
+  // 5. every bound agent_run terminal — bounded by the SAME activity clock P2.1's idle
+  //    suppression uses (`countLiveAgents`, src/liveness.ts; `eta_live_agent_max_min`,
+  //    default 120 min). The arm used to count any run with `started_at IS NOT NULL AND
+  //    ended_at IS NULL`, which is what a live agent looks like AND what §5.6's
+  //    `agent_never_returned` population looks like — 54 such rows on the live corpus,
+  //    49 of them older than six hours. One corpse therefore blocked its task from ever
+  //    being closeable, by a human or by the sweeper, which made the close pass unable
+  //    to close precisely the tasks it exists for (work finished, session gone, nothing
+  //    left to end the run). The clock is last-observed-activity, not `started_at`, so a
+  //    genuinely long delegation is never aged out — only one that stopped emitting.
+  const nonterminal = countLiveAgents(db, { tid }, now, liveAgentMaxMin(db));
+  if (nonterminal > 0) failing.push(`${nonterminal} bound agent_run(s) are still live`);
 
   return {
     ok: failing.length === 0,
     failing,
     completion_signal: completionSignal,
+    completion_kind: completionKind,
     stale_hours: staleHours,
     quiet_minutes: quietMinutes,
     open_turns: openTurns,
@@ -524,6 +630,8 @@ export interface CloseInput {
    * flag family rather than a second mechanism.
    */
   attributed?: boolean;
+  /** Shared live-session map — see {@link QuiescenceOptions.livePids}. */
+  livePids?: Map<string, number[]>;
 }
 
 export interface CloseResult {
@@ -685,7 +793,7 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
   // healed or swept task is O(corpus) work for an answer that cannot have changed since.
   if (input.heal !== true && input.attributed !== true) attributeTasks(db);
 
-  const gate = quiescence(db, input.tid, now);
+  const gate = quiescence(db, input.tid, now, input.livePids === undefined ? {} : { livePids: input.livePids });
   // The acceptance bypasses EVERY arm, the open-turn one included, and that is the
   // point rather than an oversight: consent arrives mid-conversation, so the turn in
   // which Craig says "this is done" is by construction open when the close runs.
@@ -697,9 +805,21 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
   // close that would have passed the gate anyway was not bypassed by anyone.
   const accepted = withAcceptance && !gate.ok;
   if (!gate.ok && !forced && !withAcceptance && input.heal !== true) {
-    throw new InvariantError(
+    // The remedy names what the SWEEPER will do, because since 2026-07-30 it actually
+    // does it (src/autoclose.ts). The old text said "wait for the task to go quiet",
+    // which read as an instruction to poll — and the design's own "leave it for the
+    // sweeper" promise pointed at a component that did not exist. It also has to state
+    // the CONSEQUENCE of doing nothing, or the advice is only half true: a task that
+    // never gets a completion signal is eventually closed `abandoned`, which is
+    // right-censored and therefore preserves no measurement. Relaying real consent is
+    // what keeps the task in the calibration corpus.
+    throw new QuiescenceError(
       `quiescence gate not met for ${input.tid}: ${gate.failing.join("; ")}`,
-      'wait for the task to go quiet; if the human has explicitly accepted completion, relay it verbatim via --accept "<their words>" (records anomaly(accepted_close)). --force is Craig\'s own override at a terminal, never Claude\'s',
+      "do nothing: the sweeper's close pass finalizes quiet tasks by itself, on every sweep, with this same gate — " +
+        "it closes `completed` on a completion signal, or `abandoned` (right-censored, so the actual is only a lower " +
+        'bound) after the no-signal window. If the human has explicitly accepted completion, relay it verbatim via --accept "<their words>" ' +
+        "(records anomaly(accepted_close)) — that is what preserves a real measurement. --force is Craig's own override at a terminal, never Claude's",
+      gate,
     );
   }
 

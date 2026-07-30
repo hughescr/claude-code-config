@@ -36,13 +36,19 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
  *     always refused a premature close with "leave it for the sweeper", and no sweeper
  *     close pass existed — so the population it named (work that finished, session gone,
  *     nobody left to run `est close`) accumulated as `in_progress` forever, contributing
- *     no `outcome` row and therefore nothing to `v_velocity`. Two objects, no row moved:
- *     the partial index `ix_task_event_completed`, which is what makes the pass's
- *     candidate filter one indexed read per open task instead of a lifecycle-table scan
- *     per open task; and the `close_pass_min_interval_min` config seed, which is a
- *     migration step rather than a schema.sql line for the reason v12 documents — P2.0's
- *     key set is CLOSED, so a knob the code reads but `est config set` refuses is exactly
- *     the asymmetry the closed set exists to prevent.
+ *     no `outcome` row and therefore nothing to `v_velocity`. One index and four config
+ *     seeds, no row moved. The partial index `ix_task_event_completed` covers the LINKED
+ *     TERMINAL lifecycle rows — `completed` AND `deleted`, because §6.2's gate has always
+ *     read both and P1.11's delete-capture hook exists so a deletion is RECORDED rather
+ *     than laundered into an abandon — and is what makes the pass's candidate filter one
+ *     indexed read per open task instead of a lifecycle-table scan per open task. The
+ *     seeds are `close_pass_min_interval_min` (throttle), `close_abandon_after_h` (the
+ *     no-signal abandon is held back far longer than the gate's 48 h permission
+ *     threshold, because an auto-abandon permanently seals a task's attribution window),
+ *     `close_fail_alert_after` and `close_blocked_after_h`. They are migration steps
+ *     rather than schema.sql lines alone for the reason v12 documents — P2.0's key set is
+ *     CLOSED, so a knob the code reads but `est config set` refuses is exactly the
+ *     asymmetry the closed set exists to prevent.
  * 13 — ONE partial index, `ix_task_event_unlinked` (§3.2 step 6, Craig 2026-07-30). The
  *     sweep now links `task_event` rows to the tasks their planted `est_tid` names, and
  *     the linking UPDATE selects on `tid IS NULL` — a predicate no ordinary index can
@@ -953,10 +959,13 @@ CREATE INDEX IF NOT EXISTS ix_task_event_unlinked ON task_event(session_id, task
     // is CLOSED — `est config get/set` refuses a key that is not SEEDED — so a database
     // that never re-ran schema.sql would have a live default nobody could see or change.
     sql: `
-CREATE INDEX IF NOT EXISTS ix_task_event_completed ON task_event(tid)
-  WHERE tid IS NOT NULL AND to_status = 'completed';
+CREATE INDEX IF NOT EXISTS ix_task_event_completed ON task_event(tid, ts, to_status)
+  WHERE tid IS NOT NULL AND to_status IN ('completed','deleted');
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('close_pass_min_interval_min', '10');
+  ('close_pass_min_interval_min', '10'),
+  ('close_abandon_after_h',       '168'),
+  ('close_fail_alert_after',      '3'),
+  ('close_blocked_after_h',       '24');
 `,
   },
 ];

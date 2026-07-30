@@ -958,6 +958,30 @@ describe("est open — the near-duplicate warning", () => {
     expect(r.err).toBe("");
   });
 
+  test("an EXACT repeat of a terse subject warns, even though it tokenises to nothing", async () => {
+    // The token rule strips stopwords and fragments under three characters, so a terse
+    // imperative — the exact shape of a resubmission — reduces to the empty set and
+    // scores 0 against an identical copy of itself. That is the one case the overlap
+    // rule structurally cannot see, and it is not a rare one.
+    expect(subjectTokens("fix all the CI").size).toBe(0);
+
+    const first = await h.cli(
+      ...openArgs({ subject: "fix all the CI" }), "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(first.code).toBe(0);
+    const firstTid = first.json<{ tid: string }>().tid;
+
+    // Re-typed with different capitalisation and punctuation: the same words.
+    const second = await h.cli(
+      ...openArgs({ subject: "Fix all the CI!" }), "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(second.code).toBe(0);
+    const dups = second.json<{ near_duplicates: { tid: string; overlap: number }[] }>().near_duplicates;
+    expect(dups.map((d) => d.tid)).toEqual([firstTid]);
+    expect(dups[0]!.overlap).toBe(1);
+    expect(second.err).toContain(firstTid);
+  });
+
   test("the overlap rule is the overlap COEFFICIENT, not Jaccard", () => {
     // The incident shape: a short goal restated as a longer one. Jaccard scores this
     // ~0.3 and slips under any threshold worth having; min-normalised overlap sees it.

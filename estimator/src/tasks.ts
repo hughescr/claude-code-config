@@ -519,6 +519,20 @@ const SUBJECT_STOPWORDS: ReadonlySet<string> = new Set([
  * above. Exported because the test suite asserts on the OVERLAP rule rather than on a
  * warning string, and the rule is only meaningful if both sides tokenise identically.
  */
+/**
+ * A subject reduced to what two people would call "the same words": lowercased, with
+ * every run of non-alphanumerics collapsed to one space and the ends trimmed.
+ *
+ * Deliberately much weaker than {@link subjectTokens} — it drops nothing. It exists for
+ * the one case the token rule structurally cannot see: a subject made entirely of short
+ * or common words tokenises to the empty set, so its overlap with anything (including an
+ * identical copy of itself) is 0. Those are precisely the terse subjects a resubmission
+ * repeats verbatim.
+ */
+export function normalizeSubject(subject: string): string {
+  return subject.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
 export function subjectTokens(subject: string): Set<string> {
   const out = new Set<string>();
   for (const raw of subject.toLowerCase().split(/[^a-z0-9]+/)) {
@@ -595,7 +609,12 @@ export function findNearDuplicates(
   subject: string,
 ): NearDuplicate[] {
   const mine = subjectTokens(subject);
-  if (mine.size === 0) return [];
+  const mineExact = normalizeSubject(subject);
+  // An empty token set is NOT "nothing to compare": a terse subject ("fix it", "ship
+  // the CI job") tokenises to nothing after the stopword and length filters, and those
+  // are exactly the subjects a resubmission repeats VERBATIM. The exact-match arm below
+  // is what covers them, so the early return is on having neither signal available.
+  if (mine.size === 0 && mineExact === "") return [];
   return db
     .query<{ tid: string; subject: string; status: string }, [string]>(
       `SELECT t.tid AS tid, s.subject AS subject, t.status AS status
@@ -604,7 +623,17 @@ export function findNearDuplicates(
           AND t.status IN ('estimating','in_progress','pending_verification')`,
     )
     .all(sessionId)
-    .map((r) => ({ ...r, overlap: subjectOverlap(mine, subjectTokens(r.subject)) }))
+    .map((r) => ({
+      ...r,
+      // An identical normalized subject is 1.0 BY DEFINITION, whatever the tokeniser
+      // makes of it. Two open tasks in one session with the same subject is the least
+      // ambiguous form of the incident this warning exists for, and it was the one case
+      // the token rule could not see.
+      overlap:
+        normalizeSubject(r.subject) === mineExact && mineExact !== ""
+          ? 1
+          : subjectOverlap(mine, subjectTokens(r.subject)),
+    }))
     .filter((r) => r.overlap >= NEAR_DUPLICATE_MIN_OVERLAP)
     .sort((a, b) => b.overlap - a.overlap);
 }
@@ -801,7 +830,13 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
     ) {
       throw new InvariantError(
         `tid ${tid} is finalized (${terminal.final_status}); estimates cannot be appended to a closed task`,
-        "reopen it first with `est close <tid> --status reopened`, which appends a new outcome revision rather than editing the old one",
+        // The remedy names the exact command, because since 2026-07-30 the SWEEPER can
+        // be what closed it — `abandoned` after a week of silence, with nobody present
+        // to remember doing it. Someone resuming that work meets this refusal with no
+        // idea why the task is closed, and the road back has to be signposted rather
+        // than inferred: until the reopen lands, the resumed work attributes to nothing.
+        `run \`est close ${tid} --status reopened\` first — that APPENDS a new outcome revision (nothing is edited or lost) and re-opens the task's attribution window, so the resumed work is metered. ` +
+          `If the sweeper closed it as abandoned after a week of silence, this is exactly the intended way back; \`est census\` shows the anomaly(swept_abandon) row that recorded it`,
       );
     }
 

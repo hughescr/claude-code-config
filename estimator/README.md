@@ -68,12 +68,12 @@ Phase 0 collects; **Phase 1 is the estimation loop** and is what the verbs below
 | Verb | What it does |
 |---|---|
 | `est refclass --text "<subject>" [--kind <k>] [--fanout <n>] [--full]` | The reference class, **shown before any number is stated** — top-5 FTS5 matches among completed tasks with their raw band, actual and velocity, plus one bucket line. Read-only, takes no lock, capped at 8,000 characters, and **always exits 0**: an empty reference class is a valid answer. Below 10 comparable tasks it prints the raw actual-cost distribution and **no multiplier**. `--fanout` narrows to a comparable agent fan-out as a **tolerance band** (half to double, minimum ±2), never equality, and falls back to the unfiltered class — saying so — rather than manufacturing an empty one. |
-| `est open --kind <k> --subject <t> --raw-p50 <n> --raw-p90 <n> --exp-…` | Mint a task (uuidv7) or append a re-estimate with `--tid <tid> --reason refinement\|scope_change\|recalibration`. Applies the bucket multiplier at write time, snapshots `ref_model`/`estimand`/`price_epoch`, and prints the band plus the exact `TaskUpdate` call that plants `est_tid`. `--continue <tid>` is sugar for bind + refinement. |
+| `est open --kind <k> --subject <t> --raw-p50 <n> --raw-p90 <n> --exp-…` | Mint a task (uuidv7) or append a re-estimate with `--tid <tid> --reason refinement\|scope_change\|recalibration`. Applies the bucket multiplier at write time, snapshots `ref_model`/`estimand`/`price_epoch`, and prints the band plus the exact `TaskUpdate` call that plants `est_tid`. `--continue <tid>` is sugar for bind + refinement. **Near-duplicate warning** (2026-07-30): if this session already has an *open* task whose subject overlaps, the mint still happens — exit `0`, observe-first, nothing written — but a warning goes to **stderr** naming the existing tid, and `--json` carries `near_duplicates: [{tid, subject, status, overlap}]` (present, usually `[]`). The rule is the overlap **coefficient** over normalized content tokens (threshold 0.5), plus an always-warn arm for an exact normalized subject match, which is what catches terse resubmissions that tokenise to nothing. It exists because two tasks in one session split that session's spend between them (§5.4) and *both* actuals come out wrong: the two correct responses are `est open --tid <existing> --reason refinement` (same goal) or `est bind <existing>` (delegated work). |
 | `est block <tid> --phase <i> --title <t> --p50 <n> --p90 <n>` | One estimate per declared workflow phase, **before the launch**. `--phase` is **0-based** — the `phases[]` index, not the 1-based `workflowProgress.phaseIndex`. |
 | `est bind <tid> [--session] [--task] [--run] [--agent]` | Attach a harness identity to a tid. Idempotent; an alias already bound to a *different* tid is a conflict, never a silent re-point. |
 | `est scope <tid> --reason <t> [--subject] [--description] [--dod]` | Append a scope revision with a stored diff. A revision that changes nothing is refused — that is what stops `--reason scope_change` being manufacturable. |
 | `est burn [<tid>] [--session <sid>] [--refresh]` | Consumption against the band. Read-only, never sweeps, never locks, **always exits 0**; `--json` is the statusline contract (one indexed `burn_cache` row, read-only connection, 50 ms timeout, well-formed empty result on every failure). Phase 2 (P2.2) adds two objects to that payload, additively: `check_back` — the forecast of Claude-**active** time to the next human-input boundary, **session**-scoped and **never token-derived** — and `compute`, the API-time clock with the coverage share it is a fraction of. `check_back` has three shapes, all well-formed at exit 0: a band; `{"waiting_on_input": true}` when Claude is **blocked on the human** — no *fresh* live agent, no *fresh* open workflow, newest turn closed — so there is nothing to forecast (an unfinished delegation stops counting once it has been silent for `eta_live_agent_max_min`, default 120 min, because "started and never ended" is also what a dead agent looks like); or `null`, with the key still present, when the session has no open segment or the corpus is thinner than `eta_min_fit`. Craig's 2026-07-30 amendment adds three more additive fields: `task_attrib` (`active` | `quiet` | `none`), `pending_close`, and `active_tid` — whether the SESSION's current activity is being metered against a task at all, how many bound open tasks are awaiting close, and WHICH task the `active` state is about. The state is session-wide and reuses attribution's own retirement predicate (`attr_stale_minutes` **and** `attr_stale_turns`, src/attribute.ts), so the statusline can never disagree with the ledger it reports on; `active_tid` matters on an explicit `est burn <tid>`, where the session can be metering a different task than the one named. |
-| `est close <tid> [--status …] [--accept "<quote>"] [--force]` | Finalize **by arithmetic**. No flag accepts a token count, a cost or a velocity, and none ever will. Blocks on the quiescence gate unless bypassed, and both bypasses are recorded. `--accept` is the **consent** path (Craig, 2026-07-30): the human does not know this CLI exists, so when they explicitly accept completion in conversation, their words are quoted verbatim into `anomaly(accepted_close)` — BENIGN, because it carries provenance rather than losing it — and the gate is bypassed, the accepting conversation's own open turn included. It is the only bypass an agent may use. `--force` is the raw override at a terminal, records `anomaly(forced_close)`, and stays the user's tool alone. A reopen is a new outcome revision, never an edit. **You usually do not need this verb**: since 2026-07-30 the sweeper closes quiet tasks by itself — see *the sweeper close pass* below — and the gate's own "leave the close to the sweeper" refusal is now a real instruction rather than a description of something that did not exist. |
+| `est close <tid> [--status …] [--accept "<quote>"] [--force]` | Finalize **by arithmetic**. No flag accepts a token count, a cost or a velocity, and none ever will. Blocks on the quiescence gate unless bypassed, and both bypasses are recorded. `--accept` is the **consent** path (Craig, 2026-07-30): the human does not know this CLI exists, so when they explicitly accept completion in conversation, their words are quoted verbatim into `anomaly(accepted_close)` — BENIGN, because it carries provenance rather than losing it — and the gate is bypassed, the accepting conversation's own open turn included. It is the only bypass an agent may use. `--force` is the raw override at a terminal, records `anomaly(forced_close)`, and stays the user's tool alone. A reopen is a new outcome revision, never an edit. **You usually do not need this verb**: since 2026-07-30 the sweeper closes quiet tasks by itself — see *the sweeper close pass* below — and the gate's exit-`2` remedy now opens with **"do nothing"** rather than describing a sweeper that did not exist. It also states the consequence, because "do nothing" is only half the advice: a task that never gets a completion signal is eventually closed `abandoned`, which is right-censored and preserves no measurement. `--status reopened` is the way back from that, and the refusal `est open --tid` gives on a finalized task names it. |
 | `est board [--status <col>] [--limit <n>]` \| `est board --html [--md] [--out <dir>]` | Terminal/JSON read model: Estimating · In Progress · Pending Verification · Done (7d) · Abandoned. Phase 2 (P2.7) adds the file renderer — self-contained `board.html`/`board.md`, written atomically (render to `.tmp`, `fsync`, `rename()`), regenerated at the end of a sweep that **changed** a `task` / `estimate` / `outcome` / `burn_cache` row (and then only if `board_min_interval_s` has elapsed — the change is the first gate, the throttle the second), and on demand via `--html`/`--md`, which bypass both. A render failure never touches the previous good file, never fails the sweep, and **exits `0` either way**: it is recorded as `anomaly(board_render_failed)`, because a failure only one operator's terminal ever saw is a failure the alerting cannot see. |
 | `est recon [--window 7d\|<iso>/<iso>] [--source <axis>…] [--certify] [--dry-run]` | Phase 2 (P2.6): **our** numbers against **Anthropic-computed** ones, on four axes that fail independently — USD, tokens, active seconds and request count — with the OTEL↔transcript join coverage beside them, because a small delta on a small join is agreement with nothing. Refuses to sum a window that mixes DELTA and CUMULATIVE metric points. Exits `3` when an axis passes `recon_alert_pct` and writes `recon_mismatch`. `--certify` evaluates the criterion that retires the statusline's `[unvalidated]` marker (four consecutive weeks inside `unvalidated_max_delta_pct` at or above `unvalidated_min_join_pct`); retirement is **rolling**, so any later breaching week clears it again. |
 | `est segments [--session <sid>] [--gap <min>] [--since <iso>] [--limit <n>]` | Phase 2 (P2.1): the **run segments** the check-back forecast is fitted on — start, active, busy, max concurrency, turns, agents, the gaps either side, the terminator and the dominant task. Read-only, never writes, never locks, **always exits 0**. `--gap` recomputes the whole partition at another threshold and **persists nothing**, which is how `segment_gap_min` gets fitted by evidence instead of by taste: the measured p50 segment length moves about tenfold across plausible values of it. |
@@ -112,32 +112,70 @@ row, so they contribute nothing to `v_velocity`: the calibration corpus silently
 that ended the ordinary way instead of the ceremonial one.
 
 **Candidate filter first, gate second.** One indexed query answers *arm 1 of the gate and nothing
-else* — does this open task have a **linked completion signal** (a `task_event` whose `tid` this
-database resolved, `to_status = 'completed'`; served by the partial index
-`ix_task_event_completed`), or has it been silent past `STALE_CLOSE_HOURS` (48; served by
-`ix_req_tid`). Only its hits pay for the five-condition gate, which is then evaluated **in full**
-through the ordinary `closeTask` path: no `--force`, no `--accept`, no private shortcut. A
-candidate whose session is still live, whose newest turn is open, or whose delegated agents have
-not returned stays exactly where it was, and the next pass asks again.
+else* — three ways a task qualifies:
 
-**The ruling follows the evidence.** A signal-bearing candidate closes `completed`. A silent one
-closes **`abandoned`** — Craig's ruling: silence means the data is not calibration-grade, and
-`abandoned` is `censored = 1`, so the actual enters the corpus as the lower bound it genuinely is
-rather than as a completion nobody observed. If that is wrong, `est close <tid> --status reopened`
-corrects it by appending, like everything else here.
+- a **linked terminal signal**: a `task_event` whose `tid` this database resolved, with
+  `to_status IN ('completed','deleted')`, recorded *after* the task's latest reopen (served by the
+  partial index `ix_task_event_completed`);
+- **`status = 'pending_verification'`**, unconditionally — the gate already treats that status as a
+  completion signal in its own right (the harness said "done, awaiting check"), so a filter that
+  made it wait would contradict the gate it is filtering for;
+- **silence past `STALE_CLOSE_HOURS`** (48; served by `ix_req_tid`).
+
+Only its hits pay for the five-condition gate, which is then evaluated **in full** through the
+ordinary `closeTask` path: no `--force`, no `--accept`, no private shortcut. A candidate whose
+session is still live, whose newest turn is open, or whose delegated agents are still live stays
+exactly where it was, and the next pass asks again. A candidate the gate has refused continuously
+for `close_blocked_after_h` (24) records the BENIGN `anomaly(close_blocked)` naming the arm, once.
+
+**The GATE decides the status, never the filter.** The filter is an optimisation and is allowed to
+be conservative; a ruling is not. The close status comes from the gate's own `completion_kind`,
+computed over *both* alias shapes and both terminal statuses:
+
+- a `completed` signal → **`completed`**;
+- a `deleted` signal → **`deleted`**. P1.11's delete-capture hook exists so a
+  `TaskUpdate status:"deleted"` survives a process death; folding it into anything else would
+  launder the one signal that hook was built to preserve;
+- no signal at all → **`abandoned`**, but only after `close_abandon_after_h`.
+
+**The abandon arm has its own, much longer clock.** `STALE_CLOSE_HOURS` (48) is the gate's
+*permission* threshold. `close_abandon_after_h` (**168** — seven days) answers a different
+question: may this be closed *as a failure*, on no evidence either way. An auto-abandon permanently
+seals the task's attribution window, so a task left quiet over a weekend would otherwise be
+abandoned by Monday's cron and every hour of resumed work would land unattributed. Craig's ruling
+stands underneath the margin — silence means the data is not calibration-grade, and `abandoned` is
+`censored = 1`, so the actual enters the corpus as the lower bound it genuinely is — but the road
+back is signposted: `est close <tid> --status reopened` appends a correction and re-opens the
+attribution window, and the refusal `est open --tid` gives on a finalized task names that command.
 
 **Provenance.** `outcome` has no "who closed this" column and the pass does not add one: the
 provenance mechanism for a close is already the `anomaly` ledger (`forced_close` names nobody,
-`accepted_close` quotes the human). A swept close writes `anomaly(kind='swept_close', tid=…)` in
-the same transaction — **BENIGN**, because the sweeper doing its documented job on every cron leg
-must not exit 3.
+`accepted_close` quotes the human). A swept close writes one row in the same transaction —
+`swept_close` (**BENIGN**: the sweeper doing its documented job on every cron leg must not exit 3)
+or `swept_abandon` (**ALERTING**: an abandon preserves no measurement and seals a window, it is
+rare by construction, and it is the one a human must be told about). Three failed attempts on one
+task raise the ALERTING `close_failed`. `est retro`'s data-quality panel counts both swept arms and
+prints the abandoned *share*, which is DECISIONS §12's own re-open trigger.
 
-**Throttle.** `close_pass_min_interval_min` (config, default **10**) gates the pass on an `mtime`
-check of a `.closepass` marker held **per database** — the same mechanism `.board` uses and for the
-same reason a shared one would be wrong. A throttled sweep runs no query at all. `est backfill`
-ignores the marker: a deliberate full rebuild should not be silenced by one a hook stamped ninety
-seconds ago. `est sweep --json` reports the pass as `close_pass: {attempted, candidates, completed,
-abandoned, blocked, failed}`.
+**Throttle, and when it does not run at all.** `close_pass_min_interval_min` (config, default
+**10**) gates the pass on an `mtime` check of a `.closepass.<db>` marker keyed to the database's own
+path — not merely to a directory, because `EST_SPOOL_DIR` is per-installation and sweeping a
+throwaway `copy.db` must not silence the live database's close pass. A throttled sweep runs no
+query at all. `est backfill` ignores the marker. And the pass is **skipped entirely** when the sweep
+could not read its corpus completely (budget expiry, or a file read that aborted before EOF): the
+unread rows are exactly the ones that would have moved `MAX(request.ts)`, so a live task could look
+quiet and be closed on partial evidence — and `healClosedOutcomes` cannot repair that later, since
+it only re-checks spend *postdating* `finalized_at`. That skip does not stamp the marker, so the
+next complete sweep runs immediately. `est sweep --json` reports
+`close_pass: {attempted, skipped, candidates, completed, deleted, abandoned, blocked, failed,
+awaiting_abandon}`.
+
+**What the first sweep after landing this will do.** It closes the existing quiet, signal-bearing
+tasks — every open task carrying a terminal `task_event` that passes the gate becomes `completed`
+(or `deleted`) in one pass, which is a burst of `swept_close` rows and a one-off jump in the number
+of scored outcomes. It will **not** abandon anything that has been silent for less than a week, and
+`est sweep --json`'s `awaiting_abandon` is the count sitting in that margin. Run `est census`
+afterwards: `swept_abandon` is alerting, so a sweep that abandons anything exits `3` and says so.
 
 ### `est census`
 

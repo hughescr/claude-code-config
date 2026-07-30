@@ -86,14 +86,38 @@ export const BOARD_MARKER = ".board";
 /**
  * P1.7's sweeper close-pass throttle marker (Craig 2026-07-30), declared here for the
  * same reason `.board` is: `pruneMarkers` has to recognise every name written into this
- * directory. `src/autoclose.ts` writes and stats it; it re-exports this constant rather
- * than declaring a second one.
+ * directory. `src/autoclose.ts` writes and stats it; it re-exports this prefix and
+ * {@link closePassMarkerFile} rather than declaring a second copy.
  *
- * ONE file, like `.microsweep` and for the same reason: every hook fire in the machine
- * spawns the SAME `est sweep`, so a per-session window would let N sessions run N close
- * passes inside one interval — the fan-out the throttle exists to collapse.
+ * **Per DATABASE, not per directory** — the suffix is what makes that true, and it is
+ * the one place this marker differs from `.microsweep` and `.board`. One file per
+ * session would be the fan-out the throttle exists to collapse (every hook fire spawns
+ * the SAME `est sweep`), but one file per DIRECTORY is worse in the other direction:
+ * `EST_SPOOL_DIR` is per-installation, so a live `estimator.db` and a `copy.db` someone
+ * is poking at share a spool, and sweeping the copy would silence the live database's
+ * close pass for the whole window — leaving real tasks open with nothing saying why.
+ * `.board` gets away with a bare name only because `runSweep` hands it a db-relative
+ * directory computed WITHOUT the environment; this marker carries its identity in the
+ * filename so it is correct no matter which directory it lands in.
  */
 export const CLOSE_PASS_MARKER = ".closepass";
+
+/**
+ * The marker filename (not path) for one database: `.closepass.<8 hex of the db path>`.
+ *
+ * A hash rather than the path itself because a path is not a filename — it has
+ * separators, it is long, and two of them can differ only past `NAME_MAX`.
+ * `Bun.hash` is not cryptographic and does not need to be: the only property required
+ * is that two DIFFERENT databases get different names, and a 32-bit prefix over the
+ * handful of database files that ever coexist on one machine is far past sufficient.
+ * The input is the caller's already-resolved path, so a caller that wants two spellings
+ * of one file to agree must resolve it (`runSweep` uses `db.filename`, which SQLite
+ * itself canonicalises).
+ */
+export function closePassMarkerFile(dbPath: string): string {
+  const h = (BigInt(Bun.hash(dbPath)) & 0xffffffffn).toString(16).padStart(8, "0");
+  return `${CLOSE_PASS_MARKER}.${h}`;
+}
 
 /** Filesystem-safe form of an id used inside a marker filename. */
 export function sanitizeForFilename(id: string): string {
@@ -439,11 +463,20 @@ export const OVERRUN_MARKER_TTL_MS = 30 * 24 * 60 * 60 * 1000;
  */
 export const BOARD_MARKER_TTL_MS = 24 * 60 * 60 * 1000;
 /**
- * The `.closepass` marker is re-stamped by every close pass that actually ran, so one
- * older than this belongs to an estimator nobody has swept in a day. Reaping it costs
- * exactly one un-throttled candidate query on the next sweep — the same "cheapest
- * possible way to be wrong" the board marker is reaped by, and the query is one indexed
- * read per open task.
+ * A `.closepass.<db>` marker is re-stamped by every close pass that actually ran, so one
+ * older than this belongs to a database nobody has swept in a day — most often a
+ * throwaway copy whose marker would otherwise sit in the spool forever, since the name
+ * carries a hash nothing else will ever reuse. Reaping it costs exactly one un-throttled
+ * candidate query on the next sweep of that database, which is the cheapest possible way
+ * to be wrong.
+ *
+ * NOTE ON WHO REAPS IT: `pruneMarkers` runs against the sweep's HOOK spool
+ * (`drainSpool`), while `runSweep` writes this marker into the per-database directory
+ * `<dirname(db.filename)>/spool`. In production those are the same directory and the
+ * marker is reaped normally; where `EST_SPOOL_DIR` points elsewhere they diverge, and a
+ * stale marker for an abandoned database is then left behind. That is stated rather than
+ * papered over: it is one ~10-byte file per database that stopped being swept, and
+ * teaching the pruner to walk a second directory would give it two owners.
  */
 export const CLOSE_PASS_MARKER_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -474,10 +507,11 @@ export function pruneMarkers(dir: string = SPOOL_DIR, now: Date = new Date()): n
       // form is `writeAtomic`'s staging file for the marker itself, left behind only by
       // a crash between the write and the rename.
       ttl = BOARD_MARKER_TTL_MS;
-    } else if (name === CLOSE_PASS_MARKER) {
-      // Same contract as `.board` above: the pruner learns the name so the marker
-      // cannot leak. No `.tmp.` sibling — only the mtime is ever read, so the writer
-      // is a plain `writeFileSync` and there is no staging file to reap.
+    } else if (name === CLOSE_PASS_MARKER || name.startsWith(`${CLOSE_PASS_MARKER}.`)) {
+      // Same contract as `.board` above: the pruner learns the name so the marker cannot
+      // leak. The `.` form is the per-database suffix (`closePassMarkerFile`); the bare
+      // form is a pre-suffix leftover. No `.tmp.` sibling — only the mtime is ever read,
+      // so the writer is a plain `writeFileSync` and there is no staging file to reap.
       ttl = CLOSE_PASS_MARKER_TTL_MS;
     } else {
       continue;

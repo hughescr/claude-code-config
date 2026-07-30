@@ -997,10 +997,11 @@ describe("schema migration", () => {
    * a config-seeding step carries: the key must land where `est config set` can see it,
    * and a value Craig has already tuned must survive the migration untouched.
    */
-  test("a v13 database gains the close-pass index and seed, and matches a fresh file exactly", () => {
+  test("a v13 database gains the close-pass index and seeds, and matches a fresh file exactly", () => {
     db.exec(`
       DROP INDEX ix_task_event_completed;
-      DELETE FROM config WHERE k = 'close_pass_min_interval_min';
+      DELETE FROM config WHERE k IN ('close_pass_min_interval_min','close_abandon_after_h',
+                                     'close_fail_alert_after','close_blocked_after_h');
       UPDATE config SET v = '13' WHERE k = 'schema_version';
     `);
     const path = join(dir, "estimator.db");
@@ -1008,9 +1009,15 @@ describe("schema migration", () => {
 
     db = openDb({ path }); // migrates on open
     expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
-    expect(
-      db.query<{ v: string }, []>("SELECT v FROM config WHERE k='close_pass_min_interval_min'").get()?.v,
-    ).toBe("10");
+    const seed = (k: string): string | undefined =>
+      db.query<{ v: string }, [string]>("SELECT v FROM config WHERE k = ?").get(k)?.v;
+    expect(seed("close_pass_min_interval_min")).toBe("10");
+    // The abandon window is a SEPARATE, much longer clock than the gate's 48 h
+    // permission threshold — an auto-abandon seals a task's attribution window, so it
+    // gets a margin the permission threshold does not need.
+    expect(seed("close_abandon_after_h")).toBe("168");
+    expect(seed("close_fail_alert_after")).toBe("3");
+    expect(seed("close_blocked_after_h")).toBe("24");
 
     const freshDir = mkdtempSync(join(tmpdir(), "estimator-schema-v14-"));
     const fresh = openDb({ path: join(freshDir, "estimator.db") });
@@ -1037,13 +1044,28 @@ describe("schema migration", () => {
       .join(" | ");
     expect(plan).toContain("ix_task_event_completed");
     expect(plan).not.toMatch(/SCAN task_event(?! USING)/);
+
+    // The index covers BOTH terminal statuses. §6.2's gate has always read both, and
+    // P1.11's delete-capture hook exists so a `TaskUpdate status:"deleted"` is RECORDED
+    // — an index that saw only completions would make the close pass blind to every
+    // captured deletion, which would then reach it via the staleness arm and be filed
+    // `abandoned`: the exact laundering that hook exists to prevent.
+    const ddl =
+      db
+        .query<{ sql: string }, []>(
+          "SELECT sql FROM sqlite_master WHERE name = 'ix_task_event_completed'",
+        )
+        .get()?.sql ?? "";
+    expect(ddl).toContain("'completed'");
+    expect(ddl).toContain("'deleted'");
   });
 
-  test("migration rule 2: a tuned close_pass_min_interval_min survives the v14 step", () => {
+  test("migration rule 2: a tuned close-pass knob survives the v14 step", () => {
     db.exec(`
       DROP INDEX ix_task_event_completed;
-      UPDATE config SET v = '90' WHERE k = 'close_pass_min_interval_min';
-      UPDATE config SET v = '13' WHERE k = 'schema_version';
+      UPDATE config SET v = '90'  WHERE k = 'close_pass_min_interval_min';
+      UPDATE config SET v = '720' WHERE k = 'close_abandon_after_h';
+      UPDATE config SET v = '13'  WHERE k = 'schema_version';
     `);
     const path = join(dir, "estimator.db");
     db.close();
@@ -1051,9 +1073,10 @@ describe("schema migration", () => {
     expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
     // `INSERT OR IGNORE`, not `INSERT OR REPLACE`: a migration never restates a value a
     // human has already set.
-    expect(
-      db.query<{ v: string }, []>("SELECT v FROM config WHERE k='close_pass_min_interval_min'").get()?.v,
-    ).toBe("90");
+    const seed = (k: string): string | undefined =>
+      db.query<{ v: string }, [string]>("SELECT v FROM config WHERE k = ?").get(k)?.v;
+    expect(seed("close_pass_min_interval_min")).toBe("90");
+    expect(seed("close_abandon_after_h")).toBe("720");
   });
 
   test("the v8 step lands on a file that already has the shape and only lacks the marker", () => {

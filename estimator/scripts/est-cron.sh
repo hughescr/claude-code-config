@@ -43,7 +43,14 @@ esac
 
 log() { printf '%s est-cron: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 
+# FIRST failure wins. Every leg after the sweep called `rc=$leg_rc` unconditionally, so a
+# later leg's code overwrote an earlier failure and the script exited naming the wrong
+# one — and the sweep is the system, where the others are checks on it or housekeeping
+# around it. A diagnosis that points at the wrong leg is worse than a bare non-zero.
 rc=0
+fail() {
+  if [ "$rc" -eq 0 ]; then rc="$1"; fi
+}
 
 # --- daily: sweep -----------------------------------------------------------
 log "sweep (budget $SWEEP_BUDGET)"
@@ -53,7 +60,7 @@ case "$sweep_rc" in
   0) ;;
   3) log "sweep recorded anomalies or hit its budget (exit 3) — expected, see \`est census\`" ;;
   4) log "sweep lock held by a live session (exit 4) — skipped, the next run finishes the job" ;;
-  *) log "sweep FAILED (exit $sweep_rc)"; rc=$sweep_rc ;;
+  *) log "sweep FAILED (exit $sweep_rc)"; fail "$sweep_rc" ;;
 esac
 
 # --- daily: recon ------------------------------------------------------------
@@ -85,7 +92,7 @@ case "$recon_rc" in
   0) log "recon ok" ;;
   3) log "recon recorded an axis breach (exit 3) — expected while [unvalidated] stands, see \`est recon --dry-run\`" ;;
   4) log "recon lock held by a live session (exit 4) — skipped, tomorrow's run takes the point" ;;
-  *) log "recon FAILED (exit $recon_rc)"; rc=$recon_rc ;;
+  *) log "recon FAILED (exit $recon_rc)"; fail "$recon_rc" ;;
 esac
 
 # --- weekly: is it due? -----------------------------------------------------
@@ -123,7 +130,7 @@ if weekly_due; then
     date +%s > "$WEEKLY_STAMP"
   else
     log "backup FAILED (exit $backup_rc) — weekly leg not stamped, it will retry on the next run"
-    rc=$backup_rc
+    fail "$backup_rc"
   fi
 else
   log "weekly leg not due"

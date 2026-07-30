@@ -389,16 +389,26 @@ CREATE TABLE task_event (           -- lifecycle from transcript toolUseResult (
 CREATE INDEX ix_task_event_unlinked ON task_event(session_id, task_num)
   WHERE tid IS NULL AND task_num <> '';
 -- v14: the mirror image of the index above, for the SWEEPER CLOSE PASS (src/autoclose.ts).
--- Its candidate filter asks, once per open task, "is there a LINKED completion signal for
+-- Its candidate filter asks, once per open task, "is there a LINKED terminal signal for
 -- this tid" -- and `tid` had no index at all, so the answer cost a scan of the whole
 -- lifecycle table per open task, on the micro-sweep's path. PARTIAL over exactly the rows
--- that can ever answer yes: linked, and `to_status='completed'`. That is a handful of rows
--- per finished task rather than every transition ever recorded, and it GROWS only with
--- completions (where ix_task_event_unlinked shrinks with them). CLOSE_PASS_CANDIDATE_SQL
--- repeats both predicates verbatim so the planner can use it; test/schema.test.ts asserts
--- the plan rather than the prose.
-CREATE INDEX ix_task_event_completed ON task_event(tid)
-  WHERE tid IS NOT NULL AND to_status = 'completed';
+-- that can ever answer yes: linked, and terminal. That is a handful of rows per finished
+-- task rather than every transition ever recorded, and it GROWS only with terminations
+-- (where ix_task_event_unlinked shrinks with them).
+--
+-- BOTH terminal statuses, not just 'completed'. §6.2's gate has always read
+-- `to_status IN ('completed','deleted')` as its completion signal, and P1.11's
+-- delete-capture hook exists precisely so a deletion is RECORDED rather than lost -- an
+-- index that saw only completions would have made the close pass blind to every captured
+-- deletion, so the pass would have reached those tasks only via the staleness arm and
+-- filed them as `abandoned`, laundering the one signal that hook exists to preserve into
+-- its opposite. `ts` is in the index because the candidate filter bounds every signal
+-- below by the task's latest reopen; `to_status` because the filter carries the terminal
+-- KIND through to the close status. CLOSE_PASS_CANDIDATE_SQL repeats the partial
+-- predicate verbatim so the planner can use it; test/schema.test.ts asserts the plan
+-- rather than the prose.
+CREATE INDEX ix_task_event_completed ON task_event(tid, ts, to_status)
+  WHERE tid IS NOT NULL AND to_status IN ('completed','deleted');
 
 CREATE TABLE outcome (              -- APPEND-ONLY; current = MAX(revision). Reopen = new revision.
   tid TEXT NOT NULL REFERENCES task(tid),
@@ -613,17 +623,42 @@ CREATE TABLE anomaly (              -- loud, queryable failure ledger
                                     --      share of closed tasks that came through either.
                                     --   src/autoclose.ts: swept_close -- the SWEEPER close pass
                                     --      (v14, Craig 2026-07-30) finalized a task nobody ran
-                                    --      `est close` on: either on a linked
-                                    --      task_event(to_status='completed'), closing it
-                                    --      `completed`, or after STALE_CLOSE_HOURS of silence,
-                                    --      closing it `abandoned` (censored). The full §6.2
-                                    --      quiescence gate was met either way -- this pass has no
-                                    --      bypass -- so the row is PROVENANCE, not an override:
-                                    --      `outcome` has no "who closed this" column, and this
-                                    --      ledger is where `forced_close`/`accepted_close` already
-                                    --      answer that question. BENIGN in src/cli.ts: the sweeper
-                                    --      doing its documented job on every cron leg must not
-                                    --      exit 3, or the watchdog learns to be ignored.
+                                    --      `est close` on, on the strength of a terminal
+                                    --      task_event the §6.2 gate observed (`completed` or
+                                    --      `deleted`; the gate's own kind is carried through to
+                                    --      the close status). The full quiescence gate was met --
+                                    --      this pass has no bypass -- so the row is PROVENANCE,
+                                    --      not an override: `outcome` has no "who closed this"
+                                    --      column, and this ledger is where
+                                    --      `forced_close`/`accepted_close` already answer that
+                                    --      question. BENIGN in src/cli.ts: the sweeper doing its
+                                    --      documented job on every cron leg must not exit 3, or
+                                    --      the watchdog learns to be ignored.
+                                    --      |swept_abandon -- the same pass closing a task it has
+                                    --      NO signal for, after `close_abandon_after_h` (168 h) of
+                                    --      silence. ALERTING, unlike its sibling, and the split is
+                                    --      the point: an abandon is right-censored, so it
+                                    --      preserves NO measurement and permanently seals the
+                                    --      task's attribution window. It is rare by construction
+                                    --      (a week of silence), so it cannot cry wolf, and the
+                                    --      thing a human most needs told is exactly this one --
+                                    --      `est close <tid> --status reopened` is the way back.
+                                    --      |close_failed -- `close_fail_alert_after` (3)
+                                    --      consecutive close attempts on one tid threw for a
+                                    --      reason that was NOT the gate. ALERTING: a task that
+                                    --      cannot be finalized never enters the calibration
+                                    --      corpus, and nothing else would ever say so.
+                                    --      |close_attempt_failed -- one such attempt, BENIGN, and
+                                    --      capped at `close_fail_alert_after` rows per tid so the
+                                    --      breadcrumbs that COUNT toward the alert cannot
+                                    --      themselves become the spam.
+                                    --      |close_blocked -- a candidate the gate has refused
+                                    --      continuously for `close_blocked_after_h` (24 h); detail
+                                    --      names the failing ARM, never a count, so the ledger's
+                                    --      (kind, detail, tid) dedup holds it to one row per arm.
+                                    --      BENIGN: the gate refusing is the gate working, and the
+                                    --      row exists so a refusal that has stopped being
+                                    --      temporary is visible rather than silent.
                                     --   src/ingest.ts: plant_unlinked -- a planted est_tid that
                                     --      could not become a session_task alias: either it named
                                     --      a tid with no task row, or its tool_result never
@@ -1347,6 +1382,29 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   -- already been silent for `quiesce_main_min` (60) before the gate lets it through, so
   -- the pass adds at most a rounding error to when a quiet task is finalized.
   ('close_pass_min_interval_min', '10'),
+  -- v14 (2026-07-30): hours of silence before the close pass may close a task it has NO
+  -- completion signal for, as `abandoned`. SEPARATE from the gate's 48 h permission
+  -- threshold (src/close.ts STALE_CLOSE_HOURS) and deliberately much longer, because the
+  -- two answer different questions. 48 h is "may this be closed at all"; this is "may it
+  -- be closed AS A FAILURE, with no evidence either way". An auto-abandon permanently
+  -- seals the task's attribution window, and the failure it guards against is ordinary:
+  -- a task left quiet over a weekend would be abandoned by Monday's cron, so every hour
+  -- of resumed work on it lands unattributed and nothing says why. 168 h (7 days) puts
+  -- the boundary past any normal gap in Craig's working week. A signal-bearing close is
+  -- NOT gated by this -- there the evidence exists, and 48 h is the right line.
+  ('close_abandon_after_h',       '168'),
+  -- v14 (2026-07-30): consecutive failed close attempts on ONE tid before the pass raises
+  -- the ALERTING anomaly(close_failed). Not 1: a close can fail transiently (a busy
+  -- snapshot, a half-written row another writer is mid-way through) and alerting on the
+  -- first would cry wolf, which is the failure BENIGN_ANOMALY_KINDS exists to prevent.
+  -- Not never: a task that cannot be finalized is a task that never enters the corpus.
+  ('close_fail_alert_after',      '3'),
+  -- v14 (2026-07-30): hours a candidate may be CLOSEABLE and continuously refused by the
+  -- gate before the pass records the BENIGN anomaly(close_blocked) naming the arm. The
+  -- gate refusing is normal for minutes and suspicious for days -- a bound session whose
+  -- pid never dies, an agent_run the activity clock still believes -- and without this
+  -- the refusal is invisible: the task simply never closes and nothing says so.
+  ('close_blocked_after_h',       '24'),
   ('job_item_min_pop',          '0.5'),  -- fan[].startedAt population below which item grain sleeps
   ('otel_max_body_mb',          '8'),    -- receiver request-body cap
   ('otel_stale_min',            '15'),   -- minutes of silence before otel_receiver_down
