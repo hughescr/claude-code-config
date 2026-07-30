@@ -33,7 +33,9 @@
  *     a time model.
  *
  *     **And it is not always a forecast.** Since Craig's 2026-07-30 amendment the payload may
- *     say `check_back: {waiting_on_input: true}` — Claude is blocked on the human, so there is
+ *     say `check_back: {waiting_on_input: true}` — Claude is blocked on the human, with no FRESH
+ *     delegation in flight (an unfinished agent that has been silent for
+ *     `config.eta_live_agent_max_min` stops counting as one), so there is
  *     nothing to forecast — and this slot renders `⏸ awaiting input` instead of a number. That
  *     is a REPLACEMENT, never a blanking: rule 2's "degrade to an empty segment" is about a
  *     payload that would put a wrong number on screen, and an idle session's burn percentage is

@@ -26,7 +26,9 @@ import { isoNow, TERMINAL_TASK_STATUS } from "./tasks.ts";
 import {
   buildEtaFit,
   checkBackForSession,
+  countLiveAgents,
   formatEta,
+  liveAgentMaxMin,
   type CheckBack,
   type CheckBackSeconds,
   type CheckBackState,
@@ -143,7 +145,7 @@ export function aggregateBurn(db: Database, tid: string, now: Date = new Date())
   const burnPerMin = spanMin > 0 ? win.wcet / spanMin : 0;
 
   const activeS = activeSeconds(db, tid);
-  const agents = agentCounts(db, tid);
+  const agents = agentCounts(db, tid, now);
   const prices = priceFlagCounts(db, tid);
   // Linear: consumed + rate * (remaining time in this window). With no rate the
   // projection IS the consumption, which is the honest degenerate answer.
@@ -162,28 +164,39 @@ export function aggregateBurn(db: Database, tid: string, now: Date = new Date())
 }
 
 /**
- * Bound agents: live (started, not ended — the "2 agents live" of §6.3) and total,
- * from ONE indexed pass over `agent_run(tid)`.
+ * Bound agents: live (started, not ended, and still FRESH — the "2 agents live" of §6.3)
+ * and total, from `agent_run(tid)`.
  *
  * Both land in `burn_cache`. The statusline reads them back off that row and never
  * calls this: `COUNT(*) FROM agent_run WHERE tid = ?` on the render path was a table
  * SCAN before `ix_agent_run_tid` and is a per-render count of an unbounded table
  * after it, and P1.9's budget is ONE indexed row read, not "a cheap query".
+ *
+ * **`live` goes through `countLiveAgents` (Craig, 2026-07-30) so this number and the idle
+ * predicate cannot disagree.** Before the age bound, a session could render "1 agent" and
+ * `⏸ awaiting input` in the same breath — the count saying work was in flight while the
+ * suppression said nothing was — which is worse than either answer alone. `total` is
+ * deliberately NOT bounded: it is the census of every agent this task ever launched, and a
+ * dead one still ran.
+ *
+ * `now` defaults for callers that have none; `aggregateBurn` — the only production caller
+ * — always passes the sweep's clock.
  */
-export function agentCounts(db: Database, tid: string): { live: number; total: number } {
-  const row = db
-    .query<{ live: number; total: number }, [string]>(
-      `SELECT COUNT(*) AS total,
-              COALESCE(SUM(CASE WHEN started_at IS NOT NULL AND ended_at IS NULL THEN 1 ELSE 0 END), 0) AS live
-         FROM agent_run WHERE tid = ?`,
-    )
-    .get(tid);
-  return { live: row?.live ?? 0, total: row?.total ?? 0 };
+export function agentCounts(
+  db: Database,
+  tid: string,
+  now: Date = new Date(),
+): { live: number; total: number } {
+  const total =
+    db
+      .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM agent_run WHERE tid = ?")
+      .get(tid)?.n ?? 0;
+  return { live: countLiveAgents(db, { tid }, now, liveAgentMaxMin(db)), total };
 }
 
 /** Live agents alone — kept as the named concept §6.3 talks about. */
-export function liveAgents(db: Database, tid: string): number {
-  return agentCounts(db, tid).live;
+export function liveAgents(db: Database, tid: string, now: Date = new Date()): number {
+  return agentCounts(db, tid, now).live;
 }
 
 /**
@@ -500,6 +513,11 @@ export type EmptyReason = "no_open_estimate" | "no_cache" | "db_busy" | "db_miss
 
 /**
  * `check_back` when Claude is blocked on the human (Craig, 2026-07-30).
+ *
+ * "Blocked" means no FRESH delegation is in flight: an unfinished `agent_run` or
+ * `workflow_run` stops counting once it has been silent for `config.eta_live_agent_max_min`
+ * (src/eta.ts `countLiveAgents`), because "started and never ended" is also what a dead
+ * agent looks like and one corpse would otherwise pin its session as busy forever.
  *
  * Deliberately ONE field. The temptation is to attach the last segment's start, or how
  * long the session has been quiet, and both would be read as a forecast in disguise —

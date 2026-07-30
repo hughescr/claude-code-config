@@ -32,6 +32,16 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
 /**
  * Must match the config.schema_version seed in schema.sql.
  *
+ * 12 — dangling delegations age out of ETA liveness (P2.1, Craig 2026-07-30). ONE config
+ *     seed, `eta_live_agent_max_min` = 120. Root cause: v11's idle suppression read
+ *     "started and never ended" as "running", which is also what §5.6's
+ *     `agent_never_returned` population looks like — 54 unfinished `agent_run` rows on the
+ *     live corpus, 49 of them more than six hours old, across 9 sessions. One corpse
+ *     therefore pinned its session as busy forever and suppression could never fire for
+ *     it, neutering v11 for exactly the long-lived sessions it was built for. 120 mirrors
+ *     `attr_stale_minutes` rather than inventing a second answer to "how long may
+ *     something the transcript never closed still be believed"; the liveness clock is
+ *     last-observed-activity, so a genuinely long run is never aged out.
  * 11 — the check-back ETA answers the question it claims to (P2.1/P2.2, Craig
  *     2026-07-30). Root cause: `run_segment` was cut on GAPS alone, so a background
  *     agent bridging a gap that contained a prompt glued several human-to-human spans
@@ -131,7 +141,7 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
  *     `v_phase_actual.phase_conf`, auxiliary origin excluded from calibration.
  * 1 — initial R3 §4.2 shape.
  */
-export const SCHEMA_VERSION = "11";
+export const SCHEMA_VERSION = "12";
 
 /**
  * Forward-only, additive migrations, applied by {@link openDb} on a WRITABLE
@@ -865,6 +875,27 @@ INSERT INTO burn_cache (tid, as_of, consumed_wcet, wcet_main, wcet_sub, wcet_aux
          eta_model, eta_probation, eta_n_seg, compute_s, compute_coverage_pct
     FROM burn_cache_pre_v11;
 DROP TABLE burn_cache_pre_v11;
+`,
+  },
+  {
+    from: "11",
+    to: "12",
+    // Dangling delegations age out of ETA liveness (see the SCHEMA_VERSION doc comment).
+    //
+    // ONE `config` seed and nothing else — no table, no column, no view. It is a whole
+    // migration step rather than a line added to schema.sql's seed block because P2.0's
+    // key set is CLOSED: `est config get/set` refuses a key that is not SEEDED, so a
+    // database that never re-ran `schema.sql` would have a knob the code reads (via
+    // `configNum`'s default) and Craig cannot tune. That asymmetry — a live default nobody
+    // can see or change — is exactly what the closed key set exists to prevent, and it is
+    // the same reason v4 -> v5 seeded `attr_stale_minutes` through a migration instead of
+    // leaving it to the seed block.
+    //
+    // `INSERT OR IGNORE`, so a value Craig has already tuned is never restated (migration
+    // rule 2). Nothing else in the append-only spine is touched.
+    sql: `
+INSERT OR IGNORE INTO config (k, v) VALUES
+  ('eta_live_agent_max_min', '120');
 `,
   },
 ];

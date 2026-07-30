@@ -1163,14 +1163,138 @@ export function phaseMedianSeconds(db: Database, asOf?: Date): number | null {
   return quantileOf(spans, 0.5);
 }
 
-/** Live structural features for one session (no token counter is read here). */
-export function liveFeatures(db: Database, sessionId: string, phaseMedianS: number | null): Features {
-  const agents =
+// ---------------------------------------------------------------------------
+// liveness — what still counts as work in flight
+// ---------------------------------------------------------------------------
+
+/**
+ * How long an unfinished `agent_run` keeps counting as work in flight, in minutes.
+ *
+ * `config.eta_live_agent_max_min`, seeded at **120** — the same wall clock
+ * `attr_stale_minutes` uses to close a turn's attribution window (§5.4), and chosen to
+ * match it rather than invented here: both answer "how long may something the transcript
+ * never closed still be believed", and two different answers to that in one system is a
+ * knob nobody can reason about. A `config` row rather than a code constant for the same
+ * reason `attr_stale_minutes` is one: it is a belief about Craig's own working shape,
+ * and the retro is expected to fit it.
+ */
+export const DEFAULT_ETA_LIVE_AGENT_MAX_MIN = 120;
+
+export function liveAgentMaxMin(db: Database): number {
+  const v = configNum(db, "eta_live_agent_max_min", DEFAULT_ETA_LIVE_AGENT_MAX_MIN);
+  return v > 0 ? v : DEFAULT_ETA_LIVE_AGENT_MAX_MIN;
+}
+
+/**
+ * Count the agents that are still plausibly RUNNING — the one liveness rule in the
+ * system, called by both the session-scoped idle predicate ({@link blockState}) and the
+ * task-scoped `agents.live` the statusline prints (`agentCounts` in src/burn.ts).
+ *
+ * **Why an age bound exists at all (Craig, 2026-07-30).** "Started and never ended" is
+ * what a live agent looks like — and also what an agent that DIED looks like. §5.6
+ * already names that population (`agent_never_returned`) and it is not small: measured on
+ * the live corpus, **54** unfinished `agent_run` rows, **49 of them started more than six
+ * hours earlier**, across 9 sessions. Without a bound, one dead agent pins its session as
+ * "busy" forever, so idle suppression could never fire for it — neutering the fix for
+ * exactly the long-lived sessions it was built for.
+ *
+ * **The clock is `MAX(started_at, last request the agent made)`, not `started_at` alone.**
+ * That distinction is the whole reason the bound is safe to apply. An agent that is
+ * genuinely working emits requests, so its clock keeps advancing and a three-hour run is
+ * never mistaken for a corpse; an agent that died stops emitting, and its clock freezes at
+ * the moment it stopped. Bounding on `started_at` alone would have aged out real long
+ * runs, which is the one direction this must not fail in — a false "awaiting input" while
+ * Claude is mid-delegation is a wrong statement on screen. `request(agent_id)` is indexed
+ * (`ix_req_agent`), so the signal costs an index probe per unfinished agent, and only
+ * unfinished agents are probed.
+ *
+ * **`julianday()` on both sides, never a string compare.** `agent_run.started_at` carries
+ * milliseconds and `request.ts` is ISO seconds; at index 19 `'.' < 'Z'`, so a lexicographic
+ * MAX would silently prefer the seconds-precision value at a shared second. Immaterial
+ * against a 120-minute threshold and wrong on principle — and this file has the
+ * `run_segment.ended_at` scar to show where that reasoning ends up.
+ */
+export function countLiveAgents(
+  db: Database,
+  scope: { session: string } | { tid: string },
+  now: Date,
+  maxMin: number,
+): number {
+  const freshSince = isoNow(new Date(now.getTime() - maxMin * 60_000));
+  const where = "session" in scope ? "a.session_id = ?1" : "a.tid = ?1";
+  const key = "session" in scope ? scope.session : scope.tid;
+  return (
     db
-      .query<{ n: number }, [string]>(
-        "SELECT COUNT(*) AS n FROM agent_run WHERE session_id = ? AND started_at IS NOT NULL AND ended_at IS NULL",
+      .query<{ n: number }, [string, string]>(
+        `SELECT COUNT(*) AS n FROM agent_run a
+          WHERE ${where} AND a.started_at IS NOT NULL AND a.ended_at IS NULL
+            AND MAX(julianday(a.started_at),
+                    COALESCE((SELECT MAX(julianday(r.ts)) FROM request r
+                               WHERE r.agent_id = a.agent_id), 0)) >= julianday(?2)`,
       )
-      .get(sessionId)?.n ?? 0;
+      .get(key, freshSince)?.n ?? 0
+  );
+}
+
+/**
+ * Open `workflow_run` rows that are still plausibly running, by the same rule.
+ *
+ * A workflow dangles the same way an agent does — worse, in fact: `workflow_run.ended_at`
+ * is DERIVED from its agents' transcripts (R2), so a run whose agents never returned has
+ * nothing to close it. Its liveness clock is `MAX(started_at, the newest bound of any of
+ * its agents)`, which advances while phases keep finishing and freezes when they stop.
+ *
+ * `started_at IS NULL` counts as LIVE: the column is nullable because the start is derived
+ * too, so a NULL means "no age evidence at all", and the safe reading of no evidence is
+ * "do not claim Claude is waiting".
+ */
+export function countLiveWorkflows(
+  db: Database,
+  sessionId: string,
+  now: Date,
+  maxMin: number,
+): number {
+  const freshSince = isoNow(new Date(now.getTime() - maxMin * 60_000));
+  return (
+    db
+      .query<{ n: number }, [string, string]>(
+        `SELECT COUNT(*) AS n FROM workflow_run w
+          WHERE w.session_id = ?1 AND w.ended_at IS NULL
+            AND (w.started_at IS NULL
+                 OR MAX(julianday(w.started_at),
+                        COALESCE((SELECT MAX(julianday(COALESCE(a.ended_at, a.started_at)))
+                                    FROM agent_run a
+                                   WHERE a.run_id = w.run_id AND a.wf_launch_id = w.wf_launch_id),
+                                 0)) >= julianday(?2))`,
+      )
+      .get(sessionId, freshSince)?.n ?? 0
+  );
+}
+
+/**
+ * Live structural features for one session (no token counter is read here).
+ *
+ * `live_agents` is the `fanout_cond` STRATUM, so it uses the bounded liveness rule too
+ * ({@link countLiveAgents}): the strata are fitted from `run_segment.n_agents`, which
+ * counts agents with BOTH bounds, and predicting with an unbounded live count would let a
+ * dead agent push a solo session into the `small` stratum and answer from the wrong curve.
+ * `now`/`maxMin` default so a caller that has neither still gets the old, unbounded count
+ * rather than a silently-shifted one.
+ */
+export function liveFeatures(
+  db: Database,
+  sessionId: string,
+  phaseMedianS: number | null,
+  opts: { now?: Date; maxMin?: number } = {},
+): Features {
+  const agents =
+    opts.now !== undefined
+      ? countLiveAgents(db, { session: sessionId }, opts.now, opts.maxMin ?? liveAgentMaxMin(db))
+      : db
+          .query<{ n: number }, [string]>(
+            "SELECT COUNT(*) AS n FROM agent_run WHERE session_id = ? AND started_at IS NOT NULL AND ended_at IS NULL",
+          )
+          .get(sessionId)?.n ?? 0;
   const wf = db
     .query<{ planned: number | null; done: number | null }, [string]>(
       `SELECT w.n_phases_planned AS planned,
@@ -1196,31 +1320,40 @@ export function liveFeatures(db: Database, sessionId: string, phaseMedianS: numb
  * the live half of the boundary rule (see the file header).
  */
 export interface BlockState {
-  /** `agent_run` rows for this session that started and have not ended. */
+  /**
+   * `agent_run` rows for this session that started, have not ended, and are still FRESH
+   * by {@link countLiveAgents}' rule. A dead agent is not a running one.
+   */
   live_agents: number;
-  /** A `workflow_run` with no `ended_at`: a headless run cannot ask for input mid-flight. */
+  /** A fresh `workflow_run` with no `ended_at`: a headless run cannot ask for input mid-flight. */
   open_workflow: boolean;
   /**
    * The session's NEWEST turn carries no `turn_duration` record yet, so as far as the
    * transcript is concerned the main chain is still mid-response.
    */
   open_turn: boolean;
+  /**
+   * Unfinished rows the age bound EXCLUDED — dangling agents, and open workflow runs whose
+   * phases stopped advancing. Reported rather than merely dropped: "Claude is waiting"
+   * over a session holding two corpses is a different sentence from the same verdict over
+   * a session holding none, and this is the number that says which one you are reading.
+   */
+  stale_agents: number;
 }
 
-export function blockState(db: Database, sessionId: string): BlockState {
-  const agents =
-    db
-      .query<{ n: number }, [string]>(
-        "SELECT COUNT(*) AS n FROM agent_run WHERE session_id = ? AND started_at IS NOT NULL AND ended_at IS NULL",
-      )
-      .get(sessionId)?.n ?? 0;
+export function blockState(db: Database, sessionId: string, now: Date = new Date()): BlockState {
+  const maxMin = liveAgentMaxMin(db);
+  const agents = countLiveAgents(db, { session: sessionId }, now, maxMin);
   // Not `liveFeatures.wf_phases_left > 0`: that is 0 for an open run whose
   // `n_phases_planned` never landed, and "we do not know how many phases are left" is
   // not the same fact as "no workflow is running".
-  const wf =
+  const wf = countLiveWorkflows(db, sessionId, now, maxMin);
+  const unfinished =
     db
       .query<{ n: number }, [string]>(
-        "SELECT COUNT(*) AS n FROM workflow_run WHERE session_id = ? AND ended_at IS NULL",
+        `SELECT (SELECT COUNT(*) FROM agent_run
+                  WHERE session_id = ?1 AND started_at IS NOT NULL AND ended_at IS NULL)
+              + (SELECT COUNT(*) FROM workflow_run WHERE session_id = ?1 AND ended_at IS NULL) AS n`,
       )
       .get(sessionId)?.n ?? 0;
   const turn = db
@@ -1233,6 +1366,7 @@ export function blockState(db: Database, sessionId: string): BlockState {
     open_workflow: wf > 0,
     // No turn at all is not an open turn: an empty session is not mid-response.
     open_turn: turn !== null && turn !== undefined && turn.duration_ms === null,
+    stale_agents: Math.max(0, unfinished - agents - wf),
   };
 }
 
@@ -1254,7 +1388,15 @@ export function blockState(db: Database, sessionId: string): BlockState {
  *  - an open turn — the newest turn has no `turn_duration` record, so the main chain
  *    has not handed control back yet.
  *
- * The last one is deliberately CONSERVATIVE in the safe direction. 27% of turns in the
+ * **The first two are AGE-BOUNDED (Craig, 2026-07-30).** "Unfinished" is what a running
+ * delegation looks like and also what a dead one looks like, and dead ones are common
+ * enough (§5.6's `agent_never_returned`; 49 of 54 unfinished rows on the live corpus were
+ * more than six hours old) that without a bound a single corpse would pin its session as
+ * busy forever and suppression could never fire — neutering this predicate for the
+ * long-lived sessions it exists for. {@link countLiveAgents} states the rule and why its
+ * clock is last-observed-activity rather than `started_at`.
+ *
+ * The third is deliberately CONSERVATIVE in the safe direction. 27% of turns in the
  * specification corpus never got a `turn_duration` record at all, and for those the
  * newest turn reads as open forever — so suppression sometimes fails to fire and the
  * forecast is issued as before. That is the right way round: falsely claiming "awaiting
@@ -1264,13 +1406,15 @@ export function blockState(db: Database, sessionId: string): BlockState {
  *
  * No token counter is read here — see the file header's invariant.
  */
-export function waitingOnInput(db: Database, sessionId: string): boolean {
-  const s = blockState(db, sessionId);
+export function waitingOnInput(db: Database, sessionId: string, now: Date = new Date()): boolean {
+  const s = blockState(db, sessionId, now);
   return s.live_agents === 0 && !s.open_workflow && !s.open_turn;
 }
 
 export interface EtaFit {
   gapMin: number;
+  /** `config.eta_live_agent_max_min`, resolved ONCE per sweep like every other knob here. */
+  liveAgentMaxMin: number;
   minFit: number;
   minSegments: number;
   gain: number;
@@ -1322,6 +1466,7 @@ export function buildEtaFit(db: Database): EtaFit {
   const ship = shippedModel(db);
   return {
     gapMin,
+    liveAgentMaxMin: liveAgentMaxMin(db),
     minFit: Math.max(1, Math.round(configNum(db, "eta_min_fit", 5))),
     minSegments: Math.max(1, Math.round(configNum(db, "eta_min_segments", 30))),
     gain: configNum(db, "eta_min_pinball_gain", 0.05),
@@ -1388,7 +1533,9 @@ export function forecastSession(
   if (!Number.isFinite(startedMs)) return null;
   const elapsedS = Math.max(0, Math.round((now.getTime() - startedMs) / 1000));
 
-  const features = liveFeatures(db, sessionId, fit.phaseMedianS);
+  // `now` and the liveness bound go in: the stratum must be counted by the same rule the
+  // idle predicate uses, or `fanout_cond` answers from the wrong curve when an agent died.
+  const features = liveFeatures(db, sessionId, fit.phaseMedianS, { now, maxMin: fit.liveAgentMaxMin });
   const p = predict(fit.shipped, fit.models, elapsedS, features, fit.minFit);
   if (p === null) return null;
 
@@ -1436,7 +1583,7 @@ export function checkBackForSession(
   fit: EtaFit,
   now: Date = new Date(),
 ): CheckBackState {
-  if (waitingOnInput(db, sessionId)) return { waiting: true, forecast: null };
+  if (waitingOnInput(db, sessionId, now)) return { waiting: true, forecast: null };
   return { waiting: false, forecast: forecastSession(db, sessionId, fit, now) };
 }
 

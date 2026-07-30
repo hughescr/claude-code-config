@@ -1233,7 +1233,7 @@ WHERE s.terminator = 'open'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '11'),
+  ('schema_version',          '12'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.
@@ -1269,6 +1269,16 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   ('eta_min_segments',          '30'),   -- closed segments before probation can end
   ('eta_min_fit',               '5'),    -- below this, NO forecast is issued at all
   ('eta_min_pinball_gain',      '0.05'), -- p50 gain over const_median required to graduate
+  -- v12 (2026-07-30): how long an UNFINISHED agent_run or workflow_run keeps counting as
+  -- work in flight, in minutes. "Started and never ended" is what a running delegation
+  -- looks like AND what a dead one looks like (§5.6 `agent_never_returned`), and without a
+  -- bound one corpse pins its session as busy forever, so P2.1 idle suppression could
+  -- never fire for it. 120 deliberately MIRRORS `attr_stale_minutes` above: both answer
+  -- "how long may something the transcript never closed still be believed", and two
+  -- different answers to that in one system is a knob nobody can reason about. The clock
+  -- is last-observed-activity, not started_at (src/eta.ts countLiveAgents), so a genuinely
+  -- long run is never aged out — only one that stopped emitting is.
+  ('eta_live_agent_max_min',    '120'),
   ('recon_alert_pct',           '5'),    -- |delta_pct| above which `est recon` alerts
   ('unvalidated_max_delta_pct', '2'),    -- per-week USD tolerance in the retirement criterion
   ('unvalidated_weeks',         '4'),    -- consecutive clean weeks required

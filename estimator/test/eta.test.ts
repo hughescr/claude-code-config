@@ -49,11 +49,15 @@ import {
   survivalAt,
   waitingOnInput,
   writeEtaRuns,
+  blockState,
+  liveAgentMaxMin,
+  DEFAULT_ETA_LIVE_AGENT_MAX_MIN,
   type CheckBack,
   type Observation,
   type SegmentRow,
 } from "../src/eta.ts";
 import {
+  agentCounts,
   burnJson,
   burnRead,
   isWaitingOnInput,
@@ -898,7 +902,7 @@ describe("est burn --json — the check_back fields (P2.2)", () => {
     expect(cb.seg_elapsed_min).toBe(2);
     // And the session is busy for a REASON the payload can also be asked about: a2 is
     // still running, which is why this is a forecast and not `waiting_on_input`.
-    expect(waitingOnInput(h.db, fx.session)).toBe(false);
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(false);
   });
 
   test("a delegation spanning the prompt keeps ONE segment, and it is still forecast", async () => {
@@ -979,7 +983,7 @@ describe("est burn --json — the check_back fields (P2.2)", () => {
     loadFixture(h.db, fx);
     seedSegments(h.db, 20);
     const tid = await liveTask(h, fx.session, now);
-    expect(waitingOnInput(h.db, fx.session)).toBe(true);
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(true);
 
     // 1. an agent that started and has not ended. It contributes NO interval (the union
     //    needs both bounds), so this is not the same fact as "the segment is still open".
@@ -993,9 +997,9 @@ describe("est burn --json — the check_back fields (P2.2)", () => {
                  '2026-03-01T11:30:00Z',NULL,'transcript',NULL,NULL,NULL,NULL,NULL,NULL,NULL)`,
       )
       .run(fx.session);
-    expect(waitingOnInput(h.db, fx.session)).toBe(false);
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(false);
     h.db.query("DELETE FROM agent_run WHERE agent_id = 'ag-live'").run();
-    expect(waitingOnInput(h.db, fx.session)).toBe(true);
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(true);
 
     // 2. a workflow run with no ended_at — and with NO declared phase count, which is
     //    exactly the case `liveFeatures.wf_phases_left > 0` would have missed.
@@ -1007,9 +1011,9 @@ describe("est burn --json — the check_back fields (P2.2)", () => {
          VALUES ('wf-1','wl-1',?,'w',NULL,NULL,NULL,NULL,'2026-03-01T11:30:00Z',NULL,NULL)`,
       )
       .run(fx.session);
-    expect(waitingOnInput(h.db, fx.session)).toBe(false);
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(false);
     h.db.query("DELETE FROM workflow_run WHERE run_id = 'wf-1'").run();
-    expect(waitingOnInput(h.db, fx.session)).toBe(true);
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(true);
 
     // 3. a newest turn with no `turn_duration` record: the main chain has not handed
     //    control back. Conservative in the safe direction — 27% of turns never get one,
@@ -1020,7 +1024,123 @@ describe("est burn --json — the check_back fields (P2.2)", () => {
          VALUES (?, 'p-open', '2026-03-01T11:45:00Z', NULL, NULL, NULL, NULL)`,
       )
       .run(fx.session);
-    expect(waitingOnInput(h.db, fx.session)).toBe(false);
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(false);
+  });
+
+  test("a DANGLING agent ages out of liveness; a working one of the same age does not", async () => {
+    // The hole v11's suppression left, and the reason the bound is on last-observed
+    // ACTIVITY rather than on `started_at`. Measured on the live corpus when this landed:
+    // 54 unfinished `agent_run` rows, 49 of them started more than six hours earlier,
+    // across 9 sessions — one corpse per session was enough to pin it "busy" forever and
+    // stop suppression ever firing.
+    const fx = loadFixtures().find((f) => f.name === "basic")!;
+    const now = new Date(fx.now); // 12:00
+    loadFixture(h.db, fx);
+    seedSegments(h.db, 20);
+    const tid = await liveTask(h, fx.session, now);
+    const insertAgent = h.db.prepare(
+      `INSERT INTO agent_run (agent_id, session_id, run_id, wf_launch_id, agent_type, spawn_depth,
+                              launch_prompt_id, transcript_path, status, label, started_at, ended_at,
+                              interval_src, queued_at, attempt, reported_tokens, phase_idx,
+                              phase_title, phase_conf, tid)
+       VALUES (?,?,NULL,NULL,'general-purpose',1,NULL,NULL,'running',NULL,?,NULL,
+               'transcript',NULL,NULL,NULL,NULL,NULL,NULL,NULL)`,
+    );
+
+    // (a) YOUNGER than the 120-minute threshold: work in flight, forecast issued.
+    insertAgent.run("ag-young", fx.session, "2026-03-01T11:00:00Z"); // 60 min old
+    expect(blockState(h.db, fx.session, now).live_agents).toBe(1);
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(false);
+
+    // (b) OLDER, and silent since it started: a corpse. It ages out, so suppression fires.
+    h.db.query("UPDATE agent_run SET started_at = '2026-03-01T06:00:00Z' WHERE agent_id = 'ag-young'").run();
+    const stale = blockState(h.db, fx.session, now);
+    expect(stale.live_agents).toBe(0);
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(true);
+    // Aged out, not swept under the rug: "Claude is waiting" over a session holding a
+    // corpse is a different sentence from the same verdict over a clean one.
+    expect(stale.stale_agents).toBe(1);
+
+    // (c) The SAME age, but still emitting requests — a genuinely long delegation. Its
+    //     clock is last-observed activity, so it does NOT age out. This is the case a
+    //     `started_at`-only bound would have got wrong, and getting it wrong means
+    //     printing "awaiting input" while Claude is mid-delegation.
+    h.db
+      .query(
+        `INSERT INTO request (request_id, message_id, is_sidechain, session_id, prompt_id, origin,
+                              agent_id, run_id, wf_launch_id, model, model_family,
+                              attribution_agent, attribution_skill, ts,
+                              in_tok, out_tok, cw_tok, cr_tok, duration_ms, tid, attr)
+         VALUES ('rq-alive','msg-alive',1,?,NULL,'subagent','ag-young',NULL,NULL,
+                 'claude-test-1','claude-test-1',NULL,NULL,'2026-03-01T11:50:00Z',
+                 1,1,1,1,NULL,NULL,'none')`,
+      )
+      .run(fx.session);
+    expect(blockState(h.db, fx.session, now).live_agents).toBe(1);
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(false);
+
+    // And the threshold is the CONFIG ROW, not a constant: tightening it below the
+    // agent's activity age ages even that one out.
+    h.db.query("UPDATE config SET v = '5' WHERE k = 'eta_live_agent_max_min'").run();
+    expect(liveAgentMaxMin(h.db)).toBe(5);
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(true);
+    // A nonsensical value falls back to the seed rather than to zero — a 0-minute window
+    // would age out every agent in existence, i.e. suppress every forecast in the system.
+    h.db.query("UPDATE config SET v = '0' WHERE k = 'eta_live_agent_max_min'").run();
+    expect(liveAgentMaxMin(h.db)).toBe(DEFAULT_ETA_LIVE_AGENT_MAX_MIN);
+
+    // The task-scoped count the statusline prints obeys the SAME rule, so the segment can
+    // never say "1 agent · ⏸ awaiting input" — a live count and a suppression verdict
+    // contradicting each other in one line is worse than either answer alone.
+    h.db.query("UPDATE config SET v = '120' WHERE k = 'eta_live_agent_max_min'").run();
+    h.db.query("DELETE FROM request WHERE request_id = 'rq-alive'").run();
+    h.db.query("UPDATE agent_run SET tid = ? WHERE agent_id = 'ag-young'").run(tid);
+    expect(agentCounts(h.db, tid, now).live).toBe(0);
+    // `total` is the CENSUS and is deliberately not bounded: a dead agent still ran.
+    expect(agentCounts(h.db, tid, now).total).toBeGreaterThan(0);
+  });
+
+  test("an open workflow_run dangles the same way, and ages out by the same rule", async () => {
+    // Worse than an agent, in fact: `workflow_run.ended_at` is DERIVED from its agents'
+    // transcripts (R2), so a run whose agents never returned has nothing to close it.
+    const fx = loadFixtures().find((f) => f.name === "basic")!;
+    const now = new Date(fx.now);
+    loadFixture(h.db, fx);
+    seedSegments(h.db, 20);
+    await liveTask(h, fx.session, now);
+    const wf = h.db.prepare(
+      `INSERT OR REPLACE INTO workflow_run (run_id, wf_launch_id, session_id, workflow_name,
+                                            transcript_dir, default_model, launch_prompt_id,
+                                            n_phases_planned, started_at, ended_at, tid)
+       VALUES ('wf-1','wl-1',?,'w',NULL,NULL,NULL,NULL,?,NULL,NULL)`,
+    );
+
+    wf.run(fx.session, "2026-03-01T11:00:00Z"); // fresh
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(false);
+
+    wf.run(fx.session, "2026-03-01T06:00:00Z"); // stale, no phase has finished since
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(true);
+
+    // A phase that finished recently keeps the run alive even though it STARTED long ago —
+    // the same last-observed-activity clock the agents use.
+    h.db
+      .query(
+        `INSERT INTO agent_run (agent_id, session_id, run_id, wf_launch_id, agent_type, spawn_depth,
+                                launch_prompt_id, transcript_path, status, label, started_at, ended_at,
+                                interval_src, queued_at, attempt, reported_tokens, phase_idx,
+                                phase_title, phase_conf, tid)
+         VALUES ('ag-phase',?, 'wf-1','wl-1','general-purpose',1,NULL,NULL,'completed',NULL,
+                 '2026-03-01T11:20:00Z','2026-03-01T11:40:00Z','transcript',
+                 NULL,NULL,NULL,0,NULL,'exact',NULL)`,
+      )
+      .run(fx.session);
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(false);
+
+    // No `started_at` at all is NOT aged out: the column is derived too, so NULL means "no
+    // age evidence", and the safe reading of no evidence is "do not claim Claude is idle".
+    h.db.query("DELETE FROM agent_run WHERE agent_id = 'ag-phase'").run();
+    h.db.query("UPDATE workflow_run SET started_at = NULL WHERE run_id = 'wf-1'").run();
+    expect(waitingOnInput(h.db, fx.session, now)).toBe(false);
   });
 
   test("the cached and the --refresh paths agree", async () => {
