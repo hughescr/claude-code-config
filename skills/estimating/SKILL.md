@@ -23,6 +23,14 @@ An estimate is required before starting work when the planned goal involves **AN
 
 **Exempt:** a single background agent on a trivial errand, lookups, single-file edits.
 
+**Delegated work is presumed already estimated.** If you are working a slice that an orchestrator
+or parent agent handed you, do not open a new task for it, even if your slice alone meets T1–T3 —
+the spend books through the parent's `tid` via attribution, not through a second estimate of your
+piece. If your prompt names an `est tid`, `est bind` is how you attach your identity to it; `est
+open` is not. Opening a duplicate task for delegated work double-books the corpus and steals the
+parent task's actuals. If you genuinely believe your slice is not covered by any existing estimate,
+ask your orchestrator rather than minting a tid yourself.
+
 **T1 and T2 are mechanically detectable after the fact; T3 and T4 are not.** "Coordinated work
 toward one goal" is a semantic judgement no log records, and a verbal request for a budget is not
 distinguishable from other prose. So skipping the ceremony on a T3 task is invisible to every
