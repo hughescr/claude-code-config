@@ -446,6 +446,26 @@ describe("est retro — P1.8", () => {
     expect(human.out).toContain("reconciliation: none");
   });
 
+  test("the panel reports the gate bypasses — the lever has to be self-reporting", async () => {
+    // `est close --accept` decides what enters the calibration corpus, so a retro that
+    // did not report it would leave the share of the corpus that never passed quiescence
+    // invisible until someone thought to look. Counts AND a share: a rising share is a
+    // finding about the gate, not about any one close.
+    const tid = await completedTask(1);
+    h.db.query(
+      "INSERT INTO anomaly (ts, kind, detail, tid) VALUES (?, 'accepted_close', 'the human accepted completion', ?)",
+    ).run(LONG_AGO, tid);
+
+    const report = retro(h.db, { asOf: NOW, dryRun: true });
+    expect(report.quality.accepted_closes).toBe(1);
+    expect(report.quality.forced_closes).toBe(0);
+    expect(report.quality.bypass_share).toBe(1);
+
+    const human = await h.cli("retro", "--dry-run");
+    expect(human.out).toContain("closes bypassing the gate");
+    expect(human.out).toContain("recorded human consent");
+  });
+
   test("--as-of must parse; a garbage instant is a usage error rather than a silent now()", async () => {
     expect((await h.cli("retro", "--as-of", "last tuesday")).code).toBe(1);
   });

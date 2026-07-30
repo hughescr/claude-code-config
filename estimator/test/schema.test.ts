@@ -15,7 +15,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb, SCHEMA_VERSION, schemaVersion } from "../src/db.ts";
-import { INSERT_TASK_EVENT_SQL } from "../src/ingest.ts";
+import { BACKFILL_TASK_EVENT_TID_SQL, INSERT_TASK_EVENT_SQL } from "../src/ingest.ts";
 import { ABOVE_200K_SUFFIX, LONG_CONTEXT_THRESHOLD } from "../src/prices.ts";
 
 let dir: string;
@@ -939,6 +939,55 @@ describe("schema migration", () => {
    * idempotent against objects that already exist, or the database is stuck a version
    * behind forever with a confusing "table already exists" error.
    */
+  /**
+   * v12 -> v13 (§3.2 step 6): the partial index the `session_task` backfill needs. One
+   * object, no row touched — but the same two things have to hold as for every step
+   * above: a migrated file is byte-identical to a fresh one, and the statement the
+   * index exists for actually uses it.
+   */
+  test("a v12 database gains ix_task_event_unlinked and matches a fresh file exactly", () => {
+    db.exec(`
+      DROP INDEX ix_task_event_unlinked;
+      UPDATE config SET v = '12' WHERE k = 'schema_version';
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+
+    db = openDb({ path }); // migrates on open
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    const freshDir = mkdtempSync(join(tmpdir(), "estimator-schema-v13-"));
+    const fresh = openDb({ path: join(freshDir, "estimator.db") });
+    try {
+      const objects = (d: Database): unknown =>
+        d
+          .query<unknown, []>(
+            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+          )
+          .all();
+      // The whole row, `sql` text included: `IF NOT EXISTS` is stripped before storage,
+      // so the migration's idempotence guard costs nothing in fidelity.
+      expect(objects(db)).toEqual(objects(fresh));
+    } finally {
+      fresh.close();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+
+    // The point of the index, asserted against the planner rather than against prose:
+    // the backfill's predicates and the index's have to stay verbatim identical, and a
+    // full scan here is exactly the regression this step exists to prevent.
+    const plan = db
+      .query<{ detail: string }, []>(`EXPLAIN QUERY PLAN ${BACKFILL_TASK_EVENT_TID_SQL}`)
+      .all()
+      .map((r) => r.detail)
+      .join(" | ");
+    // "SCAN task_event USING INDEX ix_task_event_unlinked" IS the win: the partial index
+    // holds only the unlinked rows, so scanning all of it is scanning only them — and in
+    // the steady state, nothing. What must never come back is the bare table scan.
+    expect(plan).toContain("ix_task_event_unlinked");
+    expect(plan).not.toMatch(/SCAN task_event(?! USING)/);
+  });
+
   test("the v8 step lands on a file that already has the shape and only lacks the marker", () => {
     db.query("UPDATE config SET v='7' WHERE k='schema_version'").run();
     const path = join(dir, "estimator.db");

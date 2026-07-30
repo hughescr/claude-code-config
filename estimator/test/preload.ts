@@ -78,3 +78,19 @@ process.env.EST_SETTINGS_JSON ??= join(
   tmpdir(),
   `est-test-no-settings-${process.pid}-${Date.now()}.json`,
 );
+
+/**
+ * Same argument again, and the newest reason for it: `~/.claude/projects` (`PROJECTS_ROOT`,
+ * `EST_PROJECTS` override) is now read by `est close --accept`, which verifies the quoted
+ * acceptance against a bound session's transcript (src/close.ts).
+ *
+ * Sweep tests always pass `--root`, so this path was previously unreachable from a test.
+ * The verification has no such flag — it resolves the root itself — so without this a
+ * test's acceptance could be "verified" against Craig's REAL transcripts, which is both
+ * live machine state and, since those transcripts contain this project's own discussions
+ * of the feature, a genuine chance of a false PASS. Pointed at a path guaranteed not to
+ * exist, so the verification takes its documented refusing branch; a test that wants a
+ * corpus sets the variable itself or passes `projectsRoot` to `closeTask`, either of
+ * which wins.
+ */
+process.env.EST_PROJECTS ??= join(tmpdir(), `est-test-no-projects-${process.pid}-${Date.now()}`);

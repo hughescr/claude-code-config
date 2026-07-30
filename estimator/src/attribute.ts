@@ -121,6 +121,50 @@ const SEP = "\u0000";
 
 const MINUTE_MS = 60_000;
 
+/**
+ * §5.4's staleness closure, as two numbers and one predicate — EXPORTED, because a
+ * second reader now exists and two implementations of "has this task stopped absorbing
+ * work" would be two answers to one question.
+ *
+ * `src/burn.ts` asks it for the statusline's tracked-task state, which is a claim about
+ * the very pass this file runs: if the segment said "tracked" while attribution had
+ * retired the task, the number on Craig's screen would be reporting on a ledger that
+ * had stopped agreeing with it. Sharing the predicate is what makes that impossible
+ * rather than merely unlikely — and it is why the MINUTES check cannot travel alone:
+ * attribution retires on `attr_stale_turns` as well, so a minutes-only reader would
+ * call a task active through any number of intervening turns that booked elsewhere.
+ */
+export interface AttrWindow {
+  staleMs: number;
+  maxQuietTurns: number;
+}
+
+export function attrWindow(db: Database): AttrWindow {
+  const staleTurns = Number.parseInt(getConfig(db, "attr_stale_turns") ?? "5", 10);
+  const staleMinutes = Number.parseInt(getConfig(db, "attr_stale_minutes") ?? "120", 10);
+  return {
+    staleMs: (Number.isFinite(staleMinutes) ? staleMinutes : 120) * MINUTE_MS,
+    maxQuietTurns: Number.isFinite(staleTurns) ? staleTurns : 5,
+  };
+}
+
+/**
+ * Has the task stopped absorbing turns by `atMs`?
+ *
+ * `lastTouchMs` non-finite means "never touched", which is deliberately NOT stale by
+ * the clock arm — a task whose window has only just opened has no elapsed time to
+ * measure — and falls to the turn counter, exactly as the turn walk does.
+ */
+export function attrRetired(
+  w: AttrWindow,
+  lastTouchMs: number,
+  atMs: number,
+  quietTurns: number,
+): boolean {
+  if (Number.isFinite(lastTouchMs) && atMs - lastTouchMs > w.staleMs) return true;
+  return quietTurns >= w.maxQuietTurns;
+}
+
 function ms(ts: string | null): number {
   if (ts === null) return Number.NaN;
   const t = Date.parse(ts);
@@ -192,10 +236,7 @@ function clearAllClaims(db: Database): void {
  * half (§5.4's third touch, which the comment claimed and the code never did).
  */
 export function attributeTasks(db: Database): AttributionResult {
-  const staleTurns = Number.parseInt(getConfig(db, "attr_stale_turns") ?? "5", 10);
-  const staleMinutes = Number.parseInt(getConfig(db, "attr_stale_minutes") ?? "120", 10);
-  const staleMs = (Number.isFinite(staleMinutes) ? staleMinutes : 120) * MINUTE_MS;
-  const maxQuietTurns = Number.isFinite(staleTurns) ? staleTurns : 5;
+  const { staleMs, maxQuietTurns } = attrWindow(db);
 
   const tasks = db
     .query<TaskRow, []>("SELECT tid, status, created_at, anchor_session, anchor_prompt FROM task")
@@ -476,9 +517,7 @@ export function attributeTasks(db: Database): AttributionResult {
         const end = windowEnd.get(tid) ?? Number.POSITIVE_INFINITY;
         if (!(at >= start && at <= end)) return false;
         const last = lastTouch.get(tid) ?? Number.NEGATIVE_INFINITY;
-        if (Number.isFinite(last) && at - last > staleMs) return false;
-        if ((quietTurns.get(tid) ?? 0) >= maxQuietTurns) return false;
-        return true;
+        return !attrRetired({ staleMs, maxQuietTurns }, last, at, quietTurns.get(tid) ?? 0);
       });
 
       let chosen: { tid: string; attr: Attr } | null = null;

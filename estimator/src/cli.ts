@@ -75,6 +75,7 @@ import {
 import { applyFix, auditReport, renderAudit, type AuditReport } from "./audit.ts";
 import {
   INSERT_ANOMALY_SQL,
+  backfillTaskEventTids,
   detectForkReplays,
   ingestSession,
   markSidechainReplays,
@@ -92,7 +93,7 @@ import { LOCK_PATH, LockBusyError, withLock } from "./lock.ts";
 import { isoSeconds, setManualPrice, showPrices, sync, type SyncResult } from "./prices.ts";
 import { attributeTasks } from "./attribute.ts";
 import { burnJson, burnRead, classifyOpenError, refreshBurnCache, renderBurn } from "./burn.ts";
-import { closeTask, type FinalStatus } from "./close.ts";
+import { closeTask, healClosedOutcomes, type FinalStatus } from "./close.ts";
 import { board, retro, type RetroReport } from "./retro.ts";
 import { DEFAULT_BOARD_LIMIT, regenerateBoardIfDue, renderBoardFiles } from "./board-render.ts";
 import { promoteStartedTasks } from "./promote.ts";
@@ -223,7 +224,9 @@ export const COMMAND_FLAGS: Record<Command, FlagSpec> = {
   bind: { booleans: [], values: ["session", "task", "run", "agent"] },
   scope: { booleans: [], values: ["reason", "subject", "description", "dod"] },
   burn: { booleans: ["refresh"], values: ["session"] },
-  close: { booleans: ["force"], values: ["status"] },
+  // `accept` takes a VALUE — the human's verbatim acceptance — because a boolean
+  // "the human agreed" is exactly the unattributable override `--force` already is.
+  close: { booleans: ["force"], values: ["status", "accept"] },
   board: { booleans: ["html", "md"], values: ["status", "limit", "out"] },
   retro: { booleans: ["dry-run"], values: ["as-of"] },
   recon: { booleans: ["certify", "dry-run"], values: ["window", "source"] },
@@ -478,6 +481,20 @@ export const BENIGN_ANOMALY_KINDS: ReadonlySet<string> = new Set([
   // `insertAnomalies` dedups on (kind, detail) and the detail carries the CLASS rather
   // than the values, so a segment contributes at most two rows for its whole life.
   "segment_recut",
+  // Craig, 2026-07-30: `est close --accept` — the human said the work is done, in the
+  // conversation, and the agent relayed their words. BENIGN, and pointedly not
+  // `forced_close`'s severity: `forced_close` is alerting because an override with no
+  // one named behind it is a hole in the corpus's provenance, and this row is the
+  // opposite — it exists to CARRY the provenance. It is also the ordinary path now
+  // that the gate's completion signal can fire, so alerting on it would train the
+  // watchdog to be ignored, which is what this whole set exists to prevent.
+  "accepted_close",
+  // §3.2 step 6: a planted `est_tid` naming a tid with no `task` row. The alias is
+  // correctly REFUSED (a transcript is untrusted input), so the row is evidence rather
+  // than damage — same reading as `promotion_backdated` above. It is still worth a
+  // ledger row: it is the only visible difference between "nobody planted" and
+  // "somebody planted something this database cannot resolve".
+  "plant_unlinked",
   // NOTE: `board_render_failed` (P2.7) is deliberately ABSENT from this set — it
   // does not go through `report.anomalies` at all (see the sweep's board-regen
   // step). The design's "never fails the sweep" is unconditional: `--strict`
@@ -597,6 +614,12 @@ export interface SweepReport {
     workflow_phases: number;
     /** `task_event` rows — TaskCreate AND TaskUpdate statusChange (§6.1). */
     task_events: number;
+    /** Planted `est_tid`s seen — `task_alias(session_task)` candidates (§3.2 step 6).
+     *  Seen, not minted: a plant naming a tid this database has never minted is
+     *  dropped by `INSERT_TASK_ALIAS_SQL`'s existence guard. */
+    task_plants: number;
+    /** `task_event` rows this sweep linked to a tid via those aliases. */
+    task_event_tids: number;
   };
   parse: ParseStats;
   /** Files whose read aborted before EOF; their watermark was deliberately NOT
@@ -680,6 +703,12 @@ export interface SweepReport {
   };
   /** P1.9: non-terminal tasks whose materialised burn row was rewritten. */
   burn_cache_rows: number;
+  /**
+   * §6.2: corrective `outcome` revisions appended for closed tasks whose actual moved
+   * after finalization — the late spend of an `--accept` close, chiefly. 0 in a steady
+   * state, and a non-zero count is a correction that happened, not a warning.
+   */
+  outcomes_healed: number;
   /** P2.1: the check-back corpus — sessions revisited, segments cut, still open. */
   segments: { sessions: number; segments: number; open: number };
   /** P2.8: the sweeper's one status edge, and the `started_at` corrections beside it. */
@@ -758,6 +787,7 @@ function emptyBatch(): IngestBatch {
     workflowRuns: [],
     workflowPhases: [],
     taskEvents: [],
+    taskPlants: [],
     anomalies: [],
     files: [],
     stats: { lines: 0, blank: 0, parsed: 0, malformed: 0, truncatedTail: 0 },
@@ -779,6 +809,7 @@ function mergeBatch(into: IngestBatch, from: IngestBatch): void {
   into.workflowRuns.push(...from.workflowRuns);
   into.workflowPhases.push(...from.workflowPhases);
   into.taskEvents.push(...from.taskEvents);
+  into.taskPlants.push(...from.taskPlants);
   into.anomalies.push(...from.anomalies);
   into.incompleteFiles.push(...from.incompleteFiles);
   into.skippedFiles.push(...from.skippedFiles);
@@ -951,6 +982,8 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
       workflow_runs: 0,
       workflow_phases: 0,
       task_events: 0,
+      task_plants: 0,
+      task_event_tids: 0,
     },
     parse: { lines: 0, blank: 0, parsed: 0, malformed: 0, truncatedTail: 0 },
     files_incomplete: 0,
@@ -994,6 +1027,7 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     },
     attribution: { tasks: 0, turns: 0, agents: 0, runs: 0, requests: 0, by_attr: {} },
     burn_cache_rows: 0,
+    outcomes_healed: 0,
     segments: { sessions: 0, segments: 0, open: 0 },
     promotion: { promoted: 0, started_at_set: 0, started_at_backdated: 0 },
     identity_repair: { candidates: 0, repaired: 0, ambiguous: 0, pending: 0 },
@@ -1036,6 +1070,9 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
       batch.agentRuns.length === 0 &&
       batch.workflowRuns.length === 0 &&
       batch.taskEvents.length === 0 &&
+      // A `TaskUpdate` that plants a tid without changing status writes a plant and
+      // no event, so the plants are their own reason to open a transaction.
+      batch.taskPlants.length === 0 &&
       files.length === 0 &&
       anomalies.length === 0
     ) {
@@ -1049,8 +1086,11 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
       // `writeBatch` writes rows only; anomalies go through insertAnomalies(), the
       // single writer, so the (kind, detail) de-duplication above applies to
       // ingest's anomalies too.
-      writeBatch(db, batch);
-      writtenAnomalies.push(...insertAnomalies(db, anomalies, sweptAt));
+      // `writeBatch` returns the anomalies only the WRITER can see — a planted
+      // est_tid whose task row does not exist is a fact about the database, not
+      // about the file, so ingest cannot raise it and the writer must.
+      const written = writeBatch(db, batch);
+      writtenAnomalies.push(...insertAnomalies(db, [...anomalies, ...written.anomalies], sweptAt));
       const stmt = db.prepare(UPSERT_SWEEP_STATE_SQL);
       for (const f of files) {
         stmt.run({
@@ -1075,6 +1115,7 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     report.rows.workflow_runs += batch.workflowRuns.length;
     report.rows.workflow_phases += batch.workflowPhases.length;
     report.rows.task_events += batch.taskEvents.length;
+    report.rows.task_plants += batch.taskPlants.length;
     report.parse.lines += batch.stats.lines;
     report.parse.blank += batch.stats.blank;
     report.parse.parsed += batch.stats.parsed;
@@ -1274,6 +1315,16 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     markers_pruned: spool.markers_pruned,
   };
 
+  // 1a2. **Link the lifecycle stream to its tasks.** Both `task_event` writers have
+  //      now run (the batches above, and the spool drain), and the `session_task`
+  //      aliases the plants minted are in place, so this is the first moment the join
+  //      is complete. Corpus-wide and once per sweep rather than per batch: a plant
+  //      seen in one chunk routinely links events written from another, and the
+  //      statement only ever touches rows whose `tid` is still NULL.
+  db.transaction(() => {
+    report.rows.task_event_tids += backfillTaskEventTids(db);
+  }).immediate();
+
   // 1b. **Drain the OTEL spool** (P2.3, P2.4), for the same reason and with the same
   //     crash-safety: the receiver is a long-lived unattended process that must never
   //     contend for the writer lock, so it appends lines and the sweeper — the single
@@ -1399,6 +1450,16 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     n_items_started: jobs.n_items_started,
   };
   pendingAnomalies.push(...jobs.anomalies);
+
+  // 3b. **Heal closed outcomes whose actual has since moved** (§6.2, Craig 2026-07-30).
+  //     AFTER attribution, so the recomputed actual sees every request this sweep
+  //     claimed, and before the cache/board so they publish the corrected number.
+  //     It is the mechanism behind "a close is a revision, never an edit": the accepting
+  //     turn's own spend lands after an `--accept` close by construction, and nothing
+  //     used to append the correction. Appends nothing when nothing moved.
+  db.transaction(() => {
+    report.outcomes_healed = healClosedOutcomes(db, now, { spoolDir: sweepSpoolDir }).length;
+  }).immediate();
 
   // 4. **Cut the run segments** (P2.1), and do it BEFORE `refreshBurnCache`: the
   //    check-back forecast the cache writes is issued against the OPEN segment this
@@ -1703,7 +1764,8 @@ function sweepSummary(r: SweepReport): string {
       (r.corpus.oldest_mtime === null ? "" : `, oldest ${r.corpus.oldest_mtime.slice(0, 10)}`),
     `rows    ${num(r.rows.requests)} request, ${num(r.rows.turns)} turn, ${num(r.rows.agent_runs)} agent_run, ` +
       `${num(r.rows.workflow_runs)} workflow_run, ${num(r.rows.workflow_phases)} workflow_phase, ` +
-      `${num(r.rows.task_events)} task_event`,
+      `${num(r.rows.task_events)} task_event (${num(r.rows.task_plants)} planted est_tid, ` +
+      `${num(r.rows.task_event_tids)} linked)`,
     `parsed  ${num(r.parse.parsed)}/${num(r.parse.lines)} lines` +
       (r.parse.malformed > 0 ? `, ${r.parse.malformed} malformed` : "") +
       (r.parse.truncatedTail > 0 ? `, ${r.parse.truncatedTail} truncated tail(s)` : ""),
@@ -1732,7 +1794,12 @@ function sweepSummary(r: SweepReport): string {
       `attrib  ${num(r.attribution.tasks)} task(s): ${num(r.attribution.turns)} turn, ${num(r.attribution.agents)} agent, ` +
         `${num(r.attribution.runs)} run, ${num(r.attribution.requests)} request row(s) changed${split === "" ? "" : ` (${split})`}`,
     );
-    lines.push(`burn    ${num(r.burn_cache_rows)} materialised burn_cache row(s) refreshed`);
+    lines.push(
+      `burn    ${num(r.burn_cache_rows)} materialised burn_cache row(s) refreshed` +
+        (r.outcomes_healed > 0
+          ? `  ·  ${num(r.outcomes_healed)} closed outcome(s) corrected: spend landed after finalization, so a revision was appended`
+          : ""),
+    );
     lines.push(
       `segs    ${num(r.segments.segments)} run segment(s) over ${num(r.segments.sessions)} session(s), ` +
         `${num(r.segments.open)} still open — the check-back corpus (\`est segments\`)`,
@@ -2747,6 +2814,28 @@ async function cmdClose(ctx: Ctx): Promise<number> {
   if (statusRaw !== null && !allowed.includes(statusRaw)) {
     throw new UsageError(`--status must be one of: ${allowed.join(" | ")}`);
   }
+  // Rejected rather than treated as consent: `--accept` with nothing in it is a close
+  // with no one behind it, which is what `--force` is for and is named as.
+  const acceptRaw = flagString(ctx.parsed, "accept");
+  const forceFlag = flagBool(ctx.parsed, "force");
+  if (acceptRaw !== null && acceptRaw.trim() === "") {
+    throw new UsageError(
+      'est close --accept: quote the human\'s acceptance, e.g. --accept "I accept the task is done"',
+    );
+  }
+  // The two bypasses make opposite claims about who decided, so passing both says
+  // nothing. `closeTask` refuses the same combination — this layer exists for the
+  // message, that one so no other caller can get past it.
+  if (acceptRaw !== null && forceFlag) {
+    throw new UsageError(
+      "est close: pass --accept (the human decided, and the ledger records their words) or --force (nobody is named), never both",
+    );
+  }
+  if (acceptRaw !== null && (statusRaw === "reopened" || statusRaw === "deleted")) {
+    throw new UsageError(
+      `est close --accept: an acceptance asserts the work is COMPLETE, so it cannot close as '${statusRaw}' — use --status completed or abandoned`,
+    );
+  }
   return await withLock(
     (): number => {
       const db = openDb({ path: ctx.dbPath });
@@ -2754,7 +2843,8 @@ async function cmdClose(ctx: Ctx): Promise<number> {
         const r = closeTask(db, {
           tid,
           status: (statusRaw as FinalStatus | null) ?? "completed",
-          force: flagBool(ctx.parsed, "force"),
+          force: forceFlag,
+          accept: acceptRaw,
           now: new Date(),
         });
         if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...r }));
@@ -2777,6 +2867,13 @@ async function cmdClose(ctx: Ctx): Promise<number> {
                 `${r.in_band === true ? "inside" : "OUTSIDE"} the p90 band (judged against eid ${r.eid_at_start}, the FIRST estimate — always)`,
           );
           if (r.forced) ctx.out(`FORCED  the quiescence gate was overridden: ${r.quiescence.failing.join("; ")}`);
+          if (r.accepted) {
+            ctx.out(
+              `ACCEPTED  closed on the human's recorded acceptance` +
+                (r.quiescence.ok ? "" : ` (gate bypassed: ${r.quiescence.failing.join("; ")})`) +
+                ` — anomaly(accepted_close) carries the quote`,
+            );
+          }
           if (r.alerts.length > 0) ctx.out(`alerts  ${r.alerts.join(", ")}`);
         }
         return r.alerts.length > 0 ? 3 : 0;
@@ -3467,6 +3564,11 @@ function renderRetro(r: RetroReport): string {
     `  compliance_t1t2 ${pct(q.compliance_t1t2)} (EXACT, and T1/T2 only — an upper bound on true compliance)`,
     `  t3_candidates ${q.t3_candidates} — an UPPER BOUND on T3 misses, never a gate input.  ${q.t4_note}`,
     `  scope declared ${pct(q.scope_declared_pct)} · identity planted ${pct(q.identity_planted_pct)} · overhead ${pct(q.overhead_share)}`,
+    // The gate bypasses, reported every retro whether or not they fired. A lever that
+    // decides what enters the calibration corpus has to be self-reporting: a climbing
+    // share is evidence about the QUIESCENCE gate (it is finalizing less of the corpus
+    // on its own), which is exactly the kind of drift nobody goes looking for.
+    `  closes bypassing the gate ${pct(q.bypass_share)} of closed tasks — ${q.accepted_closes} on recorded human consent (--accept), ${q.forced_closes} forced`,
     `  unpriced ${pct(q.unpriced_share)} · provisional ${pct(q.provisional_share)} · cross-epoch tasks ${q.cross_epoch_tasks}`,
     `  fork replays ${q.fork_replays} · sidechain replays ${q.sidechain_replays} · compactions ${q.compactions} · spawn_depth>1 ${q.spawn_depth_gt1}`,
     `  dangling agents ${q.dangling_agents} · phase-unmapped ${q.phase_unmapped_agents} · unlabelled workflow agents ${q.unlabeled_wf_agents}`,
@@ -3609,7 +3711,13 @@ block <tid>:
 bind <tid>:               [--session <sid>] [--task <n>] [--run <runId>] [--agent <agentId>]
 scope <tid>:              --reason <text> [--subject <t>] [--description <t>] [--dod <json|@file>]
 burn [<tid>]:             [--session <sid>] [--refresh]      read-only; never writes; always exits 0
-close <tid>:              [--status completed|abandoned|deleted|reopened] [--force]
+close <tid>:              [--status completed|abandoned|deleted|reopened]
+                          --accept "<the human's verbatim acceptance>"   closes on
+                            recorded consent, bypassing the gate; the ONLY bypass
+                            Claude may use, and only when the human has explicitly
+                            said the work is done. Records anomaly(accepted_close).
+                          [--force]   Craig's own override at a terminal, never
+                            Claude's. Records anomaly(forced_close).
 board:                    [--status <column>] [--limit <n>]
                           [--html] [--md] [--out <dir>]   P2.7 file renderer — writes
                           board.html/board.md (default dir: alongside the database),

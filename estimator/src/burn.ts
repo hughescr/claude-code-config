@@ -22,6 +22,7 @@
 
 import type { Database } from "bun:sqlite";
 import { getConfig, openDb, unvalidatedRetired } from "./db.ts";
+import { attrRetired, attrWindow } from "./attribute.ts";
 import { isoNow, TERMINAL_TASK_STATUS } from "./tasks.ts";
 import {
   buildEtaFit,
@@ -637,6 +638,33 @@ export interface BurnActive {
    * for why the second number is not optional.
    */
   compute: ComputeClock;
+  /**
+   * Whether the SESSION's current activity is being metered against a task, and how
+   * many bound open tasks are waiting to be closed — see {@link taskAttribState}.
+   *
+   * ADDITIVE under P2.0's rule (no field removed, none retyped), so `"schema"` stays
+   * `1`. It exists because the band alone is not an answer to "am I on a tracked task
+   * right now": a task the sweeper has not closed yet keeps its band on screen, and a
+   * morning of unrelated chatter against a finished task's percent-of-band is a number
+   * that is *true about the task* and *wrong about what Craig is doing*. Consumers that
+   * only want the band can keep ignoring it; the statusline reads it and stops rendering.
+   */
+  task_attrib: TaskAttrib;
+  /** Bound open tasks whose attribution window has lapsed. 0 whenever `task_attrib`
+   *  is `none`; may be non-zero while `active`, when a SECOND task is awaiting close. */
+  pending_close: number;
+  /**
+   * WHICH bound open task the `active` state is about; null unless `task_attrib` is
+   * `active`.
+   *
+   * `task_attrib` is session-wide, so on an explicit `est burn <tid> --json` it can say
+   * `active` about a task that is not the one in `tid` — a session holding two open
+   * tasks, of which the caller asked about the quiet one. Without this field that
+   * consumer cannot tell the two cases apart, and "active" would read as a claim about
+   * the task it named. On the session path this equals `tid` by construction: the
+   * payload follows the active task (see {@link TaskAttribState.active_tid}).
+   */
+  active_tid: string | null;
   warn: BurnWarn[];
 }
 
@@ -653,6 +681,29 @@ export interface BurnTargetResolution {
   target: BurnTarget;
 }
 
+/** Open in the sense both readers below mean: not terminal, not already finalized. */
+function isOpenTask(db: Database, tid: string): boolean {
+  const t = db.query<{ status: string }, [string]>("SELECT status FROM task WHERE tid = ?").get(tid);
+  if (t === null || t === undefined) return false;
+  if (TERMINAL_TASK_STATUS.has(t.status)) return false;
+  const o = db
+    .query<{ final_status: string }, [string]>("SELECT final_status FROM v_outcome_current WHERE tid = ?")
+    .get(tid);
+  return o === null || o === undefined || o.final_status === "reopened";
+}
+
+/**
+ * The session the payload is about: explicit, else whatever the harness exported.
+ *
+ * Shared with {@link taskAttribState} on purpose — a target resolved from one session
+ * and a tracked-task state computed from another would be two answers about two
+ * different screens.
+ */
+function resolveSession(session?: string | null): string | null {
+  const s = session ?? process.env.EST_SESSION_ID ?? process.env.CLAUDE_SESSION_ID ?? null;
+  return s === null || s === "" ? null : s;
+}
+
 /**
  * Target resolution, in P1.6's order: explicit `<tid>` -> the tid bound to
  * `--session` -> the resolved anchor session's binding -> the most recently touched
@@ -665,21 +716,13 @@ export interface BurnTargetResolution {
  * task back can decline to render it.
  */
 export function resolveBurnTarget(db: Database, opts: BurnTargetOptions = {}): BurnTargetResolution {
-  const nonTerminal = (tid: string): boolean => {
-    const t = db.query<{ status: string }, [string]>("SELECT status FROM task WHERE tid = ?").get(tid);
-    if (t === null || t === undefined) return false;
-    if (TERMINAL_TASK_STATUS.has(t.status)) return false;
-    const o = db
-      .query<{ final_status: string }, [string]>("SELECT final_status FROM v_outcome_current WHERE tid = ?")
-      .get(tid);
-    return o === null || o === undefined || o.final_status === "reopened";
-  };
+  const nonTerminal = (tid: string): boolean => isOpenTask(db, tid);
 
   if (opts.tid !== null && opts.tid !== undefined && opts.tid !== "") {
     return { tid: nonTerminal(opts.tid) ? opts.tid : null, target: "explicit" };
   }
-  const session = opts.session ?? process.env.EST_SESSION_ID ?? process.env.CLAUDE_SESSION_ID ?? null;
-  if (session !== null && session !== "") {
+  const session = resolveSession(opts.session);
+  if (session !== null) {
     // A session hosts many tasks (schema v6), so this asks for the NEWEST binding
     // first: the statusline follows the work in front of Craig, not the first task
     // this session ever opened. `tid` breaks ties because uuidv7 sorts by mint time,
@@ -702,6 +745,177 @@ export function resolveBurnTarget(db: Database, opts: BurnTargetOptions = {}): B
     )
     .get();
   return { tid: recent?.tid ?? null, target: "fallback" };
+}
+
+/**
+ * Is the session's CURRENT activity being metered against an `est` task (Craig,
+ * 2026-07-30)?
+ *
+ *  - `active` — an open task is bound to this session AND it is still absorbing work:
+ *    a turn attributed to it inside the attribution window, or a delegation of its own
+ *    still in flight.
+ *  - `quiet`  — an open task is bound, but its attribution window has lapsed. Nothing
+ *    said since is booking to it; it is waiting to be closed.
+ *  - `none`   — no open task is bound to this session at all.
+ */
+export type TaskAttrib = "active" | "quiet" | "none";
+
+export interface TaskAttribState {
+  state: TaskAttrib;
+  /** Open tasks bound to this session whose window has lapsed — awaiting close. */
+  pending_close: number;
+  /**
+   * The bound open task actually absorbing work, and therefore the one whose band the
+   * segment should render. Null iff `state` is not `active`.
+   *
+   * It is NOT necessarily `resolveBurnTarget`'s answer. That resolver takes the NEWEST
+   * binding, which is the right guess when nothing better is known and the wrong one
+   * whenever a session holds two open tasks and the older is the live one: the payload
+   * would then carry the quiet task's band while spend accrued to the other, and the
+   * segment would print "no tracked task" over a running task. So the state names the
+   * task, and `burnJson` follows it.
+   */
+  active_tid: string | null;
+}
+
+/**
+ * Compute {@link TaskAttrib} for the session this payload is about.
+ *
+ * **SESSION-WIDE, never about one task.** The question is "is anything Craig does right
+ * now being metered", and a session hosts many tasks (schema v6): asking it of the
+ * newest binding alone reported `quiet` — and the segment printed "no tracked task" —
+ * while an OLDER open task in the same session absorbed every turn. That is the
+ * wrong-claim-on-screen failure P1.9 exists to prevent, arrived at from the other
+ * direction. So: `active` if ANY bound open task is still absorbing work, and
+ * `active_tid` names which, so the band that renders is that task's.
+ *
+ * **The retirement test is attribution's own** (`attrRetired`, src/attribute.ts), not a
+ * threshold of this file's. Both arms travel with it: `attr_stale_minutes` since the
+ * last attributed turn, AND `attr_stale_turns` worth of intervening turns that booked
+ * elsewhere. A minutes-only copy here would call a task tracked through a dozen turns
+ * of unrelated chatter — the exact complaint this state was added to answer.
+ *
+ * Three things count as still absorbing:
+ *
+ *  1. an attributed turn inside that window — `turn.tid`, not `request.ts`: attribution
+ *     assigns the TURN and requests inherit it, so a turn carrying this tid IS the
+ *     record of the session's work being metered against the task. It is also reachable
+ *     through the `turn` primary key's `session_id` prefix, where `MAX(request.ts)` per
+ *     task is an unbounded scan of the biggest table in the database at a 5 s cadence.
+ *  2. the session's newest turn being OPEN and attributed to it (§6.2's own open-turn
+ *     test). Attribution timestamps a turn by its START, so a single long turn — the
+ *     20.9-hour case close.ts protects by construction — would otherwise age into
+ *     `quiet` while it was still running. Only the NEWEST turn qualifies: a NULL
+ *     duration anywhere in history is what a killed session leaves behind, permanently.
+ *  3. a live delegation of its own, from `burn_cache.n_agents_live` — §5.4's third
+ *     touch, and the case this system exists to measure, since a background run is
+ *     exactly when the orchestrator's own session goes quiet for hours.
+ *
+ * All of it stays inside P1.9's bounded read budget: one row for the session's newest
+ * turn, and per bound task one indexed `MAX`, one counter and one PK probe.
+ *
+ * **A task with no cache row reads as ZERO live agents on the cached path**, never as a
+ * live `agent_run` count: that query is exactly what this file forbids per render, and
+ * "no row yet" is a one-sweep condition — a task opened seconds ago, before the next
+ * §6.3 micro-sweep. The bounded cost of being wrong is that a brand-new task's
+ * delegation does not count as activity until that sweep lands, seconds later, and
+ * `est open` itself makes the task active by the touch clock meanwhile. `live: "fresh"`
+ * opts into the live count, and is for `--refresh` — the live path by contract.
+ */
+export function taskAttribState(
+  db: Database,
+  opts: {
+    tid?: string | null;
+    session?: string | null;
+    now?: Date;
+    live?: "cache" | "fresh";
+  } = {},
+): TaskAttribState {
+  const empty: TaskAttribState = { state: "none", pending_close: 0, active_tid: null };
+  const session = resolveSession(opts.session);
+  if (session === null) return empty;
+
+  const bound = db
+    .query<{ tid: string }, [string]>("SELECT DISTINCT tid FROM task_alias WHERE session_id = ?")
+    .all(session)
+    .map((r) => r.tid)
+    .filter((tid) => isOpenTask(db, tid));
+  if (bound.length === 0) return empty;
+
+  const win = attrWindow(db);
+  const nowMs = (opts.now ?? new Date()).getTime();
+  const newest = db
+    .query<{ tid: string | null; duration_ms: number | null }, [string]>(
+      "SELECT tid, duration_ms FROM turn WHERE session_id = ? ORDER BY started_at DESC, prompt_id DESC LIMIT 1",
+    )
+    .get(session);
+  const openTurnTid =
+    newest !== null && newest !== undefined && newest.duration_ms === null ? newest.tid : null;
+
+  const lastTurn = db.prepare<{ ts: string | null }, [string, string]>(
+    "SELECT MAX(started_at) AS ts FROM turn WHERE session_id = ? AND tid = ?",
+  );
+  // The turns that booked somewhere else since — attribution's `quietTurns` counter,
+  // computed from the same evidence: a turn later than this task's last attributed one
+  // is by construction a turn that did not go to it.
+  const sinceCount = db.prepare<{ n: number }, [string, string]>(
+    "SELECT COUNT(*) AS n FROM turn WHERE session_id = ? AND started_at > ?",
+  );
+  const liveCached = db.prepare<{ n: number | null }, [string]>(
+    "SELECT n_agents_live AS n FROM burn_cache WHERE tid = ?",
+  );
+  const openedAt = db.prepare<{ created_at: string }, [string]>(
+    "SELECT created_at FROM task WHERE tid = ?",
+  );
+
+  // Memoised: the state, the chosen task and the pending count all ask about the same
+  // tids, and this runs on the statusline's read path at a >= 5 s cadence forever.
+  const decided = new Map<string, { active: boolean; touched: number }>();
+  const assess = (tid: string): { active: boolean; touched: number } => {
+    const was = decided.get(tid);
+    if (was !== undefined) return was;
+    const lastTs = lastTurn.get(session, tid)?.ts ?? null;
+    // No attributed turn yet means the window has only just opened, so the task's own
+    // mint time stands in for the touch — the same substitution the turn walk makes
+    // with `windowStart`.
+    const touched = lastTs !== null
+      ? Date.parse(lastTs)
+      : Date.parse(openedAt.get(tid)?.created_at ?? "");
+    const live =
+      opts.live === "fresh"
+        ? liveAgents(db, tid, opts.now ?? new Date())
+        : liveCached.get(tid)?.n ?? 0;
+    const quietTurns = lastTs === null ? 0 : sinceCount.get(session, lastTs)?.n ?? 0;
+    const active =
+      live > 0 ||
+      openTurnTid === tid ||
+      !attrRetired(win, touched, nowMs, quietTurns);
+    const out = { active, touched: Number.isFinite(touched) ? touched : 0 };
+    decided.set(tid, out);
+    return out;
+  };
+
+  const active = bound.filter((tid) => assess(tid).active);
+  if (active.length === 0) {
+    return { state: "quiet", pending_close: bound.length, active_tid: null };
+  }
+  // The caller's own task wins when it is one of the active ones — an explicit `--tid`
+  // must not be silently answered about a different task. Otherwise the most recently
+  // touched, with `tid` breaking ties so two same-instant tasks resolve the same way
+  // on every render (uuidv7 sorts by mint time).
+  const chosen =
+    opts.tid !== null && opts.tid !== undefined && active.includes(opts.tid)
+      ? opts.tid
+      : active.reduce((a, b) => {
+          const ta = assess(a).touched;
+          const tb = assess(b).touched;
+          return tb > ta || (tb === ta && b > a) ? b : a;
+        });
+  return {
+    state: "active",
+    pending_close: bound.length - active.length,
+    active_tid: chosen,
+  };
 }
 
 interface BandRow {
@@ -768,10 +982,26 @@ export interface BurnJsonOptions {
 export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
   const now = opts.now ?? new Date();
   const asOf = isoNow(now);
-  const { tid, target } = resolveBurnTarget(db, {
+  const resolved = resolveBurnTarget(db, {
     tid: opts.tid ?? null,
     session: opts.session ?? null,
   });
+  const target = resolved.target;
+  // The state is computed BEFORE the payload, because it can change which task the
+  // payload is about: `resolveBurnTarget` takes the newest binding, and when a session
+  // holds two open tasks the newest is not necessarily the one absorbing work. The
+  // band on screen has to be the band of the task the spend is going to.
+  const attrib = taskAttribState(db, {
+    tid: resolved.tid,
+    session: opts.session ?? null,
+    now,
+    // `--refresh` refits the corpus rather than reading yesterday's columns, and the
+    // live-agent leg is part of that: a human asking `est burn --refresh` about a task
+    // whose cache row is missing or stale should get the count as it is NOW. The
+    // statusline never passes it, which is the whole point.
+    live: opts.refresh === true ? "fresh" : "cache",
+  });
+  const tid = target === "session" && attrib.active_tid !== null ? attrib.active_tid : resolved.tid;
   if (tid === null) return { schema: 1, active: false, as_of: asOf, reason: "no_open_estimate" };
 
   const band = currentBand(db, tid);
@@ -985,6 +1215,9 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
     unvalidated: !unvalidatedRetired(db),
     check_back: checkBack,
     compute,
+    task_attrib: attrib.state,
+    pending_close: attrib.pending_close,
+    active_tid: attrib.active_tid,
     warn,
   };
 }
@@ -1037,6 +1270,24 @@ export function burnRead(dbPath: string, opts: BurnJsonOptions = {}): BurnJson {
   }
 }
 
+/**
+ * The "is this what you are working on" note for the terminal renderer.
+ *
+ * Suppressed for a `fallback` target only, where the GUESSED TARGET note beside it
+ * already says nothing is bound — two sentences making the same point on one line.
+ */
+function trackingNote(b: BurnActive): string {
+  if (b.target === "fallback") return "";
+  if (b.task_attrib === "none") return "  (NOT CURRENTLY TRACKED: no open task is bound to this session)";
+  if (b.task_attrib === "quiet") {
+    return "  (NOT CURRENTLY TRACKED: no attributed turn inside the attribution window — awaiting close)";
+  }
+  if (b.active_tid !== null && b.active_tid !== b.tid) {
+    return `  (NOT THIS TASK: the session is metering ${b.active_tid} right now)`;
+  }
+  return "";
+}
+
 /** `est burn`'s human line plus a burn bar. One line, because that is the budget. */
 export function renderBurn(b: BurnJson): string {
   if (!b.active) {
@@ -1052,7 +1303,15 @@ export function renderBurn(b: BurnJson): string {
       // Nothing bound this task to the caller: it is the most recently touched open
       // task, which may be someone else's. Say so rather than let the band be read
       // as an answer about the work in front of the reader.
-      (b.target === "fallback" ? "  (GUESSED TARGET: no binding — most recently touched open task)" : ""),
+      (b.target === "fallback" ? "  (GUESSED TARGET: no binding — most recently touched open task)" : "") +
+      // The same fact the statusline acts on, said rather than acted on: a terminal
+      // asked an explicit question and deserves the band it asked for, plus the note
+      // that nothing being said right now is booking to it.
+      //
+      // Three cases, and the third is the one an explicit `--tid` creates: the SESSION
+      // is metering, just not this task. Saying nothing there would let "no note" read
+      // as "yes, this is what you are working on".
+      trackingNote(b),
     `${bar} ${fmt(b.wcet.consumed)}/${fmt(b.wcet.p50)} WCET (${pct}% of p50, ${b.wcet.pct_p90}% of p90)` +
       (b.band.uncalibrated ? "  UNCALIBRATED" : ""),
     `main ${fmt(b.split.main)} · sub ${fmt(b.split.sub)} · aux ${fmt(b.split.aux)} · ` +

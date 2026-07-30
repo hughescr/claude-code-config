@@ -26,8 +26,9 @@ import { join } from "node:path";
 import { attributeTasks } from "./attribute.ts";
 import { intervalUnion, taskIntervals } from "./burn.ts";
 import { getConfig } from "./db.ts";
+import { PROJECTS_ROOT } from "./discover.ts";
 import { clearOverrunMarker, SPOOL_DIR } from "./spool.ts";
-import { InvariantError, isoNow } from "./tasks.ts";
+import { InvariantError, isoNow, TERMINAL_TASK_STATUS } from "./tasks.ts";
 
 /** Where the harness records live sessions (`<pid>.json`); `EST_SESSIONS` overrides. */
 export const SESSIONS_ROOT: string =
@@ -35,6 +36,179 @@ export const SESSIONS_ROOT: string =
 
 /** §6.2: a task with no completion signal is still closeable once this stale. */
 export const STALE_CLOSE_HOURS = 48;
+
+// ---------------------------------------------------------------------------
+// `--accept`: consent has to be a FACT IN THE CORPUS, not an assertion
+// ---------------------------------------------------------------------------
+
+/**
+ * Fold a quote to the form two records of the same sentence can be compared in:
+ * case, run-length whitespace, and the quote glyphs a terminal and a chat client
+ * disagree about (`'` vs `’`, `"` vs `“`).
+ *
+ * Nothing else is touched. Stripping punctuation or stemming would start matching
+ * sentences the human did not say, and the entire value of this check is that the
+ * match is of THEIR words.
+ */
+export function normalizeAcceptance(s: string): string {
+  return s
+    .replace(/[‘’ʼ′]/g, "'")
+    .replace(/[“”″]/g, '"')
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Shortest quote the verification will accept, in normalized characters.
+ *
+ * A bare substring test with no floor verifies `--accept "ok"` against the "ok" inside
+ * "token", and against essentially any transcript ever written — which turns the check
+ * back into the assertion it exists to replace. Two guards together fix that: this
+ * floor, and whole-phrase matching below.
+ *
+ * **12 is chosen against the criterion the skill states, not against a corpus.** Every
+ * acceptance SKILL.md §6 sanctions clears it comfortably — "i accept the task is done"
+ * (25), "i approve this as complete" (26), "accepted, close it out" (22) — while the
+ * phrases that are explicitly NOT acceptance fall under it: "ok" (2), "yes" (3), "done"
+ * (4), "thanks" (6), "ship it" (7), "looks good" (10). A first-person acceptance of
+ * completion is a sentence; it cannot be two syllables. If a legitimate shorter form
+ * ever appears, the fix is to widen the criterion in SKILL.md and this constant
+ * together, deliberately — not to let one word through.
+ */
+export const MIN_ACCEPTANCE_CHARS = 12;
+
+/** Escape a normalized needle for use inside a RegExp. */
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Does the normalized haystack contain the needle as a WHOLE PHRASE?
+ *
+ * Bounded by non-word characters or the ends of the string, so "ok" no longer matches
+ * inside "token" and "i accept" no longer matches inside "i accepted the risk". The
+ * floor above stops the trivially-common needle; this stops the accidental one, and the
+ * two failures are different enough that neither guard covers the other.
+ */
+function containsPhrase(haystack: string, needle: string): boolean {
+  return new RegExp(`(?:^|[^\\w])${escapeRe(needle)}(?:$|[^\\w])`).test(haystack);
+}
+
+/** Human-authored text on one transcript line, or null when the line has none. */
+function humanText(line: Record<string, unknown>): string | null {
+  if (line.type !== "user" || line.isSidechain === true) return null;
+  // A `tool_result` is a user-ROLE line the harness wrote, and one of the things it
+  // routinely contains is this CLI's own stdout. Without this exclusion an agent could
+  // manufacture its own evidence: print the sentence, let the transcript record the
+  // print, then "verify" against it.
+  if (line.toolUseResult !== undefined) return null;
+  const content = (line.message as Record<string, unknown> | undefined)?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return null;
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block === null || typeof block !== "object") continue;
+    const b = block as Record<string, unknown>;
+    if (b.type !== "text") continue;
+    if (typeof b.text === "string") parts.push(b.text);
+  }
+  return parts.length === 0 ? null : parts.join("\n");
+}
+
+/**
+ * Did a human actually say this, in one of the sessions bound to the task?
+ *
+ * **Why a check at all.** `--accept` is the one gate bypass an agent may reach for, and
+ * an agent asserting "he accepted" is exactly the self-report the whole design refuses
+ * everywhere else (§P1.12: no flag takes a number *because* the agent would be grading
+ * its own work). The project already answers this shape of problem the same way for
+ * scope: `sweeper_diff` detects undeclared drift from the corpus rather than trusting a
+ * declaration. Consent gets the same treatment — the words have to be findable in the
+ * transcript the harness wrote.
+ *
+ * **Three things a match must be**, because a bare substring test is not evidence:
+ * long enough that a common word cannot serve ({@link MIN_ACCEPTANCE_CHARS}), a whole
+ * phrase rather than a fragment inside a longer word ({@link containsPhrase}), and
+ * SAID AFTER the task existed (`notBefore`). The last one matters as much as the
+ * others: a session is long-lived and hosts many tasks, so without it one acceptance
+ * typed in the morning would verify every task opened in that session for the rest of
+ * the day — the consent would be real and its object would be a task that had not been
+ * conceived of when it was given.
+ *
+ * **What it does NOT prove.** That the human MEANT it as acceptance of THIS task.
+ * A verified quote can still be a fragment lifted out of context, or an acceptance of
+ * another of the session's tasks. The check moves the failure mode from "an agent can
+ * invent consent" to "an agent can misread consent that was given", which is a strictly
+ * smaller and much noisier thing to get away with — and the `accepted_close` row keeps
+ * the quote, so a human reading the ledger can see exactly what was relied on. SKILL.md
+ * carries the other half: ask rather than construe.
+ *
+ * TODO (deferred, 2026-07-30): read the transcript as a STREAM rather than with
+ * `readFileSync`. A long session's file is tens of MB and this holds the whole thing in
+ * memory for one substring test. Deferred deliberately — `est close` is human-initiated
+ * and runs once per task, so the cost is a one-off pause rather than anything on a hot
+ * path, and `readJsonl` (src/ingest.ts) already has the streaming reader to reuse.
+ */
+export function acceptanceInTranscript(
+  sessions: readonly string[],
+  quote: string,
+  root: string = PROJECTS_ROOT,
+  /** ISO instant the task was minted; earlier words are not about it. */
+  notBefore: string | null = null,
+): boolean {
+  const needle = normalizeAcceptance(quote);
+  if (needle.length < MIN_ACCEPTANCE_CHARS) return false;
+  const wanted = new Set(sessions.filter((s) => s !== ""));
+  if (wanted.size === 0) return false;
+  const parsedFloor = notBefore === null ? Number.NaN : Date.parse(notBefore);
+  const floorMs = Number.isFinite(parsedFloor) ? parsedFloor : null;
+
+  let projects: string[];
+  try {
+    projects = readdirSync(root);
+  } catch {
+    // No corpus on disk at all: unverifiable, which is a refusal, never a pass.
+    return false;
+  }
+  for (const project of projects) {
+    for (const session of wanted) {
+      const path = join(root, project, `${session}.jsonl`);
+      let raw: string;
+      try {
+        raw = readFileSync(path, "utf8");
+      } catch {
+        continue; // this project dir does not host that session
+      }
+      for (const line of raw.split("\n")) {
+        // Cheap prefilter: only human lines can carry the quote, and JSON.parse of a
+        // whole transcript is the expensive part.
+        if (line === "" || !line.includes('"type":"user"')) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(line);
+        } catch {
+          continue; // a torn tail is not evidence either way
+        }
+        if (parsed === null || typeof parsed !== "object") continue;
+        const o = parsed as Record<string, unknown>;
+        // No timestamp means the line cannot be placed relative to the task, and an
+        // unplaceable line is not evidence. Compared as INSTANTS, not as strings: the
+        // harness writes milliseconds and `task.created_at` does not, and `"...00.000Z"`
+        // sorts BEFORE `"...00Z"` lexicographically.
+        if (floorMs !== null) {
+          const at = o.timestamp;
+          if (typeof at !== "string") continue;
+          const atMs = Date.parse(at);
+          if (!Number.isFinite(atMs) || atMs <= floorMs) continue;
+        }
+        const text = humanText(o);
+        if (text !== null && containsPhrase(normalizeAcceptance(text), needle)) return true;
+      }
+    }
+  }
+  return false;
+}
 
 export type FinalStatus = "completed" | "abandoned" | "deleted" | "reopened";
 
@@ -258,9 +432,38 @@ export interface CloseInput {
   tid: string;
   status?: FinalStatus;
   force?: boolean;
+  /**
+   * The human's VERBATIM acceptance that the work is done (Craig, 2026-07-30).
+   *
+   * `--force` was specified as "the user's tool, not Claude's" on the assumption that
+   * Craig would run it from a terminal, and that assumption does not survive contact:
+   * **the human does not know this CLI exists.** What actually happens is that the
+   * human states acceptance in the conversation, and the agent relays those words —
+   * only that explicit consent may put the agent's hand on the close.
+   *
+   * So this is a THIRD state, not a synonym for `force`: the gate is bypassed the same
+   * way, but the ledger row says who decided and quotes them, and the quote is
+   * mandatory. An empty one is a usage error rather than a silently unattributed
+   * override — a bypass whose provenance is "someone passed a flag" is the thing
+   * `--force`'s anomaly already covers.
+   */
+  accept?: string | null;
   now?: Date;
   /** Where the hook markers live; tests point this at a temp dir. Defaults to the spool. */
   spoolDir?: string;
+  /** Corpus root the `--accept` verification reads; tests point it at a temp corpus. */
+  projectsRoot?: string;
+  /**
+   * SWEEPER ONLY: append a corrective revision to an already-closed task.
+   *
+   * Not reachable from the CLI, and deliberately: it is not a third way for a human or
+   * an agent to bypass the gate, it is the mechanism that makes "a close is a revision"
+   * true instead of merely documented (see {@link healClosedOutcomes}). It bypasses the
+   * gate — the task is already closed, so every arm is moot — and records NO anomaly,
+   * because the sweeper correcting its own arithmetic is not an event anyone needs to
+   * be told about.
+   */
+  heal?: boolean;
 }
 
 export interface CloseResult {
@@ -298,6 +501,8 @@ export interface CloseResult {
   ambiguous_share: number | null;
   unattrib_share: number | null;
   forced: boolean;
+  /** The gate was bypassed on the human's recorded acceptance — see {@link CloseInput.accept}. */
+  accepted: boolean;
   quiescence: QuiescenceReport;
   /** Non-empty => the CLI exits 3: finalized, with alerting conditions recorded. */
   alerts: string[];
@@ -343,23 +548,98 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
   const ts = isoNow(now);
   const status: FinalStatus = input.status ?? "completed";
   const forced = input.force === true;
+  // Present-but-empty is refused HERE as well as at the CLI, because the quote is the
+  // entire evidentiary content of this path: a caller that reaches the library with
+  // `accept: ""` has an acceptance it cannot produce, which is indistinguishable from
+  // not having one.
+  const acceptance = input.accept === null || input.accept === undefined ? null : input.accept.trim();
+  if (acceptance !== null && acceptance === "") {
+    throw new InvariantError(
+      "est close --accept: the human's acceptance must be quoted",
+      'pass their words verbatim, e.g. --accept "I accept the task is done"',
+    );
+  }
+  const withAcceptance = acceptance !== null;
+  // Guarded at BOTH layers, here and in `cmdClose`: the CLI's job is a good message,
+  // and the library's is that no caller — a future verb, a script, a test — can reach a
+  // state the CLI would have refused.
+  if (withAcceptance && forced) {
+    throw new InvariantError(
+      "est close: --accept and --force are two different claims about the same close",
+      "--accept records WHO decided; --force records that nobody is named. Pass exactly one",
+    );
+  }
+  if (withAcceptance && (status === "reopened" || status === "deleted")) {
+    throw new InvariantError(
+      `est close --accept: an acceptance asserts the work is COMPLETE, so it cannot close as '${status}'`,
+      "use --status completed (or abandoned, if they accepted stopping rather than finishing)",
+    );
+  }
 
   const task = db
-    .query<{ status: string; anchor_session: string }, [string]>(
-      "SELECT status, anchor_session FROM task WHERE tid = ?",
+    .query<{ status: string; anchor_session: string; created_at: string }, [string]>(
+      "SELECT status, anchor_session, created_at FROM task WHERE tid = ?",
     )
     .get(input.tid);
   if (task === null || task === undefined) {
     throw new InvariantError(`unknown tid: ${input.tid}`, "run `est open` to mint a task first");
   }
 
-  attributeTasks(db);
+  if (withAcceptance) {
+    // An already-finalized task cannot be accepted again: the close it would bypass the
+    // gate for has already happened, and a second acceptance of the same words would be
+    // a second outcome revision with no new decision behind it.
+    if (TERMINAL_TASK_STATUS.has(task.status)) {
+      throw new InvariantError(
+        `est close --accept: ${input.tid} is already ${task.status}`,
+        "reopen it first (`est close <tid> --status reopened`) if the work restarted — closing is a revision, never an edit",
+      );
+    }
+    // §P1.12 applied to consent: the agent does not get to be the evidence. The words
+    // have to be in a transcript the harness wrote — see `acceptanceInTranscript` for
+    // what that does and does not prove.
+    const sessions = db
+      .query<{ session_id: string }, [string]>(
+        "SELECT DISTINCT session_id FROM task_alias WHERE tid = ? AND session_id <> ''",
+      )
+      .all(input.tid)
+      .map((r) => r.session_id);
+    if (!sessions.includes(task.anchor_session)) sessions.push(task.anchor_session);
+    // Resolved at CALL time, not at import: `EST_PROJECTS` is how every other corpus
+    // reader is pointed at a fixture, and a constant captured at import cannot be
+    // redirected by a test that drives the real CLI in-process.
+    const root = input.projectsRoot ?? process.env.EST_PROJECTS ?? PROJECTS_ROOT;
+    // `created_at` is the floor: words typed before the task existed cannot be about it.
+    if (!acceptanceInTranscript(sessions, acceptance, root, task.created_at)) {
+      throw new InvariantError(
+        `est close --accept: those words appear in no bound session's transcript for ${input.tid}, after it was opened`,
+        "quote the human's acceptance EXACTLY as they typed it, in full — never paraphrase it, and never supply one they did not give. " +
+          `It must be at least ${MIN_ACCEPTANCE_CHARS} characters and match as a whole phrase, because a single common word is not consent. ` +
+          'If they have not accepted, ask them ("do you accept this task as complete?") or leave the close to the sweeper',
+      );
+    }
+  }
+
+  // Skipped on the heal path alone: `runSweep` has just run this pass over the whole
+  // corpus, and re-running it once per healed task is O(corpus) work for an answer that
+  // cannot have changed since.
+  if (input.heal !== true) attributeTasks(db);
 
   const gate = quiescence(db, input.tid, now);
-  if (!gate.ok && !forced) {
+  // The acceptance bypasses EVERY arm, the open-turn one included, and that is the
+  // point rather than an oversight: consent arrives mid-conversation, so the turn in
+  // which Craig says "this is done" is by construction open when the close runs.
+  // Blocking on it would make the flag unreachable in the only situation it exists for.
+  // The cost is bounded and already handled — the final turn's requests sweep in
+  // afterwards, and a close is a REVISION, so the late tokens produce another one
+  // (see this file's header) rather than being lost.
+  // TRUE only when the acceptance actually overrode something, mirroring `forced` — a
+  // close that would have passed the gate anyway was not bypassed by anyone.
+  const accepted = withAcceptance && !gate.ok;
+  if (!gate.ok && !forced && !withAcceptance && input.heal !== true) {
     throw new InvariantError(
       `quiescence gate not met for ${input.tid}: ${gate.failing.join("; ")}`,
-      "wait for the task to go quiet, or pass --force (which records anomaly(forced_close)) — --force is for Craig, not for Claude",
+      'wait for the task to go quiet; if the human has explicitly accepted completion, relay it verbatim via --accept "<their words>" (records anomaly(accepted_close)). --force is Craig\'s own override at a terminal, never Claude\'s',
     );
   }
 
@@ -642,18 +922,61 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
         input.tid,
       );
     }
-    if (scopeChanged && !scopeDeclared) {
-      db.query("INSERT INTO anomaly (ts, kind, detail, tid) VALUES (?, 'scope_undeclared', ?, ?)").run(
-        ts,
+    // Recorded whether or not the gate was failing — the provenance of a close is worth
+    // the same row either way — and BENIGN (src/cli.ts `BENIGN_ANOMALY_KINDS`): a human
+    // ending their own task is the system working, not damage taken by it. What the row
+    // is for is provenance: the quote is the whole audit trail for a close no arithmetic
+    // authorised, and it is stored verbatim. The database is local-only (§4), which is
+    // what makes storing his words fine.
+    //
+    // De-duplicated on (kind, detail, tid) rather than inserted blindly. `est close`
+    // exits 3 when it finalizes WITH alerts, and a caller that reads 3 as failure and
+    // retries would otherwise append the same acceptance again — the ledger would then
+    // show two consents where one was given. `insertAnomalies` (src/cli.ts) cannot be
+    // reused for this: it drops the `tid` column and only de-duplicates against rows
+    // where `tid IS NULL`, so a task-scoped row is outside its key.
+    if (withAcceptance) {
+      const detail =
+        `est close --accept: the human accepted completion — "${acceptance}" ` +
+        `(verified against a bound session's transcript)` +
+        (gate.ok ? " (the quiescence gate was already met)" : ` (gate bypassed: ${gate.failing.join("; ")})`);
+      db.query(
+        `INSERT INTO anomaly (ts, kind, detail, tid)
+         SELECT ?, 'accepted_close', ?, ?
+          WHERE NOT EXISTS (SELECT 1 FROM anomaly
+                             WHERE kind = 'accepted_close' AND detail = ? AND tid = ?)`,
+      ).run(ts, detail, input.tid, detail, input.tid);
+    }
+    // The two JUDGEMENT anomalies below are skipped entirely on the heal path, and
+    // de-duplicated on the normal one.
+    //
+    // Skipped, because a heal is not a second close: it re-runs the arithmetic over the
+    // same finished work, so re-raising "the scope drifted undeclared" or "nothing
+    // planted the tid" says nothing that was not already said at the real close — and
+    // `tid_unplanted` is ALERTING, so a nightly sweep that healed one task would exit 3
+    // on a row the sweeper itself had just written, about a fact nobody could act on.
+    //
+    // De-duplicated, for the same reason `accepted_close` is (see above): `est close`
+    // exits 3 when it finalizes with alerts, a caller may retry, and a reopen/re-close
+    // cycle re-evaluates the same condition. Neither row carries a count or a timestamp
+    // in its detail, so an identical row is the same observation restated.
+    const anomalyOnce = (kind: string, detail: string): void => {
+      db.query(
+        `INSERT INTO anomaly (ts, kind, detail, tid)
+         SELECT ?, ?, ?, ?
+          WHERE NOT EXISTS (SELECT 1 FROM anomaly WHERE kind = ? AND detail = ? AND tid = ?)`,
+      ).run(ts, kind, detail, input.tid, kind, detail, input.tid);
+    };
+    if (input.heal !== true && scopeChanged && !scopeDeclared) {
+      anomalyOnce(
+        "scope_undeclared",
         `scope moved from seq ${baseline.scope_seq} to ${scopeFinal} with no \`est scope\` revision — the drift was detected, not declared`,
-        input.tid,
       );
     }
-    if (tidPlanted === 0) {
-      db.query("INSERT INTO anomaly (ts, kind, detail, tid) VALUES (?, 'tid_unplanted', ?, ?)").run(
-        ts,
+    if (input.heal !== true && tidPlanted === 0) {
+      anomalyOnce(
+        "tid_unplanted",
         "a Task-tool task existed in the anchor session but no task file carried this est_tid; cross-session stitching is not working for this task",
-        input.tid,
       );
     }
   }).immediate();
@@ -706,9 +1029,84 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
     ambiguous_share: ambiguousShare,
     unattrib_share: unattribShare,
     forced: forced && !gate.ok,
+    accepted,
     quiescence: gate,
     alerts,
   };
+}
+
+/** One corrective revision the sweeper appended — see {@link healClosedOutcomes}. */
+export interface OutcomeHeal {
+  tid: string;
+  revision: number;
+  from_wcet: number;
+  to_wcet: number;
+}
+
+/**
+ * Append a corrective `outcome` revision wherever a closed task's actual has MOVED.
+ *
+ * This is the working half of a promise this file's header has always made: "premature
+ * finalization is self-healing rather than fatal — late tokens produce a new revision".
+ * Nothing appended that revision. It was true that a human COULD close again; it was
+ * not true that anything did, so every close taken before the last of its spend landed
+ * left an `outcome` that under-reports — and `v_velocity` reads the latest revision, so
+ * the under-report propagates straight into the calibrator.
+ *
+ * `est close --accept` turns that from an edge case into the ordinary one. Consent
+ * arrives mid-turn, by construction: the accepting turn's own requests are still
+ * streaming when the close runs, and its sub-agents may not have returned at all. So
+ * the repair has to be automatic, and it belongs in the sweeper — the one component
+ * that already re-reads the corpus, re-attributes it, and holds the write lock.
+ *
+ * Three properties keep it from becoming noise:
+ *
+ *  - **Only when the actual actually moved.** A candidate whose recomputed Work-CET
+ *    equals the one on file is skipped, so a steady state appends nothing and the
+ *    revision counter is a record of real corrections rather than of sweeps.
+ *  - **No anomaly row.** The sweeper correcting its own arithmetic is the system
+ *    working. `forced_close` and `accepted_close` record who overrode a gate; this
+ *    overrides nothing.
+ *  - **Idempotent.** The new revision is stamped `now`, so the "spend postdates the
+ *    close" predicate that selected it is false on the next sweep unless yet more
+ *    spend has landed — in which case it should fire again.
+ *
+ * Reopened tasks are excluded: `final_status = 'reopened'` means the task is live
+ * again, and a live task's actual moving is not a correction, it is progress.
+ */
+export function healClosedOutcomes(
+  db: Database,
+  now: Date = new Date(),
+  opts: { spoolDir?: string } = {},
+): OutcomeHeal[] {
+  const candidates = db
+    .query<{ tid: string; final_status: string; actual_wcet: number }, []>(
+      `SELECT o.tid, o.final_status, o.actual_wcet
+         FROM v_outcome_current o
+        WHERE o.final_status <> 'reopened'
+          AND EXISTS (SELECT 1 FROM request r WHERE r.tid = o.tid AND r.ts > o.finalized_at)`,
+    )
+    .all();
+
+  const healed: OutcomeHeal[] = [];
+  for (const c of candidates) {
+    const live = db
+      .query<{ wcet: number | null }, [string]>("SELECT wcet FROM v_task_actual WHERE tid = ?")
+      .get(c.tid);
+    // Rounded the same way `closeTask` writes it, so the comparison is between two
+    // numbers of the same kind rather than between a float and its own rounding.
+    const to = Math.max(0, Math.round(live?.wcet ?? 0));
+    if (to === c.actual_wcet) continue;
+    const r = closeTask(db, {
+      tid: c.tid,
+      status: c.final_status as FinalStatus,
+      heal: true,
+      now,
+      ...(opts.spoolDir === undefined ? {} : { spoolDir: opts.spoolDir }),
+    });
+    healed.push({ tid: c.tid, revision: r.revision, from_wcet: c.actual_wcet, to_wcet: r.actual_wcet });
+  }
+  return healed;
 }
 
 /**

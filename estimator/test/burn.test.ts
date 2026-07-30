@@ -34,14 +34,16 @@ import {
   burnJson,
   burnRead,
   intervalUnion,
+  resolveBurnTarget,
   refreshBurnCache,
   renderBurn,
+  taskAttribState,
   taskIntervals,
   type BurnActive,
   type BurnEmpty,
 } from "../src/burn.ts";
 import { attributeTasks } from "../src/attribute.ts";
-import { openDb } from "../src/db.ts";
+import { openDb, setConfig } from "../src/db.ts";
 import { formatSegment } from "../scripts/statusline-burn.ts";
 
 let h: Harness;
@@ -489,21 +491,287 @@ describe("the ccstatusline segment — P1.9", () => {
     expect(formatSegment(b)).toBe("");
   });
 
-  test("renders NOTHING when the target was GUESSED — that band may be another session's", async () => {
+  test("renders no NUMBER when the target was GUESSED — that band may be another session's", async () => {
     // The statusline always supplies a session. If nothing is bound to it, P1.6's
     // last step hands back the most recently touched open task in the whole database:
     // a fine answer at a terminal, and someone else's number in Craig's prompt.
+    //
+    // Craig, 2026-07-30: the guessed target is also, in this session's terms, exactly
+    // `task_attrib: "none"` — nothing here is being metered — so the segment now SAYS
+    // that where it used to go blank. The invariant the test protects is unchanged and
+    // asserted below: not one figure from the other session's band reaches the line.
     const now = new Date("2026-01-01T00:03:00Z");
     await boundAndSwept(now);
     const b = burnJson(h.db, { session: "some-other-session", now }) as BurnActive;
     expect(b.target).toBe("fallback");
-    expect(formatSegment(b)).toBe("");
+    expect(b.task_attrib).toBe("none");
+    expect(formatSegment(b)).toBe("no tracked task");
+    expect(formatSegment(b)).not.toContain("WCET");
   });
 
   test("renders nothing for every empty result", () => {
     for (const reason of ["no_open_estimate", "no_cache", "db_busy", "db_missing"] as const) {
       expect(formatSegment({ schema: 1, active: false, as_of: "2026-01-01T00:00:00Z", reason })).toBe("");
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// task_attrib — "am I on a tracked task right now" (Craig, 2026-07-30)
+// ---------------------------------------------------------------------------
+
+describe("task_attrib — the tracked-task state", () => {
+  /**
+   * A task bound to `s1` with attributed spend and NO live delegation, so the only
+   * thing that can make it `active` is the attribution window itself. The anchor turn
+   * sits at 00:00, which is what every `now` below is measured against.
+   */
+  async function boundTask(now: Date): Promise<string> {
+    const tid = await openTask();
+    request(h.db, "r-main", { origin: "main", out: 150, cw: 50, ts: "2026-01-01T00:01:00Z" });
+    attributeTasks(h.db);
+    refreshBurnCache(h.db, now);
+    return tid;
+  }
+
+  test("active: a bound task with an attributed turn inside the window", async () => {
+    const now = new Date("2026-01-01T00:30:00Z");
+    await boundTask(now);
+    const b = burnJson(h.db, { session: "s1", now }) as BurnActive;
+    expect(b.task_attrib).toBe("active");
+    expect(b.pending_close).toBe(0);
+    // The band renders exactly as it always did — this state changes nothing.
+    expect(formatSegment(b)).toContain("WCET");
+  });
+
+  test("quiet: the same task once the attribution window has lapsed", async () => {
+    // 5 hours on from the anchor turn, against the default `attr_stale_minutes` of
+    // 120. The task is still open and still bound; nothing said since is booking to
+    // it, which is the whole complaint — a finished task's percentage sitting on
+    // screen all morning while unrelated chatter meters nowhere.
+    const now = new Date("2026-01-01T05:00:00Z");
+    await boundTask(now);
+    const b = burnJson(h.db, { session: "s1", now }) as BurnActive;
+    expect(b.task_attrib).toBe("quiet");
+    expect(b.pending_close).toBe(1);
+    expect(formatSegment(b)).toBe("no tracked task · 1 pending close");
+    expect(formatSegment(b)).not.toContain("%");
+  });
+
+  test("none: a session with no open task bound to it", async () => {
+    const now = new Date("2026-01-01T00:30:00Z");
+    await boundTask(now);
+    const b = burnJson(h.db, { session: "s-unrelated", now }) as BurnActive;
+    expect(b.task_attrib).toBe("none");
+    // Nothing is bound HERE, so there is nothing here to close either — the pending
+    // count is about this session's own tasks, never the database's.
+    expect(b.pending_close).toBe(0);
+    expect(formatSegment(b)).toBe("no tracked task");
+  });
+
+  test("two open tasks in one session: the ACTIVE one is rendered, not the newest", async () => {
+    // The failure this pins: a session hosts many tasks (schema v6), the older one is
+    // absorbing work (here through a delegation still in flight) and the newer one is
+    // quiet. `resolveBurnTarget` takes the NEWEST binding, so the payload carried the
+    // quiet task's band — and once the state existed, the segment printed
+    // "no tracked task · 1 pending close" while spend was accruing. Both halves are
+    // wrong on screen, which is the one thing P1.9 forbids.
+    const now = new Date("2026-01-01T06:00:00Z");
+    const older = await boundTask(now);
+    // FRESH, not merely unfinished: `countLiveAgents` ages a silent delegation out at
+    // `eta_live_agent_max_min`, so a corpse cannot pin a task as active forever.
+    agentRun(h.db, "a-live", {
+      session: "s1",
+      launchPrompt: "p1",
+      startedAt: "2026-01-01T05:50:00Z",
+      endedAt: null,
+    });
+
+    turn(h.db, { session: "s1", prompt: "p2", at: "2026-01-01T00:05:00Z", durationMs: 60_000 });
+    const opened = await h.cli(
+      ...openArgs({ subject: "the second task" }),
+      "--session",
+      "s1",
+      "--prompt",
+      "p2",
+      "--json",
+    );
+    expect(opened.code).toBe(0);
+    const newer = opened.json<{ tid: string }>().tid;
+    attributeTasks(h.db);
+    // Hand the second turn to the newer task directly. Attribution's delegation touch
+    // keeps giving BOTH turns to the older one here, and what this test is about is the
+    // reader, not the walk: the fixture states the shape the reader has to handle —
+    // each task with a turn of its own, one still live and one long since quiet.
+    h.db.query("UPDATE turn SET tid = ? WHERE session_id = 's1' AND prompt_id = 'p2'").run(newer);
+    refreshBurnCache(h.db, now);
+
+    // The resolver on its own still answers "the newest binding" — that is its
+    // documented job, and the reason the state has to name the task instead.
+    expect(resolveBurnTarget(h.db, { session: "s1" })).toEqual({ tid: newer, target: "session" });
+
+    const b = burnJson(h.db, { session: "s1", now }) as BurnActive;
+    expect(b.task_attrib).toBe("active");
+    expect(b.tid).toBe(older);
+    expect(b.pending_close).toBe(1);
+    expect(formatSegment(b)).toContain("WCET");
+    expect(formatSegment(b)).not.toContain("no tracked task");
+  });
+
+  test("a long single turn stays active: attribution timestamps a turn by its START", async () => {
+    // §6.2 protects the 20.9-hour turn by construction, and the statusline has to agree:
+    // measuring from the turn's start alone would age a still-running turn into `quiet`
+    // and blank the band exactly while it was burning. Only the session's NEWEST turn
+    // counts — a NULL duration in history is what a killed session leaves behind.
+    const now = new Date("2026-01-01T09:00:00Z");
+    const tid = await boundTask(now);
+    turn(h.db, { session: "s1", prompt: "p-long", at: "2026-01-01T01:00:00Z", durationMs: null });
+    h.db.query("UPDATE turn SET tid = ? WHERE prompt_id = 'p-long'").run(tid);
+    refreshBurnCache(h.db, now);
+
+    const b = burnJson(h.db, { session: "s1", now }) as BurnActive;
+    expect(b.task_attrib).toBe("active");
+    expect(b.pending_close).toBe(0);
+  });
+
+  test("intervening turns retire it even inside the minutes window — attr_stale_turns", async () => {
+    // The other arm of attribution's own predicate, which a minutes-only copy of this
+    // logic silently dropped: five turns that booked somewhere else IS the session
+    // having moved on, whatever the clock says.
+    const now = new Date("2026-01-01T00:40:00Z");
+    await boundTask(now);
+    for (let i = 0; i < 5; i += 1) {
+      turn(h.db, {
+        session: "s1",
+        prompt: `p-chat-${i}`,
+        at: `2026-01-01T00:${10 + i}:00Z`,
+        durationMs: 1000,
+      });
+    }
+    refreshBurnCache(h.db, now);
+    const b = burnJson(h.db, { session: "s1", now }) as BurnActive;
+    expect(b.task_attrib).toBe("quiet");
+    expect(formatSegment(b)).toBe("no tracked task · 1 pending close");
+  });
+
+  test("a live delegation keeps it active with no turn inside the window at all", async () => {
+    // §5.4's third touch, on the statusline: the orchestrator's own session goes quiet
+    // for hours while a background agent burns tokens against the task. That is the
+    // pattern this system exists to measure, and blanking the band through it would
+    // hide the number exactly when it is moving fastest.
+    const now = new Date("2026-01-01T05:00:00Z");
+    const tid = await boundTask(now);
+    agentRun(h.db, "a-live", {
+      session: "s1",
+      launchPrompt: "p1",
+      startedAt: "2026-01-01T04:50:00Z",
+      endedAt: null,
+    });
+    attributeTasks(h.db);
+    refreshBurnCache(h.db, now);
+    const b = burnJson(h.db, { session: "s1", now }) as BurnActive;
+    expect(b.agents.live).toBeGreaterThan(0);
+    expect(b.task_attrib).toBe("active");
+    expect(tid).toBe(b.tid);
+  });
+
+  test("the boundary is `attr_stale_minutes` — the SAME key attribution closes on", async () => {
+    // Not a threshold of its own: the claim `quiet` makes is "the attribution pass has
+    // stopped booking turns here", so a second window could only make the statusline
+    // disagree with the ledger it reports on.
+    const now = new Date("2026-01-01T00:30:00Z");
+    await boundTask(now);
+    expect((burnJson(h.db, { session: "s1", now }) as BurnActive).task_attrib).toBe("active");
+
+    setConfig(h.db, "attr_stale_minutes", "5");
+    expect((burnJson(h.db, { session: "s1", now }) as BurnActive).task_attrib).toBe("quiet");
+  });
+
+  test("a stale cache row still blanks the segment, whatever the state says", async () => {
+    // P1.9's blanking rule is untouched: with no sweep inside the staleness window
+    // every number on the payload is from the past, and so is the state derived from
+    // it. The segment comes back on the next sweep, saying whichever it then is.
+    const swept = new Date("2026-01-01T00:03:00Z");
+    await boundTask(swept);
+    const later = new Date("2026-01-01T06:00:00Z");
+    const b = burnJson(h.db, { session: "s1", now: later }) as BurnActive;
+    expect(b.warn).toContain("stale");
+    expect(b.task_attrib).toBe("quiet");
+    expect(formatSegment(b)).toBe("");
+  });
+
+  test("a task with no cache row reads as zero live agents — no per-render query", async () => {
+    // P1.9's budget is ONE indexed row read, and `liveAgents` is a count over an
+    // unbounded table. A missing cache row is a one-sweep condition (a task opened
+    // seconds ago), so the cached path treats it as zero and lets the next micro-sweep
+    // fix it — `--refresh`, the live path by contract, still asks for the real count.
+    const now = new Date("2026-01-01T09:00:00Z");
+    const tid = await boundTask(now);
+    agentRun(h.db, "a-live", {
+      session: "s1",
+      launchPrompt: "p1",
+      startedAt: "2026-01-01T08:55:00Z",
+      endedAt: null,
+    });
+    attributeTasks(h.db);
+    h.db.query("DELETE FROM burn_cache WHERE tid = ?").run(tid);
+
+    expect(taskAttribState(h.db, { session: "s1", now })).toMatchObject({
+      state: "quiet",
+      active_tid: null,
+    });
+    expect(taskAttribState(h.db, { session: "s1", now, live: "fresh" })).toMatchObject({
+      state: "active",
+      active_tid: tid,
+    });
+  });
+
+  test("active_tid names the task the session is metering, even on an explicit --tid", async () => {
+    // `task_attrib` is session-wide, so an explicit `est burn <quiet-tid>` can report
+    // `active` about a DIFFERENT task. Without `active_tid` a consumer cannot tell that
+    // apart from "the task you asked about is the live one".
+    const now = new Date("2026-01-01T06:00:00Z");
+    const older = await boundTask(now);
+    agentRun(h.db, "a-live", {
+      session: "s1",
+      launchPrompt: "p1",
+      startedAt: "2026-01-01T05:50:00Z",
+      endedAt: null,
+    });
+    turn(h.db, { session: "s1", prompt: "p2", at: "2026-01-01T00:05:00Z", durationMs: 60_000 });
+    const opened = await h.cli(
+      ...openArgs({ subject: "the quiet one" }),
+      "--session",
+      "s1",
+      "--prompt",
+      "p2",
+      "--json",
+    );
+    const quiet = opened.json<{ tid: string }>().tid;
+    attributeTasks(h.db);
+    h.db.query("UPDATE turn SET tid = ? WHERE session_id = 's1' AND prompt_id = 'p2'").run(quiet);
+    refreshBurnCache(h.db, now);
+
+    const b = burnJson(h.db, { tid: quiet, session: "s1", now }) as BurnActive;
+    // The explicit tid is honoured — the payload is about the task that was named...
+    expect(b.tid).toBe(quiet);
+    expect(b.target).toBe("explicit");
+    // ...and the state says, unambiguously, that the session is on the other one.
+    expect(b.task_attrib).toBe("active");
+    expect(b.active_tid).toBe(older);
+    expect(renderBurn(b)).toContain("NOT THIS TASK");
+    expect(renderBurn(b)).toContain(older);
+  });
+
+  test("an older binary's payload — no task_attrib at all — renders the band", async () => {
+    // P2.0's additive rule from the consumer's side: an absent field means the producer
+    // has nothing to say, never "there is no tracked task".
+    const now = new Date("2026-01-01T00:30:00Z");
+    await boundTask(now);
+    const legacy = { ...(burnJson(h.db, { session: "s1", now }) as BurnActive) } as Partial<BurnActive>;
+    delete legacy.task_attrib;
+    delete legacy.pending_close;
+    expect(formatSegment(legacy as BurnActive)).toContain("WCET");
   });
 });
 

@@ -1213,6 +1213,10 @@ describe("the statusline segment — P2.2", () => {
       basis: "session",
     },
     compute: { s: 1840, coverage_pct: 73.2 },
+    // The session is on this task right now — the state that renders the band at all.
+    task_attrib: "active",
+    pending_close: 0,
+    active_tid: "t-1",
     warn: [],
   };
 

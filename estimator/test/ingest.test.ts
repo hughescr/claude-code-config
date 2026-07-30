@@ -1111,6 +1111,7 @@ function blank(parts: Partial<Parameters<typeof writeBatch>[1]>): Parameters<typ
     workflowRuns: [],
     workflowPhases: [],
     taskEvents: [],
+    taskPlants: [],
     anomalies: [],
     files: [],
     stats: { lines: 0, blank: 0, parsed: 0, malformed: 0, truncatedTail: 0 },

@@ -378,6 +378,16 @@ CREATE TABLE task_event (           -- lifecycle from transcript toolUseResult (
                                     -- 'pretooluse' = the restored delete-capture hook (§6.1)
   UNIQUE (session_id, task_num, ts, to_status, kind)
 ) STRICT;
+-- v13: the sweep's `session_task` backfill (src/ingest.ts BACKFILL_TASK_EVENT_TID_SQL)
+-- selects on `tid IS NULL`, which no index could serve — so every sweep re-scanned every
+-- lifecycle row this database has ever held, forever, to find the handful that just
+-- became linkable. PARTIAL, so the index holds only the rows still awaiting a tid and
+-- SHRINKS as they are linked: the steady state is an empty index and a scan of nothing.
+-- The `task_num <> ''` half drops the sentinel rows (a `task_event` with no task number
+-- can never match an alias), and the UPDATE repeats both predicates verbatim so the
+-- planner can actually use this.
+CREATE INDEX ix_task_event_unlinked ON task_event(session_id, task_num)
+  WHERE tid IS NULL AND task_num <> '';
 
 CREATE TABLE outcome (              -- APPEND-ONLY; current = MAX(revision). Reopen = new revision.
   tid TEXT NOT NULL REFERENCES task(tid),
@@ -581,6 +591,23 @@ CREATE TABLE anomaly (              -- loud, queryable failure ledger
                                     --      session/prompt without an explicit flag; a wrong guess
                                     --      is visible rather than silent (P1.0)
                                     --   src/close.ts:  forced_close|scope_undeclared|tid_unplanted
+                                    --      |accepted_close -- `est close --accept`: the human said
+                                    --      the work was done and the agent relayed their words,
+                                    --      which are stored VERBATIM in detail (the whole audit
+                                    --      trail for a close no arithmetic authorised, verified
+                                    --      against a bound session's transcript). BENIGN in
+                                    --      src/cli.ts, unlike forced_close: forced_close alerts
+                                    --      because nobody is named behind it, and this row exists
+                                    --      to name someone. `est retro` reports both plus the
+                                    --      share of closed tasks that came through either.
+                                    --   src/ingest.ts: plant_unlinked -- a planted est_tid that
+                                    --      could not become a session_task alias: either it named
+                                    --      a tid with no task row, or its tool_result never
+                                    --      arrived (the session died mid-call, so nothing says
+                                    --      the harness accepted it). BENIGN: refusing the alias is
+                                    --      correct in both cases -- a transcript is untrusted
+                                    --      input and an alias is permanent -- but a silent drop is
+                                    --      indistinguishable from the ingest never looking.
                                     --   src/spool.ts:  missed_estimate -- a drained PostToolUse
                                     --      compliance record with no bound task (P1.10)
                                     -- WRITTEN BY PHASE 2 (§Phase 2 interfaces):
@@ -1233,7 +1260,7 @@ WHERE s.terminator = 'open'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '12'),
+  ('schema_version',          '13'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.

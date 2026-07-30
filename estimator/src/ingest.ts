@@ -169,6 +169,31 @@ export interface TaskEventRow {
   to_status: string | null;
 }
 
+/**
+ * A PLANTED `est_tid` (§3.2 step 6) — the link between a harness task number and the
+ * logical task, and the row that makes `task_alias(id_kind='session_task')` exist.
+ *
+ * **It lives in the tool_use INPUT, not in `toolUseResult`.** The ceremony's
+ * `EST_PLANT` line is `TaskUpdate({ taskId: "<n>", metadata: { est_tid: "<uuidv7>" } })`,
+ * and the harness's tool_result reports only `updatedFields: ["metadata", ...]` — the
+ * VALUE never appears on the result side. An ingest that watched `toolUseResult` alone
+ * therefore saw every plant as "some metadata changed" and minted nothing, which is why
+ * the live corpus held zero `session_task` aliases and the §6.2 completion-signal arm
+ * (src/close.ts) could never fire: it looks up `task_event` BY that alias.
+ *
+ * `TaskCreate` is covered too, and needs the pairing `TaskUpdate` does not: its input
+ * carries no task number (the harness assigns one), so a plant on a create is held by
+ * `tool_use` id until the matching tool_result names `task.id`.
+ */
+export interface TaskPlantRow {
+  session_id: string;
+  /** The harness task number — `task_alias.local_id`, and `task_event.task_num`. */
+  task_num: string;
+  /** The planted `est_tid`. Written ONLY if a `task` row already carries it. */
+  tid: string;
+  ts: string;
+}
+
 export interface ParseStats {
   lines: number;
   blank: number;
@@ -215,6 +240,11 @@ export interface IngestAnomaly {
     // Phase 1, raised by src/spool.ts when the sweep drains the hook spool: a
     // matched `Task`/`Workflow` launch that no open estimate was bound to.
     | "missed_estimate"
+    // §3.2 step 6: a planted `est_tid` naming a tid with no `task` row, so no
+    // `session_task` alias could be minted. BENIGN (src/cli.ts) — a transcript is
+    // untrusted input and refusing the alias is the correct outcome — but reported,
+    // because a silent drop looks exactly like the ingest bug this pass fixed.
+    | "plant_unlinked"
     // Phase 2 (P2.3/P2.4/P2.6), raised by src/otel.ts and src/recon.ts. Same reason
     // the sweep-level kinds are named above: the ledger's vocabulary is open, the
     // writer's parameter type is not, and casting them in one by one would just move
@@ -280,6 +310,8 @@ export interface MainIngest extends TranscriptIngest {
   turns: TurnRow[];
   launches: WorkflowLaunch[];
   taskEvents: TaskEventRow[];
+  /** Planted `est_tid`s — see {@link TaskPlantRow}. */
+  taskPlants: TaskPlantRow[];
   /** `toolUseId` -> promptId, for Agent/Task/Workflow launches. Resolves
    *  `agent-<id>.meta.json`'s `toolUseId` to its launching turn (§5.3). */
   toolUsePrompts: Map<string, string>;
@@ -309,6 +341,7 @@ export interface IngestBatch {
   workflowRuns: WorkflowRunRow[];
   workflowPhases: WorkflowPhaseRow[];
   taskEvents: TaskEventRow[];
+  taskPlants: TaskPlantRow[];
   anomalies: IngestAnomaly[];
   /** Per-file id sets for {@link detectForkReplays}. Not rows — never written. */
   files: TranscriptIndexEntry[];
@@ -666,6 +699,50 @@ export async function ingestAgentTranscript(
 }
 
 const LAUNCH_TOOLS = new Set(["Agent", "Task", "Workflow"]);
+/** The two tools that can carry a planted `est_tid` — see {@link TaskPlantRow}. */
+const TASK_TOOLS = new Set(["TaskCreate", "TaskUpdate"]);
+
+/**
+ * EVERY `tool_result` block on a user line, with its error flag.
+ *
+ * All of them, not the first: a turn that issues parallel tool calls can have its
+ * results batched onto one line, and taking `content[0]` would tie a plant to whichever
+ * call happened to be printed first. `task_alias` is first-plant-wins and physically
+ * exclusive (`ux_alias_exclusive`), so that mistake is PERMANENT — one wrong task
+ * number silently books another task's whole stream of spend, and no re-sweep can
+ * correct it.
+ *
+ * `is_error` travels with the block because a plant must not survive a call that
+ * failed: `TaskUpdate` on a task id that does not exist comes back as an error result,
+ * and minting the alias from the attempt would freeze the corpus onto a task number the
+ * harness never accepted.
+ */
+function toolResultBlocks(line: Record<string, unknown>): Array<{ id: string; isError: boolean }> {
+  const content = (line.message as Record<string, unknown> | undefined)?.content;
+  if (!Array.isArray(content)) return [];
+  const out: Array<{ id: string; isError: boolean }> = [];
+  for (const block of content) {
+    if (block === null || typeof block !== "object") continue;
+    const b = block as Record<string, unknown>;
+    if (b.type !== "tool_result") continue;
+    const id = str(b.tool_use_id);
+    if (id !== null) out.push({ id, isError: b.is_error === true });
+  }
+  return out;
+}
+
+/**
+ * `metadata.est_tid` out of a `TaskCreate`/`TaskUpdate` payload, from either side of
+ * the call: the tool_use INPUT (where the ceremony actually puts it) or a
+ * `toolUseResult` that echoes the metadata back (which no harness version observed so
+ * far does — read defensively rather than betting on the shape).
+ */
+function plantedTid(v: unknown): string | null {
+  if (v === null || typeof v !== "object") return null;
+  const meta = (v as Record<string, unknown>).metadata;
+  if (meta === null || typeof meta !== "object") return null;
+  return str((meta as Record<string, unknown>).est_tid);
+}
 
 /**
  * Ingest a main transcript in ONE pass: turn segmentation, request extraction,
@@ -682,6 +759,17 @@ export async function ingestMainTranscript(
   const requests: RequestRow[] = [];
   const launches: WorkflowLaunch[] = [];
   const taskEvents: TaskEventRow[] = [];
+  const taskPlants: TaskPlantRow[] = [];
+  /**
+   * `tool_use` id -> the plant that call made, held until its RESULT arrives.
+   *
+   * Every plant waits, `TaskUpdate`'s included even though its input already names the
+   * task number: the result is the only evidence the harness ACCEPTED the call, and an
+   * alias minted from a rejected attempt cannot be taken back (see
+   * {@link toolResultBlocks}). `task_num` is null for a `TaskCreate`, whose number the
+   * harness assigns in the result.
+   */
+  const pendingPlants = new Map<string, { tid: string; task_num: string | null }>();
   const toolUsePrompts = new Map<string, string>();
   const anomalies: IngestAnomaly[] = [];
   const uuids: string[] = [];
@@ -717,18 +805,25 @@ export async function ingestMainTranscript(
         anomalies.push({ kind: "unusable_usage_line", detail: result.reason, path });
       }
 
-      // --- launch tool_use ids -> launching turn ----------------------------
+      // --- launch tool_use ids -> launching turn, and planted est_tids -------
       const content = (line.message as Record<string, unknown> | undefined)?.content;
-      if (Array.isArray(content) && promptId !== null) {
+      if (Array.isArray(content)) {
         for (const block of content) {
           if (block === null || typeof block !== "object") continue;
           const b = block as Record<string, unknown>;
           if (b.type !== "tool_use") continue;
           const name = str(b.name);
           const id = str(b.id);
-          if (id !== null && name !== null && LAUNCH_TOOLS.has(name)) {
+          if (id !== null && name !== null && promptId !== null && LAUNCH_TOOLS.has(name)) {
             toolUsePrompts.set(id, promptId);
           }
+          if (name === null || id === null || !TASK_TOOLS.has(name)) continue;
+          const tid = plantedTid(b.input);
+          if (tid === null) continue;
+          pendingPlants.set(id, {
+            tid,
+            task_num: str((b.input as Record<string, unknown> | undefined)?.taskId),
+          });
         }
       }
       return;
@@ -756,6 +851,30 @@ export async function ingestMainTranscript(
 
     if (ts === null) return;
 
+    // --- planted est_tids, resolved against THIS result ----------------------
+    // Matched by `tool_use_id` against the plants still in flight, never by position
+    // (see {@link toolResultBlocks}). A matched call is retired from `pendingPlants`
+    // either way: a plant whose call failed is dropped, not carried forward to be
+    // resolved by some later result that happens to arrive.
+    const results = toolResultBlocks(line);
+    const matched = results.filter((b) => pendingPlants.has(b.id));
+    for (const m of matched) {
+      const pend = pendingPlants.get(m.id);
+      pendingPlants.delete(m.id);
+      if (pend === undefined) continue;
+      // `success: false` is the WHOLE line's verdict, so it is only readable when one
+      // call is on it; `is_error` is per block and always is.
+      if (m.isError || (matched.length === 1 && r.success === false)) continue;
+      // A `TaskCreate` plant needs the number out of the result, and only an
+      // unambiguous line can say which result is its own.
+      const num =
+        pend.task_num ??
+        (matched.length === 1
+          ? str((r.task as Record<string, unknown> | undefined)?.id) ?? str(r.taskId)
+          : null);
+      if (num !== null) taskPlants.push({ session_id: sessionId, task_num: num, tid: pend.tid, ts });
+    }
+
     // --- task lifecycle ------------------------------------------------------
     // Same shapes, same order as gates/g-attr.ts:readTaskStream(), because the
     // gate's attribution measurement is the thing this pipeline has to be able to
@@ -764,6 +883,14 @@ export async function ingestMainTranscript(
     if (task !== null && typeof task === "object") {
       const id = str((task as Record<string, unknown>).id);
       if (id !== null) {
+        // Defensive, and separate from the `tool_use` path above: no harness version
+        // observed so far echoes the metadata back on the result, and a shape change
+        // that started to should not need an ingest change to be seen. Gated on the
+        // same error check — an echo from a failed call is not a plant.
+        const echoed = results.some((b) => b.isError) || r.success === false
+          ? null
+          : plantedTid(task) ?? plantedTid(r);
+        if (echoed !== null) taskPlants.push({ session_id: sessionId, task_num: id, tid: echoed, ts });
         taskEvents.push({
           session_id: sessionId,
           task_num: id,
@@ -781,9 +908,15 @@ export async function ingestMainTranscript(
     const statusChange = r.statusChange;
     if (statusChange !== null && typeof statusChange === "object") {
       const sc = statusChange as Record<string, unknown>;
+      const num = str(r.taskId) ?? str(sc.taskId);
+      // Same defensive echo as the create branch above, and gated the same way.
+      const echoed = results.some((b) => b.isError) || r.success === false ? null : plantedTid(r);
+      if (echoed !== null && num !== null) {
+        taskPlants.push({ session_id: sessionId, task_num: num, tid: echoed, ts });
+      }
       taskEvents.push({
         session_id: sessionId,
-        task_num: str(r.taskId) ?? str(sc.taskId),
+        task_num: num,
         ts,
         kind: "status",
         from_status: str(sc.from) ?? str(sc.fromStatus),
@@ -791,6 +924,27 @@ export async function ingestMainTranscript(
       });
     }
   });
+
+  // A plant whose tool_result never arrived. The ordinary cause is the one P1.11 exists
+  // for: the session died between the `tool_use` line and its result, so the harness's
+  // verdict on that call is not on disk and never will be. Dropping it is right — an
+  // alias minted from a call nobody saw succeed is permanent (§ `INSERT_TASK_ALIAS_SQL`)
+  // — but dropping it SILENTLY leaves "the plant was never made" and "the plant was made
+  // and lost" looking identical, which is the same blindness `plant_unlinked` was added
+  // to remove. A torn tail also lands here and self-heals: the file is still growing, so
+  // the next sweep re-reads it in full and the pair resolves.
+  for (const [toolUseId, pend] of pendingPlants) {
+    anomalies.push({
+      kind: "plant_unlinked",
+      detail:
+        `a planted est_tid was never confirmed: ${toolUseId} carried the plant and no tool_result ` +
+        `for it appears in the transcript (session ${sessionId}` +
+        `${pend.task_num === null ? "" : `, harness task ${pend.task_num}`}), so no session_task ` +
+        `alias was minted. A call the harness never acknowledged is not evidence it succeeded. ` +
+        `If the file is still being written this resolves itself on the next sweep`,
+      path,
+    });
+  }
 
   const segmented = segmenter.result();
 
@@ -818,6 +972,7 @@ export async function ingestMainTranscript(
     turns: segmented.turns,
     launches,
     taskEvents,
+    taskPlants,
     toolUsePrompts,
     compactions: segmented.compactions,
     orphanTurnDurations: segmented.orphanTurnDurations,
@@ -1498,6 +1653,7 @@ export async function ingestSession(
     workflowRuns: [],
     workflowPhases: [],
     taskEvents: [],
+    taskPlants: [],
     anomalies: [],
     files: [],
     stats: { lines: 0, blank: 0, parsed: 0, malformed: 0, truncatedTail: 0 },
@@ -1543,6 +1699,7 @@ export async function ingestSession(
     batch.requests.push(...main.requests);
     batch.turns.push(...main.turns);
     batch.taskEvents.push(...main.taskEvents);
+    batch.taskPlants.push(...main.taskPlants);
     batch.anomalies.push(...main.anomalies);
     absorb(main);
     for (const [k, v] of main.toolUsePrompts) toolUsePrompts.set(k, v);
@@ -1949,6 +2106,81 @@ VALUES ($session_id, $task_num, $ts, $kind, $from_status, $to_status, 'transcrip
 ON CONFLICT(session_id, task_num, ts, to_status, kind) DO NOTHING
 `;
 
+/**
+ * Mint the `session_task` alias a planted `est_tid` names (§3.2 step 6).
+ *
+ * Two properties, both deliberate:
+ *
+ *  - **`WHERE EXISTS` on `task`, not a bare INSERT.** `task_alias.tid` is a foreign
+ *    key and `est audit` treats an alias pointing at nothing as damage; a transcript
+ *    is untrusted input, so a plant naming a tid this database has never minted (a
+ *    typo, a tid from another machine, a `task` row since deleted) is DROPPED rather
+ *    than written — and REPORTED, as `anomaly(plant_unlinked)`, because a silent drop
+ *    is indistinguishable from the ingest bug this whole pass exists to fix.
+ *
+ *    **A drop DOES self-heal, on the next sweep that re-reads the file.** `readJsonl`
+ *    streams every transcript from byte zero; `sweep_state.bytes_read` is only the
+ *    "unchanged, skip it" comparison, never a seek offset. So a session that is still
+ *    being written is re-read in full on the next sweep and the plant is retried then,
+ *    by which time the `task` row it names normally exists. The only case that does not
+ *    retry by itself is a SETTLED file — byte-identical, so the sweep skips it — and
+ *    `est backfill` re-reads those. The anomaly detail says exactly this.
+ *  - **`OR IGNORE`, not an upsert.** Re-sweeping the same transcript must be a no-op
+ *    (§5.8), and `ux_alias_exclusive` also makes a task number that was re-planted at
+ *    a SECOND tid a conflict — which is exactly right. First plant wins, and the
+ *    second is not silently re-pointed at another task's actual.
+ */
+export const INSERT_TASK_ALIAS_SQL = `
+INSERT OR IGNORE INTO task_alias (tid, id_kind, session_id, local_id, first_seen, source)
+SELECT $tid, 'session_task', $session_id, $task_num, $ts, 'sweeper'
+ WHERE EXISTS (SELECT 1 FROM task WHERE tid = $tid)
+`;
+
+/**
+ * Point every unlinked `task_event` at the task its `session_task` alias names.
+ *
+ * A targeted UPDATE, which `task_event` permits — unlike `estimate`/`outcome`/
+ * `task_scope`, it carries no append-only trigger, because it is a DERIVED record of
+ * the harness's own lifecycle stream rather than a claim anyone is scored against.
+ * It has to be an update rather than a wider insert: the alias is planted at
+ * `TaskUpdate` time, so the create event that precedes it — and every event swept
+ * before the plant landed — was necessarily written with a NULL tid.
+ *
+ * `ux_alias_exclusive` guarantees at most one `session_task` alias per
+ * (session_id, local_id), so the correlated subquery can never pick between two tids.
+ *
+ * **The WHERE clause is written to match `ix_task_event_unlinked` (schema v13) exactly.**
+ * `tid IS NULL` alone is unindexable, so this statement used to re-scan every lifecycle
+ * row in the database on every sweep to find the few that had just become linkable. The
+ * partial index covers precisely the unlinked rows and shrinks as they are linked —
+ * which only holds while both predicates here stay verbatim identical to the index's.
+ */
+export const BACKFILL_TASK_EVENT_TID_SQL = `
+UPDATE task_event SET tid = (
+  SELECT a.tid FROM task_alias a
+   WHERE a.id_kind = 'session_task'
+     AND a.session_id = task_event.session_id
+     AND a.local_id = task_event.task_num)
+ WHERE tid IS NULL
+   AND task_num <> ''
+   AND EXISTS (
+     SELECT 1 FROM task_alias a
+      WHERE a.id_kind = 'session_task'
+        AND a.session_id = task_event.session_id
+        AND a.local_id = task_event.task_num)
+`;
+
+/**
+ * Link the lifecycle stream to the tasks the aliases name, and report how many rows
+ * moved. Call it INSIDE the sweep's transaction, AFTER every batch has been written
+ * and after the hook spool has drained — both of those are `task_event` writers, and
+ * a plant seen in one file routinely links events written from another.
+ */
+export function backfillTaskEventTids(db: Database): number {
+  db.prepare(BACKFILL_TASK_EVENT_TID_SQL).run();
+  return Number(db.query<{ n: number }, []>("SELECT changes() AS n").get()?.n ?? 0);
+}
+
 export const INSERT_ANOMALY_SQL = `
 INSERT INTO anomaly (ts, kind, detail) VALUES ($ts, $kind, $detail)
 `;
@@ -1974,7 +2206,7 @@ function bind<T extends object>(row: T): Record<string, unknown> {
  * (kind, detail) — and two writers for one table, only one of them idempotent, is
  * how a caller ends up choosing the wrong one.
  */
-export function writeBatch(db: Database, batch: IngestBatch): void {
+export function writeBatch(db: Database, batch: IngestBatch): { anomalies: IngestAnomaly[] } {
   const requestStmt = db.prepare(UPSERT_REQUEST_SQL);
   for (const row of batch.requests) requestStmt.run(bind(row) as never);
 
@@ -1993,6 +2225,35 @@ export function writeBatch(db: Database, batch: IngestBatch): void {
 
   const eventStmt = db.prepare(INSERT_TASK_EVENT_SQL);
   for (const row of batch.taskEvents) eventStmt.run(bind(row) as never);
+
+  // Aliases AFTER the events, so a plant and the events it links can arrive in one
+  // batch; the linking UPDATE itself is a sweep-level pass (`backfillTaskEventTids`),
+  // not a per-batch one, because the two halves routinely land in different chunks.
+  const aliasStmt = db.prepare(INSERT_TASK_ALIAS_SQL);
+  const knownTid = db.prepare<{ n: number }, [string]>(
+    "SELECT COUNT(*) AS n FROM task WHERE tid = ?",
+  );
+  const anomalies: IngestAnomaly[] = [];
+  for (const row of batch.taskPlants) {
+    // Asked BEFORE the insert, so the report can name what the statement's own
+    // existence guard would otherwise swallow. One indexed PK probe per plant, and a
+    // sweep sees a handful of plants at most.
+    if ((knownTid.get(row.tid)?.n ?? 0) === 0) {
+      anomalies.push({
+        kind: "plant_unlinked",
+        detail:
+          `a planted est_tid names a task this database has no row for (session ${row.session_id}, ` +
+          `harness task ${row.task_num}) — no session_task alias was minted, so this task's ` +
+          `lifecycle events stay unlinked and §6.2's completion signal cannot fire for it. ` +
+          `Retried automatically on the next sweep that re-reads the transcript (every sweep ` +
+          `reads a growing file in full); a SETTLED file is skipped as unchanged, so run ` +
+          `\`est backfill\` if the tid has since appeared`,
+      });
+      continue;
+    }
+    aliasStmt.run(bind(row) as never);
+  }
+  return { anomalies };
 }
 
 /**

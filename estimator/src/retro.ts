@@ -115,6 +115,20 @@ export interface DataQualityPanel {
   t4_note: string;
   scope_declared_pct: number | null;
   identity_planted_pct: number | null;
+  /**
+   * The two gate bypasses, and how much of the corpus came through one.
+   *
+   * `est close --accept` (Craig, 2026-07-30) lets an agent close on the human's recorded
+   * consent, and a lever that changes what enters the calibration corpus has to be
+   * self-reporting or it is invisible until someone goes looking. `bypass_share` is over
+   * the CURRENT outcome of every closed task: a rising share means quiescence is
+   * finalizing less and less of the corpus on its own, which is a finding about the
+   * gate, not about any one close. Counts are of ledger ROWS, so a task closed under
+   * both (reopened, re-closed differently) contributes to both.
+   */
+  forced_closes: number;
+  accepted_closes: number;
+  bypass_share: number | null;
   overhead_share: number | null;
   unpriced_share: number | null;
   provisional_share: number | null;
@@ -608,6 +622,19 @@ function qualityPanel(db: Database): DataQualityPanel {
       "T4 (the user asked for a budget) is undetectable without a prompt classifier — a known blind spot, stated (§3.3)",
     scope_declared_pct: ratio(scopeChanged?.declared ?? 0, scopeChanged?.total ?? 0),
     identity_planted_pct: ratio(planted?.planted ?? 0, planted?.total ?? 0),
+    forced_closes: anomalyCount("forced_close"),
+    accepted_closes: anomalyCount("accepted_close"),
+    // DISTINCT tid, over closed tasks: the question is what share of the corpus came
+    // through a bypass, and two rows against one task is still one task.
+    bypass_share: ratio(
+      num(
+        db,
+        `SELECT COUNT(DISTINCT a.tid) AS v FROM anomaly a
+          WHERE a.kind IN ('forced_close','accepted_close') AND a.tid IS NOT NULL
+            AND a.tid IN (SELECT tid FROM v_outcome_current WHERE final_status <> 'reopened')`,
+      ),
+      num(db, "SELECT COUNT(*) AS v FROM v_outcome_current WHERE final_status <> 'reopened'"),
+    ),
     overhead_share: ratio(overhead, totalWcet),
     unpriced_share: ratio(unpriced, priced + unpriced),
     provisional_share: ratio(provisional, priced),

@@ -68,8 +68,30 @@ export function formatSegment(b: BurnJson): string {
   //  2. `stale` — the sweeper has not refreshed this row inside the staleness window,
   //     so the numbers are older than `staleAfterS` and the percentage is a number from
   //     the past dressed as the present. The segment reappears on the next sweep.
-  if (b.target === "fallback") return "";
   if (b.warn.includes("stale")) return "";
+  // Craig, 2026-07-30: the band is a fact about the TASK, and the segment is a claim
+  // about what he is doing RIGHT NOW. Those come apart the moment a task stops
+  // absorbing work and the sweeper has not closed it yet — which, before the
+  // `session_task` alias landed, was every task until the 48-hour backstop fired. A
+  // finished task's percent-of-band sitting there all morning while unrelated chatter
+  // books nowhere is exactly the wrong-number-on-screen case P1.9 blanks for, so the
+  // band is REPLACED by the honest state rather than shown.
+  //
+  // `fallback` is folded in here rather than blanked above it: nothing bound the
+  // caller's session to that task, which IS `task_attrib: "none"`, and "no tracked
+  // task" says so where the old blank said nothing at all.
+  //
+  // Tested against the FIELD, not against `!== "active"`: a payload written by an
+  // older binary carries no `task_attrib` at all, and P2.0's additive rule is read
+  // from the consumer's side — an absent field means "this producer has nothing to
+  // say", never "there is no tracked task".
+  if (b.task_attrib === "quiet" || b.task_attrib === "none") {
+    // Terse on purpose — this slot shares one line with the model, the branch and the
+    // context bar, and the whole content of the message is that there is no number.
+    const pending = b.pending_close > 0 ? ` · ${b.pending_close} pending close` : "";
+    return `no tracked task${pending}`;
+  }
+  if (b.target === "fallback") return "";
   const pct = b.wcet.pct_p50;
   const bits = [`${fmtNum(b.wcet.consumed)}/${fmtNum(b.wcet.p50)} WCET`, `${pct}% p50`];
   if (b.agents.live > 0) {

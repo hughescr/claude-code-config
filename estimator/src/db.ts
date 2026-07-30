@@ -32,6 +32,14 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
 /**
  * Must match the config.schema_version seed in schema.sql.
  *
+ * 13 — ONE partial index, `ix_task_event_unlinked` (§3.2 step 6, Craig 2026-07-30). The
+ *     sweep now links `task_event` rows to the tasks their planted `est_tid` names, and
+ *     the linking UPDATE selects on `tid IS NULL` — a predicate no ordinary index can
+ *     serve, so it re-scanned the entire lifecycle table on every sweep for the handful
+ *     of rows that had just become linkable. The index is PARTIAL over exactly the
+ *     unlinked rows, so it shrinks as they are linked and the steady state is an empty
+ *     index rather than a growing scan. No row is touched; the append-only spine is not
+ *     involved.
  * 12 — dangling delegations age out of ETA liveness (P2.1, Craig 2026-07-30). ONE config
  *     seed, `eta_live_agent_max_min` = 120. Root cause: v11's idle suppression read
  *     "started and never ended" as "running", which is also what §5.6's
@@ -141,7 +149,7 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
  *     `v_phase_actual.phase_conf`, auxiliary origin excluded from calibration.
  * 1 — initial R3 §4.2 shape.
  */
-export const SCHEMA_VERSION = "12";
+export const SCHEMA_VERSION = "13";
 
 /**
  * Forward-only, additive migrations, applied by {@link openDb} on a WRITABLE
@@ -896,6 +904,25 @@ DROP TABLE burn_cache_pre_v11;
     sql: `
 INSERT OR IGNORE INTO config (k, v) VALUES
   ('eta_live_agent_max_min', '120');
+`,
+  },
+  {
+    from: "12",
+    to: "13",
+    // ONE partial index, so the sweep's `session_task` backfill stops re-scanning the
+    // whole lifecycle table (see schema.sql's note on `ix_task_event_unlinked`).
+    //
+    // `IF NOT EXISTS` for the reason the v8 step documents: `sqlite3 estimator.db <
+    // schema.sql` over an older file creates every new object while `INSERT OR IGNORE`
+    // leaves `schema_version` behind, so a migration that assumed the object was absent
+    // would strand the database one version back with a "table already exists" error.
+    // SQLite strips the clause before storing the definition, so `sqlite_master` still
+    // matches a fresh database byte for byte — which `test/schema.test.ts` asserts.
+    //
+    // No row is read, written or moved: migration rule 2 holds trivially.
+    sql: `
+CREATE INDEX IF NOT EXISTS ix_task_event_unlinked ON task_event(session_id, task_num)
+  WHERE tid IS NULL AND task_num <> '';
 `,
   },
 ];

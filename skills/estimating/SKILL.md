@@ -179,6 +179,7 @@ message names the append path that *is* allowed. Take that path or leave the rec
 
 ```
 est close <tid> [--status completed|abandoned|deleted|reopened]
+est close <tid> --accept "<the human's verbatim words>"
 ```
 
 `--status reopened` is the append-only remedy the exit-`2` message points you at when a task is
@@ -191,7 +192,35 @@ report. Do not offer a number; you do not have one.
 `est close` runs a quiescence check (a completion signal or staleness, no attributable request in
 the quiet window, no open turn, no live session, every bound agent terminal). If it exits `2` it
 names the failing condition — wait for quiescence and close again, or leave it for the sweeper.
-`--force` exists and it is **the user's tool, not yours.**
+
+**`--accept` is the one bypass you may use, and only on explicit human consent.** The user does not
+know this CLI exists; what they do is say the work is done.
+
+The criterion is narrow and positive: **a first-person acceptance of completion, addressed to the
+work.** "I accept the task is done", "I approve this as complete", "accepted, close it out". That
+shape and nothing looser. Silence, thanks, praise, "nice", "ship it", moving on to another topic,
+and your own reading that the work looks finished are **not** acceptance. **When it is not clearly
+that shape, ask** — "do you accept this task as complete?" — and wait. Construing a borderline
+phrase as consent is the failure this flag is designed around; asking costs one turn.
+
+Then close with their words quoted verbatim:
+
+```
+est close <tid> --accept "<their words, exactly as they typed them>"
+```
+
+The quote is **verified against the transcript**: `est close` looks for those words in a human
+message of a session bound to the task, and exits `2` if they are not there. Three things a quote
+must be, so pass the whole sentence rather than a word of it — at least 12 characters, matching as a
+**whole phrase** (a common word like "ok" or "done" is not consent, and will not match inside a
+longer one), and **said after the task was opened** (an acceptance from earlier in the session was
+about something else). Paraphrasing fails the check, and inventing an acceptance is the one thing
+you must never do — the verification exists because an agent asserting "they accepted" is exactly
+the self-report this design refuses everywhere else. What lands in `anomaly(accepted_close)` is the
+quote itself, which is the entire audit trail for a close no arithmetic authorised.
+
+`--accept` closes as `completed` (or `abandoned`); it cannot be combined with `--force`, and it
+cannot reopen or delete. `--force` is unchanged and remains **the user's tool, never yours.**
 
 Closing is a revision, never an edit: a later close appends a new revision and the latest one wins.
 Nothing is overwritten.
