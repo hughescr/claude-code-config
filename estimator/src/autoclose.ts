@@ -103,7 +103,9 @@ export const DEFAULT_CLOSE_PASS_MIN_INTERVAL_MIN = 10;
  */
 export const DEFAULT_CLOSE_ABANDON_AFTER_H = 168;
 
-/** Consecutive non-gate failures on one tid before `close_failed` is raised. */
+/** Consecutive non-gate failures on one tid before `close_failed` is raised. A
+ *  successful close of that tid clears the breadcrumbs, so the count really is
+ *  consecutive rather than a lifetime tally a reopened task carries forward. */
 export const DEFAULT_CLOSE_FAIL_ALERT_AFTER = 3;
 
 /** Hours a candidate may be closeable and continuously refused before `close_blocked`. */
@@ -388,6 +390,26 @@ function sweptCloseDetail(status: FinalStatus, abandonAfterH: number): string {
   );
 }
 
+/**
+ * Stable identifiers for the gate arms a report shows as failing.
+ *
+ * Derived from the report's FIELDS, never from `failing[]`. That array is rendered prose
+ * and arm 4 interpolates the live pids, so keying `close_blocked`'s detail on it would
+ * mint a new dedup key every time a session restarts — one row per restart, from the
+ * mechanism whose adjacent comment promises one row per arm.
+ */
+function failingArms(db: Database, gate: QuiescenceReport): string[] {
+  const quiesceMin = configNum(db, "quiesce_main_min", 60);
+  const arms: string[] = [];
+  if (!gate.completion_signal && !(gate.stale_hours !== null && gate.stale_hours > STALE_CLOSE_HOURS))
+    arms.push("no_completion_signal_and_not_stale");
+  if (gate.quiet_minutes !== null && gate.quiet_minutes < quiesceMin) arms.push("recent_attributed_request");
+  if (gate.open_turns > 0) arms.push("open_turn_in_a_bound_session");
+  if (gate.live_pids.length > 0) arms.push("live_session_process");
+  if (gate.nonterminal_agents > 0) arms.push("live_bound_agent_run");
+  return arms;
+}
+
 /** `completion_kind` → the status the close is filed under. Never the filter's answer. */
 function statusForGate(gate: QuiescenceReport): FinalStatus | null {
   if (gate.completion_kind === "completed") return "completed";
@@ -402,7 +424,8 @@ const FAIL_DETAIL = (alertAfter: number, message: string): string =>
 
 /**
  * Record one non-gate close failure, and raise the ALERTING row once there have been
- * `alertAfter` of them for the same task.
+ * `alertAfter` CONSECUTIVE ones for the same task — a successful close deletes the
+ * breadcrumbs (see the close path), so the run resets rather than accumulating for life.
  *
  * The counter lives in the ledger rather than in a new table, and it is BOUNDED: at most
  * `alertAfter` `close_attempt_failed` breadcrumbs are ever written per tid, because the
@@ -484,10 +507,24 @@ export function runClosePass(db: Database, opts: ClosePassOptions): ClosePassRes
   // `liveSessionPids` is a `readdir` plus a `JSON.parse` and a `kill(0)` per file; doing
   // that per candidate is the same answer recomputed N times per sweep — a per-item call
   // in a hot path, which is a defect rather than a style choice.
-  const livePids = liveSessionPids();
+  // …and not at all when there is nothing to evaluate. A steady-state pass finds no
+  // candidates, and walking the sessions directory for that answer is a syscall burst
+  // every `close_pass_min_interval_min` in exchange for nothing.
+  const livePids = candidates.length === 0 ? new Map<string, number[]>() : liveSessionPids();
 
+  // Every ledger write below is best-effort. `runClosePass` promises never to throw, and
+  // an INSERT can still take SQLITE_BUSY_SNAPSHOT — a bookkeeping row that failed to land
+  // must not fail the whole SWEEP, which is what an escaping throw from a catch handler
+  // would do. The next pass re-derives and re-writes it.
+  const quietly = (f: () => void): void => {
+    try {
+      f();
+    } catch {
+      /* the observation is lost, not the sweep */
+    }
+  };
   const anomalyOnce = (kind: string, detail: string, tid: string): void => {
-    db.query(INSERT_CLOSE_ANOMALY_SQL).run(ts, kind, detail, tid, kind, detail, tid);
+    quietly(() => db.query(INSERT_CLOSE_ANOMALY_SQL).run(ts, kind, detail, tid, kind, detail, tid));
   };
 
   for (const c of candidates) {
@@ -500,32 +537,28 @@ export function runClosePass(db: Database, opts: ClosePassOptions): ClosePassRes
       gate = quiescence(db, c.tid, now, { livePids });
     } catch (e) {
       result.failed += 1;
-      recordFailure(db, c.tid, ts, e instanceof Error ? e.message : String(e), failAlertAfter);
+      quietly(() =>
+        recordFailure(db, c.tid, ts, e instanceof Error ? e.message : String(e), failAlertAfter),
+      );
       continue;
     }
 
     const signalled = statusForGate(gate);
-    if (signalled === null) {
-      // No signal: the abandon arm, held back by its own much longer clock.
-      const silentH = (now.getTime() - Date.parse(c.last_activity)) / 3_600_000;
-      if (!(Number.isFinite(silentH) && silentH >= abandonAfterH)) {
-        result.awaiting_abandon += 1;
-        continue;
-      }
-    }
-    const status: FinalStatus = signalled ?? "abandoned";
 
+    // THE GATE IS TESTED FIRST, before the abandon margin. The other order let the
+    // margin absorb candidates the gate would have refused anyway — they were counted
+    // `awaiting_abandon` rather than `blocked`, and their `close_blocked` row was
+    // delayed by the whole abandon window on top of its own. A refusal is a refusal
+    // whatever the clock says about the abandon arm.
     if (!gate.ok) {
       result.blocked += 1;
-      // A refusal is normal for minutes and suspicious for days. `eligibleSince` is the
-      // moment this candidate first satisfied arm 1 — the staleness window for a
-      // signalled task, the abandon window for a silent one — so the row claims only
-      // what it can prove: "closeable for over N hours and still refused", with the ARM
-      // named and no count in it, so (kind, detail, tid) holds it to one row per arm for
-      // the life of the task.
-      const eligibleSince =
-        Date.parse(c.last_activity) +
-        (signalled === null ? abandonAfterH : STALE_CLOSE_HOURS) * 3_600_000;
+      // `eligibleSince` is when this candidate first satisfied arm 1 — the staleness
+      // window, INDEPENDENT of the abandon margin, so a silent task's refusal surfaces
+      // on the same 24 h schedule as a signalled one's. The detail names the failing
+      // ARMS by stable identifier and carries no rendered value (arm 4 renders live
+      // pids), so the ledger's (kind, detail, tid) dedup really does hold it to one row
+      // per arm for the life of the task.
+      const eligibleSince = Date.parse(c.last_activity) + STALE_CLOSE_HOURS * 3_600_000;
       if (
         Number.isFinite(eligibleSince) &&
         now.getTime() - eligibleSince >= blockedAfterH * 3_600_000
@@ -533,13 +566,25 @@ export function runClosePass(db: Database, opts: ClosePassOptions): ClosePassRes
         anomalyOnce(
           "close_blocked",
           `the sweeper's close pass has been refused by the quiescence gate for over ${blockedAfterH}h on: ` +
-            `${gate.failing.join("; ")} — the task cannot be finalized while this holds, so it contributes ` +
-            "nothing to the calibration corpus",
+            `${failingArms(db, gate).join(", ")} — the task cannot be finalized while this holds, so it ` +
+            "contributes nothing to the calibration corpus",
           c.tid,
         );
       }
       continue;
     }
+
+    if (signalled === null) {
+      // Gate-eligible, no signal: the abandon arm, held back by its own much longer
+      // clock. `awaiting_abandon` therefore counts ONLY candidates the margin alone is
+      // holding back — which is what makes it readable as "the margin is working".
+      const silentH = (now.getTime() - Date.parse(c.last_activity)) / 3_600_000;
+      if (!(Number.isFinite(silentH) && silentH >= abandonAfterH)) {
+        result.awaiting_abandon += 1;
+        continue;
+      }
+    }
+    const status: FinalStatus = signalled ?? "abandoned";
 
     try {
       // ONE transaction per candidate, IMMEDIATE like every sibling sweep step: a
@@ -561,6 +606,11 @@ export function runClosePass(db: Database, opts: ClosePassOptions): ClosePassRes
         const detail = sweptCloseDetail(status, abandonAfterH);
         const kind = status === "abandoned" ? "swept_abandon" : "swept_close";
         db.query(INSERT_CLOSE_ANOMALY_SQL).run(ts, kind, detail, c.tid, kind, detail, c.tid);
+        // The failure count is CONSECUTIVE, so a success resets it. Only the
+        // breadcrumbs: the ALERTING `close_failed` row, if one was ever raised, is real
+        // history and stays. Without this a reopened task carried its ancient failures
+        // forward and could alert on the strength of a run that ended months ago.
+        db.query("DELETE FROM anomaly WHERE kind = 'close_attempt_failed' AND tid = ?").run(c.tid);
       }).immediate();
 
       // AFTER the commit, never inside it. Pushed inside, a rollback left the tid on
@@ -584,7 +634,9 @@ export function runClosePass(db: Database, opts: ClosePassOptions): ClosePassRes
         continue;
       }
       result.failed += 1;
-      recordFailure(db, c.tid, ts, e instanceof Error ? e.message : String(e), failAlertAfter);
+      quietly(() =>
+        recordFailure(db, c.tid, ts, e instanceof Error ? e.message : String(e), failAlertAfter),
+      );
     }
   }
 

@@ -651,7 +651,8 @@ CREATE TABLE anomaly (              -- loud, queryable failure ledger
                                     --      |close_attempt_failed -- one such attempt, BENIGN, and
                                     --      capped at `close_fail_alert_after` rows per tid so the
                                     --      breadcrumbs that COUNT toward the alert cannot
-                                    --      themselves become the spam.
+                                    --      themselves become the spam, and DELETED when that tid
+                                    --      closes successfully so the count is consecutive.
                                     --      |close_blocked -- a candidate the gate has refused
                                     --      continuously for `close_blocked_after_h` (24 h); detail
                                     --      names the failing ARM, never a count, so the ledger's
@@ -1393,7 +1394,7 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   -- the boundary past any normal gap in Craig's working week. A signal-bearing close is
   -- NOT gated by this -- there the evidence exists, and 48 h is the right line.
   ('close_abandon_after_h',       '168'),
-  -- v14 (2026-07-30): consecutive failed close attempts on ONE tid before the pass raises
+  -- v14 (2026-07-30): CONSECUTIVE failed close attempts on ONE tid before the pass raises
   -- the ALERTING anomaly(close_failed). Not 1: a close can fail transiently (a busy
   -- snapshot, a half-written row another writer is mid-way through) and alerting on the
   -- first would cry wolf, which is the failure BENIGN_ANOMALY_KINDS exists to prevent.

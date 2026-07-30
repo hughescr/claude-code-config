@@ -795,6 +795,19 @@ describe("close pass — failures are counted, bounded and eventually alerting",
     expect(BENIGN_ANOMALY_KINDS.has("close_failed")).toBe(false);
   });
 
+  test("a successful close RESETS the breadcrumbs — the count is consecutive", async () => {
+    // Without the reset a reopened task carried ancient failures forward and could alert
+    // on the strength of a run that ended months ago.
+    const tid = await quietTask({ subject: "gamma indexer" });
+    terminalEvent(tid);
+    h.db
+      .query("INSERT INTO anomaly (ts, kind, detail, tid) VALUES (?, 'close_attempt_failed', 'old', ?)")
+      .run(LONG_AGO, tid);
+    runClosePass(h.db, { now: NOW, markerPath: marker });
+    expect(statusOf(tid)).toBe("completed");
+    expect(anomalyCount("close_attempt_failed", tid)).toBe(0);
+  });
+
   test("one or two failures do NOT alert", async () => {
     const orphan = await orphanTask();
     for (let i = 0; i < 2; i++) {
