@@ -20,7 +20,7 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { readdirSync, readFileSync } from "node:fs";
+import { closeSync, openSync, readdirSync, readFileSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { attributeTasks } from "./attribute.ts";
@@ -144,12 +144,62 @@ function humanText(line: Record<string, unknown>): string | null {
  * the quote, so a human reading the ledger can see exactly what was relied on. SKILL.md
  * carries the other half: ask rather than construe.
  *
- * TODO (deferred, 2026-07-30): read the transcript as a STREAM rather than with
- * `readFileSync`. A long session's file is tens of MB and this holds the whole thing in
- * memory for one substring test. Deferred deliberately — `est close` is human-initiated
- * and runs once per task, so the cost is a one-off pause rather than anything on a hot
- * path, and `readJsonl` (src/ingest.ts) already has the streaming reader to reuse.
+ * Reads each transcript as a stream (`scanLinesSync`, below) and stops at the first
+ * matching line rather than loading the whole file and running to EOF (2026-07-30).
  */
+/**
+ * Sync line-by-line scan of one file, stopping — and closing the fd — the instant
+ * `onLine` returns true, rather than reading to EOF and deciding after.
+ *
+ * `readJsonl` (src/ingest.ts) already streams JSONL, but it is async, and
+ * `acceptanceInTranscript`'s caller `closeTask` has to stay synchronous: it is
+ * called without `await` throughout test/close.test.ts's consent tests
+ * (`expect(() => closeTask(...)).toThrow(...)`, bare `.revision`/`.quiescence.ok`
+ * reads on the return value), and an async function that throws before its first
+ * `await` yields a rejected Promise there instead of a synchronous throw. So this
+ * is a small sync sibling, not a reuse — fixed 64 KB reads via
+ * `openSync`/`readSync` instead of one `readFileSync` of the whole file, decoded
+ * with `TextDecoder` in streaming mode so a multi-byte UTF-8 character split
+ * across a chunk boundary decodes correctly (same trick `readJsonl` uses). Any
+ * failure (missing file, permission, a read error mid-file) reads as "no match" —
+ * the same fate the `readFileSync` catch it replaces gave an unreadable file.
+ */
+function scanLinesSync(path: string, onLine: (line: string) => boolean): boolean {
+  const CHUNK_SIZE = 64 * 1024;
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch {
+    return false; // this project dir does not host that session
+  }
+  try {
+    const chunk = Buffer.alloc(CHUNK_SIZE);
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const n = readSync(fd, chunk, 0, CHUNK_SIZE, null);
+      if (n === 0) break;
+      buf += decoder.decode(chunk.subarray(0, n), { stream: true });
+      // Scan with a moving offset and re-slice the buffer once per chunk, not once
+      // per line — see `readJsonl` for why (quadratic otherwise).
+      let start = 0;
+      let nl = buf.indexOf("\n", start);
+      while (nl >= 0) {
+        if (onLine(buf.slice(start, nl))) return true;
+        start = nl + 1;
+        nl = buf.indexOf("\n", start);
+      }
+      if (start > 0) buf = buf.slice(start);
+    }
+    buf += decoder.decode(); // flush any trailing partial character
+    return buf.length > 0 && onLine(buf); // trailing line with no final newline
+  } catch {
+    return false;
+  } finally {
+    closeSync(fd);
+  }
+}
+
 export function acceptanceInTranscript(
   sessions: readonly string[],
   quote: string,
@@ -174,23 +224,17 @@ export function acceptanceInTranscript(
   for (const project of projects) {
     for (const session of wanted) {
       const path = join(root, project, `${session}.jsonl`);
-      let raw: string;
-      try {
-        raw = readFileSync(path, "utf8");
-      } catch {
-        continue; // this project dir does not host that session
-      }
-      for (const line of raw.split("\n")) {
+      const matched = scanLinesSync(path, (line) => {
         // Cheap prefilter: only human lines can carry the quote, and JSON.parse of a
         // whole transcript is the expensive part.
-        if (line === "" || !line.includes('"type":"user"')) continue;
+        if (line === "" || !line.includes('"type":"user"')) return false;
         let parsed: unknown;
         try {
           parsed = JSON.parse(line);
         } catch {
-          continue; // a torn tail is not evidence either way
+          return false; // a torn tail is not evidence either way
         }
-        if (parsed === null || typeof parsed !== "object") continue;
+        if (parsed === null || typeof parsed !== "object") return false;
         const o = parsed as Record<string, unknown>;
         // No timestamp means the line cannot be placed relative to the task, and an
         // unplaceable line is not evidence. Compared as INSTANTS, not as strings: the
@@ -198,13 +242,14 @@ export function acceptanceInTranscript(
         // sorts BEFORE `"...00Z"` lexicographically.
         if (floorMs !== null) {
           const at = o.timestamp;
-          if (typeof at !== "string") continue;
+          if (typeof at !== "string") return false;
           const atMs = Date.parse(at);
-          if (!Number.isFinite(atMs) || atMs <= floorMs) continue;
+          if (!Number.isFinite(atMs) || atMs <= floorMs) return false;
         }
         const text = humanText(o);
-        if (text !== null && containsPhrase(normalizeAcceptance(text), needle)) return true;
-      }
+        return text !== null && containsPhrase(normalizeAcceptance(text), needle);
+      });
+      if (matched) return true;
     }
   }
   return false;
