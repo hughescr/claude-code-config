@@ -462,8 +462,36 @@ describe("est retro — P1.8", () => {
     expect(report.quality.bypass_share).toBe(1);
 
     const human = await h.cli("retro", "--dry-run");
-    expect(human.out).toContain("closes bypassing the gate");
+    expect(human.out).toContain("closes not made by a human at a quiet task");
     expect(human.out).toContain("recorded human consent");
+  });
+
+  test("the panel counts the SWEEPER's two close arms apart from each other", async () => {
+    // DECISIONS §12's re-open trigger is the ABANDONED SHARE of swept closes: past
+    // roughly half, the finding is that the harness's terminal `task_event` is not
+    // reaching the tasks it should — a §3.2 step 6 problem wearing a §6.2 costume — and
+    // not anything about a particular close. Without these two counters there was no
+    // instrument to read that trigger off, so the trigger was unactionable.
+    const a = await completedTask(1);
+    const b = await completedTask(2);
+    h.db
+      .query("INSERT INTO anomaly (ts, kind, detail, tid) VALUES (?, 'swept_close', 'signal', ?)")
+      .run(LONG_AGO, a);
+    h.db
+      .query("INSERT INTO anomaly (ts, kind, detail, tid) VALUES (?, 'swept_abandon', 'silence', ?)")
+      .run(LONG_AGO, b);
+
+    const report = retro(h.db, { asOf: NOW, dryRun: true });
+    expect(report.quality.swept_closes).toBe(1);
+    expect(report.quality.swept_abandons).toBe(1);
+    // Both belong in the share: a swept close bypasses no gate, but it is equally "the
+    // corpus closed itself", which is what this share exists to watch.
+    expect(report.quality.bypass_share).toBe(1);
+
+    const human = await h.cli("retro", "--dry-run");
+    expect(human.out).toContain("swept on a completion signal");
+    expect(human.out).toContain("swept as ABANDONED");
+    expect(human.out).toContain("were abandoned");
   });
 
   test("--as-of must parse; a garbage instant is a usage error rather than a silent now()", async () => {

@@ -94,6 +94,22 @@ of the whole thing.
    Mints the `tid` and returns the calibrated band. Below a bucket of 10 the band is labelled
    `uncalibrated` and equals the raw band — cold start is explicit, not faked.
 
+   **If it warns about a near-duplicate, STOP and use the tid it names.** When this session
+   already has an open task whose subject overlaps yours, `est open` prints a warning to stderr
+   and carries `near_duplicates: [{tid, subject, status, overlap}]` in its `--json` output. It
+   still mints — this never blocks, and the exit code is still `0` — but a non-empty
+   `near_duplicates` almost always means you should not have minted at all. Two real incidents on
+   2026-07-30: a session re-opened for work it was already tracking, and a sub-agent minting its
+   own tid for work its orchestrator had already estimated. Both split one session's spend across
+   two tasks, so **both** actuals come out wrong and neither task looks broken afterwards. The two
+   correct moves:
+
+   - same goal, the estimate moved → `est open --tid <named tid> --reason refinement …` (§5);
+   - delegated work under an estimate that already exists → `est bind <named tid> …`.
+
+   Only mint anyway when the overlap is genuinely coincidental — two different pieces of work that
+   happen to share vocabulary. If you do, say so in one clause when you show the band.
+
 5. **Definition of Done, captured now.** Pass `--dod` with each item tagged `deterministic` (a
    machine-checkable command) or `human` (the user judges). Capturing it at estimate time is what
    stops "done" from being renegotiated later to fit whatever got built.
@@ -198,8 +214,29 @@ The actual is computed by deterministic SQL over the harness's own logs — neve
 report. Do not offer a number; you do not have one.
 
 `est close` runs a quiescence check (a completion signal or staleness, no attributable request in
-the quiet window, no open turn, no live session, every bound agent terminal). If it exits `2` it
-names the failing condition — wait for quiescence and close again, or leave it for the sweeper.
+the quiet window, no open turn, no live session, every bound agent still live). If it exits `2` it
+names the failing condition, and its remedy now begins **"do nothing"** — because since 2026-07-30
+the sweeper's close pass really does finalize quiet tasks, on every sweep, with that same gate and
+no bypass. Closing `completed` on a terminal signal, `deleted` on a captured deletion.
+
+**But "do nothing" has a consequence, and it is the reason `--accept` exists.** A task with *no*
+completion signal is eventually closed **`abandoned`** — after `close_abandon_after_h` (a week) of
+silence, recorded as `anomaly(swept_abandon)`. An abandoned outcome is **right-censored**: the
+actual is stored as a lower bound, so the task preserves *no measurement* and contributes nothing
+usable to calibration. Waiting is right when the work really did finish and the harness recorded
+it; relaying real consent is what keeps a task in the corpus when it did not.
+
+**Resuming work on a task the sweeper closed starts with a reopen.** `est open --tid <tid>` on a
+finalized task exits `2` and names the command; run it:
+
+```
+est close <tid> --status reopened
+```
+
+That APPENDS a revision (nothing is edited or lost) and re-opens the task's attribution window.
+Until it lands, every hour of the resumed work is metered against nothing — resumed spend does not
+re-attach on its own. `est census` shows the `swept_abandon` row if you want to see when and why it
+was closed.
 
 **`--accept` is the one bypass you may use, and only on explicit human consent.** The user does not
 know this CLI exists; what they do is say the work is done.

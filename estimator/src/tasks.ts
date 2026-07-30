@@ -485,9 +485,158 @@ export interface OpenResult {
   refclassAsOf: string | null;
   anchor: Anchor;
   plant: { marker: string; call: string };
+  /**
+   * OPEN tasks in the SAME anchor session whose subject overlaps this one — see
+   * {@link findNearDuplicates}. Always empty on a re-estimate (`--tid`): appending to an
+   * existing task is the very thing the warning asks for, so warning about it would be
+   * telling the caller to do what they just did. Advisory: nothing about the mint,
+   * the band or the exit code depends on it.
+   */
+  nearDuplicates: NearDuplicate[];
 }
 
 export const PLANT_MARKER = "EST_PLANT:";
+
+// ---------------------------------------------------------------------------
+// near-duplicate detection at mint (P1.0, Craig 2026-07-30)
+// ---------------------------------------------------------------------------
+
+/**
+ * Tokens too common to be evidence that two subjects are about the same work. Kept
+ * deliberately tiny: this is a WARNING heuristic, and a long stopword list is a second
+ * thing to be wrong about. Every entry is a word that appears in the framing of an
+ * estimate rather than in its subject.
+ */
+const SUBJECT_STOPWORDS: ReadonlySet<string> = new Set([
+  "the", "and", "for", "with", "from", "into", "that", "this", "then",
+  "add", "new", "use", "via", "per", "its", "not", "all", "any", "out",
+  "est", "task", "work", "make", "fix",
+]);
+
+/**
+ * Normalised content tokens of a subject: lowercased, split on anything that is not a
+ * letter or a digit, and stripped of one- and two-character fragments and the stopwords
+ * above. Exported because the test suite asserts on the OVERLAP rule rather than on a
+ * warning string, and the rule is only meaningful if both sides tokenise identically.
+ */
+/**
+ * A subject reduced to what two people would call "the same words": lowercased, with
+ * every run of non-alphanumerics collapsed to one space and the ends trimmed.
+ *
+ * Deliberately much weaker than {@link subjectTokens} — it drops nothing. It exists for
+ * the one case the token rule structurally cannot see: a subject made entirely of short
+ * or common words tokenises to the empty set, so its overlap with anything (including an
+ * identical copy of itself) is 0. Those are precisely the terse subjects a resubmission
+ * repeats verbatim.
+ */
+export function normalizeSubject(subject: string): string {
+  return subject.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+export function subjectTokens(subject: string): Set<string> {
+  const out = new Set<string>();
+  for (const raw of subject.toLowerCase().split(/[^a-z0-9]+/)) {
+    if (raw.length < 3) continue;
+    if (SUBJECT_STOPWORDS.has(raw)) continue;
+    out.add(raw);
+  }
+  return out;
+}
+
+/**
+ * Overlap coefficient: |A ∩ B| / min(|A|, |B|), 0 when either side is empty.
+ *
+ * NOT Jaccard, on purpose. Jaccard punishes a long subject for being long, so
+ * "sweeper close pass" vs "sweeper close pass, cron recon, SessionStart hook and the
+ * near-duplicate warning" scores ~0.3 and slips under any threshold worth having —
+ * and that pair is precisely the incident this exists for (an estimate refined into a
+ * bigger goal, re-opened instead of `--reason refinement`).
+ */
+export function subjectOverlap(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let shared = 0;
+  for (const t of a) if (b.has(t)) shared += 1;
+  return shared / Math.min(a.size, b.size);
+}
+
+/**
+ * The overlap at which two subjects in ONE session are worth a warning.
+ *
+ * Half the shorter subject's content words in common. Low enough to catch a re-phrased
+ * restatement of the same goal, high enough that two genuinely different tasks in one
+ * session — the ordinary shape of a working day, and the case schema v6 exists to
+ * support — do not trip it. It is a warning either way: the doctrine here is
+ * observe-first, so the cost of a false positive is one line of stderr.
+ */
+export const NEAR_DUPLICATE_MIN_OVERLAP = 0.5;
+
+/** An OPEN task in this session whose subject overlaps the one being minted. */
+export interface NearDuplicate {
+  tid: string;
+  subject: string;
+  status: string;
+  overlap: number;
+}
+
+/**
+ * OPEN tasks anchored to `sessionId` whose subject overlaps `subject` (P1.0, Craig
+ * 2026-07-30).
+ *
+ * **Two real incidents, both on 2026-07-30, both silent.** A session RE-OPENED for work
+ * it was already tracking instead of appending `est open --tid <existing> --reason
+ * refinement`, and a sub-agent minted its own tid for work its orchestrator had already
+ * estimated instead of `est bind`. Both produce the same corpus damage and it is not
+ * cosmetic: two tasks share one session, §5.4's staleness closure splits the session's
+ * spend between them by recency, and BOTH actuals are wrong — the first is truncated,
+ * the second never had a baseline for what it actually did. Neither task is detectably
+ * broken afterwards; they just quietly calibrate on halves.
+ *
+ * **A warning, and only ever a warning.** It never blocks the mint, never changes an
+ * exit code and never writes a row. A duplicate-looking subject is EVIDENCE, not proof:
+ * two phases of one project legitimately share most of their words, and refusing the
+ * second would be the estimator overruling the human about what their own work is.
+ * Observe-first — the same doctrine that keeps `anchor_inferred` a ledger row rather
+ * than a refusal.
+ *
+ * Scoped to `anchor_session` rather than to every alias: an alias is how a task ABSORBS
+ * a session, so matching on aliases would warn about every task a long-lived session has
+ * ever touched. The anchor is where a task was minted, and minting twice in one place is
+ * the shape of both incidents.
+ */
+export function findNearDuplicates(
+  db: Database,
+  sessionId: string,
+  subject: string,
+): NearDuplicate[] {
+  const mine = subjectTokens(subject);
+  const mineExact = normalizeSubject(subject);
+  // An empty token set is NOT "nothing to compare": a terse subject ("fix it", "ship
+  // the CI job") tokenises to nothing after the stopword and length filters, and those
+  // are exactly the subjects a resubmission repeats VERBATIM. The exact-match arm below
+  // is what covers them, so the early return is on having neither signal available.
+  if (mine.size === 0 && mineExact === "") return [];
+  return db
+    .query<{ tid: string; subject: string; status: string }, [string]>(
+      `SELECT t.tid AS tid, s.subject AS subject, t.status AS status
+         FROM task t JOIN v_scope_current s ON s.tid = t.tid
+        WHERE t.anchor_session = ?
+          AND t.status IN ('estimating','in_progress','pending_verification')`,
+    )
+    .all(sessionId)
+    .map((r) => ({
+      ...r,
+      // An identical normalized subject is 1.0 BY DEFINITION, whatever the tokeniser
+      // makes of it. Two open tasks in one session with the same subject is the least
+      // ambiguous form of the incident this warning exists for, and it was the one case
+      // the token rule could not see.
+      overlap:
+        normalizeSubject(r.subject) === mineExact && mineExact !== ""
+          ? 1
+          : subjectOverlap(mine, subjectTokens(r.subject)),
+    }))
+    .filter((r) => r.overlap >= NEAR_DUPLICATE_MIN_OVERLAP)
+    .sort((a, b) => b.overlap - a.overlap);
+}
 
 /**
  * The estimator model family velocity history is keyed by, for ONE ceremony.
@@ -681,7 +830,13 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
     ) {
       throw new InvariantError(
         `tid ${tid} is finalized (${terminal.final_status}); estimates cannot be appended to a closed task`,
-        "reopen it first with `est close <tid> --status reopened`, which appends a new outcome revision rather than editing the old one",
+        // The remedy names the exact command, because since 2026-07-30 the SWEEPER can
+        // be what closed it — `abandoned` after a week of silence, with nobody present
+        // to remember doing it. Someone resuming that work meets this refusal with no
+        // idea why the task is closed, and the road back has to be signposted rather
+        // than inferred: until the reopen lands, the resumed work attributes to nothing.
+        `run \`est close ${tid} --status reopened\` first — that APPENDS a new outcome revision (nothing is edited or lost) and re-opens the task's attribution window, so the resumed work is metered. ` +
+          `If the sweeper closed it as abandoned after a week of silence, this is exactly the intended way back; \`est census\` shows the anomaly(swept_abandon) row that recorded it`,
       );
     }
 
@@ -724,6 +879,12 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
       note: null,
     };
   }
+
+  // Computed BEFORE the mint transaction, and only on the mint path. After the INSERT
+  // the new task is itself an open task anchored to this session with this exact
+  // subject, so the same query would score it at 1.0 against itself.
+  const nearDuplicates =
+    existingTid === null ? findNearDuplicates(db, anchor.sessionId, input.subject) : [];
 
   // Resolved from the ANCHOR — session AND prompt — and bounded above by this
   // estimate's own timestamp, so the answer is a function of the row rather than of
@@ -880,6 +1041,7 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
       marker: PLANT_MARKER,
       call: `TaskUpdate({ taskId: "<n>", metadata: { est_tid: "${tid}" } })`,
     },
+    nearDuplicates,
   };
 }
 

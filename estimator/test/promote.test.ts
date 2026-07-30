@@ -199,6 +199,23 @@ describe("est sweep — P2.8 wiring", () => {
     const report = r.json<{ promotion: { promoted: number; started_at_set: number; started_at_backdated: number } }>();
     expect(report.promotion.promoted).toBe(1);
     expect(report.promotion.started_at_set).toBe(1);
-    expect(taskRow(tid).status).toBe("in_progress");
+
+    // …and then the SWEEPER CLOSE PASS finalizes it in the same sweep, which is correct
+    // and worth pinning here rather than hiding behind a fresher fixture. The task's
+    // only attributed request is months old and nothing signalled completion, so it is
+    // exactly the population Craig's 2026-07-30 ruling calls abandoned: silence past
+    // STALE_CLOSE_HOURS means the actual is a lower bound, not a measurement.
+    //
+    // The ORDER is the load-bearing part for this file: promotion runs first and
+    // reports 1, so `est sweep`'s one status EDGE is still observed even when the close
+    // pass ends the task in the same pass.
+    expect(taskRow(tid).status).toBe("abandoned");
+    expect(
+      h.db
+        .query<{ final_status: string; censored: number }, [string]>(
+          "SELECT final_status, censored FROM v_outcome_current WHERE tid = ?",
+        )
+        .get(tid),
+    ).toEqual({ final_status: "abandoned", censored: 1 });
   });
 });

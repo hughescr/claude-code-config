@@ -238,13 +238,54 @@ describe("est close — P1.7 quiescence", () => {
     expect((await h.cli("close", tid)).code).toBe(0);
   });
 
-  test("a bound agent that never ended blocks the close", async () => {
+  test("a bound agent that is still LIVE blocks the close", async () => {
     const tid = await quietTask();
-    agentRun(h.db, "a-live", { session: "s1", launchPrompt: "p1", startedAt: LONG_AGO, endedAt: null });
+    // FRESH, not merely unfinished: arm 5 now uses the same activity clock P2.1's idle
+    // suppression does (`countLiveAgents`, `eta_live_agent_max_min` = 120 min).
+    agentRun(h.db, "a-live", {
+      session: "s1",
+      launchPrompt: "p1",
+      startedAt: new Date(NOW.getTime() - 10 * 60_000).toISOString(),
+      endedAt: null,
+    });
     attributeTasks(h.db);
     const gate = quiescence(h.db, tid, NOW);
     expect(gate.ok).toBe(false);
     expect(gate.nonterminal_agents).toBe(1);
+  });
+
+  test("a DANGLING agent no longer blocks it forever (Craig, 2026-07-30)", async () => {
+    // "Started and never ended" is what a live agent looks like AND what a DEAD one
+    // looks like — §5.6's `agent_never_returned` population, 54 rows on the live corpus
+    // with 49 of them older than six hours. Under the old unbounded arm, one corpse made
+    // its task permanently un-closeable by anyone: `--force` for it forever, and the
+    // sweeper's close pass unable to reach the exact population it exists for.
+    const tid = await quietTask();
+    agentRun(h.db, "a-dead", { session: "s1", launchPrompt: "p1", startedAt: LONG_AGO, endedAt: null });
+    attributeTasks(h.db);
+    const gate = quiescence(h.db, tid, NOW);
+    expect(gate.nonterminal_agents).toBe(0);
+    expect(gate.ok).toBe(true);
+    expect((await h.cli("close", tid)).code).toBeLessThanOrEqual(3);
+  });
+
+  test("...but one still EMITTING requests is not aged out", async () => {
+    // The clock is `MAX(started_at, the agent's own last request)`, so a genuinely long
+    // delegation keeps blocking. Bounding on `started_at` alone would close live work,
+    // which is the one direction this must not fail in.
+    const tid = await quietTask();
+    agentRun(h.db, "a-long", { session: "s1", launchPrompt: "p1", startedAt: LONG_AGO, endedAt: null });
+    request(h.db, "r-still-going", {
+      origin: "subagent",
+      agent: "a-long",
+      prompt: null,
+      out: 10,
+      ts: new Date(NOW.getTime() - 5 * 60_000).toISOString(),
+    });
+    attributeTasks(h.db);
+    const gate = quiescence(h.db, tid, NOW);
+    expect(gate.nonterminal_agents).toBe(1);
+    expect(gate.ok).toBe(false);
   });
 
   test("--force overrides the gate, records anomaly(forced_close), and says FORCED", async () => {
@@ -261,18 +302,42 @@ describe("est close — P1.7 quiescence", () => {
     expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM outcome").get()?.n).toBe(1);
   });
 
-  test("the exit-2 message names the accept path, and still refuses --force to Claude", async () => {
+  test("the exit-2 message names the sweeper and the accept path, and still refuses --force to Claude", async () => {
     const tid = await openTask();
     request(h.db, "r-now", { out: 100, ts: new Date().toISOString() });
     attributeTasks(h.db);
     const r = await h.cli("close", tid);
     expect(r.code).toBe(2);
-    // Unchanged for the NO-consent path: it still names the failing condition and
-    // still tells the reader to wait.
     expect(r.err).toContain("quiescence gate not met");
-    expect(r.err).toContain("wait for the task to go quiet");
+    // The remedy used to say "wait for the task to go quiet", which reads as an
+    // instruction to POLL and pointed, in its second half, at a sweeper close pass that
+    // did not exist. Since 2026-07-30 it does, so the honest advice is to do nothing —
+    // and the message has to state the CONSEQUENCE of that, or it is only half true.
+    expect(r.err).toContain("do nothing");
+    expect(r.err).toContain("close pass");
+    expect(r.err).toContain("abandoned");
     expect(r.err).toContain("--accept");
     expect(r.err).toContain("never Claude's");
+  });
+
+  test("the gate refusal is identifiable by CLASS, not by matching its prose", async () => {
+    // `src/autoclose.ts` has to tell "the gate said no" (designed; retried next pass)
+    // from "this task is broken" (counted, and eventually alerting). A regex over the
+    // message made that discrimination hostage to the wording of an error string.
+    const { QuiescenceError } = await import("../src/close.ts");
+    const tid = await openTask();
+    request(h.db, "r-now", { out: 100, ts: new Date().toISOString() });
+    attributeTasks(h.db);
+    let thrown: unknown;
+    try {
+      closeTask(h.db, { tid, now: NOW });
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(QuiescenceError);
+    // Still exit 2, so every existing caller behaves identically.
+    expect((thrown as { exitCode: number }).exitCode).toBe(2);
+    expect((thrown as { report: { ok: boolean } }).report.ok).toBe(false);
   });
 
   test("--accept closes on the human's words and records anomaly(accepted_close)", async () => {

@@ -128,6 +128,20 @@ export interface DataQualityPanel {
    */
   forced_closes: number;
   accepted_closes: number;
+  /**
+   * The SWEEPER's two close arms (P1.7 close pass, Craig 2026-07-30), counted apart
+   * because they are opposite epistemic events. `swept_closes` gained the corpus a
+   * measurement; `swept_abandons` gained it a right-censored LOWER BOUND and sealed a
+   * task's attribution window on no evidence either way.
+   *
+   * The abandoned share is DECISIONS §12's own re-open trigger: past roughly half of
+   * swept closes, the finding is not about any one task but about the SIGNAL — the
+   * harness's terminal `task_event` is not reaching the tasks it should, which is a
+   * §3.2 step 6 problem wearing a §6.2 costume. Without this pair there was no
+   * instrument to read that trigger off.
+   */
+  swept_closes: number;
+  swept_abandons: number;
   bypass_share: number | null;
   overhead_share: number | null;
   unpriced_share: number | null;
@@ -624,13 +638,19 @@ function qualityPanel(db: Database): DataQualityPanel {
     identity_planted_pct: ratio(planted?.planted ?? 0, planted?.total ?? 0),
     forced_closes: anomalyCount("forced_close"),
     accepted_closes: anomalyCount("accepted_close"),
-    // DISTINCT tid, over closed tasks: the question is what share of the corpus came
-    // through a bypass, and two rows against one task is still one task.
+    swept_closes: anomalyCount("swept_close"),
+    swept_abandons: anomalyCount("swept_abandon"),
+    // DISTINCT tid, over closed tasks: the question is what share of the corpus was
+    // finalized by something other than a human running `est close` on a quiet task,
+    // and two rows against one task is still one task. The two SWEPT kinds belong in
+    // here beside the two bypasses: a swept close bypasses no gate, but it is equally
+    // "the corpus closed itself", which is the thing this share exists to watch.
     bypass_share: ratio(
       num(
         db,
         `SELECT COUNT(DISTINCT a.tid) AS v FROM anomaly a
-          WHERE a.kind IN ('forced_close','accepted_close') AND a.tid IS NOT NULL
+          WHERE a.kind IN ('forced_close','accepted_close','swept_close','swept_abandon')
+            AND a.tid IS NOT NULL
             AND a.tid IN (SELECT tid FROM v_outcome_current WHERE final_status <> 'reopened')`,
       ),
       num(db, "SELECT COUNT(*) AS v FROM v_outcome_current WHERE final_status <> 'reopened'"),
