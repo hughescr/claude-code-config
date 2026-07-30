@@ -1,15 +1,14 @@
 {
   "name": "gap-sensitivity",
-  "note": "Identical inputs, two thresholds, two different partitions — three segments at gap 2 and two at gap 5. This is the knob the measured corpus moved a 10x p50 across, and the fixture exists so that a change to the segmentation rule shows up as a change in SHAPE rather than in one number.",
+  "note": "Identical inputs, two thresholds, two different partitions — three segments at gap 2 and two at gap 5. The gap the threshold decides (10:01 -> 10:03) is deliberately PROMPT-FREE: since the 2026-07-30 boundary rule a prompt in a gap cuts the segment at any width, so a gap containing one partitions identically at every threshold and this fixture would stop testing the knob at all. What is left is the knob's real remaining job — bridging silence INSIDE one stretch of Claude-active work, here between a turn and the agent it launched.",
   "session": "s-fx-gap",
   "now": "2026-03-01T12:00:00.000Z",
   "live": false,
   "turns": [
     { "prompt": "p1", "at": "2026-03-01T10:00:00.000Z", "duration_ms": 60000 },
-    { "prompt": "p2", "at": "2026-03-01T10:03:00.000Z", "duration_ms": 60000 },
-    { "prompt": "p3", "at": "2026-03-01T10:10:00.000Z", "duration_ms": 60000 }
+    { "prompt": "p2", "at": "2026-03-01T10:10:00.000Z", "duration_ms": 60000 }
   ],
-  "agents": [],
+  "agents": [{ "id": "a1", "started_at": "2026-03-01T10:03:00Z", "ended_at": "2026-03-01T10:04:00Z" }],
   "requests": [],
   "compactions": [],
   "cases": [
@@ -35,12 +34,12 @@
           "active_s": 60,
           "busy_s": 60,
           "max_concurrency": 1,
-          "n_turns": 1,
-          "n_agents": 0,
+          "n_turns": 0,
+          "n_agents": 1,
           "gap_before_s": 120,
           "gap_after_s": 360,
           "terminator": "human_input",
-          "interval_src_mix": "turn"
+          "interval_src_mix": "agent"
         },
         {
           "started_at": "2026-03-01T10:10:00Z",
@@ -66,12 +65,12 @@
           "active_s": 120,
           "busy_s": 120,
           "max_concurrency": 1,
-          "n_turns": 2,
-          "n_agents": 0,
+          "n_turns": 1,
+          "n_agents": 1,
           "gap_before_s": null,
           "gap_after_s": 360,
           "terminator": "human_input",
-          "interval_src_mix": "turn"
+          "interval_src_mix": "turn+agent"
         },
         {
           "started_at": "2026-03-01T10:10:00Z",

@@ -449,11 +449,17 @@ async function gateStatusline(): Promise<void> {
       // by the row and never re-derives a forecast at render time (P1.9), so the row IS
       // the interface this gate is testing. 1620 s -> `~27m`, and `eta_probation = 1`
       // must surface as the trailing `?`.
+      //
+      // `eta_waiting_on_input = 0` is part of the fiction rather than noise: this fixture
+      // session has one CLOSED turn and no agent, so the sweep above correctly found it
+      // idle and set the flag, which outranks every forecast column (Craig 2026-07-30).
+      // The row is pretending to be a session with work in flight.
       const n = db
         .query(
           `UPDATE burn_cache SET seg_started_at = ?, seg_elapsed_s = 120,
               check_back_p50_s = 1620, check_back_p90_s = 5400,
-              eta_model = 'residual_life', eta_probation = 1, eta_n_seg = 12
+              eta_model = 'residual_life', eta_probation = 1, eta_n_seg = 12,
+              eta_waiting_on_input = 0
             WHERE tid = ?`,
         )
         .run(isoAt(new Date(now.getTime() - 120_000)), tid);
@@ -531,6 +537,21 @@ async function gateStatusline(): Promise<void> {
     const garbage = await runOnce("{ this is not json");
     check(garbage.code === 0 && garbage.out === "", "malformed stdin -> empty segment, exit 0",
       `code=${garbage.code} out=${JSON.stringify(garbage.out)}`);
+
+    // --- idle suppression, through the same process ---------------------------------
+    // Flip the one column and re-render: the ETA is REPLACED by `awaiting input` and the
+    // rest of the segment survives. Both halves matter — a suppression that blanked the
+    // line would trade a wrong ETA for a missing burn bar (Craig 2026-07-30).
+    {
+      const db = new Database(s.dbPath);
+      db.query("UPDATE burn_cache SET eta_waiting_on_input = 1 WHERE tid = ?").run(tid);
+      db.close();
+    }
+    const idle = await runOnce(stdinPayload);
+    check(idle.code === 0, "statusline exits 0 with a waiting payload", String(idle.code));
+    check(/awaiting input/.test(idle.out), "an idle session renders `awaiting input`", idle.out);
+    check(!/check back/.test(idle.out), "and no forecast leaks alongside it", idle.out);
+    check(idle.out.startsWith("task "), "the rest of the segment survives suppression", idle.out);
   } finally {
     s.dispose();
   }

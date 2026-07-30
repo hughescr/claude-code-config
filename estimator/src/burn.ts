@@ -25,10 +25,11 @@ import { getConfig, openDb, unvalidatedRetired } from "./db.ts";
 import { isoNow, TERMINAL_TASK_STATUS } from "./tasks.ts";
 import {
   buildEtaFit,
-  forecastSession,
+  checkBackForSession,
   formatEta,
   type CheckBack,
   type CheckBackSeconds,
+  type CheckBackState,
   type EtaFit,
   type EtaModel,
 } from "./eta.ts";
@@ -348,16 +349,36 @@ export function forecastSessionForTask(db: Database, tid: string): string | null
   return bound[0]!;
 }
 
-/** The check-back forecast for a task, via its session. `null` is a valid answer. */
+/**
+ * What the check-back field says about a task, via its session — the forecast, or the
+ * fact that Claude is blocked on the human (P2.2, Craig 2026-07-30).
+ *
+ * A task bound to no session is neither: nothing here can observe whether anybody is
+ * waiting, and `{waiting: false, forecast: null}` is the existing "no answer" shape.
+ */
+export function checkBackStateForTask(
+  db: Database,
+  tid: string,
+  fit: EtaFit,
+  now: Date,
+): CheckBackState {
+  const session = forecastSessionForTask(db, tid);
+  if (session === null) return { waiting: false, forecast: null };
+  return checkBackForSession(db, session, fit, now);
+}
+
+/**
+ * The forecast alone, for callers that only want the band. Prefer
+ * {@link checkBackStateForTask}: this one cannot tell "nothing to forecast" from
+ * "Claude is waiting for you", and the payload has to.
+ */
 export function checkBackForTask(
   db: Database,
   tid: string,
   fit: EtaFit,
   now: Date,
 ): CheckBackSeconds | null {
-  const session = forecastSessionForTask(db, tid);
-  if (session === null) return null;
-  return forecastSession(db, session, fit, now);
+  return checkBackStateForTask(db, tid, fit, now).forecast;
 }
 
 // ---------------------------------------------------------------------------
@@ -369,12 +390,14 @@ INSERT INTO burn_cache (tid, as_of, consumed_wcet, wcet_main, wcet_sub, wcet_aux
                         n_agents_live, n_agents_total, n_provisional, n_unpriced,
                         active_s, burn_wcet_per_min, proj_total_wcet,
                         seg_started_at, seg_elapsed_s, check_back_p50_s, check_back_p90_s,
-                        eta_model, eta_probation, eta_n_seg, compute_s, compute_coverage_pct)
+                        eta_model, eta_probation, eta_n_seg, compute_s, compute_coverage_pct,
+                        eta_waiting_on_input)
 VALUES ($tid, $as_of, $consumed_wcet, $wcet_main, $wcet_sub, $wcet_aux, $usd, $n_req,
         $n_agents_live, $n_agents_total, $n_provisional, $n_unpriced,
         $active_s, $burn_wcet_per_min, $proj_total_wcet,
         $seg_started_at, $seg_elapsed_s, $check_back_p50_s, $check_back_p90_s,
-        $eta_model, $eta_probation, $eta_n_seg, $compute_s, $compute_coverage_pct)
+        $eta_model, $eta_probation, $eta_n_seg, $compute_s, $compute_coverage_pct,
+        $eta_waiting_on_input)
 ON CONFLICT(tid) DO UPDATE SET
   as_of = excluded.as_of, consumed_wcet = excluded.consumed_wcet,
   wcet_main = excluded.wcet_main, wcet_sub = excluded.wcet_sub, wcet_aux = excluded.wcet_aux,
@@ -387,7 +410,8 @@ ON CONFLICT(tid) DO UPDATE SET
   check_back_p50_s = excluded.check_back_p50_s, check_back_p90_s = excluded.check_back_p90_s,
   eta_model = excluded.eta_model, eta_probation = excluded.eta_probation,
   eta_n_seg = excluded.eta_n_seg,
-  compute_s = excluded.compute_s, compute_coverage_pct = excluded.compute_coverage_pct
+  compute_s = excluded.compute_s, compute_coverage_pct = excluded.compute_coverage_pct,
+  eta_waiting_on_input = excluded.eta_waiting_on_input
 `;
 
 /**
@@ -419,7 +443,12 @@ export function refreshBurnCache(db: Database, now: Date = new Date()): number {
   const stmt = db.prepare(UPSERT_BURN_SQL);
   for (const { tid } of open) {
     const agg = aggregateBurn(db, tid, now);
-    const cb = checkBackForTask(db, tid, fit, now);
+    // The WHOLE state, not just the band: when the session is idle every forecast column
+    // is written NULL and the flag carries the answer instead. Storing a suppressed
+    // forecast "in case" is how a stale number gets back on screen the moment a reader
+    // forgets to check the flag.
+    const st = checkBackStateForTask(db, tid, fit, now);
+    const cb = st.forecast;
     const compute = computeClock(db, tid);
     stmt.run({
       $tid: tid,
@@ -450,6 +479,10 @@ export function refreshBurnCache(db: Database, now: Date = new Date()): number {
       $eta_n_seg: cb?.n_seg ?? null,
       $compute_s: compute.s,
       $compute_coverage_pct: compute.coverage_pct,
+      // 0, not NULL, when the session is busy: NULL is reserved for a row written by a
+      // binary that predates the column, and `burnJson` reads that as "not waiting" for
+      // exactly one sweep. Writing 0 makes the distinction unnecessary going forward.
+      $eta_waiting_on_input: st.waiting ? 1 : 0,
     } as never);
   }
   const stale = db.query<{ tid: string }, []>("SELECT tid FROM burn_cache").all();
@@ -464,6 +497,29 @@ export function refreshBurnCache(db: Database, now: Date = new Date()): number {
 
 export type BurnWarn = "over_p50" | "over_p90" | "stale" | "provisional_price" | "unpriced";
 export type EmptyReason = "no_open_estimate" | "no_cache" | "db_busy" | "db_missing";
+
+/**
+ * `check_back` when Claude is blocked on the human (Craig, 2026-07-30).
+ *
+ * Deliberately ONE field. The temptation is to attach the last segment's start, or how
+ * long the session has been quiet, and both would be read as a forecast in disguise —
+ * "waiting since 14:32" invites the arithmetic the estimand refuses. The whole content
+ * of this object is that there is no forecast to make, and why.
+ *
+ * A separate SHAPE rather than a flag inside {@link CheckBack} for the same reason: a
+ * band with `waiting_on_input: true` and numbers in it would let a consumer render the
+ * numbers, which is the defect this exists to prevent.
+ */
+export interface CheckBackWaiting {
+  waiting_on_input: true;
+}
+
+/** Discriminator for the two non-null `check_back` shapes. */
+export function isWaitingOnInput(
+  cb: CheckBack | CheckBackWaiting | null | undefined,
+): cb is CheckBackWaiting {
+  return cb !== null && cb !== undefined && "waiting_on_input" in cb;
+}
 
 /**
  * HOW the task in this payload was chosen (P1.6's resolution order), so a consumer can
@@ -536,15 +592,27 @@ export interface BurnActive {
    * boundary. **Session-scoped**, which is why it sits in its own object rather than
    * inside `wcet` or `time`: every other number in this payload is about the task.
    *
-   * `null`, with the field still present, in exactly these cases: the resolved session
-   * has no open segment, or fewer than `config.eta_min_fit` closed segments exist to
-   * fit. A `null` here is a well-formed answer at exit 0, on the same rule as every
-   * other empty result.
+   * THREE shapes, and a consumer has to handle all three:
    *
-   * ADDITIVE under P2.0's rule — no field removed, none retyped — so `"schema"` stays
-   * `1` and a tolerant consumer (the statusline) needs no re-verification.
+   *  - a {@link CheckBack} band — a forecast was issued;
+   *  - `{waiting_on_input: true}` — Claude is blocked on the human, so there is nothing
+   *    to forecast (see {@link CheckBackWaiting});
+   *  - `null` — no answer either way: the resolved session has no open segment, or
+   *    fewer than `config.eta_min_fit` closed segments exist to fit, or the task is
+   *    bound to no session at all.
+   *
+   * All three are well-formed answers at exit 0, on the same rule as every other empty
+   * result. ADDITIVE under P2.0's rule — no field removed, none retyped, and a field
+   * that was already `object | null` gaining a second object shape is the same widening
+   * `unvalidated` made when it stopped being the literal `true` — so `"schema"` stays
+   * `1`. What it does cost is a re-read of every consumer that DEREFERENCES the object:
+   * `scripts/statusline-burn.ts` and `renderBurn` below both discriminate on
+   * `waiting_on_input` (via {@link isWaitingOnInput}) rather than on truthiness. The
+   * board (`src/retro.ts`) reads the `burn_cache` COLUMNS instead of this payload, and
+   * needs no change for a different reason: the sweeper nulls every forecast column when
+   * it sets the flag, so an idle session's card simply carries no check-back line.
    */
-  check_back: CheckBack | null;
+  check_back: CheckBack | CheckBackWaiting | null;
   /**
    * §7.3 clock 1. `s` is `SUM(request.duration_ms)/1000` over the task's attributed
    * requests and `coverage_pct` is the share that carry one — see {@link ComputeClock}
@@ -715,7 +783,7 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
   let perMin: number;
   let projTotal: number;
   let cacheAsOf: string;
-  let checkBack: CheckBack | null;
+  let checkBack: CheckBack | CheckBackWaiting | null;
   let compute: ComputeClock;
 
   if (opts.refresh === true) {
@@ -723,8 +791,12 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
     // `--refresh` is the live path by contract: it refits the corpus rather than
     // reading yesterday's columns. It is for humans and for tests; the statusline
     // never passes it, and this is why.
-    const cb = checkBackForTask(db, tid, buildEtaFit(db), now);
-    checkBack = cb === null ? null : stripSeconds(cb);
+    const st = checkBackStateForTask(db, tid, buildEtaFit(db), now);
+    checkBack = st.waiting
+      ? { waiting_on_input: true }
+      : st.forecast === null
+        ? null
+        : stripSeconds(st.forecast);
     compute = computeClock(db, tid);
     consumed = agg.consumed_wcet;
     main = agg.wcet_main;
@@ -771,6 +843,7 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
           eta_n_seg: number | null;
           compute_s: number | null;
           compute_coverage_pct: number | null;
+          eta_waiting_on_input: number | null;
         },
         [string]
       >("SELECT * FROM burn_cache WHERE tid = ?")
@@ -800,8 +873,15 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
     // the drift is bounded anyway: the segment blanks entirely once `stale` fires.
     // Every column is NULL on a row written before the v7 -> v8 rebuild, which is one
     // sweep away and reads as "no forecast yet", exactly like too thin a corpus.
-    checkBack =
-      row.seg_started_at === null || row.check_back_p50_s === null || row.eta_model === null
+    //
+    // The waiting flag is read FIRST and outranks the columns, mirroring
+    // `checkBackForSession`'s precedence — and the sweeper writes the forecast columns
+    // NULL whenever it sets the flag, so the two cannot contradict each other even if a
+    // future reader gets the order wrong. NULL means "written by a binary older than the
+    // column", which reads as not-waiting for the one sweep it takes to fill in.
+    checkBack = (row.eta_waiting_on_input ?? 0) !== 0
+      ? { waiting_on_input: true }
+      : row.seg_started_at === null || row.check_back_p50_s === null || row.eta_model === null
         ? null
         : {
             p50_min: Math.round(row.check_back_p50_s / 60),
@@ -966,7 +1046,16 @@ export function renderBurn(b: BurnJson): string {
   // shows p50 alone (one line of budget, and a two-number band stops being glanceable);
   // a terminal has room to say how wide the band actually is, and the width is the
   // honest part: p90 runs ~30× p50 on the corpus this was specified against.
-  if (b.check_back !== null) {
+  if (isWaitingOnInput(b.check_back)) {
+    // No band, and deliberately no number of any kind: the session has no live agent, no
+    // open workflow and a closed newest turn, so the honest answer to "when will this
+    // stop needing me" is "it already does". Saying how long it has been waiting would
+    // be the availability model §7.3 descoped, arrived at by the back door.
+    lines.push(
+      `check back NOW — awaiting input: no agent live, no delegation open and the last turn is closed, ` +
+        `so Claude is blocked on you. No forecast is issued for an idle session (the burn figures above are unaffected)`,
+    );
+  } else if (b.check_back !== null) {
     const cb = b.check_back;
     lines.push(
       `check back ${formatEta(cb.p50_min)}${cb.probation ? "?" : ""} (p90 ${formatEta(cb.p90_min)}) · ` +

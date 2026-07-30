@@ -1,0 +1,34 @@
+{
+  "name": "delegation-spans-prompt",
+  "note": "THE EXCEPTION to the boundary rule, and the reason it is stated as 'the main chain blocking on input' rather than 'a prompt'. A delegated agent runs 10:00:30-10:20:00 and Craig interjects at 10:10, in the middle of it. Claude was not waiting for anybody at that instant, so 10:10 is NOT a boundary: cutting there would enter the pre-prompt piece into the survival corpus as a genuine 'Claude needed a human' observation that never happened, biasing every later forecast short. The delegated work keeps its own segment, one row, still open. The mechanical test is free — the prompt is INSIDE a union component, and a component is by definition covered by running work.",
+  "session": "s-fx-span",
+  "now": "2026-03-01T10:22:00.000Z",
+  "live": true,
+  "turns": [
+    { "prompt": "p1", "at": "2026-03-01T10:00:00.000Z", "duration_ms": 60000 },
+    { "prompt": "p2", "at": "2026-03-01T10:10:00.000Z", "duration_ms": 60000 }
+  ],
+  "agents": [{ "id": "a1", "started_at": "2026-03-01T10:00:30Z", "ended_at": "2026-03-01T10:20:00Z" }],
+  "requests": [],
+  "compactions": [],
+  "cases": [
+    {
+      "gap_min": 5,
+      "segments": [
+        {
+          "started_at": "2026-03-01T10:00:00Z",
+          "ended_at": "2026-03-01T10:20:00Z",
+          "active_s": 1200,
+          "busy_s": 1290,
+          "max_concurrency": 2,
+          "n_turns": 2,
+          "n_agents": 1,
+          "gap_before_s": null,
+          "gap_after_s": null,
+          "terminator": "open",
+          "interval_src_mix": "turn+agent"
+        }
+      ]
+    }
+  ]
+}

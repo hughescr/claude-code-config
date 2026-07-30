@@ -573,9 +573,13 @@ describe("check_back.n_seg comes out of burn_cache — P1.9", () => {
 
     h.db
       .query(
+        // `eta_waiting_on_input = 0` is part of the fiction, not decoration: the sweep
+        // above found an idle session and set the flag, which outranks every forecast
+        // column by design. This row is pretending to be a session with work in flight.
         `UPDATE burn_cache SET seg_started_at = ?, seg_elapsed_s = 60,
             check_back_p50_s = 600, check_back_p90_s = 1800,
-            eta_model = 'residual_life', eta_probation = 1, eta_n_seg = 41
+            eta_model = 'residual_life', eta_probation = 1, eta_n_seg = 41,
+            eta_waiting_on_input = 0
           WHERE tid = ?`,
       )
       .run("2026-01-01T00:02:00Z", tid);
@@ -583,7 +587,8 @@ describe("check_back.n_seg comes out of burn_cache — P1.9", () => {
     expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM run_segment").get()?.n).toBe(0);
 
     const b = burnJson(h.db, { session: "s7", now }) as BurnActive;
-    expect(b.check_back?.n_seg).toBe(41);
+    expect(b.check_back).not.toBeNull();
+    expect((b.check_back as { n_seg: number }).n_seg).toBe(41);
     expect(renderBurn(b)).toContain("over 41 closed segment(s)");
   });
 
@@ -595,10 +600,12 @@ describe("check_back.n_seg comes out of burn_cache — P1.9", () => {
     h.db
       .query(
         `UPDATE burn_cache SET seg_started_at = ?, check_back_p50_s = 600,
-            eta_model = 'residual_life', eta_n_seg = NULL WHERE tid = ?`,
+            eta_model = 'residual_life', eta_n_seg = NULL, eta_waiting_on_input = 0
+          WHERE tid = ?`,
       )
       .run("2026-01-01T00:02:00Z", tid);
-    expect((burnJson(h.db, { session: "s7", now }) as BurnActive).check_back?.n_seg).toBe(0);
+    const cb = (burnJson(h.db, { session: "s7", now }) as BurnActive).check_back;
+    expect((cb as { n_seg: number }).n_seg).toBe(0);
   });
 });
 

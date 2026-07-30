@@ -15,12 +15,41 @@
  * have the burn rate right here".
  *
  * THE UNIT is a **run segment**: a maximal run of components of the §7.3 interval
- * union whose consecutive gaps are all shorter than `config.segment_gap_min`. Three
- * interval sources feed the union — turns (`turn.started_at` + `turn.duration_ms`),
- * agent runs (`started_at`..`ended_at`) and OTEL-upgraded requests (`request.ts` +
+ * union whose consecutive gaps are all shorter than `config.segment_gap_min` **and
+ * none of which contains a user prompt**. Three interval sources feed the union —
+ * turns (`turn.started_at` + `turn.duration_ms`), agent runs
+ * (`started_at`..`ended_at`) and OTEL-upgraded requests (`request.ts` +
  * `request.duration_ms`, filled by the P2.4 drain). The third is what OTEL buys: a
  * turn whose `turn_duration` record never landed contributes nothing to the union,
  * and per-request durations fill the inside of exactly those turns.
+ *
+ * THE BOUNDARY RULE (Craig, 2026-07-30) is the second half of that definition and it
+ * is the difference between answering the question and answering a different one. A
+ * purely gap-based segment measures **how long an activity streak lasts**; the estimand
+ * is **Claude-active time to the next human-input boundary**. Those come apart exactly
+ * when a background agent BRIDGES a gap that contains a prompt: measured live, one
+ * segment ran 4.6 h across five prompts, so `residual_life` forecast "check back ~5.3h"
+ * at a moment when zero agents were live and Claude was, in fact, waiting on Craig.
+ * A prompt that lands while Claude is idle therefore CUTS the segment, however short
+ * the surrounding gap — and the cut is what makes both halves of the number honest:
+ * `seg_elapsed` is measured from the prompt, and the closed segment enters the survival
+ * corpus as one prompt-to-boundary span instead of a streak of several glued together.
+ *
+ * THE ONE EXCEPTION, and it is the whole of the exception: **a prompt that lands while
+ * work is still in flight is not a boundary.** The rule is about the MAIN CHAIN
+ * blocking on input, not about the human speaking. If the interval union covers the
+ * prompt instant then something — a turn mid-response, a delegated agent, an in-flight
+ * request — was running, so Claude was not waiting for anybody, and cutting there would
+ * fabricate an idle boundary inside a still-running delegation: the pre-prompt piece
+ * would enter the corpus as a genuine "Claude needed a human" observation that never
+ * happened, biasing every subsequent forecast short. The delegated work keeps its own
+ * segment, and the mechanical test for "was Claude blocked" is free: a prompt inside a
+ * union COMPONENT is covered by definition, and a prompt in a GAP is not.
+ *
+ * The complement of that rule lives in {@link waitingOnInput}: when nothing is in
+ * flight there is no forecast to issue at all, only the fact that Claude is blocked.
+ * The two are deliberately the same predicate read at two instants — the prompt's, for
+ * where the corpus is cut, and now, for whether a forecast is issued.
  *
  * SCOPE: the forecast is **session-scoped**, not task-scoped, and that is a deliberate
  * departure from every other number in the system. `run_segment.tid` records the task
@@ -269,7 +298,19 @@ export interface SegmentRow {
 }
 
 export interface SegmentContext {
-  /** Turn start instants, for the `human_input` discriminator. */
+  /**
+   * User-prompt instants (`turn.started_at`), which do two jobs here: they are the
+   * `human_input` discriminator, and since the 2026-07-30 boundary rule they are also
+   * the CUT POINTS — a prompt that falls in a gap ends a segment however narrow the gap
+   * is. See the file header for why, and for the one case that is not a cut.
+   *
+   * These are derived at sweep time from the transcript's own user-message timestamps
+   * (`src/segment.ts` -> the `turn` table), never from the `UserPromptSubmit` hook. The
+   * hook is a FRESHNESS assist only — it spawns a micro-sweep so the boundary lands in
+   * `run_segment` within seconds — because a boundary definition that depended on a hook
+   * would silently differ between sessions that had it wired and sessions that did not,
+   * and the historical corpus has none of them.
+   */
   turnStarts: readonly number[];
   /** `/compact` boundary instants for this session, from the anomaly ledger. */
   compactions: readonly number[];
@@ -285,10 +326,25 @@ export interface SegmentContext {
  * Pure: everything it needs about the world arrives in `ctx`, which is what makes the
  * fixture tests possible and what keeps the classification rules readable in one place.
  *
+ * TWO things split a segment, and the second is the 2026-07-30 boundary rule:
+ *
+ *  a. a gap at least `gapMin` wide — the original rule, and the only one that ever
+ *     applies INSIDE a component (there are no gaps inside one, by construction);
+ *  b. a **user prompt lying in a gap**, at any width. A prompt inside a component is
+ *     covered by work that was still running and is therefore NOT a cut: that is the
+ *     "still-running delegation" exception the file header sets out, and it needs no
+ *     extra evidence — component containment IS the test for "was Claude blocked".
+ *
  * Terminator precedence, and the reason for each step:
  *
- *  1. `open` — the last segment, with less than one gap-width of silence since it
- *     ended. The ONLY kind a live forecast is issued against.
+ *  1. `open` — the last segment, with less than one gap-width of silence since it ended
+ *     AND no prompt after it. The ONLY kind a live forecast is issued against. The
+ *     prompt clause is rule (b) applied to the tail: if Craig has typed since the last
+ *     observable activity then that segment ended at a human-input boundary, and leaving
+ *     it open would forecast from a start instant that predates the prompt — the exact
+ *     defect this rule exists to kill, in the one shape a re-grouping cannot reach
+ *     (there is no later component to group away from). What follows the prompt has not
+ *     become visible yet, so the honest answer until it does is no open segment at all.
  *  2. `compaction` — a `compact_boundary` fell inside the gap. Positive evidence, so
  *     it outranks the inference below: `/compact` ENDS a session, and reading that as
  *     "a human typed something" would put a boundary in the corpus that never happened.
@@ -311,13 +367,31 @@ export function classifySegments(
   if (components.length === 0) return [];
   const gapMs = ctx.gapMin * 60_000;
 
-  // group components into segments
+  // Ascending, because `promptInGap` scans it and the callers hand it over already
+  // sorted — copying and re-sorting costs one small array per session and removes an
+  // ordering assumption from a pure function's contract.
+  const prompts = [...ctx.turnStarts].sort((a, b) => a - b);
+
+  /**
+   * Is there a prompt in the silence between `from` and `to` that the segment starting
+   * at `after` has not already been cut at?
+   *
+   * INCLUSIVE at both ends on purpose. The ordinary case is a prompt that lands while
+   * Claude is idle: the turn interval it opens starts at exactly that instant, so the
+   * next component's `start` IS the prompt and an exclusive test would miss every real
+   * boundary. `p > after` keeps a group from being cut at the prompt that opened it.
+   */
+  const promptInGap = (from: number, to: number, after: number): boolean =>
+    prompts.some((p) => p >= from && p <= to && p > after);
+
+  // group components into segments: a wide-enough gap splits, and so does a prompt in
+  // any gap (rule (b) above)
   const groups: Component[][] = [];
   let cur: Component[] = [components[0]!];
   for (let i = 1; i < components.length; i += 1) {
     const c = components[i]!;
     const prev = cur[cur.length - 1]!;
-    if (c.start - prev.end < gapMs) cur.push(c);
+    if (c.start - prev.end < gapMs && !promptInGap(prev.end, c.start, cur[0]!.start)) cur.push(c);
     else {
       groups.push(cur);
       cur = [c];
@@ -362,9 +436,12 @@ export function classifySegments(
     const boundary = nextStart ?? ctx.now;
     const compacted = ctx.compactions.some((c) => c > end && c <= boundary);
     const turnAfter = ctx.turnStarts.some((t) => t > end && (nextStart === null || t <= nextStart + 1000));
+    // Rule (b) on the tail. Only the LAST group can be affected: for every other group
+    // a prompt after `end` is inside the gap the grouping loop already cut at.
+    const promptAfter = isLast && prompts.some((p) => p > end);
 
     let terminator: Terminator;
-    if (isLast && ctx.now - end < gapMs) terminator = "open";
+    if (isLast && !promptAfter && ctx.now - end < gapMs) terminator = "open";
     else if (compacted) terminator = "compaction";
     else if (turnAfter) terminator = "human_input";
     else if (isLast && !ctx.live) terminator = "session_end";
@@ -525,6 +602,28 @@ function recutClass(prior: PriorSegment, next: SegmentRow): "span" | "shape" | n
 }
 
 /**
+ * Does any surviving interval still overlap a stored segment's span?
+ *
+ * The test a full rebuild uses before it removes a cut from outside the recompute
+ * horizon. "No overlap" means the evidence for that stretch of wall clock is gone — GC
+ * pruned it (P2.10) — and a recompute that cannot see the inputs is not entitled to
+ * conclude the segment never happened. A degenerate stored span (`ended_at ==
+ * started_at`, which the schema permits) gets a one-second window so an interval
+ * beginning at exactly that instant still counts as coverage.
+ */
+function spanStillCovered(
+  raw: readonly SessionInterval[],
+  startedAt: string,
+  endedAt: string,
+): boolean {
+  const from = Date.parse(startedAt);
+  const to = Date.parse(endedAt);
+  if (!Number.isFinite(from)) return false;
+  const until = Math.max(Number.isFinite(to) ? to : from, from + 1000);
+  return raw.some((i) => i.end > from && i.start < until);
+}
+
+/**
  * Rebuild `run_segment` for the sessions that could still be moving, INSIDE the
  * sweeper's existing transaction (so it takes no lock of its own, like
  * `refreshBurnCache`).
@@ -589,19 +688,33 @@ export function refreshSegments(
   //     nothing about a retired partition, so it may not delete from one.
   //   * OPEN rows at ANY age — an open segment is not yet an observation, it is a
   //     provisional cut of the live tail, so the refresh owns it outright.
-  //   * TERMINAL rows only INSIDE the recompute horizon. Outside it the transcripts
-  //     that produced a segment may already have been pruned (P2.10 prunes at 365 days
-  //     and a segment outlives its inputs by design), so the recompute is not
-  //     authoritative there and silence must not be read as "this segment never was".
+  //   * TERMINAL rows only INSIDE the recompute horizon — UNLESS this is a full rebuild,
+  //     and then only where the inputs are still visible. Outside the horizon the
+  //     transcripts that produced a segment may already have been pruned (P2.10 prunes
+  //     at 365 days and a segment outlives its inputs by design), so silence from
+  //     `loadIntervalIndex` must not be read as "this segment never was".
+  //
+  //     A full rebuild (`est backfill`, or the bootstrap case of an empty table) has to
+  //     reach further back than that, because the 2026-07-30 boundary rule changed WHERE
+  //     segments are cut: every stored cut is an observation of a superseded estimand,
+  //     and leaving the old ones beside the new ones would hand Kaplan–Meier the same
+  //     wall-clock minute twice — once as a prompt-to-boundary span and once inside the
+  //     streak it was carved out of. So a full rebuild loads the prior rows unbounded and
+  //     earns its authority per ROW instead of per horizon: an old cut is superseded only
+  //     if some surviving interval still OVERLAPS it (see the removal loop). Pruned
+  //     inputs produce no overlap, so a segment whose evidence is gone is kept, which is
+  //     the same protection the horizon was giving — expressed against the thing that
+  //     actually matters rather than against a date.
+  const priorBound = all ? null : since;
   const prior = new Map<string, Map<string, PriorSegment>>();
   for (const r of db
-    .query<PriorSegment, [number, string]>(
+    .query<PriorSegment, [number, string | null]>(
       `SELECT session_id, started_at, ended_at, active_s, busy_s, max_concurrency,
               n_turns, n_agents, terminator, gap_min
          FROM run_segment
-        WHERE gap_min = ? AND (terminator = 'open' OR started_at >= ?)`,
+        WHERE gap_min = ?1 AND (?2 IS NULL OR terminator = 'open' OR started_at >= ?2)`,
     )
-    .all(gapMin, since)) {
+    .all(gapMin, priorBound)) {
     if (!sessions.has(r.session_id)) continue;
     let bySession = prior.get(r.session_id);
     if (bySession === undefined) {
@@ -631,8 +744,16 @@ export function refreshSegments(
     // successor at once and `v_eta_corpus` fed Kaplan-Meier the same wall-clock minute
     // twice — once as a short observation, once inside a long one.
     const keepStarts = new Set(rows.map((r) => r.started_at));
+    const raw = idx.intervals.get(sid) ?? [];
     for (const [startedAt, stale] of was) {
       if (keepStarts.has(startedAt)) continue;
+      // The per-row half of the authority rule above: past the horizon a stored cut is
+      // only superseded if its own span is still covered by surviving evidence. GC prunes
+      // by AGE, not by session, so a long-lived session can keep contributing intervals
+      // while its oldest ones are gone — and a session-level check would eat exactly
+      // those segments. `since` is the boundary of the incremental horizon; inside it
+      // nothing changes, so this cannot alter what a normal sweep does.
+      if (startedAt < since && !spanStillCovered(raw, startedAt, stale.ended_at)) continue;
       del.run(sid, gapMin, startedAt);
       removed += 1;
       // Only a TERMINAL removal is a finding. An open row being re-cut is the normal
@@ -1070,6 +1191,84 @@ export function liveFeatures(db: Database, sessionId: string, phaseMedianS: numb
   };
 }
 
+/**
+ * The three pieces of evidence that decide whether Claude is blocked on the human —
+ * the live half of the boundary rule (see the file header).
+ */
+export interface BlockState {
+  /** `agent_run` rows for this session that started and have not ended. */
+  live_agents: number;
+  /** A `workflow_run` with no `ended_at`: a headless run cannot ask for input mid-flight. */
+  open_workflow: boolean;
+  /**
+   * The session's NEWEST turn carries no `turn_duration` record yet, so as far as the
+   * transcript is concerned the main chain is still mid-response.
+   */
+  open_turn: boolean;
+}
+
+export function blockState(db: Database, sessionId: string): BlockState {
+  const agents =
+    db
+      .query<{ n: number }, [string]>(
+        "SELECT COUNT(*) AS n FROM agent_run WHERE session_id = ? AND started_at IS NOT NULL AND ended_at IS NULL",
+      )
+      .get(sessionId)?.n ?? 0;
+  // Not `liveFeatures.wf_phases_left > 0`: that is 0 for an open run whose
+  // `n_phases_planned` never landed, and "we do not know how many phases are left" is
+  // not the same fact as "no workflow is running".
+  const wf =
+    db
+      .query<{ n: number }, [string]>(
+        "SELECT COUNT(*) AS n FROM workflow_run WHERE session_id = ? AND ended_at IS NULL",
+      )
+      .get(sessionId)?.n ?? 0;
+  const turn = db
+    .query<{ duration_ms: number | null }, [string]>(
+      "SELECT duration_ms FROM turn WHERE session_id = ? ORDER BY started_at DESC LIMIT 1",
+    )
+    .get(sessionId);
+  return {
+    live_agents: agents,
+    open_workflow: wf > 0,
+    // No turn at all is not an open turn: an empty session is not mid-response.
+    open_turn: turn !== null && turn !== undefined && turn.duration_ms === null,
+  };
+}
+
+/**
+ * IDLE SUPPRESSION (Craig, 2026-07-30): is Claude blocked on the human right now?
+ *
+ * When it is, there is nothing to forecast — the answer to "when will Claude next need
+ * me" is "now" — and `est burn --json` says `check_back: {waiting_on_input: true}`
+ * rather than issuing a residual-life quantile against a segment that is not moving.
+ * This is the defect's live half: the 4.6 h segment was still `open` (its last activity
+ * was inside the gap window) with zero agents live, so a Lindy-style residual quantile
+ * confidently forecast five more hours of a run that had already stopped.
+ *
+ * The three conditions are the three ways work can still be in flight, and each one is
+ * a POSITIVE observation rather than an inference:
+ *
+ *  - a live `agent_run` — a delegation is running and will report back;
+ *  - an open `workflow_run` — a headless run cannot ask for input until it returns;
+ *  - an open turn — the newest turn has no `turn_duration` record, so the main chain
+ *    has not handed control back yet.
+ *
+ * The last one is deliberately CONSERVATIVE in the safe direction. 27% of turns in the
+ * specification corpus never got a `turn_duration` record at all, and for those the
+ * newest turn reads as open forever — so suppression sometimes fails to fire and the
+ * forecast is issued as before. That is the right way round: falsely claiming "awaiting
+ * input" while Claude is mid-response puts a wrong statement on Craig's screen, whereas
+ * failing to claim it merely leaves the previous behaviour in place, and the boundary
+ * rule has already fixed the segment that behaviour is issued against.
+ *
+ * No token counter is read here — see the file header's invariant.
+ */
+export function waitingOnInput(db: Database, sessionId: string): boolean {
+  const s = blockState(db, sessionId);
+  return s.live_agents === 0 && !s.open_workflow && !s.open_turn;
+}
+
 export interface EtaFit {
   gapMin: number;
   minFit: number;
@@ -1160,6 +1359,10 @@ export interface CheckBackSeconds extends CheckBack {
  *
  * `null` in exactly two cases, and BOTH are well-formed answers at exit 0: the session
  * has no open segment, or fewer than `eta_min_fit` closed segments exist to fit.
+ *
+ * This is the FORECASTER and nothing else: it does not ask whether a forecast should be
+ * issued at all. {@link checkBackForSession} owns that, so that every payload path goes
+ * through one place that can say "Claude is blocked on you" instead.
  */
 export function forecastSession(
   db: Database,
@@ -1202,6 +1405,39 @@ export function forecastSession(
     probation: fit.probation,
     basis: "session",
   };
+}
+
+/** What the check-back field of a payload is about to say, for one session. */
+export interface CheckBackState {
+  /**
+   * Claude is blocked on the human RIGHT NOW ({@link waitingOnInput}), so there is
+   * nothing to forecast. This OUTRANKS `forecast`, which is why the two never both
+   * carry a value: a residual-life quantile issued over an idle session is the defect.
+   */
+  waiting: boolean;
+  forecast: CheckBackSeconds | null;
+}
+
+/**
+ * The one place that decides what the check-back field says about a session.
+ *
+ * Precedence, and it is deliberate: **waiting beats forecasting, and waiting is
+ * reported even when no forecast could have been issued anyway.** Whether Claude is
+ * blocked on Craig is a FACT about the session, observed from live agents, open
+ * workflows and the newest turn — it does not depend on there being an open segment or
+ * on the corpus being thick enough to fit. So an idle session says `waiting_on_input`
+ * whether or not the segment closed and whether or not `n_closed >= eta_min_fit`, and
+ * the enumerated `null` cases keep their old meaning for a session that is NOT idle:
+ * "something is running and we cannot yet say for how long".
+ */
+export function checkBackForSession(
+  db: Database,
+  sessionId: string,
+  fit: EtaFit,
+  now: Date = new Date(),
+): CheckBackState {
+  if (waitingOnInput(db, sessionId)) return { waiting: true, forecast: null };
+  return { waiting: false, forecast: forecastSession(db, sessionId, fit, now) };
 }
 
 /**

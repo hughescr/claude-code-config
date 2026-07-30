@@ -31,11 +31,19 @@
  *     retires the other — `unvalidated` is about money and is retired by reconciliation, `?` is
  *     about time and is retired by pinball loss. Collapsing them would let a cost check certify
  *     a time model.
+ *
+ *     **And it is not always a forecast.** Since Craig's 2026-07-30 amendment the payload may
+ *     say `check_back: {waiting_on_input: true}` — Claude is blocked on the human, so there is
+ *     nothing to forecast — and this slot renders `⏸ awaiting input` instead of a number. That
+ *     is a REPLACEMENT, never a blanking: rule 2's "degrade to an empty segment" is about a
+ *     payload that would put a wrong number on screen, and an idle session's burn percentage is
+ *     not wrong. Losing the whole segment because the ETA went away would be a worse answer
+ *     than the one it replaced.
  */
 
 import { readFileSync } from "node:fs";
 import { DB_PATH, openDb } from "../src/db.ts";
-import { burnRead, type BurnJson } from "../src/burn.ts";
+import { burnRead, isWaitingOnInput, type BurnJson } from "../src/burn.ts";
 import { formatEta } from "../src/eta.ts";
 import { recordSessionModel } from "../src/identity.ts";
 
@@ -65,13 +73,28 @@ export function formatSegment(b: BurnJson): string {
   if (b.agents.live > 0) {
     bits.push(`${b.agents.live} agent${b.agents.live === 1 ? "" : "s"}`);
   }
-  // The check-back ETA (P2.2). Rendered ONLY when the payload carries one — `null` is a
-  // well-formed answer meaning "no open segment, or too thin a corpus to fit" — and only
-  // past the two refusals above: a guessed target with a confident ETA is worse than no
-  // ETA at all. p50 alone; p90 lives in `est burn` and on the board, because one line of
-  // budget is where a two-number band stops being glanceable.
-  if (b.check_back !== null && b.check_back !== undefined) {
-    bits.push(`check back ${formatEta(b.check_back.p50_min)}${b.check_back.probation ? "?" : ""}`);
+  // The check-back ETA (P2.2), in its three shapes — and only past the two refusals
+  // above: a guessed target with a confident ETA is worse than no ETA at all. p50 alone;
+  // p90 lives in `est burn` and on the board, because one line of budget is where a
+  // two-number band stops being glanceable.
+  //
+  //  * `{waiting_on_input: true}` — Claude is blocked on Craig, so the forecast is
+  //    SUPPRESSED and the slot says so instead. Note what this does NOT do: it does not
+  //    blank the segment. The burn percentage is still a valid measurement of a task
+  //    that is still open, and P1.9's blanking rules are about numbers that are WRONG
+  //    (someone else's task, a stale row) — an idle session makes exactly one of these
+  //    numbers unavailable, and that one is replaced rather than taking the line with it.
+  //  * `null` — no answer either way (no open segment, or too thin a corpus to fit):
+  //    no ETA text, and not a zero.
+  //  * a band — `check back ~57m`, with the probation `?`.
+  const cb = b.check_back;
+  if (isWaitingOnInput(cb)) {
+    // Six characters plus a glyph, because this slot competes with the burn figures for
+    // one line. `⏸` reads as "paused" at a glance and the words are there for a reader
+    // who does not know the glyph yet.
+    bits.push("⏸ awaiting input");
+  } else if (cb !== null && cb !== undefined) {
+    bits.push(`check back ${formatEta(cb.p50_min)}${cb.probation ? "?" : ""}`);
   }
   let text = `task ${bits.join(" · ")}`;
   // `unvalidated` is now a REAL flag, not a literal: `burnJson` computes it as

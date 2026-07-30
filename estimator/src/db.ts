@@ -32,6 +32,18 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
 /**
  * Must match the config.schema_version seed in schema.sql.
  *
+ * 11 — the check-back ETA answers the question it claims to (P2.1/P2.2, Craig
+ *     2026-07-30). Root cause: `run_segment` was cut on GAPS alone, so a background
+ *     agent bridging a gap that contained a prompt glued several human-to-human spans
+ *     into one "activity streak" — measured live at 4.6 h across five prompts, which had
+ *     `residual_life` forecasting "check back ~5.3h" while zero agents were live and
+ *     Claude was waiting on Craig. Two changes, one of which touches this schema: a
+ *     prompt in a gap now CUTS a segment (pure logic, src/eta.ts — no column moves, but
+ *     every stored cut is now an observation of a superseded estimand, so `est backfill`
+ *     rebuilds the corpus), and `burn_cache` gains `eta_waiting_on_input` so an idle
+ *     session can say `check_back: {waiting_on_input: true}` instead of forecasting.
+ *     `burn_cache` is REBUILT rather than ALTERed, the same dance v7 and v8 performed on
+ *     it and for the same reason: SQLite has no `ADD COLUMN IF NOT EXISTS`.
  * 10 — the estimator identity becomes DETERMINISTIC and CORRECTABLE. Root cause: the
  *     only writer of `estimate.estimator_model` derived it from
  *     `SELECT model_family FROM request WHERE session_id=? AND origin='main'
@@ -119,7 +131,7 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
  *     `v_phase_actual.phase_conf`, auxiliary origin excluded from calibration.
  * 1 — initial R3 §4.2 shape.
  */
-export const SCHEMA_VERSION = "10";
+export const SCHEMA_VERSION = "11";
 
 /**
  * Forward-only, additive migrations, applied by {@link openDb} on a WRITABLE
@@ -764,6 +776,95 @@ JOIN v_estimate_identity i ON i.eid = e.eid              -- v10: the EFFECTIVE i
 WHERE o.scope_changed = 0 AND o.censored = 0 AND o.final_status = 'completed'
   AND o.unpriced_share = 0 AND o.price_provisional = 0   -- R2: unpriced degrades the ROW
   AND o.actual_wcet_at_epoch IS NOT NULL;                -- R2: epoch-consistent actuals only
+`,
+  },
+  {
+    from: "10",
+    to: "11",
+    // Idle suppression for the check-back ETA (see the SCHEMA_VERSION doc comment above).
+    // ONE new column on ONE table, and that table is `burn_cache` — the single table this
+    // schema declares droppable, holding no evidence, every row rewritten by the next
+    // sweep. Rule 2 (no migration drops or rewrites a ROW) is met the way v7 -> v8 met it:
+    // the rebuild CARRIES EVERY ROW ACROSS, column for column, because `burnJson` and
+    // `renderBurn` read only this table and an emptied cache means the statusline segment
+    // disappears from the moment of the migration until the next full sweep. "Costs one
+    // sweep and nothing else" is true of the data and false of the experience.
+    //
+    // A rebuild rather than `ALTER TABLE ... ADD COLUMN` for the reason v7 -> v8, v6 -> v7
+    // and v8 -> v9 all give: SQLite has no `ADD COLUMN IF NOT EXISTS`, and schema.sql's own
+    // header documents `sqlite3 estimator.db < schema.sql` as a supported way to build the
+    // file — so this step has to land cleanly on a database that ALREADY has the column and
+    // only lacks the version marker. `ADD COLUMN` would duplicate-column-error there and
+    // strand the file one version behind forever. The copy lists only the v8 columns, which
+    // exist at every version this step can run against.
+    //
+    // And it is `CREATE TABLE burn_cache` under its real name after renaming the OLD table
+    // out of the way, never `CREATE burn_cache_v11 ... RENAME TO burn_cache`: SQLite
+    // rewrites a renamed table's stored DDL, and `test/schema.test.ts` compares
+    // `sqlite_master.sql` byte for byte against a fresh database.
+    //
+    // NOTHING here touches `run_segment`. The boundary rule that ships alongside this
+    // column changed where segments are CUT, which makes every stored cut an observation
+    // of a superseded estimand — but a migration is the wrong place to restate a corpus.
+    // `refreshSegments` already owns that, atomically and with a `segment_recut` ledger
+    // entry per moved row, and `est backfill` is the documented way to ask for it. A
+    // migration that silently deleted the fitting corpus would be the one thing this
+    // schema's doctrine forbids more firmly than a stale number.
+    sql: `
+DROP TABLE IF EXISTS burn_cache_pre_v11;   -- residue of a step that died mid-rebuild
+ALTER TABLE burn_cache RENAME TO burn_cache_pre_v11;
+CREATE TABLE burn_cache (
+  tid TEXT PRIMARY KEY REFERENCES task(tid),
+  as_of TEXT NOT NULL,              -- when the sweep that wrote this row ran; \`stale_s\` derives
+  consumed_wcet INTEGER,
+  wcet_main INTEGER, wcet_sub INTEGER, wcet_aux INTEGER,
+  usd REAL,                         -- overhead-EXCLUSIVE, like consumed_wcet: the two are divided
+  n_req INTEGER,
+  n_agents_live INTEGER,            -- bound agent_runs with no ended_at
+  n_agents_total INTEGER,           -- bound agent_runs, live or finished
+  n_provisional INTEGER,            -- requests priced from a provisional rate -> \`provisional_price\`
+  n_unpriced INTEGER,               -- requests whose family has no price row  -> \`unpriced\`
+  active_s INTEGER,                 -- §7.3 interval UNION, not a sum
+  burn_wcet_per_min REAL,           -- over the current rolling window (config burn_window_min)
+  proj_total_wcet INTEGER,          -- linear projection; CRUDE, and both output modes say so
+  -- v8 (P2.2): the check-back forecast and the compute clock. Every one is a COLUMN
+  -- for the P1.9 reason — a residual-life quantile computed per render is exactly the
+  -- unbounded per-render work this table exists to abolish. NULL until the next sweep.
+  seg_started_at TEXT,              -- the OPEN run_segment the forecast is issued against
+  seg_elapsed_s INTEGER,
+  check_back_p50_s INTEGER, check_back_p90_s INTEGER,
+  eta_model TEXT,                   -- which of the three models issued the number on screen
+  eta_probation INTEGER,            -- 1 => the statusline renders a trailing \`?\`
+  eta_n_seg INTEGER,                -- closed segments the shipped model was fitted on. A COLUMN
+                                    -- for the reason above and no other: reading it as
+                                    -- \`COUNT(*) FROM run_segment WHERE gap_min = ?\` per render is
+                                    -- a table scan (no index covers gap_min) inside the one path
+                                    -- that promises to be bounded by the ROW.
+  compute_s INTEGER,                -- SUM(request.duration_ms)/1000 over attributed requests
+  compute_coverage_pct REAL,        -- share of those requests that actually carry one; a compute
+                                    -- figure without its coverage is a moved denominator
+  -- v11: idle suppression (P2.1/P2.2, Craig 2026-07-30). 1 => the resolved session has no
+  -- live agent, no open workflow and a closed newest turn, so Claude is BLOCKED ON THE
+  -- HUMAN and no forecast is issued: \`check_back\` becomes \`{waiting_on_input: true}\` and
+  -- every column above is written NULL. A column rather than a render-time derivation for
+  -- the same P1.9 reason as its neighbours — the predicate reads \`agent_run\`,
+  -- \`workflow_run\` and \`turn\`, none of which the bounded read path may touch.
+  eta_waiting_on_input INTEGER      -- NULL only on a row written before this column existed
+) STRICT, WITHOUT ROWID;
+-- Column for column. \`eta_waiting_on_input\` stays NULL until the next sweep, which reads
+-- as "not waiting" — the pre-amendment behaviour, for one sweep.
+INSERT INTO burn_cache (tid, as_of, consumed_wcet, wcet_main, wcet_sub, wcet_aux, usd,
+                        n_req, n_agents_live, n_agents_total, n_provisional, n_unpriced,
+                        active_s, burn_wcet_per_min, proj_total_wcet,
+                        seg_started_at, seg_elapsed_s, check_back_p50_s, check_back_p90_s,
+                        eta_model, eta_probation, eta_n_seg, compute_s, compute_coverage_pct)
+  SELECT tid, as_of, consumed_wcet, wcet_main, wcet_sub, wcet_aux, usd,
+         n_req, n_agents_live, n_agents_total, n_provisional, n_unpriced,
+         active_s, burn_wcet_per_min, proj_total_wcet,
+         seg_started_at, seg_elapsed_s, check_back_p50_s, check_back_p90_s,
+         eta_model, eta_probation, eta_n_seg, compute_s, compute_coverage_pct
+    FROM burn_cache_pre_v11;
+DROP TABLE burn_cache_pre_v11;
 `,
   },
 ];

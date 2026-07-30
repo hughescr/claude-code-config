@@ -721,8 +721,15 @@ CREATE TABLE burn_cache (
                                     -- a table scan (no index covers gap_min) inside the one path
                                     -- that promises to be bounded by the ROW.
   compute_s INTEGER,                -- SUM(request.duration_ms)/1000 over attributed requests
-  compute_coverage_pct REAL         -- share of those requests that actually carry one; a compute
+  compute_coverage_pct REAL,        -- share of those requests that actually carry one; a compute
                                     -- figure without its coverage is a moved denominator
+  -- v11: idle suppression (P2.1/P2.2, Craig 2026-07-30). 1 => the resolved session has no
+  -- live agent, no open workflow and a closed newest turn, so Claude is BLOCKED ON THE
+  -- HUMAN and no forecast is issued: `check_back` becomes `{waiting_on_input: true}` and
+  -- every column above is written NULL. A column rather than a render-time derivation for
+  -- the same P1.9 reason as its neighbours — the predicate reads `agent_run`,
+  -- `workflow_run` and `turn`, none of which the bounded read path may touch.
+  eta_waiting_on_input INTEGER      -- NULL only on a row written before this column existed
 ) STRICT, WITHOUT ROWID;
 
 -- ---------------------------------------------------------------------------
@@ -1226,7 +1233,7 @@ WHERE s.terminator = 'open'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '10'),
+  ('schema_version',          '11'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.

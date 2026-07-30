@@ -16,6 +16,17 @@
  * no binding lookup, no overrun check, no database read at all: the estimating-skill
  * nudge is about launches, and re-litigating it on every prompt would be nagging.
  *
+ * **Second, incidental value since Craig's 2026-07-30 boundary rule — and it is only a
+ * freshness assist.** A user prompt now ENDS a run segment (src/eta.ts), so the sweep
+ * this hook spawns is what lands the new boundary in `run_segment`, and therefore the
+ * corrected `seg_elapsed`, within seconds of Craig hitting return instead of at the next
+ * cron. What it deliberately is NOT is the source of the boundary: that is derived at
+ * sweep time from the transcript's own user-message timestamps (`src/segment.ts` ->
+ * `turn.started_at`). Hanging the definition on this hook would make the corpus depend on
+ * which sessions had it wired — and the whole historical corpus had none of them — so a
+ * session with no hook is cut identically, just later. Nothing below changed for it; the
+ * note is here so the next reader does not "fix" the hook by making it write a boundary.
+ *
  * **Silence is a hard requirement, not a style choice.** A UserPromptSubmit hook's
  * stdout is injected verbatim into the model's context on every single prompt. Anything
  * this script prints becomes a permanent tax on every turn of every session, so the

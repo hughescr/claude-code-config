@@ -1,0 +1,50 @@
+{
+  "name": "prompt-boundary",
+  "note": "THE DEFECT, in fixture form. A turn plus the agent it launched run 10:00-10:03, Craig types again at 10:04, and the gap between them is one minute — well inside segment_gap_min, so the gap rule alone glued the two exchanges into one 5-minute 'activity streak' and the residual-life forecast conditioned on an elapsed time that spanned somebody else's turn. The prompt at 10:04 lands while nothing is running, so it is a real human-input boundary and it CUTS: two segments, and the second one starts AT the prompt, which is what makes seg_elapsed mean 'Claude-active time since Craig last spoke'. The second exchange launches a2, still running at `now`, so this session is BUSY and a forecast is issued against the post-prompt segment — a live agent has no ended_at and therefore contributes no interval, which is why the expected rows below do not mention it.",
+  "session": "s-fx-prompt",
+  "now": "2026-03-01T10:06:00.000Z",
+  "live": true,
+  "turns": [
+    { "prompt": "p1", "at": "2026-03-01T10:00:00.000Z", "duration_ms": 120000 },
+    { "prompt": "p2", "at": "2026-03-01T10:04:00.000Z", "duration_ms": 60000 }
+  ],
+  "agents": [
+    { "id": "a1", "started_at": "2026-03-01T10:00:30Z", "ended_at": "2026-03-01T10:03:00Z" },
+    { "id": "a2", "started_at": "2026-03-01T10:04:30Z", "ended_at": null }
+  ],
+  "requests": [],
+  "compactions": [],
+  "cases": [
+    {
+      "gap_min": 5,
+      "segments": [
+        {
+          "started_at": "2026-03-01T10:00:00Z",
+          "ended_at": "2026-03-01T10:03:00Z",
+          "active_s": 180,
+          "busy_s": 270,
+          "max_concurrency": 2,
+          "n_turns": 1,
+          "n_agents": 1,
+          "gap_before_s": null,
+          "gap_after_s": 60,
+          "terminator": "human_input",
+          "interval_src_mix": "turn+agent"
+        },
+        {
+          "started_at": "2026-03-01T10:04:00Z",
+          "ended_at": "2026-03-01T10:05:00Z",
+          "active_s": 60,
+          "busy_s": 60,
+          "max_concurrency": 1,
+          "n_turns": 1,
+          "n_agents": 0,
+          "gap_before_s": 60,
+          "gap_after_s": null,
+          "terminator": "open",
+          "interval_src_mix": "turn"
+        }
+      ]
+    }
+  ]
+}

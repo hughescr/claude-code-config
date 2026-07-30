@@ -46,12 +46,35 @@ import {
   segmentsReport,
   stratumOf,
   survivalAt,
+  waitingOnInput,
   writeEtaRuns,
+  type CheckBack,
   type Observation,
   type SegmentRow,
 } from "../src/eta.ts";
-import { burnJson, burnRead, refreshBurnCache, renderBurn, type BurnActive } from "../src/burn.ts";
+import {
+  burnJson,
+  burnRead,
+  isWaitingOnInput,
+  refreshBurnCache,
+  renderBurn,
+  type BurnActive,
+  type CheckBackWaiting,
+} from "../src/burn.ts";
 import { formatSegment } from "../scripts/statusline-burn.ts";
+
+/**
+ * Narrow `check_back` to the BAND, failing loudly if it is the waiting shape or null.
+ *
+ * A cast would compile just as well and would silently pass `undefined` into every
+ * following assertion the day suppression starts firing where a band was expected — so
+ * the discrimination is an assertion, not an annotation.
+ */
+function band(cb: CheckBack | CheckBackWaiting | null | undefined): CheckBack {
+  expect(isWaitingOnInput(cb)).toBe(false);
+  expect(cb).not.toBeNull();
+  return cb as CheckBack;
+}
 
 const FIXTURE_DIR = join(import.meta.dir, "fixtures", "eta");
 
@@ -66,7 +89,9 @@ interface Fixture {
   now: string;
   live: boolean;
   turns: Array<{ prompt: string; at: string; duration_ms: number | null }>;
-  agents: Array<{ id: string; started_at: string; ended_at: string }>;
+  /** `ended_at: null` is a LIVE agent: no interval (the union needs both bounds), but the
+   *  session is not idle — which is how a fixture can be busy without changing its rows. */
+  agents: Array<{ id: string; started_at: string; ended_at: string | null }>;
   requests: Array<{ id: string; at: string; duration_ms: number }>;
   compactions: string[];
   cases: FixtureCase[];
@@ -389,6 +414,54 @@ describe("run_segment persistence — P2.5", () => {
         )
         .get()?.n,
     ).toBe(1);
+  });
+
+  test("a FULL rebuild re-cuts an old segment whose inputs survive — the boundary rule is retroactive", () => {
+    // The 2026-07-30 amendment changed WHERE segments are cut, so every stored cut is an
+    // observation of a superseded estimand. An incremental sweep may not reach past its
+    // horizon (a pruned input reads as silence, and silence must not be read as "this
+    // segment never was"), but a full rebuild has to, or the fitting corpus is a mixture
+    // of two definitions and Kaplan-Meier sees the same minute twice.
+    const session = "s-hist";
+    const turn = h.db.prepare(
+      `INSERT INTO turn (session_id, prompt_id, started_at, duration_ms, pending_bg, pending_wf, tid)
+       VALUES (?,?,?,60000,NULL,NULL,NULL)`,
+    );
+    // Two exchanges four minutes apart: ONE segment under the gap rule alone (the gap is
+    // under `segment_gap_min`), TWO once the prompt in that gap counts as a boundary.
+    turn.run(session, "p0", "2026-01-05T10:00:00Z");
+    turn.run(session, "p1", "2026-01-05T10:04:00Z");
+    // The row the old rule would have written, well outside the recompute horizon.
+    h.db
+      .query(
+        `INSERT INTO run_segment (session_id, started_at, ended_at, active_s, busy_s, max_concurrency,
+                                  n_turns, n_agents, gap_before_s, gap_after_s, terminator,
+                                  interval_src_mix, gap_min, tid, first_seen, last_seen)
+         VALUES (?, '2026-01-05T10:00:00Z', '2026-01-05T10:05:00Z', 120, 120, 1, 2, 0,
+                 NULL, NULL, 'human_input', 'turn', 5, NULL,
+                 '2026-01-05T10:05:00Z', '2026-01-05T10:05:00Z')`,
+      )
+      .run(session);
+
+    const now = new Date("2026-03-01T11:30:00Z");
+    // The incremental path is still bounded: nothing here is inside seven days of `now`,
+    // so it neither re-cuts nor removes.
+    const incremental = refreshSegments(h.db, { now });
+    expect(incremental.removed).toBe(0);
+
+    const full = refreshSegments(h.db, { now, all: true });
+    const rows = h.db
+      .query<{ started_at: string; ended_at: string; n_turns: number }, [string]>(
+        "SELECT started_at, ended_at, n_turns FROM run_segment WHERE session_id = ? ORDER BY started_at",
+      )
+      .all(session);
+    expect(rows).toEqual([
+      { started_at: "2026-01-05T10:00:00Z", ended_at: "2026-01-05T10:01:00Z", n_turns: 1 },
+      { started_at: "2026-01-05T10:04:00Z", ended_at: "2026-01-05T10:05:00Z", n_turns: 1 },
+    ]);
+    // Restated, not silently: the corpus moved and the ledger says so.
+    expect(full.recut).toBe(1);
+    expect(full.anomalies.some((a) => a.detail.includes("RESTATED"))).toBe(true);
   });
 
   test("a re-cut is authoritative for ONE gap_min partition, never a retired one", () => {
@@ -740,7 +813,7 @@ describe("est burn --json — the check_back fields (P2.2)", () => {
     const b = burnJson(h.db, { tid, now }) as BurnActive;
 
     expect(b.schema).toBe(1);
-    const cb = b.check_back!;
+    const cb = band(b.check_back);
     expect(cb.basis).toBe("session");
     expect(cb.eta_model).toBe("residual_life");
     expect(cb.probation).toBe(true);
@@ -756,7 +829,11 @@ describe("est burn --json — the check_back fields (P2.2)", () => {
   });
 
   test("null — not absent, not zero — when the session has no open segment", async () => {
-    const fx = loadFixtures().find((f) => f.name === "basic")!;
+    // `trailing-prompt`: the segment closed at the prompt, and the turn that prompt
+    // opened has no `turn_duration` yet, so nothing is observable. NOT the idle case —
+    // the newest turn is open, so `waitingOnInput` is false and this stays the enumerated
+    // `null`: "something is running and we cannot yet say for how long".
+    const fx = loadFixtures().find((f) => f.name === "trailing-prompt")!;
     const now = new Date(fx.now);
     loadFixture(h.db, fx);
     seedSegments(h.db, 20);
@@ -776,6 +853,146 @@ describe("est burn --json — the check_back fields (P2.2)", () => {
     seedSegments(h.db, 20);
     refreshBurnCache(h.db, now);
     expect((burnJson(h.db, { tid, now }) as BurnActive).check_back).not.toBeNull();
+  });
+
+  test("seg_elapsed is measured from the PROMPT, not from the streak it interrupted", async () => {
+    // `prompt-boundary`: activity 10:00-10:03, prompt at 10:04, `now` 10:06. The gap rule
+    // alone would have reported one segment running since 10:00 — six minutes of
+    // 'elapsed' that includes a previous exchange — and conditioned the residual-life
+    // quantile on it.
+    const fx = loadFixtures().find((f) => f.name === "prompt-boundary")!;
+    const now = new Date(fx.now);
+    loadFixture(h.db, fx);
+    seedSegments(h.db, 20);
+    const tid = await liveTask(h, fx.session, now);
+    const cb = band((burnJson(h.db, { tid, now }) as BurnActive).check_back);
+    expect(cb.seg_started_at).toBe("2026-03-01T10:04:00Z");
+    expect(cb.seg_elapsed_min).toBe(2);
+    // And the session is busy for a REASON the payload can also be asked about: a2 is
+    // still running, which is why this is a forecast and not `waiting_on_input`.
+    expect(waitingOnInput(h.db, fx.session)).toBe(false);
+  });
+
+  test("a delegation spanning the prompt keeps ONE segment, and it is still forecast", async () => {
+    // The exception, end to end. The prompt at 10:10 landed inside a running agent, so it
+    // is not a boundary: the forecast is issued against the segment that started at 10:00,
+    // BEFORE the last prompt, and that is the correct answer rather than a leftover of the
+    // old rule — Claude was not blocked on Craig at 10:10 and is not blocked now.
+    const fx = loadFixtures().find((f) => f.name === "delegation-spans-prompt")!;
+    const now = new Date(fx.now);
+    loadFixture(h.db, fx);
+    // A second delegation, launched as the first returned and still running at `now`, so
+    // the session is busy. Live agents carry no `ended_at` and so contribute no interval:
+    // this changes what is forecast, never how the corpus is cut.
+    h.db
+      .query(
+        `INSERT INTO agent_run (agent_id, session_id, run_id, wf_launch_id, agent_type, spawn_depth,
+                                launch_prompt_id, transcript_path, status, label, started_at, ended_at,
+                                interval_src, queued_at, attempt, reported_tokens, phase_idx,
+                                phase_title, phase_conf, tid)
+         VALUES ('a2',?,NULL,NULL,'general-purpose',1,NULL,NULL,'running',NULL,
+                 '2026-03-01T10:20:30Z',NULL,'transcript',NULL,NULL,NULL,NULL,NULL,NULL,NULL)`,
+      )
+      .run(fx.session);
+    seedSegments(h.db, 20);
+    const tid = await liveTask(h, fx.session, now);
+
+    expect(
+      h.db.query<{ n: number }, [string]>(
+        "SELECT COUNT(*) AS n FROM run_segment WHERE session_id = ?",
+      ).get(fx.session)?.n,
+    ).toBe(1);
+    const cb = band((burnJson(h.db, { tid, now }) as BurnActive).check_back);
+    expect(cb.seg_started_at).toBe("2026-03-01T10:00:00Z");
+    expect(cb.seg_elapsed_min).toBe(22);
+
+    // And the two halves compose: retire the delegation without touching the corpus, and
+    // the SAME open segment stops being forecast at all. The boundary rule decides where
+    // the corpus is cut; suppression decides whether anything is issued against it.
+    h.db.query("DELETE FROM agent_run WHERE agent_id = 'a2'").run();
+    refreshBurnCache(h.db, now);
+    expect((burnJson(h.db, { tid, now }) as BurnActive).check_back).toEqual({
+      waiting_on_input: true,
+    });
+  });
+
+  test("an idle session says waiting_on_input instead of forecasting", async () => {
+    // `basic`: every turn closed, no agent live, no workflow — Craig is the only thing
+    // that can move this session, and a residual-life quantile issued over it is the
+    // 4.6-hour forecast that started all this.
+    const fx = loadFixtures().find((f) => f.name === "basic")!;
+    const now = new Date(fx.now);
+    loadFixture(h.db, fx);
+    seedSegments(h.db, 20);
+    const tid = await liveTask(h, fx.session, now);
+    const b = burnJson(h.db, { tid, now }) as BurnActive;
+    expect(b.check_back).toEqual({ waiting_on_input: true });
+    // Suppression is a REPLACEMENT, not a blanking: the task's own numbers are untouched.
+    expect(b.active).toBe(true);
+    expect(b.wcet.pct_p50).toBeGreaterThanOrEqual(0);
+    // And no suppressed forecast is left in the columns for a careless reader to find.
+    const row = h.db
+      .query<{ p50: number | null; seg: string | null; flag: number | null }, [string]>(
+        `SELECT check_back_p50_s AS p50, seg_started_at AS seg, eta_waiting_on_input AS flag
+           FROM burn_cache WHERE tid = ?`,
+      )
+      .get(tid);
+    expect(row).toEqual({ p50: null, seg: null, flag: 1 });
+    // The cached and live paths agree about it, like they do about a band.
+    expect((burnJson(h.db, { tid, now, refresh: true }) as BurnActive).check_back).toEqual({
+      waiting_on_input: true,
+    });
+  });
+
+  test("a live agent, an open workflow or an open turn each keep the forecast alive", async () => {
+    // The three conditions of `waitingOnInput`, one at a time, over the SAME idle session.
+    const fx = loadFixtures().find((f) => f.name === "basic")!;
+    const now = new Date(fx.now);
+    loadFixture(h.db, fx);
+    seedSegments(h.db, 20);
+    const tid = await liveTask(h, fx.session, now);
+    expect(waitingOnInput(h.db, fx.session)).toBe(true);
+
+    // 1. an agent that started and has not ended. It contributes NO interval (the union
+    //    needs both bounds), so this is not the same fact as "the segment is still open".
+    h.db
+      .query(
+        `INSERT INTO agent_run (agent_id, session_id, run_id, wf_launch_id, agent_type, spawn_depth,
+                                launch_prompt_id, transcript_path, status, label, started_at, ended_at,
+                                interval_src, queued_at, attempt, reported_tokens, phase_idx,
+                                phase_title, phase_conf, tid)
+         VALUES ('ag-live',?,NULL,NULL,'general-purpose',1,NULL,NULL,'running',NULL,
+                 '2026-03-01T11:30:00Z',NULL,'transcript',NULL,NULL,NULL,NULL,NULL,NULL,NULL)`,
+      )
+      .run(fx.session);
+    expect(waitingOnInput(h.db, fx.session)).toBe(false);
+    h.db.query("DELETE FROM agent_run WHERE agent_id = 'ag-live'").run();
+    expect(waitingOnInput(h.db, fx.session)).toBe(true);
+
+    // 2. a workflow run with no ended_at — and with NO declared phase count, which is
+    //    exactly the case `liveFeatures.wf_phases_left > 0` would have missed.
+    h.db
+      .query(
+        `INSERT INTO workflow_run (run_id, wf_launch_id, session_id, workflow_name, transcript_dir,
+                                   default_model, launch_prompt_id, n_phases_planned,
+                                   started_at, ended_at, tid)
+         VALUES ('wf-1','wl-1',?,'w',NULL,NULL,NULL,NULL,'2026-03-01T11:30:00Z',NULL,NULL)`,
+      )
+      .run(fx.session);
+    expect(waitingOnInput(h.db, fx.session)).toBe(false);
+    h.db.query("DELETE FROM workflow_run WHERE run_id = 'wf-1'").run();
+    expect(waitingOnInput(h.db, fx.session)).toBe(true);
+
+    // 3. a newest turn with no `turn_duration` record: the main chain has not handed
+    //    control back. Conservative in the safe direction — 27% of turns never get one,
+    //    so this errs towards forecasting rather than towards a false "awaiting input".
+    h.db
+      .query(
+        `INSERT INTO turn (session_id, prompt_id, started_at, duration_ms, pending_bg, pending_wf, tid)
+         VALUES (?, 'p-open', '2026-03-01T11:45:00Z', NULL, NULL, NULL, NULL)`,
+      )
+      .run(fx.session);
+    expect(waitingOnInput(h.db, fx.session)).toBe(false);
   });
 
   test("the cached and the --refresh paths agree", async () => {
@@ -858,7 +1075,7 @@ describe("the statusline segment — P2.2", () => {
   });
 
   test("the `?` comes off only when the model is off probation", () => {
-    const out = formatSegment({ ...base, check_back: { ...base.check_back!, probation: false } });
+    const out = formatSegment({ ...base, check_back: { ...band(base.check_back), probation: false } });
     expect(out).toContain("check back ~57m ");
     expect(out).not.toContain("~57m?");
   });
@@ -880,6 +1097,41 @@ describe("the statusline segment — P2.2", () => {
     const out = formatSegment({ ...base, check_back: null });
     expect(out).not.toContain("check back");
     expect(out).toContain("66% p50");
+  });
+
+  test("an idle session renders `awaiting input` in place of the ETA, and keeps the rest", () => {
+    // The half of the 2026-07-30 fix Craig sees. THREE things are being pinned at once,
+    // and the third is the one a careless implementation gets wrong:
+    //   1. the words are there instead of a number;
+    //   2. no forecast leaks — no "check back", no minutes, no probation `?`;
+    //   3. the SEGMENT SURVIVES. P1.9 blanks the line for numbers that are WRONG
+    //      (someone else's task, a stale row). An idle session makes exactly one number
+    //      unavailable, and taking the burn percentage down with it would be a worse
+    //      answer than the one being replaced.
+    const out = formatSegment({ ...base, check_back: { waiting_on_input: true } });
+    expect(out).toBe("task 340k/512k WCET · 66% p50 · 2 agents · ⏸ awaiting input [unvalidated]");
+    expect(out).not.toContain("check back");
+    expect(out).not.toContain("57");
+    expect(out).not.toContain("?");
+  });
+
+  test("waiting still yields to the two P1.9 refusals", () => {
+    // "Awaiting input" about a task nobody bound to this session, or out of a row that is
+    // minutes stale, is as wrong as a forecast would have been. Suppression replaces the
+    // ETA; it does not promote the payload past the refusals above it.
+    const waiting = { waiting_on_input: true } as const;
+    expect(formatSegment({ ...base, check_back: waiting, target: "fallback" })).toBe("");
+    expect(formatSegment({ ...base, check_back: waiting, warn: ["stale"] })).toBe("");
+  });
+
+  test("`est burn`'s human output says why there is no forecast, and offers no number", () => {
+    const text = renderBurn({ ...base, check_back: { waiting_on_input: true } });
+    expect(text).toContain("awaiting input");
+    expect(text).toContain("blocked on you");
+    // Not a band, not a countdown, and above all not "waiting since <time>": that would
+    // be the availability model §7.3 descoped, arrived at by the back door.
+    expect(text).not.toContain("p90 ");
+    expect(text).not.toContain("PROBATION");
   });
 
   test("rounding: minutes under 90, hours above, and never seconds", () => {
@@ -989,12 +1241,18 @@ describe("the write path scales with the corpus, not with its square", () => {
     const r = h.db.transaction(() => refreshSegments(h.db, { now, all: true })).immediate();
     const rebuildMs = performance.now() - t0;
     expect(r.sessions).toBe(250);
-    expect(r.segments).toBe(1000);
+    // SIX per session, one per turn, not the four the gap rule alone produced. Each
+    // session's turns are 11 minutes apart and two of the six launch an agent that runs
+    // 6.7 minutes, leaving a 4.3-minute gap that `segment_gap_min = 5` used to bridge —
+    // and a prompt sits in both of those gaps, so the boundary rule cuts them. This
+    // number moving is the corpus-wide effect of the 2026-07-30 amendment: what used to
+    // be one observation per activity streak is now one per prompt-to-boundary span.
+    expect(r.segments).toBe(1500);
 
     const t1 = performance.now();
     const scores = scoreEtaModels(h.db);
     const scoreMs = performance.now() - t1;
-    expect(scores.find((s) => s.eta_model === "residual_life")!.n_seg).toBe(1000);
+    expect(scores.find((s) => s.eta_model === "residual_life")!.n_seg).toBe(1500);
 
     // Generous ceilings: these are regression guards on the SHAPE of the cost, not
     // benchmarks. The quadratic forms they replaced were seconds, not milliseconds.
