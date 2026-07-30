@@ -19,7 +19,10 @@
  *      drained on the next sweep, which is the point.
  *   3. Background, micro-sweep: spawn a throttled, DETACHED `est sweep` so it
  *      cannot consume this hook's timeout. Throttled by an mtime check on a
- *      spool marker file — a filesystem stat, not a database read.
+ *      spool marker file — a filesystem stat, not a database read. The body of
+ *      this job now lives in `src/microsweep.ts`, shared with the
+ *      UserPromptSubmit hook (`scripts/prompt-sweep.ts`) so both hooks check
+ *      the same marker; a second copy would be a second, independent window.
  *
  * A fourth, best-effort job piggybacks on job 1 when a task IS bound: the
  * overrun nudge against `burn_cache` (P1.9). `burn_cache` is schema v5 and
@@ -38,13 +41,12 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
-import { homedir } from "node:os";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { DB_PATH, ROOT, openDb } from "../src/db.ts";
-import { MICROSWEEP_MARKER, overrunMarkerFile, type NudgeKind } from "../src/spool.ts";
+import { ROOT, openDb } from "../src/db.ts";
+import { overrunMarkerFile, type NudgeKind } from "../src/spool.ts";
+import { maybeSpawnMicrosweep } from "../src/microsweep.ts";
 
 // `EST_DB` already overrides the database path (db.ts); this mirrors that
 // convention for the spool directory so tests never have to touch the real
@@ -53,10 +55,6 @@ const SPOOL_DIR = process.env.EST_SPOOL_DIR ?? join(ROOT, "spool");
 const COMPLIANCE_LOG = join(SPOOL_DIR, "compliance.jsonl");
 const NUDGE_BUDGET = 500; // P1.10 job 1: "budgeted to <=500 characters"
 const OVERRUN_BUDGET = 300; // P1.10 job 4: "a <=300-character additionalContext"
-const MIN_MICROSWEEP_INTERVAL_S = Number.parseInt(
-  process.env.EST_MICROSWEEP_MIN_INTERVAL_S ?? "20",
-  10,
-);
 /**
  * Every `openDb` here overrides the 5 000 ms default (src/db.ts) for the same reason
  * `est burn --json` does (src/burn.ts): this runs on Craig's hot path, and a hook that
@@ -238,76 +236,6 @@ function recordCompliance(
   }
 }
 
-function findBun(): string | null {
-  const explicit = process.env.EST_BUN;
-  if (explicit && existsSync(explicit)) return explicit;
-  const onPath = Bun.which("bun");
-  if (onPath) return onPath;
-  for (const candidate of [
-    join(homedir(), ".bun", "bin", "bun"),
-    "/opt/homebrew/bin/bun",
-    "/usr/local/bin/bun",
-  ]) {
-    if (existsSync(candidate)) return candidate;
-  }
-  return null;
-}
-
-/**
- * Spawn a throttled, DETACHED sweep so this hook process never waits on it.
- *
- * DESIGN.md P1.10 specifies `est sweep --session <sid> --since <watermark>` —
- * a scoped micro-sweep. Those flags do not exist on `est sweep` yet (the
- * Phase 1 CLI verb surface is built concurrently with this file); passing
- * them today would make cli.ts's flag validator reject the call outright and
- * do NO sweep at all, which is worse than the corpus-wide fallback. So this
- * spawns the existing, idempotent, incremental `est sweep --quiet` instead —
- * sub-second on a swept corpus, but corpus-wide in its discovery walk and
- * contending for the writer lock every time. When `--session`/`--since` land,
- * the spawn line below is the only one to change.
- *
- * **The throttle marker is therefore GLOBAL, not per-session.** A per-session
- * marker gives every concurrently active session its own window, so N sessions
- * fan out into N unscoped corpus sweeps — precisely the pile-up the throttle
- * exists to prevent, and unobservable because the child is detached. One marker
- * collapses the whole machine to one sweep per window. If the scoped flags ever
- * land, per-session scoping becomes correct again and the marker can follow.
- */
-function maybeSpawnMicrosweep(): void {
-  // Test-only escape hatch: unset (the production default) leaves this job
-  // fully active. A real sweep is slow and corpus-wide (see comment above),
-  // which makes it unsuitable to actually exec from unit tests.
-  if (process.env.EST_DISABLE_MICROSWEEP === "1") return;
-  try {
-    mkdirSync(SPOOL_DIR, { recursive: true });
-    const marker = join(SPOOL_DIR, MICROSWEEP_MARKER);
-    let lastMs = 0;
-    try {
-      lastMs = statSync(marker).mtimeMs;
-    } catch {
-      lastMs = 0;
-    }
-    if (Date.now() - lastMs < MIN_MICROSWEEP_INTERVAL_S * 1000) return; // throttled
-
-    // Touch the marker BEFORE spawning so a burst of hook fires within the
-    // window collapses to at most one spawn even if the spawn itself is slow.
-    writeFileSync(marker, String(Date.now()));
-
-    const bun = findBun();
-    if (bun === null) return;
-    const cliPath = join(ROOT, "src", "cli.ts");
-    const child = spawn(bun, ["run", cliPath, "sweep", "--quiet"], {
-      cwd: ROOT,
-      detached: true,
-      stdio: "ignore",
-    });
-    child.unref();
-  } catch {
-    // Fail open: no sweep this time. The next hook fire, the daily cron, or a
-    // manual `est sweep` catches it. Never let this block or throw.
-  }
-}
-
 function main(): void {
   let input: HookInput = {};
   try {
@@ -357,7 +285,7 @@ function main(): void {
     process.stdout.write(JSON.stringify(payload));
   }
 
-  maybeSpawnMicrosweep();
+  maybeSpawnMicrosweep(SPOOL_DIR);
 
   process.exit(0);
 }
