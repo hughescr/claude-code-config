@@ -57,11 +57,17 @@ Estimate substantial work before starting it. Substantial = ANY of: **T1** a `Wo
 **T2** ≥2 `Task`/agent launches; **T3** ≥3 orchestrator turns toward one goal; **T4** I asked for
 an estimate or budget. Exempt: one background agent on an errand, lookups, single-file edits.
 
-Invoke the **estimating** skill at the start of the anchoring turn — prompt read, plan formed,
-nothing launched. It runs `est refclass`, then `est open`, which prints the band and the exact
-`TaskUpdate` call that plants `est_tid`; issue that verbatim when a Task-tool task exists. For a
-`Workflow`, run `est block` per declared `meta.phases` entry before launching, and give every
-`agent()` call a `label` and a `phase` (0-based). Re-estimate by appending: `est open --reason
-refinement`, or `est scope` then `--reason scope_change` if the goal moved. Never self-report tokens.
-`est` is `bun run ~/.claude/estimator/src/cli.ts` unless a shim is on `PATH` (`cd
-~/.claude/estimator && bun link` mints one) — use the long form rather than skipping the step.
+The estimate is a **p50/p90 band in Work-CET** — price-weighted `output + cache_creation` tokens
+normalised by a reference model's output price, so not "total tokens" and not the bill. Don't guess
+it; the **estimating** skill carries the procedure for deriving it from `est refclass`. The raw band
+you pass is your uncorrected best guess — the calibrator applies the correction, so never pad it
+yourself, and never self-report tokens.
+
+Invoke the skill at the start of the anchoring turn — prompt read, plan formed, nothing launched.
+It walks `est refclass` → band → `est open`, which prints the band and the exact `TaskUpdate` call
+that plants `est_tid`; issue that verbatim when a Task-tool task exists. For a `Workflow`, run `est
+block` per declared `meta.phases` entry before launching, and give every `agent()` call a `label`
+and a `phase` (0-based). Re-estimate by appending: `est open --reason refinement`, or `est scope`
+then `--reason scope_change` if the goal moved. `est` is `bun run ~/.claude/estimator/src/cli.ts`
+unless a shim is on `PATH` (`cd ~/.claude/estimator && bun link` mints one) — use the long form
+rather than skipping the step.
