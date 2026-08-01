@@ -60,6 +60,7 @@ an estimate or budget. Exempt: one background agent on an errand, lookups, singl
 Invoke the **estimating** skill at the anchoring turn — prompt read, plan formed, nothing launched.
 It sizes the work as a p50/p90 **story-point** band against a fixed anchor — never tokens, cost or
 time. Above ~40 points or more than one phase, decompose and sum: `est block` per `meta.phases`
-entry, every `agent()` carrying its 0-based `phase`. `est open` prints the band and the `TaskUpdate`
+entry, every `agent()` carrying its 0-based `phase`; `est open --tid <tid> --reason refinement
+--from-blocks` commits the block sum as the band if you did not open with it. `est open` prints the band and the `TaskUpdate`
 planting `est_tid` — issue it verbatim. Never pad the raw band, never self-report spend. Re-estimate
 by appending (`est scope` first if the goal moved). `est` is `bun run ~/.claude/estimator/src/cli.ts`.

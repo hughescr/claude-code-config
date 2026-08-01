@@ -43,7 +43,19 @@ import {
   type WeightedSample,
 } from "./calibrate.ts";
 import { getConfig } from "./db.ts";
-import { COLD_START_N, InvariantError, isoNow } from "./tasks.ts";
+// The one rule for reading a band's unit (v15 story points) lives with the statusline
+// contract, and the board reads it rather than owning a second copy: `est burn` and a
+// board card that disagreed about whether a band is Work-CET would be the same defect
+// on two screens. No cycle — src/burn.ts does not import this file.
+import { bandUnit, type BandPoints, type BandUnit } from "./burn.ts";
+import {
+  COLD_START_N,
+  InvariantError,
+  isoNow,
+  pointsToWcet,
+  type PointsRate,
+  type PointsRateKey,
+} from "./tasks.ts";
 import { priceFamily } from "./prices.ts";
 import { scoreEtaModels, writeEtaRuns, type EtaScore } from "./eta.ts";
 import { JOBS_ROOT, jobsRetroPanel, type JobsPanelRow } from "./jobs.ts";
@@ -942,9 +954,21 @@ export interface BoardCard {
   subject: string;
   kind: string;
   status: string;
+  /**
+   * The band in WORK-CET, the same unit as `consumed_wcet` — and **0 when there is
+   * none**, which since v15 covers two cases: no estimate at all, and a band issued in
+   * story points that no points→Work-CET rate can convert (see `points` below). Both
+   * are "absent", and 0 has always rendered as absent here; what these two fields must
+   * never hold is a POINTS figure, because every renderer divides `consumed_wcet` by
+   * them and a bar drawn across two units is a picture of nothing.
+   */
   cal_p50: number;
   cal_p90: number;
   uncalibrated: boolean;
+  /** Non-null EXACTLY for a band issued under `config.estimand = 'story_point'`:
+   *  the points band, and whatever the bridge back to Work-CET had to offer
+   *  ({@link bandUnit}). Null for every Work-CET band. */
+  points: BandPoints | null;
   consumed_wcet: number;
   wcet_main: number;
   wcet_sub: number;
@@ -1118,6 +1142,17 @@ interface EstimateRow {
   cal_p50: number;
   cal_p90: number;
   uncalibrated: number;
+  // v15: the unit the two columns above are actually in. `cal_*` hold POINTS for a
+  // band opened while no points→Work-CET rate existed, so {@link bandUnit} — the one
+  // rule `est burn` and the statusline also read — needs the raw band, the anchor and
+  // the calibration keys to say which. Projected here rather than re-queried per card.
+  estimand: string;
+  raw_p50_wcet: number;
+  raw_p90_wcet: number;
+  sp_anchor_id: string | null;
+  refclass_as_of: string | null;
+  ref_model: string;
+  estimator_model: string;
 }
 
 interface ActualRow {
@@ -1233,7 +1268,9 @@ export function board(
       .query<EstimateRow, string[]>(
         `SELECT tid,
                 COALESCE(cal_p50_wcet, 0) AS cal_p50, COALESCE(cal_p90_wcet, 0) AS cal_p90,
-                CASE WHEN refclass_as_of IS NULL THEN 1 ELSE 0 END AS uncalibrated
+                CASE WHEN refclass_as_of IS NULL THEN 1 ELSE 0 END AS uncalibrated,
+                estimand, raw_p50_wcet, raw_p90_wcet, sp_anchor_id, refclass_as_of,
+                ref_model, estimator_model
            FROM estimate
           WHERE eid IN (SELECT MAX(eid) FROM estimate WHERE tid IN (${q}) GROUP BY tid)`,
       )
@@ -1262,6 +1299,38 @@ export function board(
 
   const byColumn = new Map<BoardColumn, BoardCard[]>();
   for (const col of columns) byColumn.set(col, []);
+  // ONE bridge lookup per (bucket, estimator family, ref_model, estimand) across the
+  // whole board, not one per card. `pointsToWcet` costs a `COUNT(*)` over `v_velocity`,
+  // and the file renderer draws up to 200 cards per column at the tail of every sweep —
+  // including the PostToolUse micro-sweep, on Craig's hot path. The rate does not vary
+  // per card; only the band it is applied to does, which is why `bandUnit` takes the
+  // resolver rather than the answer.
+  const rateCache = new Map<string, PointsRate>();
+  const resolveRate = (k: PointsRateKey): PointsRate => {
+    const ck = `${k.bucket}|${k.estimatorFamily}|${k.refModel}|${k.estimand}`;
+    let hit = rateCache.get(ck);
+    if (hit === undefined) {
+      hit = pointsToWcet(db, k);
+      rateCache.set(ck, hit);
+    }
+    return hit;
+  };
+  const unitOf = (est: EstimateRow): BandUnit =>
+    bandUnit(
+      db,
+      {
+        estimand: est.estimand,
+        raw_p50_wcet: est.raw_p50_wcet,
+        raw_p90_wcet: est.raw_p90_wcet,
+        cal_p50_wcet: est.cal_p50,
+        cal_p90_wcet: est.cal_p90,
+        sp_anchor_id: est.sp_anchor_id,
+        refclass_as_of: est.refclass_as_of,
+        ref_model: est.ref_model,
+        estimator_model: est.estimator_model,
+      },
+      resolveRate,
+    );
   for (const r of rows) {
     const burn = burns.get(r.tid);
     const est = estimates.get(r.tid);
@@ -1285,14 +1354,18 @@ export function board(
             probation: burn.eta_probation !== 0,
           }
         : null;
+    const unit = est === undefined ? null : unitOf(est);
     byColumn.get(r.column_name)!.push({
       tid: r.tid,
       subject: r.subject,
       kind: r.kind,
       status: r.status,
-      cal_p50: est?.cal_p50 ?? 0,
-      cal_p90: est?.cal_p90 ?? 0,
+      // `?? 0` twice over: no estimate, or a points band with no conversion. Both mean
+      // "no Work-CET band", and `burnZone`'s `> 0` guards already read 0 as no claim.
+      cal_p50: unit?.p50 ?? 0,
+      cal_p90: unit?.p90 ?? 0,
       uncalibrated: est === undefined || Boolean(est.uncalibrated),
+      points: unit?.points ?? null,
       consumed_wcet: actual?.consumed_wcet ?? 0,
       wcet_main: actual?.wcet_main ?? 0,
       wcet_sub: actual?.wcet_sub ?? 0,

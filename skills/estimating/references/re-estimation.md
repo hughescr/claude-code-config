@@ -25,7 +25,9 @@ Re-pointing means re-sizing against the same anchor on the same ladder — a fre
 the work now looks. It is **not** an adjustment toward what has already been spent; the whole
 mechanism depends on the new number being another independent judgement. Where the task was
 decomposed, re-size the blocks and re-sum rather than nudging the total, and append the new blocks
-against the new estimate.
+against the new estimate — blocks attach to a task's *latest* estimate, so a re-estimate starts them
+from empty. Once they are all in, `est open --tid <tid> --reason refinement --from-blocks` will take
+the band from `SUM(estimate_block)` so the total cannot drift from its parts.
 
 `recalibration` is rare in practice. Use it when the estimate itself has not changed but the
 multipliers have — for instance a long-running task opened during cold start that you want re-banded
@@ -51,8 +53,14 @@ Exit `2` means the command was well-formed and the operation is not permitted. I
 anti-Goodhart code: it exists specifically at the points where a well-meaning agent would otherwise
 tidy the record into looking better than it was. Never retry it, never work around it, never
 downgrade it to a warning. Its message names the append path that *is* allowed; take that path or
-leave the record alone. (Exit `1` is a malformed command line — a different thing, and worth
-fixing.)
+leave the record alone.
+
+**Exit `1` is a different thing entirely** — a malformed command line, and worth fixing on the spot.
+The refusals you are most likely to meet are exit 1, not exit 2: a quantile outside
+`[1, config.sp_max_points]` under `story_point` (you typed a Work-CET-scale number; retype it), a
+p90 below the p50, `--from-blocks` without `--tid` or against a task with no blocks, and
+`--from-blocks` given alongside `--raw-p50`/`--raw-p90`. None of those are the system declining to
+perform an operation; they are the command not saying what you meant.
 
 ## `--continue <tid>`
 

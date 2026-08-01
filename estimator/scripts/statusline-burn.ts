@@ -41,6 +41,14 @@
  *     payload that would put a wrong number on screen, and an idle session's burn percentage is
  *     not wrong. Losing the whole segment because the ETA went away would be a worse answer
  *     than the one it replaced.
+ *  4. **Never a percentage across two units (v15).** The band may be denominated in STORY
+ *     POINTS, and `payload.points.rate === null` says no points→Work-CET rate exists to
+ *     convert it — at which point `wcet.p50` and `pct_p50` are null by contract rather than
+ *     carrying a points number in a Work-CET field. The segment then shows consumed Work-CET
+ *     beside the points band, with the unit named and `no pt→WCET rate` saying why there is no
+ *     percentage. Same reasoning as `⏸ awaiting input`: one number became unavailable, so that
+ *     one number is replaced. Where a rate DOES exist the percentage is real, and a `seed`-derived
+ *     one carries the probation `?` — a bootstrapped convention is a hint, not a measurement.
  */
 
 import { readFileSync } from "node:fs";
@@ -92,8 +100,31 @@ export function formatSegment(b: BurnJson): string {
     return `no tracked task${pending}`;
   }
   if (b.target === "fallback") return "";
-  const pct = b.wcet.pct_p50;
-  const bits = [`${fmtNum(b.wcet.consumed)}/${fmtNum(b.wcet.p50)} WCET`, `${pct}% p50`];
+  // The band's unit, which since v15 is not always Work-CET (P1.9's rule applied to a
+  // new failure mode): a band issued in story points with no points→Work-CET rate is
+  // a number that CANNOT be divided into `consumed`, so there is no percentage to
+  // show. That does NOT blank the segment — what Craig is consuming is still a
+  // measurement, and the band is still the commitment; they simply sit side by side
+  // with the unit spelled out and a marker saying no conversion exists. Blanking here
+  // would trade a missing percentage for a missing everything.
+  const points = b.points;
+  const noRate = points !== null && points.rate === null;
+  const bits = noRate
+    ? [
+        `${fmtNum(b.wcet.consumed)} WCET`,
+        // "pt" not "points": this slot shares one line with the model, the branch and
+        // the context bar. `no pt→WCET rate` is the whole message — there is a band,
+        // it is in a different unit, and nothing can convert it yet.
+        `band ${fmtNum(points.p50)}/${fmtNum(points.p90)} pt`,
+        "no pt→WCET rate",
+      ]
+    : [
+        `${fmtNum(b.wcet.consumed)}/${fmtNum(b.wcet.p50 ?? 0)} WCET`,
+        // The `?` is the probation marker's convention, not a new one: a percentage
+        // derived through a SEED rate is a hint, not a measurement. A fitted rate
+        // earns no marker — it is measured, on the same threshold as every multiplier.
+        `${b.wcet.pct_p50 ?? 0}%${points !== null && points.rate_source === "seed" ? "?" : ""} p50`,
+      ];
   if (b.agents.live > 0) {
     bits.push(`${b.agents.live} agent${b.agents.live === 1 ? "" : "s"}`);
   }

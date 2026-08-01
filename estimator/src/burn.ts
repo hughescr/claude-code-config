@@ -23,7 +23,16 @@
 import type { Database } from "bun:sqlite";
 import { getConfig, openDb, unvalidatedRetired } from "./db.ts";
 import { attrRetired, attrWindow } from "./attribute.ts";
-import { isoNow, TERMINAL_TASK_STATUS } from "./tasks.ts";
+import {
+  COLD_START_N,
+  isoNow,
+  isPointsEstimand,
+  pointsToWcet,
+  TERMINAL_TASK_STATUS,
+  type PointsRate,
+  type PointsRateKey,
+} from "./tasks.ts";
+import { priceFamily } from "./prices.ts";
 import {
   buildEtaFit,
   checkBackForSession,
@@ -572,7 +581,35 @@ export interface BurnActive {
   subject: string;
   kind: string;
   status: string;
-  wcet: { consumed: number; p50: number; p90: number; pct_p50: number; pct_p90: number };
+  /**
+   * **Work-CET, always.** `consumed` is log-derived; `p50`/`p90` are the band restated
+   * in the same unit, and `pct_*` are the ratio of the two.
+   *
+   * All four band fields are NULL under exactly one condition: the band was issued in
+   * story points and no points -> Work-CET rate exists (see {@link BandUnit}). Nulling
+   * them is the whole point — the alternative a consumer must never be handed is the
+   * POINTS number in a field named after Work-CET, which is a "13" that reads as
+   * thirteen tokens against a consumed figure in the tens of thousands. The key set is
+   * unchanged and the meanings are unchanged; a reader that already handled `pct_*`
+   * being 0 for an empty band now handles null for an unconvertible one, and the
+   * points band itself is in {@link BurnActive.points}.
+   */
+  wcet: {
+    consumed: number;
+    p50: number | null;
+    p90: number | null;
+    pct_p50: number | null;
+    pct_p90: number | null;
+  };
+  /**
+   * The story-point face of the band — non-null EXACTLY when `band.estimand` is
+   * `'story_point'`, null for every Work-CET band ever issued.
+   *
+   * ADDITIVE under P2.0's rule (no field removed, none retyped from a consumer's point
+   * of view), so `"schema"` stays `1`. A consumer that does not know about points sees
+   * a new key it can ignore and a `wcet` object that has gone null rather than lying.
+   */
+  points: BandPoints | null;
   split: { main: number; sub: number; aux: number };
   requests: { n: number; p50: number | null; p90: number | null };
   agents: { live: number; total: number };
@@ -591,6 +628,10 @@ export interface BurnActive {
     uncalibrated: boolean;
     ref_model: string;
     estimand: string;
+    /** v15: the story-point anchor pinned onto this band; null for a Work-CET band.
+     *  Sits beside `ref_model`/`estimand`/`price_epoch` because it is the same kind of
+     *  fact — part of the UNIT the band is denominated in, snapshotted at `est open`. */
+    sp_anchor_id: string | null;
     price_epoch: string;
     refclass_as_of: string | null;
   };
@@ -923,30 +964,233 @@ interface BandRow {
   reason: string;
   cal_p50_wcet: number;
   cal_p90_wcet: number;
+  raw_p50_wcet: number;
+  raw_p90_wcet: number;
   cal_req_p50: number | null;
   cal_req_p90: number | null;
   active_p50_s: number | null;
   active_p90_s: number | null;
   ref_model: string;
   estimand: string;
+  /** v15: WHICH story-point anchor the band is denominated against. NULL for every
+   *  Work-CET band and every pre-v15 row — never "the current anchor" (schema.sql). */
+  sp_anchor_id: string | null;
+  estimator_model: string;
   price_epoch: string;
   refclass_as_of: string | null;
   shrink_w: number;
 }
 
-/** The CURRENT band (max eid). Accuracy is judged against MIN(eid); the live burn
- *  bar is not accuracy — it is "am I about to blow the number I most recently
- *  committed to", so it reads the newest. */
+/**
+ * The CURRENT band (max eid). Accuracy is judged against MIN(eid); the live burn
+ * bar is not accuracy — it is "am I about to blow the number I most recently
+ * committed to", so it reads the newest.
+ *
+ * **`estimand` and `sp_anchor_id` are projected because the two `cal_*` columns do
+ * not say what unit they are in.** Under `story_point` with no points -> Work-CET
+ * rate at `est open`, they hold POINTS (src/tasks.ts: multipliers of 1.0, exactly as
+ * a Work-CET cold start), and every consumer below compares them against a Work-CET
+ * actual. The raw columns come along for the same reason: they are the points band
+ * itself, which is what a renderer must show when there is no honest conversion.
+ */
 export function currentBand(db: Database, tid: string): BandRow | null {
   return (
     db
       .query<BandRow, [string]>(
-        `SELECT eid, reason, cal_p50_wcet, cal_p90_wcet, cal_req_p50, cal_req_p90,
-                active_p50_s, active_p90_s, ref_model, estimand, price_epoch, refclass_as_of, shrink_w
+        `SELECT eid, reason, cal_p50_wcet, cal_p90_wcet, raw_p50_wcet, raw_p90_wcet,
+                cal_req_p50, cal_req_p90, active_p50_s, active_p90_s, ref_model, estimand,
+                sp_anchor_id, estimator_model, price_epoch, refclass_as_of, shrink_w
            FROM estimate WHERE tid = ? ORDER BY eid DESC LIMIT 1`,
       )
       .get(tid) ?? null
   );
+}
+
+// ---------------------------------------------------------------------------
+// the unit a band is denominated in (v15 story points)
+// ---------------------------------------------------------------------------
+
+/** WHEN the points -> Work-CET conversion behind a band happened. */
+export type PointsConvertedAt = "at_open" | "at_read";
+
+/**
+ * The story-point face of a band: the points that were actually estimated, and
+ * whatever the bridge back to Work-CET had to offer.
+ *
+ * Non-null EXACTLY when the band was issued under `config.estimand = 'story_point'`.
+ * `rate === null` is the state the whole of this file's points handling exists for:
+ * there is no honest Work-CET figure, so there is no percentage, no projection and no
+ * overrun warning either.
+ */
+export interface BandPoints {
+  /** The band as estimated, in points against `anchor_id`. Never Work-CET. */
+  readonly p50: number;
+  readonly p90: number;
+  /** `estimate.sp_anchor_id` — what one point was defined to be. */
+  readonly anchor_id: string | null;
+  /** Work-CET per point behind the Work-CET band, or null when there is none. */
+  readonly rate: number | null;
+  /**
+   * Where `rate` came from. A `seed` percentage and a `fitted` percentage are
+   * different epistemic objects — one is a convention reasoned to, the other is
+   * measured from completed work — so every renderer marks the seed as provisional
+   * (the `?` convention `check_back`'s probation marker already established).
+   */
+  readonly rate_source: "fitted" | "seed" | null;
+  /**
+   * Completed comparable story-point tasks behind a `fitted` rate. 0 for `seed`, and
+   * 0 for an `at_open` conversion too: the sample size behind a rate that was applied
+   * weeks ago is not recoverable from the band row, and reporting today's count for
+   * yesterday's rate would be a number about the wrong thing. Renderers print `n=` only
+   * when it is non-zero.
+   */
+  readonly rate_n: number;
+  /**
+   * `at_open` — the rate existed at `est open` and is baked into `cal_p50_wcet`.
+   * `at_read` — the band on disk is still points and this reader converted it.
+   * `null` — no conversion exists at all.
+   */
+  readonly converted: PointsConvertedAt | null;
+}
+
+/**
+ * A band resolved into the unit its consumers actually need.
+ *
+ * `p50`/`p90` are ALWAYS Work-CET or null — never points. That is the single
+ * invariant this type exists to carry: `consumed` is log-derived Work-CET, so a
+ * consumer that divides by these two numbers must be unable to obtain a points
+ * figure by accident.
+ */
+export interface BandUnit {
+  /** Work-CET band, or null when the band is in points and no rate exists. */
+  readonly p50: number | null;
+  readonly p90: number | null;
+  /** Null for a Work-CET band; the points face otherwise. */
+  readonly points: BandPoints | null;
+}
+
+/**
+ * How {@link bandUnit} asks for the points -> Work-CET rate. Injectable for ONE reason:
+ * the answer depends only on `(bucket, estimatorFamily, refModel, estimand)`, while the
+ * band it is applied to varies per row — so a caller with many rows (the board, up to
+ * 200 cards per column) memoises the lookup across them instead of paying
+ * `pointsToWcet`'s `COUNT(*) FROM v_velocity` once per card at the tail of every sweep.
+ * Default: `pointsToWcet` itself.
+ */
+export type PointsRateResolver = (key: PointsRateKey) => PointsRate;
+
+/** The columns {@link bandUnit} needs. `currentBand`'s row satisfies it, and so does
+ *  the board's estimate row — one rule, read by both surfaces. */
+export interface BandUnitRow {
+  readonly estimand: string;
+  readonly raw_p50_wcet: number;
+  readonly raw_p90_wcet: number;
+  readonly cal_p50_wcet: number;
+  readonly cal_p90_wcet: number;
+  readonly sp_anchor_id: string | null;
+  readonly refclass_as_of: string | null;
+  readonly ref_model: string;
+  readonly estimator_model: string;
+}
+
+/**
+ * THE rule for reading a band's unit. Every burn/statusline/board consumer goes
+ * through it, so none of them can invent a second answer.
+ *
+ * Three states, and the third is the one every site downstream was getting wrong:
+ *
+ *  1. **Not `story_point`.** `cal_*` are Work-CET, exactly as they have always been.
+ *     Nothing is computed, no query is issued, and the behaviour is byte-identical to
+ *     the code that predates story points. This is the hot path — the statusline's
+ *     bounded-read budget (P1.9) is not spent on a unit that cannot be points.
+ *  2. **`story_point`, converted at `est open`.** A rate existed then, so `cal_*` ARE
+ *     Work-CET and every percentage downstream was already correct. Detected from the
+ *     row alone: under points the cold-start multipliers are exactly 1.0, so
+ *     `cal_p50 === raw_p50` iff nothing converted it. The SOURCE is then read off
+ *     `refclass_as_of`, which mirrors `est open`'s own branch exactly — the seed
+ *     stands in only while the bucket is uncalibrated (`refclass_as_of IS NULL`), and
+ *     a fitted rate IS the refclass multiplier. (A fitted `mult_p50` of exactly 1.0
+ *     would read as "unconverted" and degrade to state 3 — the SAFE direction: a rate
+ *     of one Work-CET per point is not a number this system can produce, and the cost
+ *     of being wrong is an absent percentage rather than a wrong one.)
+ *  3. **`story_point`, still points.** No rate existed at `est open`. The bridge is
+ *     asked again NOW, because a seed may have been set or the bucket may have
+ *     calibrated since — a band opened cold does not have to stay unreadable forever.
+ *     If a rate exists the points band is converted at READ time and labelled as such;
+ *     if it does not, `p50`/`p90` are null and the caller must print no percentage.
+ *
+ * The read-time conversion applies ONE rate to both ends, because {@link pointsToWcet}
+ * offers one. `est open` under a fitted rate would have used `mult_p90` for the upper
+ * end, so a read-time band can be narrower than the band the same estimate would have
+ * been issued with today. It is still a Work-CET figure at a stated rate from a stated
+ * source, which is the bar; `converted: "at_read"` is what says it was not the number
+ * committed to at open time.
+ */
+export function bandUnit(db: Database, row: BandUnitRow, resolve?: PointsRateResolver): BandUnit {
+  if (!isPointsEstimand(row.estimand)) {
+    return { p50: row.cal_p50_wcet, p90: row.cal_p90_wcet, points: null };
+  }
+  const p50 = row.raw_p50_wcet;
+  const p90 = row.raw_p90_wcet;
+  const anchor = row.sp_anchor_id;
+  if (p50 > 0 && row.cal_p50_wcet !== p50) {
+    return {
+      p50: row.cal_p50_wcet,
+      p90: row.cal_p90_wcet,
+      points: {
+        p50,
+        p90,
+        anchor_id: anchor,
+        rate: row.cal_p50_wcet / p50,
+        rate_source: row.refclass_as_of === null ? "seed" : "fitted",
+        rate_n: 0,
+        converted: "at_open",
+      },
+    };
+  }
+  const bridge = (resolve ?? ((k: PointsRateKey): PointsRate => pointsToWcet(db, k)))({
+    bucket: "global",
+    estimatorFamily: priceFamily(row.estimator_model),
+    refModel: row.ref_model,
+    estimand: row.estimand,
+  });
+  if (bridge.rate === null) {
+    return {
+      p50: null,
+      p90: null,
+      points: { p50, p90, anchor_id: anchor, rate: null, rate_source: null, rate_n: 0, converted: null },
+    };
+  }
+  return {
+    p50: Math.max(0, Math.round(p50 * bridge.rate)),
+    p90: Math.max(0, Math.round(p90 * bridge.rate)),
+    points: {
+      p50,
+      p90,
+      anchor_id: anchor,
+      rate: bridge.rate,
+      rate_source: bridge.source,
+      rate_n: bridge.n,
+      converted: "at_read",
+    },
+  };
+}
+
+/** True when a band's points face carries no Work-CET conversion — the state in which
+ *  no percentage, projection or overrun warning may be shown. */
+export function pointsUnconverted(points: BandPoints | null): boolean {
+  return points !== null && points.rate === null;
+}
+
+/**
+ * The provisional marker for a points-derived figure, following `check_back`'s
+ * probation convention rather than inventing a second one: a `?` means "this number
+ * is a hint, not a measurement". A SEED rate earns it (a convention backed by no
+ * completed work); a FITTED rate does not (it is measured, on the same cold-start
+ * threshold as every other multiplier).
+ */
+export function pointsProvisional(points: BandPoints | null): boolean {
+  return points !== null && points.rate_source === "seed";
 }
 
 /**
@@ -1155,14 +1399,25 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
   const windowMin = burnWindowMin(db);
   const usdPerHour = consumed > 0 && perMin > 0 ? (usd / consumed) * perMin * 60 : 0;
   const projUsd = consumed > 0 ? (usd / consumed) * projTotal : usd;
+  // THE unit gate. Everything below that puts `consumed` and the band in one
+  // expression — the percentages, the linear projection, the two overrun warnings —
+  // reads `unit.p50`/`unit.p90` rather than the `cal_*` columns, because those columns
+  // hold POINTS for a band opened while no points -> Work-CET rate existed. A
+  // percentage across those two units is not an approximation, it is a category error
+  // wearing a decimal point.
+  const unit = bandUnit(db, band);
+  const bandP50 = unit.p50;
+  const bandP90 = unit.p90;
   const minutesToP90 =
-    perMin > 0 && band.cal_p90_wcet > consumed
-      ? Math.round((band.cal_p90_wcet - consumed) / perMin)
+    bandP90 !== null && perMin > 0 && bandP90 > consumed
+      ? Math.round((bandP90 - consumed) / perMin)
       : null;
 
   const warn: BurnWarn[] = [];
-  if (consumed >= band.cal_p90_wcet && band.cal_p90_wcet > 0) warn.push("over_p90");
-  else if (consumed >= band.cal_p50_wcet && band.cal_p50_wcet > 0) warn.push("over_p50");
+  // No band in the consumed figure's unit means no overrun can be asserted. Not "no
+  // overrun" — no claim either way, which is what an absent warning has always meant.
+  if (bandP90 !== null && consumed >= bandP90 && bandP90 > 0) warn.push("over_p90");
+  else if (bandP50 !== null && consumed >= bandP50 && bandP50 > 0) warn.push("over_p50");
   if (opts.refresh !== true && staleS > (opts.staleAfterS ?? 120)) warn.push("stale");
   if (nProvisional > 0) warn.push("provisional_price");
   if (nUnpriced > 0) warn.push("unpriced");
@@ -1179,11 +1434,12 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
     status: meta.status,
     wcet: {
       consumed,
-      p50: band.cal_p50_wcet,
-      p90: band.cal_p90_wcet,
-      pct_p50: band.cal_p50_wcet > 0 ? round1((consumed / band.cal_p50_wcet) * 100) : 0,
-      pct_p90: band.cal_p90_wcet > 0 ? round1((consumed / band.cal_p90_wcet) * 100) : 0,
+      p50: bandP50,
+      p90: bandP90,
+      pct_p50: bandP50 === null ? null : bandP50 > 0 ? round1((consumed / bandP50) * 100) : 0,
+      pct_p90: bandP90 === null ? null : bandP90 > 0 ? round1((consumed / bandP90) * 100) : 0,
     },
+    points: unit.points,
     split: { main, sub, aux },
     requests: { n: nReq, p50: band.cal_req_p50, p90: band.cal_req_p90 },
     agents: { live: liveAgentCount, total: totalAgents },
@@ -1204,6 +1460,7 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
       uncalibrated: band.shrink_w === 0 && band.refclass_as_of === null,
       ref_model: band.ref_model,
       estimand: band.estimand,
+      sp_anchor_id: band.sp_anchor_id,
       price_epoch: band.price_epoch,
       refclass_as_of: band.refclass_as_of,
     },
@@ -1293,11 +1550,54 @@ export function renderBurn(b: BurnJson): string {
   if (!b.active) {
     return `est burn: nothing to show (${b.reason}) — the statusline renders nothing at all in this state`;
   }
-  const pct = b.wcet.pct_p50;
+  const pct = b.wcet.pct_p50 ?? 0;
   const width = 24;
   const filled = Math.max(0, Math.min(width, Math.round((pct / 100) * width)));
   const bar = `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
   const fmt = (n: number): string => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
+  // The `?` is `check_back`'s probation marker, reused rather than reinvented: a
+  // seed-derived percentage is a hint, not a measurement, and it gets the same glyph
+  // and the same explaining footnote a probationary ETA gets.
+  const q = pointsProvisional(b.points) ? "?" : "";
+  const pointsBand =
+    b.points === null
+      ? ""
+      : `${fmt(b.points.p50)} / ${fmt(b.points.p90)} points (anchor ${b.points.anchor_id ?? "?"})`;
+  const rateNote =
+    b.points === null || b.points.rate === null
+      ? ""
+      : ` × ${fmt(Math.round(b.points.rate))} Work-CET/point (${b.points.rate_source}` +
+        (b.points.rate_n > 0 ? `, n=${b.points.rate_n}` : "") +
+        (b.points.converted === "at_read" ? ", applied at READ time — not the band that was committed to" : "") +
+        ")";
+  // Two shapes, and which one is chosen is the whole fix. A bar is a FRACTION, so
+  // there is no bar at all when the numerator and the denominator are different units.
+  // The remedy and the `?` footnote hang UNDER the band line, indented like `est
+  // open`'s continuations: the headline says what is and is not known in one glance,
+  // and the sentence explaining it does not have to fit on the same line to do its job.
+  const bandLine = pointsUnconverted(b.points)
+    ? `${fmt(b.wcet.consumed)} WCET consumed  ·  band ${pointsBand}  —  NOT COMPARABLE: ` +
+      `no points→Work-CET rate, so no percentage, no projection and no overrun warning`
+    : `${bar} ${fmt(b.wcet.consumed)}/${fmt(b.wcet.p50 ?? 0)} WCET ` +
+      `(${pct}%${q} of p50, ${b.wcet.pct_p90 ?? 0}%${q} of p90)` +
+      (pointsBand === "" ? "" : `  ·  ${pointsBand}${rateNote}`);
+  // The remedy, and the `?` footnote in the SHAPE of the probation footnote further
+  // down — marker, then what it costs the number's standing. They hang UNDER the band
+  // line so `UNCALIBRATED` stays attached to the headline it qualifies.
+  const bandNotes: string[] = [];
+  if (pointsUnconverted(b.points)) {
+    bandNotes.push(
+      `      a rate appears once the bucket has ${COLD_START_N} completed story-point tasks, or set the ` +
+        `bootstrap with \`est config set sp_seed_wcet_per_point <n>\` and ` +
+        `\`est config set sp_seed_anchor_id ${b.points?.anchor_id ?? "v1"}\``,
+    );
+  } else if (q !== "") {
+    bandNotes.push(
+      `      ? = SEED-DERIVED: the points→Work-CET rate is \`config.sp_seed_wcet_per_point\`, a convention ` +
+        `reasoned to and backed by NO completed story-point task. The percentages are a hint, not a ` +
+        `measurement — they move the moment the bucket fits a real rate.`,
+    );
+  }
   const lines = [
     `${b.subject}  [${b.kind}/${b.status}]` +
       // Nothing bound this task to the caller: it is the most recently touched open
@@ -1312,12 +1612,13 @@ export function renderBurn(b: BurnJson): string {
       // is metering, just not this task. Saying nothing there would let "no note" read
       // as "yes, this is what you are working on".
       trackingNote(b),
-    `${bar} ${fmt(b.wcet.consumed)}/${fmt(b.wcet.p50)} WCET (${pct}% of p50, ${b.wcet.pct_p90}% of p90)` +
-      (b.band.uncalibrated ? "  UNCALIBRATED" : ""),
+    bandLine + (b.band.uncalibrated ? "  UNCALIBRATED" : ""),
+    ...bandNotes,
     `main ${fmt(b.split.main)} · sub ${fmt(b.split.sub)} · aux ${fmt(b.split.aux)} · ` +
       `${b.requests.n} req · ${b.agents.live}/${b.agents.total} agents live · active ${Math.round(b.time.active_s / 60)}m`,
     `burn ${b.burn.wcet_per_min.toFixed(1)} WCET/min ($${b.burn.usd_per_hour.toFixed(2)}/h over a ${b.burn.window_min}m window) · ` +
-      `projection ${fmt(b.projection.total_wcet)} WCET — LINEAR AND CRUDE: it answers "will this blow the band in the next hour", not "when will this finish"`,
+      `projection ${fmt(b.projection.total_wcet)} WCET — LINEAR AND CRUDE: it answers "will this blow the band in the next hour", not "when will this finish"` +
+      (pointsUnconverted(b.points) ? " — and there is no Work-CET band here to blow, so it answers neither" : ""),
   ];
   // The check-back band, with BOTH quantiles — this is where p90 lives. The statusline
   // shows p50 alone (one line of budget, and a two-number band stops being glanceable);

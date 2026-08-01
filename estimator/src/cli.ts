@@ -3405,6 +3405,14 @@ function cmdBoard(ctx: Ctx): number {
       ctx.out(JSON.stringify({ schema: 1, ...r }));
       return 0;
     }
+    // The `consumed` column is Work-CET; the p50/p90 columns are Work-CET too, EXCEPT
+    // where the band is in story points that nothing can convert. There they carry the
+    // points band with a `pt` suffix, so a reader scanning the row cannot subtract one
+    // from the other without seeing the unit change — and the legend below spells it
+    // out whenever such a card is on screen. `cal_p50`/`cal_p90` are 0 in that state
+    // (src/retro.ts), which is why the points band has to come off `c.points`.
+    let sawPoints = false;
+    let sawSeed = false;
     for (const col of r.columns) {
       ctx.out(`${col.column} (${col.cards.length})`);
       if (col.cards.length === 0) {
@@ -3414,15 +3422,22 @@ function cmdBoard(ctx: Ctx): number {
       ctx.out(
         renderTable(
           ["subject", "kind", "consumed", "p50", "p90", "main/sub", "phase_conf"],
-          col.cards.map((c) => [
-            c.subject.length > 44 ? `${c.subject.slice(0, 43)}…` : c.subject,
-            c.kind,
-            num(c.consumed_wcet),
-            `${num(c.cal_p50)}${c.uncalibrated ? "*" : ""}`,
-            num(c.cal_p90),
-            `${num(c.wcet_main)}/${num(c.wcet_sub)}`,
-            c.phase_conf ?? "—",
-          ]),
+          col.cards.map((c) => {
+            const p = c.points;
+            const unconverted = p !== null && p.rate === null;
+            if (unconverted) sawPoints = true;
+            if (p !== null && p.rate_source === "seed") sawSeed = true;
+            const mark = (c.uncalibrated ? "*" : "") + (p !== null && p.rate_source === "seed" ? "?" : "");
+            return [
+              c.subject.length > 44 ? `${c.subject.slice(0, 43)}…` : c.subject,
+              c.kind,
+              num(c.consumed_wcet),
+              unconverted ? `${num(p.p50)} pt${mark}` : `${num(c.cal_p50)}${mark}`,
+              unconverted ? `${num(p.p90)} pt` : num(c.cal_p90),
+              `${num(c.wcet_main)}/${num(c.wcet_sub)}`,
+              c.phase_conf ?? "—",
+            ];
+          }),
         ).replace(/^/gm, "  "),
       );
     }
@@ -3430,6 +3445,18 @@ function cmdBoard(ctx: Ctx): number {
     ctx.out(
       "* = uncalibrated band (cold start). `est board --html [--md] [--out <dir>]` writes the fuller kanban view to disk (P2.7).",
     );
+    if (sawPoints) {
+      ctx.out(
+        "pt = STORY POINTS, a size relative to the anchor — NOT Work-CET and NOT comparable with the consumed column. " +
+          "No points→Work-CET rate exists for those bands yet, so no percentage or overrun is computed for them.",
+      );
+    }
+    if (sawSeed) {
+      ctx.out(
+        "? = the band was converted through the SEED rate (`config.sp_seed_wcet_per_point`) — a convention reasoned to, " +
+          "backed by no completed story-point task.",
+      );
+    }
     return 0;
   } finally {
     db.close();

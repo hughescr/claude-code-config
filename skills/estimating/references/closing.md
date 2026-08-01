@@ -80,10 +80,23 @@ est retro --dry-run
 `--dry-run` computes and prints without writing back, and is the right default habit while the
 corpus is small.
 
-The band you issued is in **story points** and the actual is in **Work-CET**, so every score below
-is computed after the fitted points→Work-CET conversion, inside one `(ref_model, estimand)`
-partition. Nothing is scored across the unit change: Work-CET-denominated estimates from before it
-stay in their own partition and never enter these panels. The retro:
+The band you issued is in **story points** and the actual is in **Work-CET**, so scoring only works
+once the two are in the same unit. Everything below runs inside one `(ref_model, estimand)`
+partition; nothing is scored across the unit change, and Work-CET-denominated estimates from before
+it stay in their own partition and never enter these panels.
+
+Two quantities, and they behave differently under points:
+
+- **`velocity_raw` = `actual / raw_p50` of the baseline** is always meaningful. Under `work_cet` it
+  was a dimensionless over/under ratio; under points it is **Work-CET per point** — which is exactly
+  the rate the retro fits and `est open` reads back. Nothing about it needed changing.
+- **`velocity_cal` and `in_band` compare the actual against the *calibrated* band**, which is only
+  legal once that band is in Work-CET. When `est open` found no rate from either source, both
+  multipliers were 1.0 and the stored `cal_*` are still points — so `est close` writes **NULL** for
+  both rather than recording a 13-point p90 as a catastrophic overrun (`src/close.ts`, the
+  `bandInPoints` branch). A missing value is the honest answer and every consumer already handles it.
+
+The retro:
 
 - fits `mult_p50` / `mult_p90` per bucket from the decay-weighted log-velocity sample and writes
   them back to `refclass`;
@@ -98,3 +111,10 @@ stay in their own partition and never enter these panels. The retro:
   moved;
 - reports the orchestrator/sub-agent split of velocity, which is what lets a miss be *diagnosed*
   rather than merely recorded, and is why the `exp_*` drivers are worth stating.
+
+One caveat while the points corpus is cold: the pinball, log-score and coverage panels read
+`estimate.cal_*` straight off the baseline row and do **not** consult the `bandInPoints` test that
+`est close` applies (`scorePanel`, `src/retro.ts`). Until a points→Work-CET rate exists — fitted or
+seeded — those three panels are comparing a Work-CET actual against a points band, so read them as
+uninformative rather than alarming for that window. The multiplier fit itself is unaffected: it runs
+off `velocity_raw`.

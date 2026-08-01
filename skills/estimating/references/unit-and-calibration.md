@@ -17,12 +17,34 @@ Everything else is placed by comparison — against the anchor, and against bloc
 Estimators pick a rung from `1 · 2 · 3 · 5 · 8 · 13 · 20 · 40` rather than computing a value; the
 widening gaps are the point, because interpolation between rungs is precision nobody has.
 
-**The anchor is versioned.** `anchor_id` is snapshotted onto every estimate at `est open`, exactly
-as `ref_model` and `price_epoch` are, and for the same reason: the unit has to be pinned or the
-history is meaningless. If the anchor is ever redefined — a different task, a different codebase, a
-different "no tests to update" — then points minted before and after mean different things. Old
-points do not become wrong; they become a different denomination, and the corpus must keep them
-apart rather than pool them.
+The estimand is named **`story_point`**, singular, and it is the value of `config.estimand`. It is a
+fourth value in a column that was already a calibration key everywhere — `estimate.estimand`,
+`refclass`'s primary key, `v_velocity`'s projection, every consumer's filter — so adopting it
+segregates the new corpus from the old automatically. The cutover is one config flip, `est config
+set estimand story_point`, and it is Craig's call: no migration runs, nothing is deleted, and no
+history is redenominated.
+
+**The anchor is versioned, and every band is stamped with which version it was sized against.** The
+anchor in force is `config.sp_anchor_id` (seeded `v1`) and `config.sp_anchor_text`; `est open` pins
+the id onto the row as `estimate.sp_anchor_id`, exactly as `ref_model` and `price_epoch` are pinned,
+and for the same reason: the unit has to be pinned or the history is meaningless. That column is
+what makes a two-year-old points band still readable — and what stops a rate fitted under `v1` being
+applied to a band issued under `v2`. If the anchor is ever redefined — a different task, a different
+codebase, a different "no tests to update" — then points minted before and after mean different
+things. Old points do not become wrong; they become a different denomination, and the corpus must
+keep them apart rather than pool them. Change the text and the id together, or the redefinition is
+silent.
+
+The `sp_` prefix is deliberate. `anchor` unqualified already means something else in this system —
+the session/prompt pair an estimate was issued from — and the two are never the same thing; `est
+open --json` returns them as separate fields (`anchor`, `sp_anchor`) for that reason.
+
+**A points quantile is bounded.** `config.sp_max_points` (seeded 1000) is a sanity ceiling: a
+Work-CET-scale number typed into `--raw-p50`, `--raw-p90` or an `est block` quantile while the
+estimand is `story_point` is the likeliest way the cutover corrupts the new corpus, and `estimate`
+is append-only, so it is refused rather than stored. The refusal is **exit 1** — a malformed command
+line, fixed by retyping the number — and deliberately not exit 2, which stays reserved for
+operations the system will not perform.
 
 ## Work-CET, arithmetically — the actual, not the estimate
 
@@ -75,6 +97,46 @@ Two consequences for what gets shown:
   point", which is not a humble default but a wrong one.
 - Points and Work-CET are never added, averaged, or compared. They are on opposite sides of the
   conversion.
+
+## The bridge, and the seed that stands in for it
+
+One function owns the points→Work-CET conversion and every consumer goes through it (`pointsToWcet`,
+`src/tasks.ts`). It has two sources, in order, and never a third:
+
+1. **`fitted`** — the normal path, and not a new calibrator. `velocity_raw` has always been
+   `actual_wcet / raw_p50`; the moment `raw_p50` is in points, that ratio *is* Work-CET per point,
+   and the retro's decayed, shrunk median of it lands in `refclass.mult_p50` as before. So the
+   cold-start rule is inherited rather than reinvented: below `COLD_START_N` completed points tasks
+   there is no fitted rate, for the same reason there is no multiplier.
+2. **`seed`** — a bootstrap, available only while (1) is not.
+
+Otherwise `rate: null`, and the caller's obligation is to print **no** Work-CET figure at all rather
+than fall back to 1.0. A band of "8" rendered as 8 Work-CET is a number derived from nothing wearing
+the units of a measurement.
+
+**The seed is a `config` row, not a table, and that is a design decision rather than an
+expedient.** Two keys:
+
+| key | what it is |
+|---|---|
+| `sp_seed_wcet_per_point` | the bootstrapped rate, in Work-CET per point. Empty means unset, and unset means no rate |
+| `sp_seed_anchor_id` | which anchor it was reasoned against. The seed is **ignored** unless this equals `sp_anchor_id` — a rate per point of the `v1` anchor says nothing about a point of the `v2` anchor |
+
+It lives in `config` beside `shrink_k` because it is the same kind of thing: a convention somebody
+reasoned their way to. The append-only spine — `estimate`, `estimate_block`, `outcome`, `refclass` —
+holds only things that were **predicted** or **observed**. Filing the seed as an `estimate` row would
+inject a fabricated prediction into the corpus the calibrator fits from; filing it as an `outcome`
+would invent an actual. Being in `config` makes it *structurally incapable* of entering `v_velocity`,
+which is the guarantee, not a side effect.
+
+Two consequences worth knowing. A seeded band converts **both** ends by the same single rate, so its
+width comes entirely from your own points spread, unwidened — a bootstrap says how big a point is
+and nothing about how wrong estimators are. And `est open` labels the source out loud (`fitted,
+n=<n> completed story-point task(s)` versus `a bootstrapped convention — NOT measured from completed
+work`), because the two are very different claims. The fitted path reports its sample size; the seed
+reports none, deliberately, since it has no observations behind it.
+
+`est census` is where you check all of this: see [cli-surface.md](cli-surface.md#verbs-you-may-use).
 
 ## The old corpus is kept, and never pooled
 
@@ -140,7 +202,9 @@ The pipeline:
    toward the global median by `n / (n + shrink_k)`, and writes back `mult_p50` / `mult_p90`.
    Band width comes from the **global** log-velocity IQR until the bucket reaches n = 20.
 3. `est open` applies those multipliers to the raw band (`src/tasks.ts`, the `calP50` / `calP90`
-   block) — which, under points, is the points→Work-CET conversion.
+   block) — which, under points, is the points→Work-CET conversion. When the bucket is too cold for
+   a fitted multiplier but a live seed exists, the seed stands in for **both** multipliers rather
+   than letting the 1.0 cold-start identity emit a points number labelled Work-CET.
 
 So any correction is applied downstream, once, from measured history. Padding your raw number
 distorts every velocity sample you contribute, moving the fitted rate for everyone, *and* gets the
@@ -165,7 +229,8 @@ Below `COLD_START_N` completed tasks in the bucket, `est open` labels the band `
 the calibrated band **equals** the raw band — multipliers of 1.0, no invented correction.
 `refclass` refuses to show a multiplier below the same threshold, for the same reason: an order
 statistic over eight points is a rumour, not a measurement. Under the story-point estimand this is
-also exactly the regime in which no Work-CET conversion can honestly be shown.
+also exactly the regime in which no *fitted* Work-CET conversion can honestly be shown — a live seed
+is the only thing that puts a Work-CET figure on the screen before the corpus reaches ten.
 
 Two constants are easy to confuse, and they are not the same thing:
 

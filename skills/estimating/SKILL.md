@@ -22,11 +22,23 @@ against one fixed anchor:
 - **A point is not a token, a minute, or a dollar.** Nothing on this path asks you to predict any of
   those. Points say how big this work is *next to the anchor*; every absolute quantity is measured
   afterwards from the harness's own logs, never stated by you.
-- **The anchor is versioned and pinned.** `est open` snapshots `anchor_id` onto the estimate exactly
-  as it snapshots `ref_model` and `price_epoch`. Confirm the current one from `est config`
-  (`anchor_id`, `estimand`) or from the `unit:` line `est refclass` prints. If the anchor is ever
-  redefined, points minted under the old one mean a different thing, and the corpus keeps the two
-  apart rather than pooling them.
+- **The anchor is versioned and pinned.** The anchor in force is `config.sp_anchor_id` /
+  `config.sp_anchor_text` (seeded `v1`), and `est open` pins the id onto the row it writes as
+  `estimate.sp_anchor_id` — exactly as it snapshots `ref_model` and `price_epoch`. That per-estimate
+  pin is what keeps a historic points band interpretable: a rate fitted under `v1` is never applied
+  to a band issued under `v2`. Confirm what is in force from `est config` (`estimand`,
+  `sp_anchor_id`, `sp_anchor_text`), or from the anchor line and the `unit:` line `est refclass`
+  prints. (The `sp_` prefix is load-bearing: `anchor` on its own already means the session/prompt an
+  estimate was issued from, an older and unrelated use of the word.) If the anchor is ever redefined,
+  points minted under the old one mean a different thing, and the corpus keeps the two apart rather
+  than pooling them.
+- **Points are live only while `config.estimand` reads `story_point`** (singular). That is the whole
+  cutover — `est config set estimand story_point`, Craig's call, no migration, no history rewritten
+  — and until it lands `--raw-p50` / `--raw-p90` are Work-CET tokens and this page is describing the
+  wrong unit. `est refclass` prints its anchor line only under points; no anchor line, no points.
+  Under points each quantile must be a whole number in `[1, config.sp_max_points]` (seeded 1000): a
+  Work-CET-scale number typed into `--raw-p50` is refused with **exit 1** — a malformed command
+  line, retype it — because `estimate` is append-only and the row could never be corrected after.
 - **Work-CET still exists — as the actual, never as your estimate.** Work-CET is computed from the
   logs, and the system fits a points→Work-CET rate per bucket. Where a rate exists, `est open`
   converts and shows it beside the points; where it does not, it shows points alone. Either way you
@@ -94,9 +106,11 @@ band — twelve agents against a 5-point p50 is a contradiction, and the retro w
 audited against actuals, and they are what let a miss be *diagnosed* (orchestrator vs sub-agent)
 rather than merely recorded.
 
-**7. Watch it.** `est burn` mid-task is the feedback loop: consumption against the band, as a share
-of p50 and p90 wherever a points→Work-CET conversion exists to compare against. Blowing past p50
-while the work is visibly half-done means `est open --tid <tid> --reason refinement`, not silence.
+**7. Watch it.** `est burn` mid-task is the feedback loop. What it measures is **Work-CET consumed**
+— that is always real, because it is read off the logs. A *percentage of the band* is only
+meaningful where a points→Work-CET rate exists to convert the band with; with no rate the band is
+still denominated in points and a share of it is not a quantity. Blowing past p50 while the work is
+visibly half-done means `est open --tid <tid> --reason refinement`, not silence.
 
 ### Decomposition is mandatory for large work
 
@@ -112,8 +126,24 @@ decompose it before you state any number.**
 - Size each block on the ladder, by the same comparison as above.
 - **The task band is the sum of the block bands** — p50 is the sum of block p50s, p90 the sum of
   block p90s. Do not also form a whole-task guess and reconcile the two; the sum *is* the estimate.
-- Then record the blocks with `est block` (see [Workflow blocks](#workflow-blocks)), which requires
-  the tid, so the order is: size blocks → sum → `est open` with the sum → `est block` each.
+- Then record the blocks with `est block` (see [Workflow blocks](#workflow-blocks)), which needs a
+  tid to attach to.
+
+`est block` requires an existing estimate, so there are exactly two orders the CLI supports, and
+they are not equivalent:
+
+**A — sum it yourself, then open once (prefer this).** Size the blocks → add them up → `est open
+--raw-p50 <sum> --raw-p90 <sum>` → `est block` each. One estimate, and the **baseline** — the row
+every accuracy number is scored against, and the row the points→Work-CET rate is fitted from — is
+the decomposed sum.
+
+**B — open coarse, block, then commit the roll-up with `--from-blocks`.** `est open` with a first
+band → `est block` each phase (every block prints the roll-up so far) → `est open --tid <tid>
+--reason refinement --from-blocks`, which takes p50 and p90 from `SUM(estimate_block)` so the task
+band equals its parts *by construction* rather than by your arithmetic. Use it when the
+decomposition only became clear after opening, or when it changed. **Know what it costs:** the
+baseline stays the coarse pre-decomposition number, and that is the number the corpus fits — the
+roll-up is scored as a refinement, beside the baseline, never as it.
 
 Work that sits comfortably on a rung at or below 40 and has no phases is still estimated whole. Do
 not manufacture blocks for it.
@@ -220,7 +250,25 @@ est block <tid> --phase <i> --title <t> --p50 <points> --p90 <points> [--exp-age
 - **Every `agent()` call carries `label` and `phase`.** These are what make per-phase attribution
   possible at all; unlabelled or unphased workflow agents are reported as a data-quality defect.
 - **`est block` needs an estimate to attach to**, so `est open` comes first even though its band was
-  derived from the blocks you had already sized.
+  derived from the blocks you had already sized. Its refusal says so: *"block estimates roll up to a
+  task band, they never replace one"* — still true under `--from-blocks`, which makes the task band
+  the roll-up rather than abolishing it.
+- **Every block prints the roll-up so far** and names the command that commits it:
+
+  ```
+  est open --tid <tid> --reason refinement --from-blocks
+  ```
+
+  It takes the band from `SUM(estimate_block)` for this task's current estimate. It **refuses**
+  three things: without `--tid` (exit 1 — blocks hang off an estimate, so there has to be one to
+  roll up); alongside `--raw-p50` or `--raw-p90` (exit 1 — a roll-up and a parallel guess are two
+  answers to one question, and it will not silently pick one); and on a tid with no blocks yet
+  (exit 1, naming `est block`).
+
+- **Blocks attach to the task's latest estimate, and the roll-up reads that same one.** So a
+  `--from-blocks` refinement mints a fresh estimate with **no** blocks under it: running it twice in
+  a row fails, and re-blocking after any re-estimate means issuing every block again against the new
+  one. That is the same append-only discipline as everything else here, not a bug.
 
 Appending is the only revision: a duplicate `(estimate, phase)` is rejected.
 

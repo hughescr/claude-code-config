@@ -42,6 +42,7 @@ import { join } from "node:path";
 import { getConfig } from "./db.ts";
 import { formatEta } from "./eta.ts";
 import type { IngestAnomaly } from "./ingest.ts";
+import type { BandPoints } from "./burn.ts";
 import { board, type BoardCard, type BoardCheckBack, type BoardColumn, type BoardPhase, type BoardReport } from "./retro.ts";
 import { BOARD_MARKER } from "./spool.ts";
 
@@ -216,6 +217,15 @@ export function escapeHtml(s: string): string {
  *  reserved for genuine problems; a task merely inside its p50 is 'good'. */
 export type BurnZone = "good" | "warning" | "critical";
 
+/**
+ * **Both arguments must be in `consumed`'s unit — Work-CET.** Since v15 a band can be
+ * denominated in STORY POINTS, and a points p50 of 8 against a consumed figure of
+ * 41,000 would colour every such card `critical` on a comparison that means nothing.
+ * The gate is upstream: `BoardCard.cal_p50`/`cal_p90` are 0 whenever no Work-CET band
+ * exists, and 0 falls through both `> 0` guards below to `good` — no claim, which is
+ * what "no band" has always meant here. Callers with a points card must not reach for
+ * `points.p50` to fill the gap.
+ */
 export function burnZone(consumed: number, p50: number, p90: number): BurnZone {
   if (p90 > 0 && consumed > p90) return "critical";
   if (p50 > 0 && consumed > p50) return "warning";
@@ -350,22 +360,61 @@ const STYLE = `
   .cold-start { color: var(--text-muted); }
 `;
 
+/**
+ * The story-point band as text: `8 / 13 pt (anchor v1)`. Never a Work-CET figure, and
+ * never a bar — see {@link burnBarHtml}.
+ */
+export function pointsBandText(points: BandPoints): string {
+  return `${points.p50} / ${points.p90} pt (anchor ${points.anchor_id ?? "?"})`;
+}
+
+/**
+ * How the points→Work-CET conversion behind a converted band is described. The SOURCE
+ * is always named, because a seed percentage and a fitted percentage are different
+ * claims, and a seed additionally earns the probation `?` this board already uses for
+ * a check-back that has not proven itself.
+ */
+export function pointsRateText(points: BandPoints): string {
+  if (points.rate === null) return "";
+  return (
+    `${pointsBandText(points)} × ${fmtWcet(Math.round(points.rate))} Work-CET/pt (${points.rate_source}` +
+    (points.rate_n > 0 ? `, n=${points.rate_n}` : "") +
+    (points.converted === "at_read" ? ", applied at read time" : "") +
+    ")"
+  );
+}
+
 function burnBarHtml(card: BoardCard): string {
+  const consumed = card.consumed_wcet;
+  const points = card.points;
+  // NO BAR when the band is in points and nothing can convert it. A bar is a fraction
+  // and a zone is a comparison; both need one unit, and `cal_p50`/`cal_p90` are 0 here
+  // precisely so nothing downstream can accidentally form either. The card still says
+  // what was consumed and what was committed to — it just refuses to draw them as a
+  // ratio, and says why in the words the reader needs.
+  if (points !== null && points.rate === null) {
+    return `
+    <div class="bar-labels"><span>${fmtWcet(consumed)}${card.uncalibrated ? " *" : ""} consumed</span><span>band ${escapeHtml(pointsBandText(points))}</span></div>
+    <div class="band">not comparable — no points→Work-CET rate yet, so no %, no zone and no bar</div>`;
+  }
   const p50 = card.cal_p50;
   const p90 = card.cal_p90;
-  const consumed = card.consumed_wcet;
   const scale = Math.max(p90, consumed, 1);
   const zone = burnZone(consumed, p50, p90);
   const fillPct = Math.min(100, (consumed / scale) * 100);
   const p50Pct = Math.min(100, (p50 / scale) * 100);
   const p90Pct = Math.min(100, (p90 / scale) * 100);
+  const via =
+    points === null
+      ? ""
+      : `\n    <div class="band">via ${escapeHtml(pointsRateText(points))}${points.rate_source === "seed" ? ' <span class="probation">?</span> a bootstrapped convention, not measured' : ""}</div>`;
   return `
     <div class="bar-track" title="consumed ${fmtWcet(consumed)} vs p50 ${fmtWcet(p50)} / p90 ${fmtWcet(p90)}">
       <div class="bar-fill${zone === "good" ? "" : ` ${zone}`}" style="width:${fillPct.toFixed(1)}%"></div>
       <div class="bar-tick" style="left:${p50Pct.toFixed(1)}%"></div>
       <div class="bar-tick" style="left:${p90Pct.toFixed(1)}%"></div>
     </div>
-    <div class="bar-labels"><span>${fmtWcet(consumed)}${card.uncalibrated ? " *" : ""}</span><span>p50 ${fmtWcet(p50)} · p90 ${fmtWcet(p90)}</span></div>`;
+    <div class="bar-labels"><span>${fmtWcet(consumed)}${card.uncalibrated ? " *" : ""}</span><span>p50 ${fmtWcet(p50)} · p90 ${fmtWcet(p90)}</span></div>${via}`;
 }
 
 function phaseStripHtml(phases: readonly BoardPhase[]): string {
@@ -434,7 +483,7 @@ export function renderBoardHtml(report: BoardReport): string {
 </head>
 <body>
 <h1>est board</h1>
-<p class="as-of">as of ${escapeHtml(report.as_of)} &middot; * = uncalibrated band (cold start)</p>
+<p class="as-of">as of ${escapeHtml(report.as_of)} &middot; * = uncalibrated band (cold start) &middot; pt = story points, a size relative to the anchor and never a token count &middot; ? = derived through the SEED rate, a convention rather than a measurement</p>
 <div class="board">
 ${columns}
 </div>
@@ -448,7 +497,16 @@ ${columns}
 // ---------------------------------------------------------------------------
 
 function cardMd(card: BoardCard): string {
-  const band = `${fmtWcet(card.cal_p50)}/${fmtWcet(card.cal_p90)}${card.uncalibrated ? " *" : ""}`;
+  const points = card.points;
+  // Same rule as the HTML card, one line shorter: a points band with no rate is stated
+  // in points, beside the consumed Work-CET, with the incomparability said out loud.
+  const band =
+    points !== null && points.rate === null
+      ? `${pointsBandText(points)}${card.uncalibrated ? " *" : ""} — NOT COMPARABLE with consumed (no points→Work-CET rate)`
+      : `${fmtWcet(card.cal_p50)}/${fmtWcet(card.cal_p90)}${card.uncalibrated ? " *" : ""}` +
+        (points === null
+          ? ""
+          : ` (via ${pointsRateText(points)}${points.rate_source === "seed" ? " ?" : ""})`);
   const proj = card.proj_total_wcet === null ? "" : ` · proj ${fmtWcet(card.proj_total_wcet)} (crude)`;
   const lines = [
     `- **${card.subject}** (${card.kind}, ${card.status})`,
@@ -470,7 +528,12 @@ function cardMd(card: BoardCard): string {
 }
 
 export function renderBoardMd(report: BoardReport): string {
-  const parts = [`# est board`, ``, `as of ${report.as_of} · \\* = uncalibrated band (cold start)`, ``];
+  const parts = [
+    `# est board`,
+    ``,
+    `as of ${report.as_of} · \\* = uncalibrated band (cold start) · pt = story points, a size relative to the anchor and never a token count · ? = derived through the SEED rate, a convention rather than a measurement`,
+    ``,
+  ];
   for (const col of report.columns) {
     parts.push(`## ${col.column} (${col.cards.length})`, ``);
     if (col.cards.length === 0) {
