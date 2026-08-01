@@ -3861,7 +3861,7 @@ repair-identity (the append-only correction path for the estimator identity):
 open:
   --kind <research|design|implement|refactor|debug|review|ops>
   --subject <t> [--description <t>] [--dod <json|@file>]
-  --raw-p50 <n> --raw-p90 <n>        raw Work-CET band; a FEATURE and a FLOOR, never a mean
+  --raw-p50 <n> --raw-p90 <n>        Work-CET band; your uncorrected guess, never pre-corrected
   --exp-agents <n> --exp-wf-phases <n> --exp-files-write <n> --exp-turns <n> --exp-requests <n>
   [--tid <tid> --reason refinement|scope_change|recalibration]   append a re-estimate
   [--session <sid>] [--prompt <promptId>]

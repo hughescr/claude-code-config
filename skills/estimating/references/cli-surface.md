@@ -49,9 +49,14 @@ and `est open --json` is what this skill drives — so its shape is not yours to
 |---|---|---|
 | `ref_model` | `claude-sonnet-4-5` | the Work-CET normaliser |
 | `estimand` | `work_cet` | which counters the unit includes |
-| `shrink_k` | 10 | comparable completed tasks before a bucket is calibrated |
+| `shrink_k` | 10 | the `k` in the shrinkage weight `n / (n + k)` — how far a calibrated bucket's own median is pulled toward the global one |
 | `velocity_half_life_days` | 30 | decay on the velocity sample |
 | `quiesce_main_min` | 60 | the close gate's quiet window |
 | `close_abandon_after_h` | 168 | silence before a task is swept `abandoned` |
 
 Read them with `est config`; the values above are a snapshot, not a source.
+
+**`COLD_START_N` is not in this table and is not tunable.** The threshold below which `est open` and
+`est refclass` refuse to calibrate is hardcoded at 10 in `src/tasks.ts`. It equals `shrink_k`'s
+default by coincidence only — changing `shrink_k` does not move it. See
+[unit-and-calibration.md](unit-and-calibration.md) for the difference.

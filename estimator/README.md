@@ -30,6 +30,7 @@ leave this machine; only source code is committed.
 | `tsconfig.json` | Typecheck-only config (`bun run typecheck`); nothing here ever emits. |
 | `estimator.db` | The database (gitignored, WAL mode). Override the path with `EST_DB`. |
 | `spool/`, `backups/`, `sweep.lock` | Hook spool + OTLP spool, weekly `VACUUM INTO` backups, writer lock — all gitignored. |
+| `~/.claude/skills/estimating/` | **Outside this repo**: the agent-facing procedure layer over this CLI — `SKILL.md` plus `references/`, saying when to estimate, how to derive a band and which verb to reach for. It is the CLI's one documented consumer, so a change to a verb, a flag or its `--help` text is not done until this is changed with it; the help text wins when the two disagree, which is exactly why they must not. |
 
 Only the gate **probes** are committed. Everything they produce — the `*.json` dumps and the
 curated `*.md` reports alike — is corpus-derived data and stays local, alongside `DESIGN.md`,

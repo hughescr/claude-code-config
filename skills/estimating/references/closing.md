@@ -12,8 +12,14 @@ minutes); no open turn; no live session; every bound agent still accounted for. 
 fails it exits `2` and names it.
 
 Since 2026-07-30 the remedy that exit-`2` message points at begins **"do nothing"** — the sweeper's
-close pass really does finalize quiet tasks, on every sweep, through the same gate with no bypass.
-Waiting is the correct move whenever the work actually finished and the harness recorded it.
+close pass really does finalize quiet tasks, through the same gate with no bypass. Waiting is the
+correct move whenever the work actually finished and the harness recorded it.
+
+The pass runs on every *eligible* sweep, not every sweep: it is throttled by
+`close_pass_min_interval_min` (default 10) via the mtime of a `.closepass.<db>` marker
+(`src/autoclose.ts`), because every hook fire in the machine spawns the same `est sweep`. A task
+that becomes closeable at T is therefore closed somewhere in [T, T+10 min] — a rounding error
+against the hour of silence it needed to qualify.
 
 Tunables, all in `est config`: `quiesce_main_min` (60), `close_blocked_after_h` (24),
 `close_abandon_after_h` (168), `close_pass_min_interval_min` (10), `close_fail_alert_after` (3).
