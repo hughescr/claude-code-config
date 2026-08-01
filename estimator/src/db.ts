@@ -32,6 +32,17 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
 /**
  * Must match the config.schema_version seed in schema.sql.
  *
+ * 16 — `v_block_accuracy` REFUSES a cross-unit comparison (Craig 2026-07-31). The SQL half
+ *     of one shared guard: `estimate_block.p50_wcet` is stored in whatever
+ *     `config.estimand` was at `est block` and is never converted by anything (the table
+ *     has no cal_* pair and estb_ro_u / estb_ro_d mean it could not acquire one), while
+ *     the actual joined beside it is log-derived Work-CET, always. Under 'story_point'
+ *     the two axes are in different units, so `actual_wcet` goes NULL and a new
+ *     `unit_mismatch` column carries the WHY — a number computed across them would wear
+ *     the units of a measurement and be none. One view replaced; no row read, written or
+ *     moved, so migration rule 2 holds trivially. The TypeScript half is `bandUnscorable`
+ *     / `blocksInWcet` in src/tasks.ts, which `est close` and both `est retro` scoring
+ *     panels now share instead of each carrying their own copy of the test.
  * 15 — STORY POINTS become an available estimand (Craig 2026-07-31). Three things, and
  *     no row is read, written or moved:
  *       - `estimate.sp_anchor_id`, an ADD COLUMN. Points are meaningless without the
@@ -184,7 +195,7 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
  *     `v_phase_actual.phase_conf`, auxiliary origin excluded from calibration.
  * 1 — initial R3 §4.2 shape.
  */
-export const SCHEMA_VERSION = "15";
+export const SCHEMA_VERSION = "16";
 
 /**
  * Forward-only, additive migrations, applied by {@link openDb} on a WRITABLE
@@ -1086,6 +1097,35 @@ INSERT OR IGNORE INTO config (k, v) VALUES
         db.exec("ALTER TABLE estimate ADD COLUMN sp_anchor_id TEXT");
       }
     },
+  },
+  {
+    from: "15",
+    to: "16",
+    // `v_block_accuracy` refuses a cross-unit comparison (see the SCHEMA_VERSION doc
+    // comment above).
+    //
+    // A straight view replacement, the same shape the 5 -> 6 and 14 -> 15 steps used: a
+    // view holds no rows, so migration rule 2 (no migration drops or rewrites a ROW) is
+    // met by construction — nothing here reads, writes or moves anything in the
+    // append-only spine, and `estimate_block` in particular is untouched. The
+    // definition below MUST stay byte-identical to schema.sql's, because
+    // `test/schema.test.ts` diffs `sqlite_master` between a migrated file and a fresh
+    // one. Idempotent for the reason v8/v12/v13/v15 document: `IF EXISTS` /
+    // `IF NOT EXISTS` cost nothing, since SQLite strips the clause before storing.
+    sql: `
+DROP VIEW IF EXISTS v_block_accuracy;
+CREATE VIEW IF NOT EXISTS v_block_accuracy AS
+SELECT b.eid, e.tid, b.phase_idx, b.title, b.p50_wcet, b.p90_wcet, b.exp_agents,
+       CASE WHEN e.estimand = 'story_point' THEN NULL ELSE pa.wcet END AS actual_wcet,
+       CASE WHEN e.estimand = 'story_point' AND pa.wcet IS NOT NULL THEN 1 ELSE 0 END AS unit_mismatch,
+       pa.n_agents, pa.phase_conf
+FROM estimate_block b
+JOIN estimate e     ON e.eid = b.eid
+JOIN workflow_run r ON r.tid = e.tid
+LEFT JOIN v_phase_actual pa
+       ON pa.run_id = r.run_id AND pa.wf_launch_id = r.wf_launch_id
+      AND pa.phase_idx = b.phase_idx;
+`,
   },
 ];
 

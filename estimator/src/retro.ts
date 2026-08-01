@@ -49,6 +49,8 @@ import { getConfig } from "./db.ts";
 // on two screens. No cycle — src/burn.ts does not import this file.
 import { bandUnit, type BandPoints, type BandUnit } from "./burn.ts";
 import {
+  bandUnscorable,
+  blocksInWcet,
   COLD_START_N,
   InvariantError,
   isoNow,
@@ -87,6 +89,10 @@ export interface BucketFit {
 }
 
 export interface ScoringPanel {
+  /**
+   * Outcomes that entered the `cal_*`-derived numbers below. Rows the unit guard
+   * refused are NOT in here — see {@link ScoringPanel.unscorable}.
+   */
   n_scored: number;
   pinball_p50: number | null;
   pinball_p90: number | null;
@@ -110,6 +116,33 @@ export interface ScoringPanel {
     velocity_sub: number | null;
     exp_agents_residual: number | null;
     parallelism_p50: number | null;
+  };
+  /**
+   * What this panel REFUSED to score, and why — the counterpart to every `null` above
+   * that is a refusal rather than an empty corpus.
+   *
+   * A story-point band whose `est open` found no points -> Work-CET rate is still
+   * denominated in POINTS, and the actual it would be scored against is Work-CET, so
+   * pinball loss, log score and coverage are undefined for it (`bandUnscorable`,
+   * src/tasks.ts). Block quantiles are stricter still: `est block` stores the unit in
+   * force and nothing ever converts an `estimate_block` row, so under `story_point`
+   * the roll-up is points even for a task whose own band WAS converted at open
+   * (`blocksInWcet`).
+   *
+   * All four counters are 0 for a Work-CET corpus, which is every corpus that predates
+   * v15. A non-zero value is not a data-quality problem — it is the cold start being
+   * honest — but it IS why `n_scored` can sit below `n_outcomes`, so it is reported
+   * rather than silently subtracted.
+   */
+  unscorable: {
+    /** Completed outcomes dropped from the baseline scores. */
+    baseline: number;
+    /** Refinement pairs dropped from the refinement scores. */
+    refinement: number;
+    /** Tasks dropped from the roll-up-vs-task comparison. */
+    block_tasks: number;
+    /** Individual `v_block_accuracy` rows with no scorable actual, for unit reasons. */
+    blocks: number;
   };
 }
 
@@ -346,6 +379,20 @@ export function retro(
   if (quality.corpus_shrink_events > 0) {
     alerts.push(`${quality.corpus_shrink_events} corpus_shrink event(s) — §5.8 expects ZERO`);
   }
+  // The refusal, said out loud. Not an anomaly and not a data-quality failure — it is
+  // the story-point cold start behaving correctly — but a `n_scored` that silently sat
+  // below `n_outcomes` would look like missing data rather than like an undefined
+  // comparison, which is the misreading the whole guard exists to prevent.
+  const u = scoring.unscorable;
+  if (u.baseline + u.refinement + u.block_tasks + u.blocks > 0) {
+    alerts.push(
+      `unit_refusal: ${u.baseline} baseline, ${u.refinement} refinement, ${u.block_tasks} block-task and ` +
+        `${u.blocks} per-block comparison(s) are UNDEFINED, not missing — the band is in story points, ` +
+        "the actual is in Work-CET, and no conversion was applied at `est open`. " +
+        "Set `sp_seed_wcet_per_point` + `sp_seed_anchor_id`, or close enough points tasks to fit a rate, " +
+        "and bands issued from then on score normally (`estimate` is append-only, so these never will).",
+    );
+  }
 
   // The check-back panel. Scored on EVERY retro, dry-run included: the comparison is
   // what licenses the shipped model to keep issuing bands, and a `--dry-run` that
@@ -404,16 +451,22 @@ interface ScoredOutcome {
   exp_agents: number;
   n_agents: number;
   parallelism_factor: number | null;
+  /** The three columns {@link bandUnscorable} reads, under the names it expects. */
+  estimand: string;
+  raw_p50_wcet: number;
+  cal_p50_wcet: number;
 }
 
 function scorePanel(db: Database, refModel: string, estimand: string): ScoringPanel {
-  const scored = db
+  const all = db
     .query<ScoredOutcome, [string, string]>(
       `SELECT o.tid AS tid, o.actual_wcet_at_epoch AS actual,
               e.raw_p50_wcet AS raw_p50, e.cal_p50_wcet AS cal_p50, e.cal_p90_wcet AS cal_p90,
               o.wcet_main AS wcet_main, o.wcet_sub AS wcet_sub,
               e.exp_agents AS exp_agents, o.n_agents AS n_agents,
-              o.parallelism_factor AS parallelism_factor
+              o.parallelism_factor AS parallelism_factor,
+              e.estimand AS estimand,
+              e.raw_p50_wcet AS raw_p50_wcet, e.cal_p50_wcet AS cal_p50_wcet
          FROM v_outcome_current o
          JOIN estimate e ON e.eid = o.eid_at_start
         WHERE o.final_status = 'completed' AND o.censored = 0
@@ -421,6 +474,14 @@ function scorePanel(db: Database, refModel: string, estimand: string): ScoringPa
           AND e.ref_model = ? AND e.estimand = ?`,
     )
     .all(refModel, estimand);
+
+  // THE guard, and the reason it is imported rather than written here: `actual` is
+  // Work-CET off the logs, and `cal_p50`/`cal_p90` are Work-CET only when the band was
+  // not left in story points by an `est open` that had no rate. Pinball loss, log score
+  // and coverage over a mixed-unit pair are not weak measurements — they are not
+  // measurements — so the rows leave the sample entirely and are counted out loud.
+  const scored = all.filter((s) => !bandUnscorable(s));
+  const unscorableBaseline = all.length - scored.length;
 
   const p50Loss = scored.map((s) => pinball(s.actual, s.cal_p50, 0.5));
   const p90Loss = scored.map((s) => pinball(s.actual, s.cal_p90, 0.9));
@@ -432,13 +493,28 @@ function scorePanel(db: Database, refModel: string, estimand: string): ScoringPa
   // Refinements: mid-task predictive skill, reported BESIDE — never blended into —
   // baseline calibration. This is where "the cone of uncertainty narrows" becomes a
   // measurement instead of a slogan.
-  const refinements = db
+  const refinementRows = db
     .query<
-      { tid: string; actual: number; cal_p50: number; base_p50: number },
+      {
+        tid: string;
+        actual: number;
+        cal_p50: number;
+        base_p50: number;
+        estimand: string;
+        raw_p50_wcet: number;
+        cal_p50_wcet: number;
+        base_estimand: string;
+        base_raw_p50_wcet: number;
+        base_cal_p50_wcet: number;
+      },
       [string, string]
     >(
       `SELECT o.tid AS tid, o.actual_wcet_at_epoch AS actual,
-              e.cal_p50_wcet AS cal_p50, b.cal_p50_wcet AS base_p50
+              e.cal_p50_wcet AS cal_p50, b.cal_p50_wcet AS base_p50,
+              e.estimand AS estimand,
+              e.raw_p50_wcet AS raw_p50_wcet, e.cal_p50_wcet AS cal_p50_wcet,
+              b.estimand AS base_estimand,
+              b.raw_p50_wcet AS base_raw_p50_wcet, b.cal_p50_wcet AS base_cal_p50_wcet
          FROM v_outcome_current o
          JOIN estimate b ON b.eid = o.eid_at_start
          JOIN estimate e ON e.tid = o.tid AND e.reason = 'refinement'
@@ -446,10 +522,25 @@ function scorePanel(db: Database, refModel: string, estimand: string): ScoringPa
           AND b.ref_model = ? AND b.estimand = ?`,
     )
     .all(refModel, estimand);
+  // BOTH ends of the pair are guarded: `pinball` reads the refinement's band and
+  // `moved_toward_actual` reads the baseline's, so one unconverted points band on
+  // either side makes the whole comparison cross-unit.
+  const refinements = refinementRows.filter(
+    (r) =>
+      !bandUnscorable(r) &&
+      !bandUnscorable({
+        estimand: r.base_estimand,
+        raw_p50_wcet: r.base_raw_p50_wcet,
+        cal_p50_wcet: r.base_cal_p50_wcet,
+      }),
+  );
+  const unscorableRefinement = refinementRows.length - refinements.length;
   const refPinball = refinements.map((r) => pinball(r.actual, r.cal_p50, 0.5));
   const moved = refinements.filter(
     (r) => Math.abs(r.cal_p50 - r.actual) < Math.abs(r.base_p50 - r.actual),
   ).length;
+
+  const blocks = blockPanel(db, refModel, estimand);
 
   return {
     n_scored: scored.length,
@@ -465,14 +556,23 @@ function scorePanel(db: Database, refModel: string, estimand: string): ScoringPa
       pinball_p50: meanOf(refPinball),
       moved_toward_actual_pct: ratio(moved, refinements.length),
     },
-    blocks: blockPanel(db, refModel, estimand),
+    blocks: blocks.panel,
+    // `origin` is deliberately over `all`, not `scored`. Every ratio here divides by
+    // `raw_p50`, and under `story_point` that is Work-CET PER POINT — the learning
+    // signal `est close` records as `velocity_raw` and keeps under points for exactly
+    // this reason. It is the CALIBRATED band that is in the wrong unit, and nothing in
+    // this object touches it.
     origin: {
-      velocity_main: meanOf(
-        scored.map((s) => (s.raw_p50 > 0 ? s.wcet_main / s.raw_p50 : null)),
-      ),
-      velocity_sub: meanOf(scored.map((s) => (s.raw_p50 > 0 ? s.wcet_sub / s.raw_p50 : null))),
-      exp_agents_residual: meanOf(scored.map((s) => s.n_agents - s.exp_agents)),
-      parallelism_p50: meanOf(scored.map((s) => s.parallelism_factor)),
+      velocity_main: meanOf(all.map((s) => (s.raw_p50 > 0 ? s.wcet_main / s.raw_p50 : null))),
+      velocity_sub: meanOf(all.map((s) => (s.raw_p50 > 0 ? s.wcet_sub / s.raw_p50 : null))),
+      exp_agents_residual: meanOf(all.map((s) => s.n_agents - s.exp_agents)),
+      parallelism_p50: meanOf(all.map((s) => s.parallelism_factor)),
+    },
+    unscorable: {
+      baseline: unscorableBaseline,
+      refinement: unscorableRefinement,
+      block_tasks: blocks.unscorableTasks,
+      blocks: blocks.unscorableBlocks,
     },
   };
 }
@@ -482,8 +582,21 @@ function scorePanel(db: Database, refModel: string, estimand: string): ScoringPa
  * estimating, TESTED against Craig's own data rather than assumed. If the roll-up
  * does not beat the task band after enough workflow tasks, that is reportable and
  * the requirement can be revisited on evidence (§3.2, §7.4).
+ *
+ * The UNIT guard here is `blocksInWcet`, not `bandUnscorable`, and the difference is
+ * the point: this panel pinballs a Work-CET actual against `SUM(estimate_block.p50_wcet)`,
+ * and a block row is stored in the unit in force at `est block` and is never converted
+ * by anything. So under `story_point` the roll-up is points even for a task whose own
+ * band a rate DID convert at `est open` — the conversion happened on `estimate`, not on
+ * the blocks hanging off it. Refusing the whole comparison is the honest answer: with
+ * `rollup_pinball_p50` null the verdict falls through to the `insufficient_data` arm
+ * that already existed, which is exactly what "we cannot tell" means here.
  */
-function blockPanel(db: Database, refModel: string, estimand: string): ScoringPanel["blocks"] {
+function blockPanel(
+  db: Database,
+  refModel: string,
+  estimand: string,
+): { panel: ScoringPanel["blocks"]; unscorableTasks: number; unscorableBlocks: number } {
   const rows = db
     .query<
       { tid: string; actual: number; task_p50: number; rollup_p50: number },
@@ -498,28 +611,41 @@ function blockPanel(db: Database, refModel: string, estimand: string): ScoringPa
           AND EXISTS (SELECT 1 FROM estimate_block WHERE eid = e.eid)`,
     )
     .all(refModel, estimand);
+  const scorable = blocksInWcet(estimand);
 
+  // The per-block leg reads its refusal from the VIEW rather than repeating it: the
+  // same rule is expressed once in SQL (`v_block_accuracy.unit_mismatch`, which also
+  // nulls `actual_wcet`) so a caller reaching for the view directly cannot get a
+  // cross-unit pair either.
   const perBlock = db
     .query<{ p50: number; actual: number | null }, []>(
       "SELECT p50_wcet AS p50, actual_wcet AS actual FROM v_block_accuracy WHERE actual_wcet IS NOT NULL",
     )
     .all();
+  const unscorableBlocks =
+    db
+      .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM v_block_accuracy WHERE unit_mismatch = 1")
+      .get()?.n ?? 0;
 
-  const rollup = meanOf(rows.map((r) => pinball(r.actual, r.rollup_p50, 0.5)));
-  const task = meanOf(rows.map((r) => pinball(r.actual, r.task_p50, 0.5)));
+  const rollup = scorable ? meanOf(rows.map((r) => pinball(r.actual, r.rollup_p50, 0.5))) : null;
+  const task = scorable ? meanOf(rows.map((r) => pinball(r.actual, r.task_p50, 0.5))) : null;
   return {
-    n_tasks: rows.length,
-    rollup_pinball_p50: rollup,
-    task_pinball_p50: task,
-    per_block_pinball_p50: meanOf(
-      perBlock.map((b) => (b.actual === null ? null : pinball(b.actual, b.p50, 0.5))),
-    ),
-    verdict:
-      rollup === null || task === null || rows.length < 3
-        ? "insufficient_data"
-        : rollup < task
-          ? "blocks_better"
-          : "task_better",
+    panel: {
+      n_tasks: scorable ? rows.length : 0,
+      rollup_pinball_p50: rollup,
+      task_pinball_p50: task,
+      per_block_pinball_p50: meanOf(
+        perBlock.map((b) => (b.actual === null ? null : pinball(b.actual, b.p50, 0.5))),
+      ),
+      verdict:
+        rollup === null || task === null || rows.length < 3
+          ? "insufficient_data"
+          : rollup < task
+            ? "blocks_better"
+            : "task_better",
+    },
+    unscorableTasks: scorable ? 0 : rows.length,
+    unscorableBlocks,
   };
 }
 

@@ -29,7 +29,7 @@ import { getConfig } from "./db.ts";
 import { PROJECTS_ROOT } from "./discover.ts";
 import { countLiveAgents, liveAgentMaxMin } from "./liveness.ts";
 import { clearOverrunMarker, SPOOL_DIR } from "./spool.ts";
-import { InvariantError, isoNow, TERMINAL_TASK_STATUS } from "./tasks.ts";
+import { bandUnscorable, InvariantError, isoNow, TERMINAL_TASK_STATUS } from "./tasks.ts";
 
 /** Where the harness records live sessions (`<pid>.json`); `EST_SESSIONS` overrides. */
 export const SESSIONS_ROOT: string =
@@ -1045,10 +1045,12 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
   // coverage panel would read the early points corpus as a catastrophe. NULL is the
   // honest answer, and it is one the schema already admits: both columns are nullable
   // and every consumer already handles a missing value.
-  const bandInPoints =
-    baseline.estimand === "story_point" &&
-    baseline.cal_p50_wcet === baseline.raw_p50_wcet &&
-    baseline.cal_p90_wcet === baseline.raw_p90_wcet;
+  //
+  // The test itself lives in `src/tasks.ts` beside `pointsToWcet`, not here. Three
+  // other scoring surfaces (`retro.ts`'s two panels and `v_block_accuracy`) had each
+  // made this same mistake independently, which is the signal that it must be ONE
+  // function a fourth consumer cannot fail to find.
+  const bandInPoints = bandUnscorable(baseline);
   const velocityCal =
     !bandInPoints && actualAtEpoch !== null && baseline.cal_p50_wcet > 0
       ? actualAtEpoch / baseline.cal_p50_wcet

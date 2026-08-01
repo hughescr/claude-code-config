@@ -44,6 +44,7 @@ import {
   storyPointAnchor,
 } from "../src/tasks.ts";
 import { attributeTasks } from "../src/attribute.ts";
+import { retro } from "../src/retro.ts";
 
 let h: Harness;
 
@@ -74,7 +75,15 @@ const KEY = {
  * consumed `wcet` Work-CET. `seedPrices` makes `usd_out = 1` for both families, so
  * `out_tok` IS the Work-CET figure and an assertion can state the ratio directly.
  */
-async function completed(n: number, wcet: number, p50 = 1000, p90 = 3000): Promise<string> {
+async function completed(
+  n: number,
+  wcet: number,
+  p50 = 1000,
+  p90 = 3000,
+  /** `close: false` leaves the task open so more fixture (blocks, a workflow) can be
+   *  hung off it before it is finalized. */
+  opts: { close?: boolean } = {},
+): Promise<string> {
   const session = `sp${n}`;
   const at = `2026-02-${String((n % 27) + 1).padStart(2, "0")}T00:00:00Z`;
   turn(h.db, { session, prompt: "p1", at, durationMs: 60_000 });
@@ -86,7 +95,9 @@ async function completed(n: number, wcet: number, p50 = 1000, p90 = 3000): Promi
   const tid = r.json<{ tid: string }>().tid;
   request(h.db, `rq-sp-${n}`, { session, out: wcet, ts: at });
   attributeTasks(h.db);
-  expect((await h.cli("close", tid, "--force")).code).toBeLessThanOrEqual(3);
+  if (opts.close !== false) {
+    expect((await h.cli("close", tid, "--force")).code).toBeLessThanOrEqual(3);
+  }
   return tid;
 }
 
@@ -798,5 +809,280 @@ describe("the cutover", () => {
       "--session", "s1", "--prompt", "p1", "--json",
     );
     expect(open.json<{ estimand: string }>().estimand).toBe(POINTS_ESTIMAND);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9 — the scoring surfaces refuse a cross-unit comparison
+// ---------------------------------------------------------------------------
+
+/**
+ * ONE guard, four consumers. `est close` had it; `est retro`'s two scoring panels and
+ * `v_block_accuracy` had each independently made the same mistake, which is why the
+ * test now lives in `src/tasks.ts` as `bandUnscorable` / `blocksInWcet` and everything
+ * reads it from there rather than carrying a copy.
+ *
+ * The refusal is NULL, never a conversion. Choosing between the rate pinned at issue
+ * time (there is none — that is the state) and whatever rate exists today is a
+ * modelling decision nobody has made, and the output would wear the units of a
+ * measurement while being neither.
+ */
+describe("scoring refuses a points band against a Work-CET actual", () => {
+  /** One workflow run + two declared phases + a phase-0 agent, on an existing task. */
+  function seedWorkflow(tid: string): string {
+    const session = h.db
+      .query<{ anchor_session: string }, [string]>("SELECT anchor_session FROM task WHERE tid = ?")
+      .get(tid)!.anchor_session;
+    h.db
+      .query(
+        `INSERT INTO workflow_run (run_id, wf_launch_id, session_id, workflow_name, transcript_dir,
+                                   default_model, launch_prompt_id, n_phases_planned, started_at, ended_at, tid)
+         VALUES ('wf-1','launch-1',?,'demo',NULL,NULL,'p1',2,'2026-02-01T00:00:00Z',NULL,?)`,
+      )
+      .run(session, tid);
+    for (const [idx, title] of [[0, "survey"], [1, "build"]] as const) {
+      h.db
+        .query(
+          "INSERT INTO workflow_phase (run_id, wf_launch_id, phase_idx, title, detail, model) VALUES ('wf-1','launch-1',?,?,NULL,NULL)",
+        )
+        .run(idx, title);
+    }
+    h.db
+      .query(
+        `INSERT INTO agent_run (agent_id, session_id, run_id, wf_launch_id, agent_type, spawn_depth,
+                                launch_prompt_id, status, label, started_at, ended_at, interval_src,
+                                phase_idx, phase_conf, tid)
+         VALUES ('a1', ?, 'wf-1', 'launch-1', 'general-purpose', 1, 'p1', 'completed', 'demo',
+                 '2026-02-01T00:01:00Z', '2026-02-01T00:05:00Z', 'transcript', 0, 'exact', ?)`,
+      )
+      .run(session, tid);
+    return session;
+  }
+
+  /** Turn on the seed rate, so `est open` converts the band AT OPEN TIME. */
+  function seedRate(perPoint: number): void {
+    h.db.query("UPDATE config SET v = ? WHERE k = 'sp_seed_wcet_per_point'").run(String(perPoint));
+    h.db.query("UPDATE config SET v = 'v1' WHERE k = 'sp_seed_anchor_id'").run();
+  }
+
+  test("a points task with no rate contributes NO number to the baseline panel", async () => {
+    flipToPoints();
+    await completed(30, 60_000, 8, 13);
+
+    const r = retro(h.db, { dryRun: true, asOf: new Date("2026-03-01T00:00:00Z") });
+    const s = r.scoring;
+    // The outcome EXISTS and is completed and priced — it is the comparison that is
+    // undefined, not the data that is missing, which is the distinction the counters
+    // and the alert carry.
+    expect(s.unscorable.baseline).toBe(1);
+    expect(s.n_scored).toBe(0);
+    expect(s.pinball_p50).toBeNull();
+    expect(s.pinball_p90).toBeNull();
+    expect(s.log_score).toBeNull();
+    expect(s.coverage_p50).toBeNull();
+    expect(s.coverage_p90).toBeNull();
+    expect(s.cov_lo).toBeNull();
+    expect(s.cov_hi).toBeNull();
+    expect(r.alerts.join(" ")).toContain("unit_refusal");
+
+    // `velocity_raw` is Work-CET PER POINT and stays a real measurement, so the
+    // raw-denominated origin ratios are computed over the refused row too.
+    expect(s.origin.velocity_main).toBeCloseTo(60_000 / 8, 6);
+  });
+
+  test("a points task WITH a rate at open scores normally at task level", async () => {
+    flipToPoints();
+    seedRate(10_000);
+    await completed(31, 60_000, 8, 13); // cal = 80,000 / 130,000 Work-CET
+
+    const s = retro(h.db, { dryRun: true, asOf: new Date("2026-03-01T00:00:00Z") }).scoring;
+    expect(s.unscorable.baseline).toBe(0);
+    expect(s.n_scored).toBe(1);
+    expect(s.pinball_p50).not.toBeNull();
+    expect(s.coverage_p50).toBe(1); // 60,000 <= 80,000
+    expect(s.coverage_p90).toBe(1);
+  });
+
+  test("a legacy Work-CET task is scored exactly as before", async () => {
+    await completed(32, 2000, 1000, 3000);
+
+    const s = retro(h.db, { dryRun: true, asOf: new Date("2026-03-01T00:00:00Z") }).scoring;
+    expect(s.unscorable).toEqual({ baseline: 0, refinement: 0, block_tasks: 0, blocks: 0 });
+    expect(s.n_scored).toBe(1);
+    // pinball(actual=2000, p50=1000, 0.5) = 0.5 * 1000
+    expect(s.pinball_p50).toBeCloseTo(500, 6);
+    expect(s.coverage_p50).toBe(0);
+    expect(s.coverage_p90).toBe(1);
+  });
+
+  /**
+   * The refinement leg is guarded on BOTH ends of its pair: `pinball` reads the
+   * refinement's band and `moved_toward_actual` reads the baseline's, so one
+   * unconverted points band on either side makes the whole comparison cross-unit.
+   */
+  test("a refinement pair is refused when either end is an unconverted points band", async () => {
+    flipToPoints();
+    const tid = await completed(36, 60_000, 8, 13, { close: false });
+    const ref = await h.cli(
+      "open", "--tid", tid, "--reason", "refinement",
+      "--raw-p50", "10", "--raw-p90", "16",
+      "--kind", "implement", "--subject", "sized work 36",
+      "--exp-agents", "2", "--exp-wf-phases", "0", "--exp-files-write", "3",
+      "--exp-turns", "10", "--exp-requests", "20", "--json",
+    );
+    expect(ref.code).toBe(0);
+    expect((await h.cli("close", tid, "--force")).code).toBeLessThanOrEqual(3);
+
+    const s = retro(h.db, { dryRun: true, asOf: new Date("2026-03-01T00:00:00Z") }).scoring;
+    expect(s.unscorable.refinement).toBe(1);
+    expect(s.refinement.n).toBe(0);
+    expect(s.refinement.pinball_p50).toBeNull();
+    expect(s.refinement.moved_toward_actual_pct).toBeNull();
+  });
+
+  test("v_block_accuracy nulls the actual under points and says why", async () => {
+    flipToPoints();
+    const tid = await completed(33, 60_000, 8, 13, { close: false });
+    const session = seedWorkflow(tid);
+    expect((await h.cli("block", tid, "--phase", "0", "--title", "survey", "--p50", "3", "--p90", "5")).code).toBe(0);
+    expect((await h.cli("block", tid, "--phase", "1", "--title", "build", "--p50", "5", "--p90", "8")).code).toBe(0);
+    request(h.db, "rq-blk-33", { session, agent: "a1", origin: "subagent", out: 40_000 });
+    attributeTasks(h.db);
+
+    const rows = h.db
+      .query<{ phase_idx: number; p50_wcet: number; actual_wcet: number | null; unit_mismatch: number }, []>(
+        "SELECT phase_idx, p50_wcet, actual_wcet, unit_mismatch FROM v_block_accuracy ORDER BY phase_idx",
+      )
+      .all();
+    expect(rows).toHaveLength(2);
+    // The ESTIMATE side is still true and still wanted — the board renders it — so the
+    // row survives; it is the actual beside it that is withheld.
+    expect(rows[0]).toMatchObject({ phase_idx: 0, p50_wcet: 3, actual_wcet: null, unit_mismatch: 1 });
+    // Phase 1 never ran, so there is no actual to refuse: `unit_mismatch` counts
+    // REFUSALS, not absences.
+    expect(rows[1]).toMatchObject({ phase_idx: 1, p50_wcet: 5, actual_wcet: null, unit_mismatch: 0 });
+  });
+
+  test("a Work-CET task's blocks keep their actuals and are never flagged", async () => {
+    const tid = await completed(34, 60_000, 1000, 3000, { close: false });
+    const session = seedWorkflow(tid);
+    expect((await h.cli("block", tid, "--phase", "0", "--title", "survey", "--p50", "300", "--p90", "500")).code).toBe(0);
+    request(h.db, "rq-blk-34", { session, agent: "a1", origin: "subagent", out: 40_000 });
+    attributeTasks(h.db);
+
+    const row = h.db
+      .query<{ actual_wcet: number | null; unit_mismatch: number }, []>(
+        "SELECT actual_wcet, unit_mismatch FROM v_block_accuracy WHERE phase_idx = 0",
+      )
+      .get()!;
+    expect(row.actual_wcet).toBe(40_000);
+    expect(row.unit_mismatch).toBe(0);
+  });
+
+  /**
+   * The block axis is refused MORE broadly than the task band, and deliberately: an
+   * `estimate_block` row is stored in the unit in force and nothing ever converts it —
+   * the table has no `cal_*` pair and its append-only triggers mean it could not acquire
+   * one — so a rate applied to `estimate` at `est open` does not reach the blocks
+   * hanging off it. A rolled-up points figure pinballed against a Work-CET actual would
+   * be cross-unit however well the task band itself scores.
+   */
+  test("the block panel stays refused even when the task band WAS converted at open", async () => {
+    flipToPoints();
+    seedRate(10_000);
+    const tid = await completed(35, 60_000, 8, 13, { close: false });
+    const session = seedWorkflow(tid);
+    expect((await h.cli("block", tid, "--phase", "0", "--title", "survey", "--p50", "3", "--p90", "5")).code).toBe(0);
+    request(h.db, "rq-blk-35", { session, agent: "a1", origin: "subagent", out: 40_000 });
+    attributeTasks(h.db);
+    expect((await h.cli("close", tid, "--force")).code).toBeLessThanOrEqual(3);
+
+    const s = retro(h.db, { dryRun: true, asOf: new Date("2026-03-01T00:00:00Z") }).scoring;
+    // Task level: converted at open, so it scores.
+    expect(s.n_scored).toBe(1);
+    expect(s.unscorable.baseline).toBe(0);
+    // Block level: refused, and the verdict falls through to the arm that already
+    // meant "we cannot tell".
+    expect(s.blocks.rollup_pinball_p50).toBeNull();
+    expect(s.blocks.task_pinball_p50).toBeNull();
+    expect(s.blocks.per_block_pinball_p50).toBeNull();
+    expect(s.blocks.n_tasks).toBe(0);
+    expect(s.blocks.verdict).toBe("insufficient_data");
+    expect(s.unscorable.block_tasks).toBe(1);
+    expect(s.unscorable.blocks).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 10 — schema migration 15 -> 16
+// ---------------------------------------------------------------------------
+
+describe("schema migration 15 -> 16", () => {
+  let dir: string;
+  let db: Database;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "est-sp-migrate16-"));
+    db = openDb({ path: join(dir, "estimator.db") });
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("a v15 database migrates to exactly the shape schema.sql builds", () => {
+    // The pre-v16 definition, verbatim: no unit guard on either column.
+    db.exec(`
+      DROP VIEW v_block_accuracy;
+      CREATE VIEW v_block_accuracy AS
+      SELECT b.eid, e.tid, b.phase_idx, b.title, b.p50_wcet, b.p90_wcet, b.exp_agents,
+             pa.wcet AS actual_wcet, pa.n_agents, pa.phase_conf
+      FROM estimate_block b
+      JOIN estimate e     ON e.eid = b.eid
+      JOIN workflow_run r ON r.tid = e.tid
+      LEFT JOIN v_phase_actual pa
+             ON pa.run_id = r.run_id AND pa.wf_launch_id = r.wf_launch_id
+            AND pa.phase_idx = b.phase_idx;
+      UPDATE config SET v = '15' WHERE k = 'schema_version';
+    `);
+    // Migration rule 2: a value Craig has already tuned must survive untouched.
+    db.query("UPDATE config SET v='999' WHERE k='shrink_k'").run();
+    const path = join(dir, "estimator.db");
+    db.close();
+
+    db = openDb({ path }); // migrates on open
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(db.query<{ v: string }, []>("SELECT v FROM config WHERE k='shrink_k'").get()?.v).toBe("999");
+
+    const freshDir = mkdtempSync(join(tmpdir(), "est-sp-fresh16-"));
+    const fresh = openDb({ path: join(freshDir, "estimator.db") });
+    try {
+      const objects = (d: Database): unknown =>
+        d
+          .query<{ type: string; name: string; sql: string | null }, []>(
+            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+          )
+          .all();
+      expect(objects(db)).toEqual(objects(fresh));
+    } finally {
+      fresh.close();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+  });
+
+  test("the step is idempotent against a file that already has the new view", () => {
+    const path = join(dir, "estimator.db");
+    db.query("UPDATE config SET v = '15' WHERE k = 'schema_version'").run();
+    db.close();
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(
+      db
+        .query<{ n: number }, []>(
+          "SELECT COUNT(*) AS n FROM pragma_table_info('v_block_accuracy') WHERE name='unit_mismatch'",
+        )
+        .get()!.n,
+    ).toBe(1);
   });
 });

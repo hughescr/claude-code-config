@@ -2983,11 +2983,16 @@ async function cmdBlock(ctx: Ctx): Promise<number> {
               `${r.declaredPhases === null ? "" : `/${r.declaredPhases}`} block(s) recorded)`,
           );
           // The roll-up, after every block: for decomposed work the SUM is the estimate,
-          // so it has to be visible while it is being built rather than only once it is
-          // committed. `est retro` has always scored the task band against this number.
+          // so it has to be visible while it is being built. `est retro` has always
+          // scored the task band against this number. It does NOT advertise
+          // `--from-blocks` here: that flag needs `--tid`, so it can only land as a
+          // refinement, and `est close` scores MIN(eid) — pointing at it from inside the
+          // blocking loop is what taught the coarse-open-then-roll-up order that leaves
+          // the coarse guess as the scored baseline.
           ctx.out(
             `      roll-up so far  ${num(r.rollup.p50)} / ${num(r.rollup.p90)} ${unit} over ${r.rollup.blocks} block(s)` +
-              ` — commit it as the task band with \`est open --tid ${r.tid} --reason refinement --from-blocks\``,
+              ` — should converge on the band this task was opened with; if it has genuinely moved,` +
+              ` re-estimate deliberately (\`est open --tid ${r.tid} --reason refinement\`)`,
           );
           if (r.declaredPhases !== null && r.blocksSoFar < r.declaredPhases) {
             ctx.out(
@@ -3892,6 +3897,18 @@ function renderRetro(r: RetroReport): string {
         `exp_agents residual ${s.origin.exp_agents_residual?.toFixed(1) ?? "n/a"} · parallelism ${s.origin.parallelism_p50?.toFixed(2) ?? "n/a"}×`,
     );
   }
+  // Said whichever branch ran, INCLUDING the n=0 one: "nothing to calibrate yet" and
+  // "the comparison is undefined" are different sentences, and a points cold start
+  // produces the second while looking exactly like the first.
+  {
+    const u = s.unscorable;
+    if (u.baseline + u.refinement + u.block_tasks + u.blocks > 0) {
+      lines.push(
+        `  UNDEFINED, not missing: ${u.baseline} baseline · ${u.refinement} refinement · ${u.block_tasks} block-task · ` +
+          `${u.blocks} per-block comparison(s) refused — band in story points, actual in Work-CET, no rate applied at open`,
+      );
+    }
+  }
   lines.push("");
   if (r.buckets.length > 0) {
     lines.push("multipliers in force after this retro");
@@ -4065,9 +4082,15 @@ open:
   --exp-agents <n> --exp-wf-phases <n> --exp-files-write <n> --exp-turns <n> --exp-requests <n>
   [--tid <tid> --reason refinement|scope_change|recalibration]   append a re-estimate
   [--from-blocks]         with --tid: take the band from SUM(this task's block estimates)
-                          instead of --raw-p50/--raw-p90, which must then be omitted. For
-                          decomposed work the decomposition IS the estimate; a whole-task
-                          number issued beside it is a second, worse guess.
+                          instead of --raw-p50/--raw-p90, which must then be omitted.
+                          A REFINEMENT lever — it requires --tid, so it can only ever be
+                          a re-estimate, and est close scores the FIRST estimate. Use it
+                          when you re-sized the phases mid-task, not to open.
+                          FOR DECOMPOSED WORK, OPEN WITH THE SUM: size each phase, add
+                          them up, est open ONCE with that total, then est block per
+                          phase. The decomposition IS the estimate, and it has to be the
+                          FIRST one or the coarse guess stays the scored baseline (and
+                          the sample velocity_raw is fitted from).
   [--session <sid>] [--prompt <promptId>]
   --continue <tid>        sugar: bind this session and append a refinement
 
@@ -4075,8 +4098,11 @@ block <tid>:
   --phase <i>             0-BASED — the phases[] index, NOT workflowProgress.phaseIndex
   --title <t> --p50 <n> --p90 <n> [--exp-agents <n>] [--model <m>]
                           Same unit and same bound as est open — blocks roll UP into the
-                          task band, so they are denominated in whatever it is. Every block
-                          prints the roll-up so far; est open --tid <tid> --from-blocks commits it.
+                          task band, so they are denominated in whatever it is. Run AFTER
+                          est open, with the SAME sizes you summed to produce its band:
+                          this records the decomposition for per-phase attribution, it
+                          does not replace the task band. Every block prints the roll-up
+                          so far, which should converge on the band already issued.
 
 bind <tid>:               [--session <sid>] [--task <n>] [--run <runId>] [--agent <agentId>]
 scope <tid>:              --reason <text> [--subject <t>] [--description <t>] [--dod <json|@file>]

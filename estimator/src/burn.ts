@@ -24,6 +24,7 @@ import type { Database } from "bun:sqlite";
 import { getConfig, openDb, unvalidatedRetired } from "./db.ts";
 import { attrRetired, attrWindow } from "./attribute.ts";
 import {
+  bandInWcet,
   COLD_START_N,
   isoNow,
   isPointsEstimand,
@@ -1133,7 +1134,11 @@ export function bandUnit(db: Database, row: BandUnitRow, resolve?: PointsRateRes
   const p50 = row.raw_p50_wcet;
   const p90 = row.raw_p90_wcet;
   const anchor = row.sp_anchor_id;
-  if (p50 > 0 && row.cal_p50_wcet !== p50) {
+  // State 2 vs state 3, decided by the SHARED rule in `src/tasks.ts` rather than by a
+  // local copy of it — `bandInWcet` is the same predicate the three scoring surfaces
+  // consult, so a band this file calls "converted at open" is exactly the band
+  // `est close` and `est retro` are willing to score.
+  if (bandInWcet(row)) {
     return {
       p50: row.cal_p50_wcet,
       p90: row.cal_p90_wcet,

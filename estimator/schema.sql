@@ -1136,9 +1136,32 @@ WHERE a.run_id IS NOT NULL
 GROUP BY a.run_id, a.wf_launch_id, a.phase_idx;
 
 -- R3: block estimate vs block actual — the evidence for "smaller items estimate better" (§3.2, §7.4).
+--
+-- v16, UNIT ENFORCED on the block axis — the SQL half of the one refusal `bandUnscorable`
+-- and `blocksInWcet` express in TypeScript (src/tasks.ts). `p50_wcet`/`p90_wcet` here are
+-- whatever `config.estimand` was at `est block`, and NOTHING ever converts an
+-- estimate_block row: the table has no cal_* pair, and estb_ro_u / estb_ro_d mean it could
+-- never acquire one retroactively. `actual_wcet` on the other side is Work-CET off the logs
+-- (v_phase_actual -> v_wcet), always, because there is no such thing as a log-derived story
+-- point. So under 'story_point' the two columns are in DIFFERENT UNITS and any loss
+-- computed across them is not a weak measurement, it is not a measurement.
+--
+-- Note this is STRICTLY BROADER than the task-band guard. A story-point band that had a
+-- rate at `est open` has Work-CET cal_* and scores normally at task level — but that
+-- conversion happened on `estimate`, not on the blocks hanging off it, so the block axis
+-- stays refused for as long as the estimand is points.
+--
+-- The refusal is a NULL actual rather than a dropped row: the estimate side of the row is
+-- still true and still wanted (the board reads title/p50/p90/exp_agents off this view), and
+-- retro's per-block leg already filtered `actual_wcet IS NOT NULL`, so the existing consumer
+-- refuses correctly without knowing why. `unit_mismatch` is what carries the why — 1 only
+-- where an actual EXISTS and had to be withheld, so it counts refusals rather than the
+-- unrun phases that are simply absent.
 CREATE VIEW v_block_accuracy AS
 SELECT b.eid, e.tid, b.phase_idx, b.title, b.p50_wcet, b.p90_wcet, b.exp_agents,
-       pa.wcet AS actual_wcet, pa.n_agents, pa.phase_conf
+       CASE WHEN e.estimand = 'story_point' THEN NULL ELSE pa.wcet END AS actual_wcet,
+       CASE WHEN e.estimand = 'story_point' AND pa.wcet IS NOT NULL THEN 1 ELSE 0 END AS unit_mismatch,
+       pa.n_agents, pa.phase_conf
 FROM estimate_block b
 JOIN estimate e     ON e.eid = b.eid
 JOIN workflow_run r ON r.tid = e.tid
@@ -1351,7 +1374,7 @@ WHERE s.terminator = 'open'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '15'),
+  ('schema_version',          '16'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.

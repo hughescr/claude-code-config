@@ -580,6 +580,79 @@ export function pointsToWcet(db: Database, key: PointsRateKey): PointsRate {
   return { rate: seed, source: "seed", n: 0 };
 }
 
+/**
+ * The columns needed to decide what unit an `estimate` row's numbers are in. Every
+ * band-carrying row satisfies it: `close.ts`'s baseline, the board's estimate row,
+ * `burn.ts`'s {@link BandUnitRow}, and the retro's scoring joins.
+ */
+export interface BandUnitColumns {
+  readonly estimand: string;
+  readonly raw_p50_wcet: number;
+  readonly cal_p50_wcet: number;
+}
+
+/**
+ * THE rule for whether `estimate.cal_p50_wcet` / `cal_p90_wcet` are Work-CET.
+ *
+ * Two states, and the second is the cold start every scoring surface independently got
+ * wrong before this helper existed:
+ *
+ *  1. **Not `story_point`** — the band has always been absolute Work-CET. True.
+ *  2. **`story_point`** — `cal = raw x Work-CET-per-point`, so the band is Work-CET iff
+ *     {@link pointsToWcet} had a rate at `est open`. When it did not, BOTH multipliers
+ *     were exactly 1.0 (the ordinary uncalibrated path) and `cal_*` are still POINTS.
+ *     Detected from the row alone: `cal_p50 === raw_p50` iff nothing converted it.
+ *
+ * A fitted `mult_p50` of exactly 1.0 reads as unconverted and so returns false — the
+ * SAFE direction, and the same trade `bandUnit` documents: one Work-CET per point is
+ * not a number this system can produce, and the cost of being wrong is a refused score
+ * rather than a wrong one.
+ */
+export function bandInWcet(band: BandUnitColumns): boolean {
+  if (!isPointsEstimand(band.estimand)) return true;
+  return band.raw_p50_wcet > 0 && band.cal_p50_wcet !== band.raw_p50_wcet;
+}
+
+/**
+ * The REFUSAL, and the reason this is one shared function rather than four copies.
+ *
+ * True when scoring a Work-CET actual against this band's `cal_*` would cross units:
+ * the band is in story points and no conversion was applied at `est open`. Every
+ * consumer that pinballs, log-scores, ratios or coverage-tests an actual against
+ * `cal_p50_wcet` / `cal_p90_wcet` must consult this first and emit **NULL** when it
+ * holds — never a converted number.
+ *
+ * Converting here instead would mean choosing between the rate pinned at issue time
+ * (there is none — that is the state) and whatever rate exists today, which is a
+ * modelling decision nobody has made; and the output would wear the units of a
+ * measurement while being neither. NULL is a state the schema already admits
+ * (`outcome.velocity_cal` and `outcome.in_band` are both nullable) and every consumer
+ * already handles.
+ *
+ * Call sites: `close.ts` (`velocity_cal` / `in_band`), `retro.ts` `scorePanel` and
+ * `blockPanel`, and `v_block_accuracy`'s SQL equivalent in `schema.sql`.
+ */
+export function bandUnscorable(band: BandUnitColumns): boolean {
+  return !bandInWcet(band);
+}
+
+/**
+ * Whether this estimate's BLOCK quantiles (`estimate_block.p50_wcet` / `p90_wcet`) are
+ * Work-CET — a strictly stronger condition than {@link bandInWcet}, and deliberately a
+ * second function rather than a reuse of it.
+ *
+ * `est block` stores what it was given, in the unit in force at the time, and nothing
+ * ever converts an `estimate_block` row: `estimate_block` has no `cal_*` pair and its
+ * append-only triggers mean it could not acquire one retroactively. So under
+ * `story_point` the block side is points FOREVER, including for a task whose own band
+ * a rate converted at `est open` — that conversion touched `estimate`, not the blocks
+ * hanging off it. A roll-up pinballed against a Work-CET actual is therefore
+ * cross-unit whenever the estimand is points, cold start or not.
+ */
+export function blocksInWcet(estimand: string): boolean {
+  return !isPointsEstimand(estimand);
+}
+
 // ---------------------------------------------------------------------------
 // `est open`
 // ---------------------------------------------------------------------------
@@ -606,6 +679,14 @@ export interface OpenInput {
    * Take the raw band from the SUM of this task's block estimates instead of from
    * `rawP50`/`rawP90` (P1.2 promoted, v15). Requires `tid` — blocks hang off an
    * estimate, so there has to be one to roll up. See {@link blockRollup}.
+   *
+   * Because it requires `tid` it can only ever land as a RE-ESTIMATE, which is why it
+   * is not how decomposed work should be opened: `est close` fits the baseline (and
+   * `velocity_raw`, and therefore the points -> Work-CET rate) from `MIN(eid)`, so a
+   * coarse opening guess followed by a `--from-blocks` refinement leaves the coarse
+   * guess as both the scored baseline and the fitting sample. Sum the blocks yourself
+   * and `est open` ONCE with that sum; use this flag when you genuinely re-sized the
+   * phases mid-task.
    */
   fromBlocks?: boolean;
 }
@@ -617,8 +698,15 @@ export interface OpenInput {
  * per-phase sizes is the thing agents do 1.96x-consistently, and a separate
  * whole-task number issued beside it is a second, worse guess that then disagrees with
  * its own parts. `est retro`'s block panel has always compared the task band against
- * `SUM(estimate_block.p50_wcet)` — `--from-blocks` is what makes them equal BY
- * CONSTRUCTION rather than by luck.
+ * `SUM(estimate_block.p50_wcet)`.
+ *
+ * Which is why the CANONICAL order puts the sum in the FIRST estimate: size the phases,
+ * add them up, `est open` once with the total, then `est block` per phase to record the
+ * decomposition for per-phase attribution. `est close` scores `MIN(eid)`
+ * (`first-estimate-wins`, src/close.ts) and that rule is load-bearing — it is what makes
+ * baseline accuracy a real measurement — so the band it scores has to be the decomposed
+ * number from the outset. `--from-blocks` then means what a refinement should mean: the
+ * phases were re-sized because something was learned.
  *
  * p90 is summed too, not root-sum-squared. Summing p90s assumes the phases overrun
  * together, which is pessimistic if they are independent — and they are not: the
@@ -993,8 +1081,10 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
     if (input.tid === null || input.tid === undefined) {
       throw new UsageError(
         "--from-blocks requires --tid: block estimates hang off an estimate, so there has to be one to roll up. " +
-          "The sequence is `est open` (the first, coarse band) -> `est block` per phase -> " +
-          "`est open --tid <tid> --reason refinement --from-blocks`",
+          "It is a REFINEMENT lever — for when you have re-sized the phases mid-task — not the way to open. " +
+          "The canonical order is: size each phase, SUM them yourself, `est open` ONCE with that sum, then " +
+          "`est block` per phase for per-phase attribution. `est close` scores the FIRST estimate, so opening " +
+          "with a coarse whole-task guess and rolling up afterwards leaves the coarse guess as the baseline.",
       );
     }
     const rollup = blockRollup(db, input.tid);
@@ -1405,9 +1495,10 @@ export interface BlockResult {
   /** The story-point anchor in force, or null under a Work-CET estimand. */
   spAnchor: StoryPointAnchor | null;
   /**
-   * The roll-up so far: what `est open --tid <tid> --reason refinement --from-blocks`
-   * would issue as the task band right now. Shown after every block so the sum is
-   * visible while it is still being built, rather than only once it is committed.
+   * The sum of this estimate's blocks so far. Shown after every block so the total is
+   * visible while it is being built — under the canonical order it should converge on
+   * the band `est open` was already given, and a divergence is the signal to re-estimate
+   * deliberately rather than something to commit silently.
    */
   rollup: { p50: number; p90: number; blocks: number };
 }
