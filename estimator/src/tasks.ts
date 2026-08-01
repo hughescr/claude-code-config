@@ -23,7 +23,7 @@
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { getConfig } from "./db.ts";
+import { ANCHOR_ID_KEY, ANCHOR_TEXT_KEY, getConfig } from "./db.ts";
 import { InvariantError, UsageError } from "./errors.ts";
 import { priceFamily } from "./prices.ts";
 import { resolveEstimatorIdentity, type EstimatorIdentity } from "./identity.ts";
@@ -670,28 +670,56 @@ export interface BandUnitColumns {
   readonly estimand: string;
   readonly raw_p50_wcet: number;
   readonly cal_p50_wcet: number;
+  /**
+   * `estimate.wcet_rate_src` (v19) — the STORED answer to "was a points -> Work-CET
+   * conversion applied to `cal_*`". Required, and that is the load-bearing part of this
+   * interface: a `SELECT estimand, raw_p50_wcet, cal_p50_wcet` no longer typechecks, so
+   * a consumer cannot re-derive the answer from two numbers by accident.
+   */
+  readonly wcet_rate_src: string;
 }
+
+/** `estimate.wcet_rate_src`'s value set. See the schema.sql column comment. */
+export type WcetRateSource = "n/a" | "fitted" | "seed" | "none" | "unrecorded";
 
 /**
  * THE rule for whether `estimate.cal_p50_wcet` / `cal_p90_wcet` are Work-CET.
  *
- * Two states, and the second is the cold start every scoring surface independently got
- * wrong before this helper existed:
+ * **A stored fact since v19, and it had to become one.** The rule used to be an
+ * inference over two columns — `cal_p50 !== raw_p50` was read as proof that a rate had
+ * converted the band — justified on the grounds that it degrades to the honest side. It
+ * does not, and the counter-example is not exotic: fit a rate under anchor v1, bump to
+ * v2, and the FIRST v2 estimate reports `wcet_rate=null` (the anchor-aware bridge
+ * correctly refuses) and then multiplies the band by the v1 snapshot's multiplier anyway
+ * (the anchor-blind calibrator, which `est open` fell through to). `cal` differed from
+ * `raw`, this predicate said "converted", and `est close` scored a `velocity_cal` and an
+ * `in_band` off a rate the system had explicitly refused to issue. An inference over two
+ * numbers cannot distinguish a conversion from a mistake; a recorded value can.
  *
- *  1. **Not `story_point`** — the band has always been absolute Work-CET. True.
- *  2. **`story_point`** — `cal = raw x Work-CET-per-point`, so the band is Work-CET iff
- *     {@link pointsToWcet} had a rate at `est open`. When it did not, BOTH multipliers
- *     were exactly 1.0 (the ordinary uncalibrated path) and `cal_*` are still POINTS.
- *     Detected from the row alone: `cal_p50 === raw_p50` iff nothing converted it.
+ * So the row says which happened:
  *
- * A fitted `mult_p50` of exactly 1.0 reads as unconverted and so returns false — the
- * SAFE direction, and the same trade `bandUnit` documents: one Work-CET per point is
- * not a number this system can produce, and the cost of being wrong is a refused score
- * rather than a wrong one.
+ *  1. **Not `story_point`** — the band has always been absolute Work-CET. True, without
+ *     reading anything else. (`'n/a'` is what the column stores for these rows; the
+ *     estimand is checked first so a mislabelled column cannot override it.)
+ *  2. **`'fitted'` / `'seed'`** — a rate was applied, `estimate.wcet_rate` names it.
+ *  3. **`'none'`** — a points band for which no rate existed. `cal_* = raw_*`, still
+ *     POINTS, unscorable. The refusal IS the stored value.
+ *  4. **`'unrecorded'`** — issued before v19. The old inference is consulted here and
+ *     ONLY here, because for those rows nothing better was ever written down. Rows the
+ *     v18 defect mis-stamped are in this population and cannot be separated from it;
+ *     that history is not repairable and is not pretended otherwise.
  */
 export function bandInWcet(band: BandUnitColumns): boolean {
   if (!isPointsEstimand(band.estimand)) return true;
-  return band.raw_p50_wcet > 0 && band.cal_p50_wcet !== band.raw_p50_wcet;
+  if (band.wcet_rate_src === "fitted" || band.wcet_rate_src === "seed") return true;
+  if (band.wcet_rate_src === "unrecorded") {
+    // Pre-v19 only. A fitted `mult_p50` of exactly 1.0 reads as unconverted and so
+    // returns false — the SAFE direction, and the same trade `bandUnit` documents: one
+    // Work-CET per point is not a number this system can produce, and the cost of being
+    // wrong is a refused score rather than a wrong one.
+    return band.raw_p50_wcet > 0 && band.cal_p50_wcet !== band.raw_p50_wcet;
+  }
+  return false;
 }
 
 /**
@@ -1153,7 +1181,8 @@ INSERT INTO estimate (
   bucket, bucket_n, refclass_as_of, shrink_w,
   cal_p50_wcet, cal_p90_wcet, cal_req_p50, cal_req_p90,
   active_p50_s, active_p90_s, active_model,
-  price_epoch, ref_model, estimand, estimator_model, sp_anchor_id, procedure_version
+  price_epoch, ref_model, estimand, estimator_model, sp_anchor_id, procedure_version,
+  wcet_rate, wcet_rate_src
 ) VALUES (
   $tid, $version, $created_at, $reason, $scope_seq,
   $raw_p50, $raw_p90,
@@ -1161,7 +1190,8 @@ INSERT INTO estimate (
   $bucket, $bucket_n, $refclass_as_of, $shrink_w,
   $cal_p50, $cal_p90, $cal_req_p50, $cal_req_p90,
   NULL, NULL, NULL,
-  $price_epoch, $ref_model, $estimand, $estimator_model, $sp_anchor_id, $procedure_version
+  $price_epoch, $ref_model, $estimand, $estimator_model, $sp_anchor_id, $procedure_version,
+  $wcet_rate, $wcet_rate_src
 )
 `;
 
@@ -1228,6 +1258,37 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
   // for a band whose vintage nobody stated would defeat the whole column.
   const procedureRaw = (getConfig(db, "procedure_version") ?? "").trim();
   const procedureVersion = procedureRaw === "" ? null : procedureRaw;
+
+  // v19: a points band whose anchor has NO recorded definition is refused, before
+  // anything is minted or written.
+  //
+  // `est config set sp_anchor_id v2` deliberately points at an id nobody has defined yet
+  // — the id-then-text order is the supported one — and `est config set sp_anchor_text
+  // "…"` closes the gap. But nothing stood in the gap: a band could be issued against
+  // `v2`, stamped `sp_anchor_id = 'v2'`, and the definition of what its points MEANT
+  // could then be supplied afterwards, chosen with the band already on disk. `estimate`
+  // is append-only, so the band cannot be corrected; the registry is append-only, so the
+  // retroactive definition cannot be corrected either. "8 points against a scale that
+  // did not exist yet" is not a size, and the whole argument for pinning `sp_anchor_id`
+  // onto every band was that a points value without its anchor means nothing.
+  //
+  // Scoped to the BAND being issued, which is always denominated in the ambient anchor:
+  // a re-estimate is held to its baseline's unit by `assertAmbientUnitMatches` above, so
+  // ambient and recorded agree by the time control reaches here. An UNVERIFIED
+  // definition (the v18 migration's reading of the config pair) passes — it is a
+  // definition, recorded, and holding work hostage to a confirmation would be a wrong
+  // refusal in place of a wrong number.
+  if (spAnchor !== null && !spAnchor.defined) {
+    throw new InvariantError(
+      `story-point anchor '${spAnchor.id}' has no recorded definition, so a band sized against it is not a size: ` +
+        "`estimate` is append-only, so the row could never be corrected, and defining the anchor after the band " +
+        "is issued chooses what those points meant with the number already committed",
+      `state the definition first: \`est config set ${ANCHOR_TEXT_KEY} "<what one point is>"\` ` +
+        `(or \`est anchor define ${spAnchor.id} "<what one point is>"\`). ` +
+        `\`est config set ${ANCHOR_ID_KEY} <id>\` deliberately leaves the new id undefined until you do — ` +
+        "that gap is the id-then-text order working, not a bug, and this is the guard that keeps a band out of it",
+    );
+  }
 
   // A RE-ESTIMATE inherits its task's unit; it does not get to restate it from ambient
   // config (v17). Checked FIRST — before the roll-up, before the band bounds, before the
@@ -1480,17 +1541,44 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
     estimand,
   });
   const seeded = wcetRate.source === "seed" && wcetRate.rate !== null;
-  const multP50 = seeded ? wcetRate.rate! : cal.multP50;
+  // False ONLY under story points with no rate from either source. Then the two
+  // numbers below are the raw points, unconverted, and every renderer must say so
+  // instead of printing them as tokens.
+  const wcetAvailable = !points || wcetRate.rate !== null;
+  // THE REFUSAL, made structural (v19). `pointsToWcet` is anchor-aware and `cal` is
+  // not: `calibrationFor` matches on (bucket, family, ref_model, estimand) and has no
+  // anchor leg, so on the FIRST band under a new anchor the bridge correctly returns no
+  // rate and `cal.multP50` is still the PREVIOUS anchor's fitted multiplier. Falling
+  // through to it — which this code did — stored a converted-looking `cal_*` pair and
+  // the old snapshot's `refclass_as_of` / `shrink_w` / `bucket_n` beneath a band whose
+  // rate the system had just refused, and every scoring surface then read `cal != raw`
+  // as licence to score it.
+  //
+  // So the refusal is written down instead of being left to be inferred: multipliers of
+  // exactly 1.0 (`cal = raw`, the band stays POINTS), NO refclass provenance — which is
+  // the cold-start state `refclass_as_of IS NULL` / `shrink_w = 0` already means
+  // everywhere else — and `wcet_rate_src = 'none'` on the row, which is what
+  // {@link bandInWcet} reads and what makes the row unscorable without inferring
+  // anything.
+  const rateRefused = points && wcetRate.rate === null;
+  const multP50 = rateRefused ? 1 : seeded ? wcetRate.rate! : cal.multP50;
   // The seed is a single rate, not a distribution, so it converts BOTH ends: the band
   // width then comes from the estimator's own points spread, unwidened. That is the
   // honest reading of a bootstrap — it says how big a point is, and nothing about how
   // wrong estimators are — and the `source: "seed"` label is what stops it being read
   // as a calibrated envelope.
-  const multP90 = seeded ? wcetRate.rate! : cal.multP90;
-  // False ONLY under story points with no rate from either source. Then the two
-  // numbers below are the raw points, unconverted, and every renderer must say so
-  // instead of printing them as tokens.
-  const wcetAvailable = !points || wcetRate.rate !== null;
+  const multP90 = rateRefused ? 1 : seeded ? wcetRate.rate! : cal.multP90;
+  // What the ROW records about the conversion. `wcetRateApplied` is non-null exactly
+  // when `wcetRateSrc` is 'fitted' or 'seed', which is the invariant `bandInWcet` and
+  // `bandUnit` both lean on.
+  const wcetRateSrc: WcetRateSource = !points
+    ? "n/a"
+    : rateRefused
+      ? "none"
+      : seeded
+        ? "seed"
+        : "fitted";
+  const wcetRateApplied = points && !rateRefused ? multP50 : null;
 
   const calP50 = Math.max(0, Math.round(rawP50 * multP50));
   const calP90 = Math.max(0, Math.round(rawP90 * multP90));
@@ -1571,9 +1659,16 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
       $exp_turns: input.expTurns,
       $exp_requests: input.expRequests,
       $bucket: cal.bucket,
-      $bucket_n: cal.bucketN,
-      $refclass_as_of: cal.refclassAsOf,
-      $shrink_w: cal.shrinkW,
+      // NO refclass provenance when the rate was refused (v19). `cal.*` here belongs to a
+      // snapshot fitted at some OTHER anchor — that is precisely why the bridge refused
+      // it — so recording its `as_of`, its shrinkage and its sample count under this band
+      // would be attributing a number to a reference class that did not produce it, and
+      // `est burn` reads `refclass_as_of IS NULL` as "seed, not fitted". NULL / 0 is the
+      // cold-start state every other uncalibrated band already carries, and it is what
+      // this one is. `bucket_n` becomes the honest count at THIS band's own anchor.
+      $bucket_n: rateRefused ? liveBucketN(db, unit, bucket, "this") : cal.bucketN,
+      $refclass_as_of: rateRefused ? null : cal.refclassAsOf,
+      $shrink_w: rateRefused ? 0 : cal.shrinkW,
       $cal_p50: calP50,
       $cal_p90: calP90,
       $cal_req_p50: calReqP50,
@@ -1584,6 +1679,10 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
       // Work-CET band is exactly as much a part of what that band means as the procedure
       // behind a points band. NULL only when nobody has stated one.
       $procedure_version: procedureVersion,
+      // v19: whether a conversion happened, and at what rate — the STORED fact that
+      // replaced `cal != raw`. See {@link bandInWcet}.
+      $wcet_rate: wcetRateApplied,
+      $wcet_rate_src: wcetRateSrc,
     };
     // `$ref_model`, `$estimand` and `$sp_anchor_id` come from the identity rather than
     // from three separate locals, so the row is stamped with exactly the value the
@@ -2285,6 +2384,23 @@ export function refclass(
      WHERE o.final_status = 'completed'
        AND e.ref_model = ? AND e.estimand = ?`;
   baseParams.push(refModel, estimand);
+  // v19: the ANCHOR is part of the filter under points, and its absence is defect 3.
+  //
+  // Every column in this projection is denominated in the anchor the band was issued
+  // against: `raw_p50` is a number of points OF SOME ANCHOR, and `velocity` is
+  // `actual_wcet / raw_p50`, i.e. Work-CET PER POINT of that anchor. Without this clause
+  // `est refclass` listed v1 rows — "raw p50 (pts) 8, velocity 2000×" — under a header
+  // reading `anchor v2`, in the one output the ceremony requires an agent to read BEFORE
+  // stating any number. A v1 point and a v2 point are different sizes by construction;
+  // that is what bumping the id means.
+  //
+  // `IS ?` rather than `= ?`, matching `SampleScopeImpl.where`: the parameter is NULL for
+  // a Work-CET band and SQLite's `=` never matches NULL. Not applied at all outside
+  // points, where `sp_anchor_id` is NULL on every row and carries no meaning.
+  if (isPointsEstimand(estimand)) {
+    sql += " AND e.sp_anchor_id IS ?";
+    baseParams.push(storyPointAnchor(db).id);
+  }
   if (q !== null) {
     sql += " AND t.tid IN (SELECT tid FROM task_fts WHERE task_fts MATCH ?)";
     baseParams.push(q);
@@ -2329,14 +2445,51 @@ export function refclass(
   }));
 
   const snap = newestRefclass(db, bucket, estFamily, refModel, estimand);
-  const liveN = liveBucketN(db, BandIdentity.ambient(db), bucket);
-  const n = snap?.n ?? liveN;
-  const uncalibrated = snap === null || n < COLD_START_N;
+  const points = isPointsEstimand(estimand);
+  const ambient = BandIdentity.ambient(db);
+  // Anchor-aware under points, for the same reason the match filter above is: `n` is the
+  // size of the reference class the multiplier beside it speaks for, and pooling two
+  // anchors' completed work into one count is the same category error as pooling their
+  // points.
+  const liveN = liveBucketN(db, ambient, bucket, points ? "this" : "any");
+  // `refclass` is not keyed on the anchor (`(as_of, bucket, estimator_family, ref_model,
+  // estimand)`), so `snap.n` is a count across every anchor in the unit and cannot stand
+  // in for the anchor-local one. Under points the live count is the only honest answer.
+  const n = points ? liveN : (snap?.n ?? liveN);
+  // v19, defect 3: under points the multiplier IS the Work-CET-per-point rate, so it is
+  // shown only when `pointsToWcet` — the anchor-aware bridge `est open` will consult a
+  // moment later, with this same anchor — is willing to hand that rate out. Before this,
+  // the two lines were computed by different rules and printed side by side: `est
+  // refclass` under `anchor v2` rendered `points→Work-CET: NO RATE YET` and, three lines
+  // down, `×2000.00 p50 · snapshot <as_of>` off the v1 snapshot. That is one anchor's
+  // number beside another anchor's label, in the output the ceremony mandates an agent
+  // read BEFORE stating any figure — so the stale multiplier anchors the estimate
+  // directly, which is exactly how a refused rate still moves a number.
+  //
+  // The SMALLER of the two available fixes, chosen deliberately over adding the anchor to
+  // `refclass`'s primary key. Re-keying the snapshot would change what `est retro` FITS,
+  // not merely what this verb renders: the retro deliberately fits across every anchor in
+  // the unit (see `AnchorFilter`'s `"any"`), and a per-anchor key makes every anchor bump
+  // empty its own reference class on day one. That is a calibration-model decision, not a
+  // rendering fix, and it is not this change's to make. Suppression makes `est refclass`
+  // agree with `est open` — which is the property that was missing — and leaves the
+  // snapshot exactly where the retro put it.
+  const rateForAnchor = pointsToWcet(db, {
+    bucket,
+    estimatorFamily: estFamily,
+    refModel,
+    estimand,
+  });
+  const multiplierSuppressed = points && rateForAnchor.source !== "fitted";
+  const uncalibrated = snap === null || n < COLD_START_N || multiplierSuppressed;
 
   const bucketLine: RefclassBucketLine = {
     bucket,
     n,
-    n_eff: snap?.n_eff ?? null,
+    // Suppressed with the multiplier it describes: `n_eff` is the decayed sample count
+    // BEHIND that multiplier, so leaving it standing beside a withheld number would print
+    // the weight of a fit whose result is not shown.
+    n_eff: uncalibrated ? null : (snap?.n_eff ?? null),
     mult_p50: uncalibrated ? null : (snap?.mult_p50 ?? null),
     mult_p90: uncalibrated ? null : (snap?.mult_p90 ?? null),
     boot_p50:
@@ -2354,13 +2507,21 @@ export function refclass(
 
   let cold: RefclassResult["cold_distribution"] = null;
   if (uncalibrated) {
-    const actuals = db
-      .query<{ w: number }, [string, string]>(
-        `SELECT COALESCE(o.actual_wcet_at_epoch, o.actual_wcet) AS w
+    // Anchor-scoped under points, exactly like the match list and `n` above. The actuals
+    // themselves are Work-CET whatever the anchor, but this distribution is offered as
+    // "what work in THIS reference class has cost", and a reference class that spans an
+    // anchor bump is two classes.
+    const coldParams: Array<string | null> = [refModel, estimand];
+    let coldSql = `SELECT COALESCE(o.actual_wcet_at_epoch, o.actual_wcet) AS w
            FROM v_outcome_current o JOIN estimate e ON e.eid = o.eid_at_start
-          WHERE o.final_status = 'completed' AND e.ref_model = ? AND e.estimand = ?`,
-      )
-      .all(refModel, estimand)
+          WHERE o.final_status = 'completed' AND e.ref_model = ? AND e.estimand = ?`;
+    if (points) {
+      coldSql += " AND e.sp_anchor_id IS ?";
+      coldParams.push(storyPointAnchor(db).id);
+    }
+    const actuals = db
+      .query<{ w: number }, Array<string | null>>(coldSql)
+      .all(...coldParams)
       .map((r) => r.w);
     cold = {
       n: actuals.length,
@@ -2381,8 +2542,11 @@ export function refclass(
     cold_distribution: cold,
     ref_model: refModel,
     estimand,
-    sp_anchor: isPointsEstimand(estimand) ? storyPointAnchor(db) : null,
-    wcet_rate: pointsToWcet(db, { bucket, estimatorFamily: estFamily, refModel, estimand }),
+    sp_anchor: points ? storyPointAnchor(db) : null,
+    // The SAME resolution the bucket line above is suppressed by, not a second call: one
+    // answer to "is there a rate for this anchor", rendered twice, so the two lines
+    // cannot disagree the way they did.
+    wcet_rate: rateForAnchor,
     estimator_model: identity.model,
     estimator_method: identity.method,
   };

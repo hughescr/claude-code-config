@@ -64,6 +64,18 @@ function flipToPoints(): void {
   h.db.query("UPDATE config SET v = ? WHERE k = 'estimand'").run(POINTS_ESTIMAND);
 }
 
+/**
+ * Bump the anchor the way a user has to since v19: the id SELECTS a definition and the
+ * text STATES it, and `est open` refuses a points band in the gap between the two. Tests
+ * that issue a band after a bump therefore state the definition; the ones that only ask
+ * `pointsToWcet` a question leave the id dangling on purpose, because "no definition
+ * recorded" is a legal state for a config key and an illegal one for a band.
+ */
+async function bumpAnchor(id: string, text: string): Promise<void> {
+  expect((await h.cli("config", "set", "sp_anchor_id", id)).code).toBe(0);
+  expect((await h.cli("config", "set", "sp_anchor_text", text)).code).toBe(0);
+}
+
 const KEY = {
   bucket: "global",
   estimatorFamily: "unknown",
@@ -268,8 +280,11 @@ describe("the story-point anchor is pinned and surfaces", () => {
   test("re-wording the anchor cannot redenominate a band already on disk", async () => {
     flipToPoints();
     const tid = await completed(8, 1000, 5, 8);
-    h.db.query("UPDATE config SET v = 'v2' WHERE k = 'sp_anchor_id'").run();
-    h.db.query("UPDATE config SET v = 'add one CLI flag with a test' WHERE k = 'sp_anchor_text'").run();
+    // Through the CLI, not raw SQL: since v19 a band cannot be issued against an anchor
+    // id with no `sp_anchor` row, and hand-editing the two config keys leaves exactly
+    // that state. `setConfig` is the registry's writer and the id-then-text order is what
+    // registers the definition.
+    await bumpAnchor("v2", "add one CLI flag with a test");
 
     expect(
       h.db
@@ -708,7 +723,7 @@ describe("the bootstrapped seed", () => {
     expect(human.out).toContain("LIVE");
 
     // Move the anchor: the seed is still SET but no longer applies, and says so.
-    await h.cli("config", "set", "sp_anchor_id", "v2");
+    await bumpAnchor("v2", "add one CLI flag with a test");
     expect(
       (await h.cli("census", "--json")).json<{ story_points: { seed: { live: boolean } } }>()
         .story_points.seed.live,
@@ -743,11 +758,13 @@ describe("schema migration 14 -> 15", () => {
    */
   test("a v14 database migrates to exactly the shape schema.sql builds", () => {
     db.exec(`
-      -- BOTH trailing columns come off, newest first. \`ALTER TABLE ADD COLUMN\` appends
+      -- EVERY trailing column comes off, newest first. \`ALTER TABLE ADD COLUMN\` appends
       -- after the LAST column definition, so a v14 file that still carried v17's
-      -- \`procedure_version\` would come out of the 14 -> 15 step with the two spliced in
-      -- the opposite order to a fresh file — which is precisely the fidelity this test
-      -- exists to catch, but for the wrong reason.
+      -- \`procedure_version\` (or v19's \`wcet_rate\` pair) would come out of the 14 -> 15
+      -- step with them spliced in the opposite order to a fresh file — which is precisely
+      -- the fidelity this test exists to catch, but for the wrong reason.
+      ALTER TABLE estimate DROP COLUMN wcet_rate_src;
+      ALTER TABLE estimate DROP COLUMN wcet_rate;
       ALTER TABLE estimate DROP COLUMN procedure_version;
       ALTER TABLE estimate DROP COLUMN sp_anchor_id;
       DROP VIEW v_task_actual_epoch;
@@ -1201,7 +1218,7 @@ describe("a fitted points rate is denominated in an anchor", () => {
   test("an estimate issued under the new anchor reports NO Work-CET band at all", async () => {
     flipToPoints();
     await fitARate(200);
-    await h.cli("config", "set", "sp_anchor_id", "v2");
+    await bumpAnchor("v2", "add one CLI flag with a test");
 
     turn(h.db, { session: "s-v2", prompt: "p1", at: "2026-03-01T00:00:00Z" });
     const r = await h.cli(
@@ -1225,7 +1242,7 @@ describe("a fitted points rate is denominated in an anchor", () => {
   test("a band keeps ITS anchor's rate after the bump, rather than losing it", async () => {
     flipToPoints();
     await fitARate(300);
-    await h.cli("config", "set", "sp_anchor_id", "v2");
+    await bumpAnchor("v2", "add one CLI flag with a test");
 
     // The corpus is still ten v1 tasks and the snapshot is still fitted from exactly
     // them, so a v1 band is still readable at 2,000 Work-CET per v1 point. The guard is
@@ -1240,7 +1257,7 @@ describe("a fitted points rate is denominated in an anchor", () => {
     flipToPoints();
     // The whole corpus is v2 from the outset, so the only fitted rate that exists is a
     // v2 rate. Asking for a v1 band is asking a question this corpus cannot answer.
-    await h.cli("config", "set", "sp_anchor_id", "v2");
+    await bumpAnchor("v2", "add one CLI flag with a test");
     await fitARate(400);
     const v2 = pointsToWcet(h.db, KEY);
     expect(v2.source).toBe("fitted");
@@ -1262,9 +1279,10 @@ describe("a fitted points rate is denominated in an anchor", () => {
     });
   });
 
-  /** An UNCONVERTED points band on disk — `cal === raw`, which is what says no rate
-   *  existed at `est open` — so `bandUnit` reaches its state-3 branch and asks the
-   *  bridge. Everything but the anchor is held constant. */
+  /** An UNCONVERTED points band on disk — `wcet_rate_src = 'none'`, which is what SAYS
+   *  no rate existed at `est open` (v19: a stored fact, not `cal === raw` inferred) — so
+   *  `bandUnit` reaches its state-3 branch and asks the bridge. Everything but the anchor
+   *  is held constant. */
   function storedBand(anchorId: string | null): BandUnitRow {
     return {
       estimand: POINTS_ESTIMAND,
@@ -1276,6 +1294,8 @@ describe("a fitted points rate is denominated in an anchor", () => {
       refclass_as_of: null,
       ref_model: REF_MODEL,
       estimator_model: "unknown",
+      wcet_rate: null,
+      wcet_rate_src: "none",
     };
   }
 
@@ -1287,7 +1307,7 @@ describe("a fitted points rate is denominated in an anchor", () => {
   test("a v1 band is not rendered at a v2 rate THROUGH bandUnit", async () => {
     flipToPoints();
     // The whole corpus is v2, so the only fitted rate in existence is a v2 rate.
-    await h.cli("config", "set", "sp_anchor_id", "v2");
+    await bumpAnchor("v2", "add one CLI flag with a test");
     await fitARate(600);
 
     // Positive control, and it is what makes the refusal below mean something: a v2 band
@@ -1327,7 +1347,7 @@ describe("a fitted points rate is denominated in an anchor", () => {
   // anchor answers for every card behind it — the same mixing, one layer up.
   test("the board's rate memo is keyed on the anchor, so a v2 card cannot answer for a v1 one", async () => {
     flipToPoints();
-    await h.cli("config", "set", "sp_anchor_id", "v2");
+    await bumpAnchor("v2", "add one CLI flag with a test");
     await fitARate(700);
 
     const seen: Array<string | null | undefined> = [];
@@ -1345,7 +1365,7 @@ describe("a fitted points rate is denominated in an anchor", () => {
   test("a snapshot fitted ACROSS a bump is refused for both anchors", async () => {
     flipToPoints();
     for (let i = 0; i < COLD_START_N; i += 1) await completed(500 + i, 20_000, 10, 20);
-    await h.cli("config", "set", "sp_anchor_id", "v2");
+    await bumpAnchor("v2", "add one CLI flag with a test");
     for (let i = 0; i < COLD_START_N; i += 1) await completed(600 + i, 60_000, 10, 20);
     // One retro, late enough to have seen every close: `refclass` is keyed on
     // (as_of, bucket, family, ref_model, estimand) and NOT on the anchor, so this
@@ -1383,6 +1403,196 @@ describe("a fitted points rate is denominated in an anchor", () => {
         )
         .get(POINTS_ESTIMAND)!.anchor,
     ).toBe("v1");
+  });
+
+  // -------------------------------------------------------------------------
+  // v19, defect 1: a REFUSED rate must not be persisted, and must not be scored
+  // -------------------------------------------------------------------------
+
+  /**
+   * Codex's repro, end to end, and the reason `bandInWcet` had to stop being an
+   * inference.
+   *
+   * `pointsToWcet` is anchor-aware and refuses correctly here — the test above pins
+   * that. `calibrationFor` is NOT anchor-aware, and `est open` fell through to it: the
+   * first v2 band came out multiplied by the V1 snapshot's multiplier, carrying the v1
+   * snapshot's `refclass_as_of` / `shrink_w` / `bucket_n`. `cal != raw` then read as
+   * "a rate converted this", so `est close` recorded a `velocity_cal` and an `in_band`
+   * against a rate the system had just declined to issue.
+   *
+   * Three assertions, and each one fails on its own without the fix.
+   */
+  test("a first band under a new anchor stores cal = raw and no refclass provenance", async () => {
+    flipToPoints();
+    await fitARate(800);
+    await bumpAnchor("v2", "add one CLI flag with a test");
+    expect(pointsToWcet(h.db, KEY)).toEqual({ rate: null, source: null, n: 0 });
+
+    turn(h.db, { session: "s-d1", prompt: "p1", at: "2026-03-01T00:00:00Z" });
+    const r = await h.cli(
+      ...openArgs({ subject: "first v2 band", "raw-p50": 8, "raw-p90": 13 }),
+      "--session", "s-d1", "--prompt", "p1", "--json",
+    );
+    expect(r.code).toBe(0);
+    const tid = r.json<{ tid: string }>().tid;
+
+    const row = h.db
+      .query<
+        {
+          raw_p50_wcet: number;
+          raw_p90_wcet: number;
+          cal_p50_wcet: number;
+          cal_p90_wcet: number;
+          refclass_as_of: string | null;
+          shrink_w: number;
+          wcet_rate: number | null;
+          wcet_rate_src: string;
+        },
+        [string]
+      >(
+        `SELECT raw_p50_wcet, raw_p90_wcet, cal_p50_wcet, cal_p90_wcet, refclass_as_of,
+                shrink_w, wcet_rate, wcet_rate_src
+           FROM estimate WHERE tid = ?`,
+      )
+      .get(tid)!;
+
+    // Codex measured 16,000 / 26,000 here — 8 and 13 v2 points priced per V1 point.
+    expect(row.cal_p50_wcet).toBe(row.raw_p50_wcet);
+    expect(row.cal_p90_wcet).toBe(row.raw_p90_wcet);
+    expect(row.cal_p50_wcet).toBe(8);
+    // No provenance, because no reference class produced this band. The v1 snapshot's
+    // `as_of` used to be stamped here, which is what made the row look calibrated.
+    expect(row.refclass_as_of).toBeNull();
+    expect(row.shrink_w).toBe(0);
+    // And the refusal is a STORED FACT, not a coincidence between two columns.
+    expect(row.wcet_rate).toBeNull();
+    expect(row.wcet_rate_src).toBe("none");
+  });
+
+  test("a band whose rate was refused is unscorable at close, not scored at the old anchor's rate", async () => {
+    flipToPoints();
+    await fitARate(900);
+    await bumpAnchor("v2", "add one CLI flag with a test");
+
+    const at = "2026-03-02T00:00:00Z";
+    turn(h.db, { session: "s-d1b", prompt: "p1", at, durationMs: 60_000 });
+    const r = await h.cli(
+      ...openArgs({ subject: "first v2 band, closed", "raw-p50": 8, "raw-p90": 13 }),
+      "--session", "s-d1b", "--prompt", "p1", "--json",
+    );
+    expect(r.code).toBe(0);
+    const tid = r.json<{ tid: string }>().tid;
+    request(h.db, "rq-d1b", { session: "s-d1b", out: 20_000, ts: at });
+    attributeTasks(h.db);
+    expect((await h.cli("close", tid, "--force")).code).toBeLessThanOrEqual(3);
+
+    const o = h.db
+      .query<{ velocity_raw: number | null; velocity_cal: number | null; in_band: number | null }, [string]>(
+        "SELECT velocity_raw, velocity_cal, in_band FROM v_outcome_current WHERE tid = ?",
+      )
+      .get(tid)!;
+    // `velocity_raw` is the learning signal and stays meaningful: Work-CET per v2 point.
+    expect(o.velocity_raw).toBeCloseTo(2500, 6);
+    // The calibrated pair is not. Before the fix these came back as 1.25 and 0 — a
+    // plausible-looking velocity and a recorded overrun, both computed against 8 points
+    // dressed up as 16,000 Work-CET by a rate for a different-sized point.
+    expect(o.velocity_cal).toBeNull();
+    expect(o.in_band).toBeNull();
+  });
+
+  // -------------------------------------------------------------------------
+  // v19, defect 3: `est refclass` never shows one anchor's number beside another's
+  // -------------------------------------------------------------------------
+
+  /**
+   * Step 1 of the ceremony is the surface an estimator is required to read BEFORE stating
+   * any number, so a stale multiplier there anchors the estimate directly. It used to
+   * render `points→Work-CET: NO RATE YET` and, four lines down, `×2000.00 p50 · snapshot
+   * <as_of>` off the v1 snapshot — with `anchor v2` in the header.
+   */
+  /**
+   * `est repair-identity --apply` before the retro is what makes this fixture reproduce
+   * the defect rather than merely assert the fix. `est open` files a brand-new session's
+   * estimates under the repairable 'unknown' family (its own requests are not on disk
+   * yet), so without the repair the snapshot is fitted under `unknown` while `est
+   * refclass` resolves `claude-test-1` and finds no snapshot at all — the multiplier
+   * would be absent for a reason that has nothing to do with the anchor.
+   */
+  async function fitARateAsThisEstimator(offset: number): Promise<void> {
+    for (let i = 0; i < COLD_START_N; i += 1) await completed(offset + i, 20_000, 10, 20);
+    expect((await h.cli("repair-identity", "--apply")).code).toBe(0);
+    expect((await h.cli("retro")).code).toBeLessThanOrEqual(3);
+  }
+
+  test("`est refclass` shows no multiplier and no foreign-anchor matches after a bump", async () => {
+    flipToPoints();
+    await fitARateAsThisEstimator(1000);
+    // The state the defect is visible from: a snapshot this estimator CAN read, fitted
+    // at ~2,000 Work-CET per v1 point, and an anchor that is no longer v1.
+    await bumpAnchor("v2", "add one CLI flag with a test");
+
+    const out = (await h.cli("refclass", "--text", "sized work")).out;
+    expect(out).toContain("anchor v2");
+    expect(out).toContain("NO RATE YET");
+    // The multiplier is the Work-CET-per-point rate under points. One of these two lines
+    // was a lie, and it was this one.
+    expect(out).not.toContain("×2000");
+    expect(out).not.toMatch(/×[\d.]+ p50/);
+
+    // ...and the match table is v2-only, which at this point means empty. Ten completed
+    // v1 tasks used to be listed as the reference class for a v2 estimate, with their
+    // v1 point counts under a "raw p50 (pts)" heading.
+    const json = (await h.cli("refclass", "--text", "sized work", "--json")).json<{
+      matches: unknown[];
+      bucket: { n: number; mult_p50: number | null; n_eff: number | null; as_of: string | null };
+    }>();
+    expect(json.matches).toEqual([]);
+    expect(json.bucket.mult_p50).toBeNull();
+    expect(json.bucket.n_eff).toBeNull();
+    expect(json.bucket.as_of).toBeNull();
+    // The count is the anchor-local one, not the v1 corpus's ten.
+    expect(json.bucket.n).toBe(0);
+
+    // The control: back under v1, the same corpus is the reference class it always was,
+    // multiplier and all. The fix is a denomination filter, not a blanket suppression.
+    expect((await h.cli("config", "set", "sp_anchor_id", "v1")).code).toBe(0);
+    const v1json = (await h.cli("refclass", "--text", "sized work", "--json")).json<{
+      matches: unknown[];
+      bucket: { n: number; mult_p50: number | null };
+    }>();
+    expect(v1json.matches.length).toBeGreaterThan(0);
+    expect(v1json.bucket.n).toBe(COLD_START_N);
+    expect(v1json.bucket.mult_p50).toBeCloseTo(2000, 6);
+  });
+
+  /**
+   * The other suppression path, and the one whose PROSE matters: ten completed tasks at
+   * the anchor in force, so the cold-start sentence ("below 10 comparable completed
+   * tasks") would be visibly false beside `n=10` — but the snapshot behind the
+   * multiplier was fitted across both anchors, so the multiplier is a median of two
+   * different units and must not be shown.
+   */
+  test("`est refclass` names the anchor, not the sample count, when the snapshot is mixed", async () => {
+    flipToPoints();
+    for (let i = 0; i < COLD_START_N; i += 1) await completed(1100 + i, 20_000, 10, 20);
+    await bumpAnchor("v2", "add one CLI flag with a test");
+    for (let i = 0; i < COLD_START_N; i += 1) await completed(1200 + i, 60_000, 10, 20);
+    expect((await h.cli("repair-identity", "--apply")).code).toBe(0);
+    expect((await h.cli("retro", "--as-of", "2030-01-01T00:00:00Z")).code).toBeLessThanOrEqual(3);
+
+    const out = (await h.cli("refclass", "--text", "sized work")).out;
+    expect(out).toContain(`n=${COLD_START_N} at anchor v2`);
+    expect(out).toContain("NO MULTIPLIER SHOWN");
+    expect(out).not.toMatch(/×[\d.]+ p50/);
+    expect(out).not.toContain("below 10 comparable completed tasks");
+    // Every listed match is a v2 task. The v1 ten are a different unit and are gone.
+    const json = (await h.cli("refclass", "--text", "sized work", "--json")).json<{
+      matches: Array<{ subject: string }>;
+    }>();
+    expect(json.matches.length).toBeGreaterThan(0);
+    for (const m of json.matches) {
+      expect(Number(m.subject.replace("sized work ", ""))).toBeGreaterThanOrEqual(1200);
+    }
   });
 });
 
@@ -1454,7 +1664,7 @@ describe("a block is denominated by the estimate it hangs off", () => {
     );
     expect(r0.code).toBe(0);
     const tid = r0.json<{ tid: string }>().tid;
-    await h.cli("config", "set", "sp_anchor_id", "v2");
+    await bumpAnchor("v2", "add one CLI flag with a test");
 
     const r = await h.cli("block", tid, "--phase", "0", "--title", "recon", "--p50", "3", "--p90", "5");
     expect(r.code).toBe(2);
@@ -1939,6 +2149,10 @@ describe("schema migration 16 -> 17", () => {
 
   test("a v16 database migrates to exactly the shape schema.sql builds", () => {
     db.exec(`
+      -- Newest first, for the reason the 14 -> 15 test spells out: a v16 file that still
+      -- carried v19's pair would have \`procedure_version\` spliced in behind it.
+      ALTER TABLE estimate DROP COLUMN wcet_rate_src;
+      ALTER TABLE estimate DROP COLUMN wcet_rate;
       ALTER TABLE estimate DROP COLUMN procedure_version;
       DROP VIEW v_velocity;
       CREATE VIEW v_velocity AS

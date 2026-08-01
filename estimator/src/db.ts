@@ -33,6 +33,30 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
 /**
  * Must match the config.schema_version seed in schema.sql.
  *
+ * 19 — a REFUSED rate stops being scoreable, and the anchor registry stops being
+ *     evadable (Craig 2026-07-31). Two ADD COLUMNs, one table, one view, three triggers;
+ *     no row is dropped, rewritten or moved.
+ *       - `estimate.wcet_rate` / `estimate.wcet_rate_src`. `bandInWcet` used to infer
+ *         "a rate converted this band" from `cal_p50_wcet <> raw_p50_wcet`, and the
+ *         inference was false: `est open` asked the ANCHOR-AWARE `pointsToWcet`, got the
+ *         correct refusal for the first band under a new anchor, and then fell through to
+ *         the ANCHOR-BLIND `calibrationFor`, multiplying the band by the previous anchor's
+ *         fitted multiplier and stamping that snapshot's provenance onto the row. `cal`
+ *         differed from `raw`, so `est close` scored a `velocity_cal` and an `in_band`
+ *         against a rate the system had refused to issue. The write path now stores
+ *         `cal = raw` with NO refclass provenance when there is no rate, and the row
+ *         RECORDS which of the two happened. `'unrecorded'` is the pre-v19 state and the
+ *         only one where the old inference is still consulted.
+ *       - `sp_anchor.origin` + `sp_anchor_repair` + `v_sp_anchor`. The 17 -> 18 step
+ *         canonised the mutable `{sp_anchor_id, sp_anchor_text}` pair into the registry —
+ *         including the exact `{v1, "<the v2 definition>"}` corruption the registry exists
+ *         to make unrepresentable. A pre-registry pair whose text nobody can vouch for now
+ *         migrates as `'unverified'`, and the way out is `estimate_identity_repair`'s: an
+ *         append-only ledger beside the row, projected by a view, with mandatory evidence.
+ *       - `spa_ro_i` / `spar_ro_i`. `INSERT OR REPLACE` deletes the conflicting row and,
+ *         with `recursive_triggers` OFF (the default), does so WITHOUT firing the delete
+ *         trigger. Append-only enforcement a one-word idiom walks past is not enforcement,
+ *         so the guard moved to the INSERT.
  * 18 — the anchor's DEFINITION gets a home of its own (Craig 2026-07-31). One table,
  *     `sp_anchor (id PRIMARY KEY, text, created_at)`, append-only like every other
  *     ledger here, seeded from the `sp_anchor_id` / `sp_anchor_text` pair already in
@@ -237,7 +261,7 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
  *     `v_phase_actual.phase_conf`, auxiliary origin excluded from calibration.
  * 1 — initial R3 §4.2 shape.
  */
-export const SCHEMA_VERSION = "18";
+export const SCHEMA_VERSION = "19";
 
 /**
  * Forward-only, additive migrations, applied by {@link openDb} on a WRITABLE
@@ -1261,8 +1285,111 @@ SELECT (SELECT v FROM config WHERE k = 'sp_anchor_id'),
        (SELECT v FROM config WHERE k = 'sp_anchor_text'),
        '2026-07-31T00:00:00Z'
  WHERE (SELECT v FROM config WHERE k = 'sp_anchor_id') IS NOT NULL
-   AND COALESCE((SELECT v FROM config WHERE k = 'sp_anchor_text'), '') <> '';
+   AND COALESCE((SELECT v FROM config WHERE k = 'sp_anchor_text'), '') <> ''
+   -- The row is SKIPPED rather than merely ignored on conflict (v19). INSERT OR IGNORE
+   -- used to be enough, but v19's spa_ro_i fires BEFORE INSERT and RAISE(ABORT)s on a
+   -- duplicate id — and RAISE(ABORT) is NOT what OR IGNORE resolves, so on rule 3's
+   -- re-run path (a file that already has the shape, walked from 17 again) this
+   -- statement would abort. It does not surface today only because bun's
+   -- multi-statement Database.exec swallows the error and runs on, which is a thing to
+   -- write a migration around rather than to depend on.
+   AND NOT EXISTS (SELECT 1 FROM sp_anchor
+                    WHERE id = (SELECT v FROM config WHERE k = 'sp_anchor_id'));
 `,
+  },
+  {
+    from: "18",
+    to: "19",
+    // A refused rate stops being scoreable, and the registry stops being evadable (see
+    // the SCHEMA_VERSION doc comment above).
+    //
+    // One new TABLE with its three append-only triggers, one new VIEW, one new trigger on
+    // `sp_anchor`, and two ADD COLUMNs on each of `estimate` and `sp_anchor`. Nothing
+    // existing is read, rewritten or moved: ADD COLUMN widens every existing row in place
+    // (it is a metadata edit — no UPDATE runs, so the append-only triggers are neither
+    // fired nor evaded), and the only DML is into a table that did not exist a statement
+    // ago. Migration rule 2 holds.
+    //
+    // `IF NOT EXISTS` throughout, for the reason v8/v12/v13/v15/v16/v17/v18 document —
+    // SQLite strips the clause before storing a definition, so rule 3's idempotence costs
+    // nothing in fidelity and `test/schema.test.ts`'s byte-for-byte comparison against a
+    // fresh file still holds.
+    //
+    // THE DEFAULTS ARE THE MIGRATION. There is no backfill and there cannot be one:
+    // `estimate` and `sp_anchor` are both append-only, so every pre-existing row keeps
+    // whatever the ADD COLUMN default says about it, and the defaults are therefore
+    // chosen to be TRUE of an unknown row rather than convenient.
+    //
+    //  - `estimate.wcet_rate_src` defaults to `'unrecorded'`, which is exactly what those
+    //    rows are: issued before anything recorded the answer. `bandInWcet` reads that
+    //    value as "fall back to the old `cal <> raw` inference", because for those rows
+    //    the inference is the only evidence that exists — including for rows the v18
+    //    defect already mis-stamped, which nothing can now separate. Defaulting to
+    //    `'none'` instead would silently un-score every points band ever issued.
+    //  - `sp_anchor.origin` defaults to `'unverified'`, which demotes a definition a user
+    //    may well have declared by hand at v18. That is the deliberate direction: v18
+    //    recorded no provenance at all, so "declared" would be an assertion about rows
+    //    nobody can distinguish, while "unverified" only asks for a confirmation that
+    //    `est anchor define <id> "<same text>"` supplies in one command. It refuses
+    //    nothing in the meantime.
+    // The three COLUMNS are in `apply` below, because SQLite has no
+    // `ADD COLUMN IF NOT EXISTS` and rule 3 requires this step to survive a file that
+    // already has the shape — the same route the 14 -> 15 and 16 -> 17 steps take, and
+    // for the same reason: neither `estimate` nor `sp_anchor` can be rebuilt.
+    sql: `
+CREATE TRIGGER IF NOT EXISTS spa_ro_i BEFORE INSERT ON sp_anchor
+  WHEN EXISTS (SELECT 1 FROM sp_anchor WHERE id = NEW.id)
+  BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
+CREATE TABLE IF NOT EXISTS sp_anchor_repair (
+  id TEXT NOT NULL REFERENCES sp_anchor(id),
+  seq INTEGER NOT NULL,
+  repaired_at TEXT NOT NULL,
+  text TEXT NOT NULL,               -- the definition as CONFIRMED or CORRECTED
+  evidence TEXT NOT NULL,           -- JSON; mandatory, exactly as estimate_identity_repair's is
+  note TEXT,
+  PRIMARY KEY (id, seq)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS spar_ro_u BEFORE UPDATE ON sp_anchor_repair
+  BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS spar_ro_d BEFORE DELETE ON sp_anchor_repair
+  BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS spar_ro_i BEFORE INSERT ON sp_anchor_repair
+  WHEN EXISTS (SELECT 1 FROM sp_anchor_repair WHERE id = NEW.id AND seq = NEW.seq)
+  BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
+DROP VIEW IF EXISTS v_sp_anchor;
+CREATE VIEW IF NOT EXISTS v_sp_anchor AS
+SELECT a.id,
+       a.text AS text_recorded,
+       COALESCE(r.text, a.text) AS text,
+       a.origin,
+       CASE WHEN a.origin = 'declared' OR r.text IS NOT NULL THEN 1 ELSE 0 END AS verified,
+       a.created_at,
+       r.repaired_at
+FROM sp_anchor a
+LEFT JOIN sp_anchor_repair r
+  ON r.id = a.id
+ AND r.seq = (SELECT MAX(seq) FROM sp_anchor_repair WHERE id = a.id);
+`,
+    apply: (db: Database): void => {
+      // Each definition is written EXACTLY as schema.sql spells it: SQLite splices this
+      // text into the stored CREATE TABLE and `test/schema.test.ts` diffs a migrated
+      // file's `sqlite_master` against a fresh one byte for byte.
+      if (!hasColumn(db, "estimate", "wcet_rate")) {
+        db.exec("ALTER TABLE estimate ADD COLUMN wcet_rate REAL CHECK (wcet_rate IS NULL OR wcet_rate > 0)");
+      }
+      if (!hasColumn(db, "estimate", "wcet_rate_src")) {
+        db.exec(
+          "ALTER TABLE estimate ADD COLUMN wcet_rate_src TEXT NOT NULL DEFAULT 'unrecorded' CHECK (wcet_rate_src IN ('n/a','fitted','seed','none','unrecorded'))",
+        );
+      }
+      if (!hasColumn(db, "sp_anchor", "origin")) {
+        db.exec(
+          "ALTER TABLE sp_anchor ADD COLUMN origin TEXT NOT NULL DEFAULT 'unverified' CHECK (origin IN ('declared','unverified'))",
+        );
+      }
+    },
   },
 ];
 
@@ -1469,26 +1596,69 @@ export const ANCHOR_ID_KEY = "sp_anchor_id";
 export const ANCHOR_TEXT_KEY = "sp_anchor_text";
 
 /**
- * The work `id` was defined to be one point, or `null` if nobody ever recorded it.
+ * An anchor's EFFECTIVE definition — the registry row with the newest
+ * `sp_anchor_repair` correction laid over it — or `null` if nobody ever recorded one.
  *
- * This is the ONLY read path for an anchor's meaning. `config.sp_anchor_text` is a
- * mirror kept for `est config list`; it is never consulted, because the entire reason
- * `sp_anchor` exists is that a second mutable copy of the definition could disagree
- * with the id it was filed under.
+ * `verified` is the v19 half and the one a caller must read before treating `text` as
+ * authoritative. It is false while the definition is still the 17 -> 18 step's reading of
+ * the mutable `{sp_anchor_id, sp_anchor_text}` config pair: that pair could be, and was
+ * demonstrably able to be, driven into `{v1, "<the v2 definition>"}`, so migrating it in
+ * as fact would launder exactly the corruption `sp_anchor` was added to prevent. A human
+ * vouches for it through {@link repairAnchor} (which `est anchor define` calls), and only
+ * then does it read as established.
+ *
+ * `verified: false` is a REPAIR STATE, not a refusal: the text is still shown, the id is
+ * still a perfectly good denomination, and nothing that worked at v18 stops working.
+ */
+export interface AnchorDefinition {
+  readonly id: string;
+  /** The effective definition — a repair if one exists, otherwise what was recorded. */
+  readonly text: string;
+  /** What the base row records. Differs from `text` only after a correction. */
+  readonly textRecorded: string;
+  /** Has a human declared or confirmed this definition? */
+  readonly verified: boolean;
+}
+
+/**
+ * The full definition of `id`, correction included, or `null`.
+ *
+ * This and {@link anchorTextOf} are the ONLY read paths for an anchor's meaning.
+ * `config.sp_anchor_text` is a mirror kept for `est config list`; it is never consulted,
+ * because the entire reason `sp_anchor` exists is that a second mutable copy of the
+ * definition could disagree with the id it was filed under.
  *
  * Lives in `src/db.ts` for the reason {@link UNVALIDATED_RETIRED_KEY} documents: this
  * file already owns every config accessor and depends on nothing, and `setConfig` — the
  * registry's only writer — is here.
  */
-export function anchorTextOf(db: Database, id: string): string | null {
+export function anchorDefinition(db: Database, id: string): AnchorDefinition | null {
   const row = db
-    .query<{ text: string }, [string]>("SELECT text FROM sp_anchor WHERE id = ?")
+    .query<{ text: string; text_recorded: string; verified: number }, [string]>(
+      "SELECT text, text_recorded, verified FROM v_sp_anchor WHERE id = ?",
+    )
     .get(id);
-  return row?.text ?? null;
+  if (row === null || row === undefined) return null;
+  return {
+    id,
+    text: row.text,
+    textRecorded: row.text_recorded,
+    verified: row.verified === 1,
+  };
 }
 
 /**
- * Define an anchor. Append-only, and idempotent on an exact restatement.
+ * The work `id` was defined to be one point, or `null` if nobody ever recorded it.
+ * Shorthand for {@link anchorDefinition}'s `text` — the effective definition, so a
+ * repaired anchor reads as its correction everywhere.
+ */
+export function anchorTextOf(db: Database, id: string): string | null {
+  return anchorDefinition(db, id)?.text ?? null;
+}
+
+/**
+ * Define an anchor. Append-only, and idempotent on an exact restatement of a VERIFIED
+ * definition.
  *
  * Re-using an id with a DIFFERENT definition is refused, and that refusal is the whole
  * mechanism: it is what makes `{id: 'v1', text: '<the v2 definition>'}` unrepresentable
@@ -1498,13 +1668,22 @@ export function anchorTextOf(db: Database, id: string): string | null {
  *
  * Exit 2: a re-wording IS a redefinition of the unit, it cannot be undone once bands
  * exist under it, and the legal path (a new id) is named in the remedy.
+ *
+ * **An UNVERIFIED definition is a different case and is routed to {@link repairAnchor}
+ * (v19).** Refusing to move it would be defending a text nobody vouched for — the 17 ->
+ * 18 step's reading of a mutable config pair — and would leave a user who can see it is
+ * wrong with no way to say so.
  */
 export function registerAnchor(db: Database, id: string, text: string, now: Date = new Date()): void {
-  const existing = anchorTextOf(db, id);
-  if (existing === text) return;
+  const existing = anchorDefinition(db, id);
+  if (existing !== null && !existing.verified) {
+    repairAnchor(db, id, text, { evidence: { method: "restated" }, now });
+    return;
+  }
+  if (existing !== null && existing.text === text) return;
   if (existing !== null) {
     throw new InvariantError(
-      `story-point anchor '${id}' is already defined as ${JSON.stringify(existing)}; ` +
+      `story-point anchor '${id}' is already defined as ${JSON.stringify(existing.text)}; ` +
         `re-wording it to ${JSON.stringify(text)} would redefine what one point means while leaving every band ` +
         "already issued — and every band issued from now on — claiming the same scale",
       `bump the id first, then state the definition: \`est config set ${ANCHOR_ID_KEY} <new id>\` ` +
@@ -1513,10 +1692,66 @@ export function registerAnchor(db: Database, id: string, text: string, now: Date
         "so its meaning cannot move after the fact",
     );
   }
-  db.query("INSERT INTO sp_anchor (id, text, created_at) VALUES (?,?,?)").run(
+  db.query("INSERT INTO sp_anchor (id, text, created_at, origin) VALUES (?,?,?,'declared')").run(
     id,
     text,
     now.toISOString().replace(/\.\d{3}Z$/, "Z"),
+  );
+}
+
+/**
+ * CONFIRM or CORRECT an unverified anchor definition (v19).
+ *
+ * The `estimate_identity_repair` pattern, applied to the same shape of problem: the base
+ * row is never touched — `SELECT text FROM sp_anchor` still returns what the migration
+ * believed — and the correction is appended beside it for `v_sp_anchor` to project.
+ * Restating the same text is a CONFIRMATION and is recorded identically, because the fact
+ * that was missing is not the wording, it is that a human vouched for it.
+ *
+ * Refused on a `'declared'` anchor: that one was stated up front and bands point at it,
+ * so {@link registerAnchor}'s refusal is the right answer and this is not a way around it.
+ */
+export function repairAnchor(
+  db: Database,
+  id: string,
+  text: string,
+  opts: { evidence: unknown; note?: string | null; now?: Date } = { evidence: {} },
+): void {
+  const existing = anchorDefinition(db, id);
+  if (existing === null) {
+    throw new InvariantError(
+      `story-point anchor '${id}' has no recorded definition, so there is nothing to repair`,
+      `state it instead: \`est anchor define ${id} "<what one point is>"\``,
+    );
+  }
+  // VERIFIED, by any route — declared up front, or vouched for by an earlier repair —
+  // means the same thing and gets the same refusal. The ledger admits many rows per id
+  // (`estimate_identity_repair` uses that), but the second one would be re-wording a
+  // definition a human has already stood behind, which is the redefinition this whole
+  // table exists to refuse. One correction is the way OUT of the migration's guess; it is
+  // not a standing licence to re-word.
+  if (existing.verified) {
+    throw new InvariantError(
+      `story-point anchor '${id}' is already vouched for as ${JSON.stringify(existing.text)}; ` +
+        "a definition someone has stood behind is what stored bands point at, and it does not move",
+      `bump the id first, then state the definition: \`est config set ${ANCHOR_ID_KEY} <new id>\` ` +
+        `followed by \`est config set ${ANCHOR_TEXT_KEY} "${text}"\``,
+    );
+  }
+  const now = opts.now ?? new Date();
+  const seq =
+    (db
+      .query<{ s: number | null }, [string]>("SELECT MAX(seq) AS s FROM sp_anchor_repair WHERE id = ?")
+      .get(id)?.s ?? 0) + 1;
+  db.query(
+    "INSERT INTO sp_anchor_repair (id, seq, repaired_at, text, evidence, note) VALUES (?,?,?,?,?,?)",
+  ).run(
+    id,
+    seq,
+    now.toISOString().replace(/\.\d{3}Z$/, "Z"),
+    text,
+    JSON.stringify(opts.evidence ?? {}),
+    opts.note ?? null,
   );
 }
 

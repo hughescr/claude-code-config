@@ -20,6 +20,7 @@
  *   est segments                the check-back corpus, and the knob that shapes it
  *   est retro                   weekly calibration + the write-back that makes it non-inert
  *   est repair-identity         append-only correction of a still-'unknown' estimator identity
+ *   est anchor                  the story-point anchor registry, by id — list / define
  *
  * Three properties this file is responsible for (§2):
  *
@@ -53,7 +54,19 @@
 import type { Database } from "bun:sqlite";
 import { mkdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { DB_PATH, ROOT, SCHEMA_VERSION, getConfig, openDb, setConfig } from "./db.ts";
+import {
+  ANCHOR_ID_KEY,
+  ANCHOR_TEXT_KEY,
+  DB_PATH,
+  ROOT,
+  SCHEMA_VERSION,
+  anchorDefinition,
+  getConfig,
+  openDb,
+  registerAnchor,
+  repairAnchor,
+  setConfig,
+} from "./db.ts";
 import {
   PROJECTS_ROOT,
   discoverCorpus,
@@ -164,6 +177,11 @@ export const COMMANDS = [
   "prices",
   "census",
   "config",
+  // v19: the story-point anchor REGISTRY, by id. `est config set sp_anchor_text` can
+  // only ever define the anchor currently in force, which left every OTHER id — a legacy
+  // one named by bands on disk, or one the v18 migration could not vouch for — with no
+  // way in through the CLI at all.
+  "anchor",
   // Phase 1 (§Phase 1 interfaces).
   "refclass",
   "open",
@@ -206,6 +224,7 @@ export const COMMAND_FLAGS: Record<Command, FlagSpec> = {
   prices: { booleans: ["sync", "show"], values: ["source", "set", "in", "out", "cw", "cr", "at"] },
   census: { booleans: [], values: ["limit", "root"] },
   config: { booleans: [], values: [] },
+  anchor: { booleans: [], values: ["note"] },
   refclass: {
     booleans: ["full"],
     // `session`/`prompt` are not a nicety: they are how step 1 of the ceremony is
@@ -2622,6 +2641,182 @@ async function cmdConfig(ctx: Ctx): Promise<number> {
   );
 }
 
+/**
+ * `est anchor` — list / `define <id> <text>` over the story-point anchor registry (v19).
+ *
+ * `est config set sp_anchor_text` writes the definition of the anchor CURRENTLY IN FORCE
+ * and there is no second form of it, so two states had no way out through the CLI at all:
+ *
+ *  - a legacy anchor id that appears only in `estimate.sp_anchor_id` — a band on disk
+ *    naming a scale whose wording nobody recorded. The v18 migration deliberately
+ *    declines to invent a definition for those, and `est config set` cannot reach one
+ *    without first pointing `sp_anchor_id` AT it, which redenominates the live unit in
+ *    order to annotate history. `est anchor define <that id> "…"` states it in place.
+ *  - an `'unverified'` definition — the v18 migration's reading of the mutable
+ *    `{sp_anchor_id, sp_anchor_text}` pair, which is exactly the artefact the registry
+ *    exists because nobody can trust. `define` with the same text CONFIRMS it; with
+ *    different text it CORRECTS it. Either way an `sp_anchor_repair` row records who
+ *    said so and when, and `sp_anchor.text` keeps what was believed at the time.
+ *
+ * It cannot re-word a `'declared'` anchor, which is the one refusal `registerAnchor`
+ * exists for: bands point at it, so its meaning does not move. Exit **2** for both
+ * refusals — an invariant, not a mistyped command line.
+ */
+async function cmdAnchor(ctx: Ctx): Promise<number> {
+  const sub = positional(ctx, 0);
+  if (sub !== null && sub !== "list" && sub !== "define") {
+    throw new UsageError(
+      `est anchor: unknown subcommand: ${sub} (expected \`list\`, \`define <id> "<what one point is>"\`, or no argument to list)`,
+    );
+  }
+
+  interface AnchorListRow {
+    id: string;
+    text: string;
+    text_recorded: string;
+    origin: string;
+    verified: number;
+    created_at: string;
+    repaired_at: string | null;
+  }
+
+  if (sub === null || sub === "list") {
+    const db = openDb({ path: ctx.dbPath, readonly: true });
+    try {
+      const inForce = getConfig(db, "sp_anchor_id");
+      const rows = db
+        .query<AnchorListRow, []>(
+          "SELECT id, text, text_recorded, origin, verified, created_at, repaired_at FROM v_sp_anchor ORDER BY id",
+        )
+        .all();
+      // Ids that BANDS name but the registry does not define. They are the population
+      // `define` exists for, so listing without them would hide the reason it exists.
+      const orphans = db
+        .query<{ id: string; n: number }, []>(
+          `SELECT sp_anchor_id AS id, COUNT(*) AS n FROM estimate
+            WHERE sp_anchor_id IS NOT NULL
+              AND sp_anchor_id NOT IN (SELECT id FROM sp_anchor)
+            GROUP BY sp_anchor_id ORDER BY sp_anchor_id`,
+        )
+        .all();
+      if (ctx.json) {
+        ctx.out(
+          JSON.stringify({
+            schema: 1,
+            in_force: inForce,
+            anchors: rows.map((r) => ({
+              id: r.id,
+              text: r.text,
+              text_recorded: r.text_recorded,
+              origin: r.origin,
+              verified: r.verified === 1,
+              created_at: r.created_at,
+              repaired_at: r.repaired_at,
+            })),
+            undefined_ids: orphans,
+          }),
+        );
+      } else if (!ctx.quiet) {
+        ctx.out(
+          renderTable(
+            ["id", "state", "1 point =", "since"],
+            rows.map((r) => [
+              r.id === inForce ? `${r.id} (in force)` : r.id,
+              r.verified === 1 ? (r.repaired_at === null ? "declared" : "repaired") : "UNVERIFIED",
+              r.text,
+              r.repaired_at ?? r.created_at,
+            ]),
+          ),
+        );
+        for (const r of rows) {
+          if (r.verified === 0) {
+            ctx.out(
+              `  ${r.id} is UNVERIFIED: this wording was read off the mutable config pair by the v18 ` +
+                `migration, not stated by anyone. Confirm or correct it with ` +
+                `\`est anchor define ${r.id} "<what one point is>"\`.`,
+            );
+          }
+        }
+        for (const o of orphans) {
+          ctx.out(
+            `  ${o.id} is named by ${o.n} band(s) and has NO recorded definition — ` +
+              `\`est anchor define ${o.id} "<what one point is>"\` records it without moving the anchor in force.`,
+          );
+        }
+      }
+      return 0;
+    } finally {
+      db.close();
+    }
+  }
+
+  const id = positional(ctx, 1);
+  if (id === null || id.trim() === "") throw new UsageError("est anchor define: missing <id>");
+  const text = positional(ctx, 2);
+  if (text === null || text.trim() === "") {
+    throw new UsageError(`est anchor define ${id}: missing "<what one point is>"`);
+  }
+  const note = flagString(ctx.parsed, "note");
+
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
+        const before = anchorDefinition(db, id);
+        db.transaction(() => {
+          if (before !== null && !before.verified) {
+            // `registerAnchor` routes an unverified id here itself; calling `repairAnchor`
+            // directly is what lets the CLI attach real evidence instead of the
+            // "restated" placeholder the config path can supply.
+            repairAnchor(db, id, text, {
+              evidence: {
+                method: "cli",
+                previous: before.textRecorded,
+                confirmed: before.text === text,
+              },
+              note,
+            });
+          } else {
+            // Absent -> declared. Present and vouched for -> a no-op on an exact
+            // restatement, and `registerAnchor`'s refusal on anything else.
+            registerAnchor(db, id, text);
+          }
+          // The MIRROR follows the registry when the id repaired is the one in force,
+          // for the reason `setConfig` maintains it at all: `est config list` and
+          // `est config get sp_anchor_text` must not read back a definition the registry
+          // has moved past.
+          if (getConfig(db, ANCHOR_ID_KEY) === id) setConfig(db, ANCHOR_TEXT_KEY, text);
+        })();
+        const after = anchorDefinition(db, id)!;
+        if (ctx.json) {
+          ctx.out(
+            JSON.stringify({
+              schema: 1,
+              id,
+              text: after.text,
+              verified: after.verified,
+              action: before === null ? "declared" : before.text === text ? "confirmed" : "corrected",
+            }),
+          );
+        } else if (!ctx.quiet) {
+          ctx.out(
+            before === null
+              ? `anchor ${id} declared: "${after.text}" = 1 point`
+              : before.text === text
+                ? `anchor ${id} confirmed: "${after.text}" = 1 point (was unverified; the wording is unchanged)`
+                : `anchor ${id} corrected: "${before.text}" → "${after.text}" = 1 point ` +
+                  "(the recorded wording is kept; the correction is appended beside it)",
+          );
+        }
+        return 0;
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("anchor") },
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Phase 1 verbs (§Phase 1 interfaces)
 // ---------------------------------------------------------------------------
@@ -3323,6 +3518,17 @@ function cmdRefclass(ctx: Ctx): number {
           `Size the work RELATIVE to that; decompose first, then sum — that is what took the ` +
           `cross-model spread from 61.9× to 1.96×.`,
       );
+      if (!r.sp_anchor.verified) {
+        // The definition is shown because it is the best reading available, and marked
+        // because it is a reading: the v18 migration took it off two independently
+        // mutable config keys, which is precisely the pair that could say `{v1, "<the v2
+        // definition>"}`. Step 1 of the ceremony is where an estimator is told what "1"
+        // means, so it is the one place that caveat cannot be left off.
+        lines.push(
+          `  ⚠ that wording is UNVERIFIED — migrated from config, not stated by anyone. ` +
+            `Confirm or correct it with \`est anchor define ${r.sp_anchor.id} "<what one point is>"\`.`,
+        );
+      }
       lines.push(
         r.wcet_rate.rate === null
           ? `  points→Work-CET: NO RATE YET (no fitted rate, no seed). A points band will be issued with no Work-CET or Spend-CET forecast.`
@@ -3364,9 +3570,19 @@ function cmdRefclass(ctx: Ctx): number {
     }
     if (r.bucket.uncalibrated) {
       const d = r.cold_distribution;
+      // Two reasons to withhold the multiplier, and they must not print the same
+      // sentence. "Fewer than ten samples" is the cold start. "Ten samples of a DIFFERENT
+      // anchor" is a unit mismatch, and saying "below 10 comparable completed tasks"
+      // beside `n=10` would read as a bug in the counter rather than as the refusal it
+      // is. This line is what a stale `×2000` used to occupy.
       lines.push(
-        `bucket ${r.bucket.bucket}: n=${r.bucket.n} — UNCALIBRATED. No velocity multiplier is shown, deliberately: ` +
-          `below 10 comparable completed tasks a multiplier is a rumour, not a measurement.`,
+        r.sp_anchor !== null && r.wcet_rate.source !== "fitted" && r.bucket.n >= 10
+          ? `bucket ${r.bucket.bucket}: n=${r.bucket.n} at anchor ${r.sp_anchor.id} — NO MULTIPLIER SHOWN. ` +
+              `The newest snapshot is not fitted from this anchor's samples alone (\`refclass\` is not keyed on the ` +
+              `anchor), and a multiplier under \`story_point\` IS the Work-CET-per-point rate — so showing it here ` +
+              `would put one anchor's number beside another anchor's name.`
+          : `bucket ${r.bucket.bucket}: n=${r.bucket.n} — UNCALIBRATED. No velocity multiplier is shown, deliberately: ` +
+              `below 10 comparable completed tasks a multiplier is a rumour, not a measurement.`,
       );
       if (d !== null && d.n > 0) {
         lines.push(
@@ -4106,6 +4322,7 @@ commands:
   audit                   the five P2.12 checks over the ledger; --fix is bounded, never the spine
   retro                   weekly calibration + refclass write-back
   repair-identity         resolve estimates still filed under the 'unknown' estimator
+  anchor                  the story-point anchor registry: list, or define <id> "<text>"
   help, version
 
 global flags:
@@ -4300,6 +4517,8 @@ export async function run(argv: readonly string[], io: RunOptions = {}): Promise
         return await cmdCensus(ctx);
       case "config":
         return await verb(ctx, () => cmdConfig(ctx));
+      case "anchor":
+        return await verb(ctx, () => cmdAnchor(ctx));
       case "refclass":
         return await verb(ctx, () => cmdRefclass(ctx));
       case "open":

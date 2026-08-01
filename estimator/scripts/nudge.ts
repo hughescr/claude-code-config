@@ -171,11 +171,14 @@ function tryOverrunNudge(tid: string): string | null {
             estimand: string;
             raw_p50_wcet: number;
             cal_p50_wcet: number;
+            /** v19: the STORED conversion fact `bandUnscorable` now reads. */
+            wcet_rate_src: string;
           },
           [string]
         >(
           `SELECT bc.consumed_wcet AS consumed_wcet, e.cal_p90_wcet AS cal_p90_wcet, e.version AS version,
-                  e.estimand AS estimand, e.raw_p50_wcet AS raw_p50_wcet, e.cal_p50_wcet AS cal_p50_wcet
+                  e.estimand AS estimand, e.raw_p50_wcet AS raw_p50_wcet, e.cal_p50_wcet AS cal_p50_wcet,
+                  e.wcet_rate_src AS wcet_rate_src
              FROM burn_cache bc
              JOIN estimate e
                ON e.tid = bc.tid

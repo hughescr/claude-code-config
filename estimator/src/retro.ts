@@ -500,10 +500,12 @@ interface ScoredOutcome {
   exp_agents: number;
   n_agents: number;
   parallelism_factor: number | null;
-  /** The three columns {@link bandUnscorable} reads, under the names it expects. */
+  /** The columns {@link bandUnscorable} reads, under the names it expects. */
   estimand: string;
   raw_p50_wcet: number;
   cal_p50_wcet: number;
+  /** v19: the STORED conversion fact; `cal != raw` is no longer the test. */
+  wcet_rate_src: string;
 }
 
 function scorePanel(db: Database, refModel: string, estimand: string): ScoringPanel {
@@ -515,7 +517,8 @@ function scorePanel(db: Database, refModel: string, estimand: string): ScoringPa
               e.exp_agents AS exp_agents, o.n_agents AS n_agents,
               o.parallelism_factor AS parallelism_factor,
               e.estimand AS estimand,
-              e.raw_p50_wcet AS raw_p50_wcet, e.cal_p50_wcet AS cal_p50_wcet
+              e.raw_p50_wcet AS raw_p50_wcet, e.cal_p50_wcet AS cal_p50_wcet,
+              e.wcet_rate_src AS wcet_rate_src
          FROM v_outcome_current o
          JOIN estimate e ON e.eid = o.eid_at_start
         WHERE o.final_status = 'completed' AND o.censored = 0
@@ -552,9 +555,11 @@ function scorePanel(db: Database, refModel: string, estimand: string): ScoringPa
         estimand: string;
         raw_p50_wcet: number;
         cal_p50_wcet: number;
+        wcet_rate_src: string;
         base_estimand: string;
         base_raw_p50_wcet: number;
         base_cal_p50_wcet: number;
+        base_wcet_rate_src: string;
       },
       [string, string]
     >(
@@ -562,8 +567,10 @@ function scorePanel(db: Database, refModel: string, estimand: string): ScoringPa
               e.cal_p50_wcet AS cal_p50, b.cal_p50_wcet AS base_p50,
               e.estimand AS estimand,
               e.raw_p50_wcet AS raw_p50_wcet, e.cal_p50_wcet AS cal_p50_wcet,
+              e.wcet_rate_src AS wcet_rate_src,
               b.estimand AS base_estimand,
-              b.raw_p50_wcet AS base_raw_p50_wcet, b.cal_p50_wcet AS base_cal_p50_wcet
+              b.raw_p50_wcet AS base_raw_p50_wcet, b.cal_p50_wcet AS base_cal_p50_wcet,
+              b.wcet_rate_src AS base_wcet_rate_src
          FROM v_outcome_current o
          JOIN estimate b ON b.eid = o.eid_at_start
          JOIN estimate e ON e.tid = o.tid AND e.reason = 'refinement'
@@ -581,6 +588,7 @@ function scorePanel(db: Database, refModel: string, estimand: string): ScoringPa
         estimand: r.base_estimand,
         raw_p50_wcet: r.base_raw_p50_wcet,
         cal_p50_wcet: r.base_cal_p50_wcet,
+        wcet_rate_src: r.base_wcet_rate_src,
       }),
   );
   const unscorableRefinement = refinementRows.length - refinements.length;
@@ -965,12 +973,13 @@ function splitCandidates(
 ): RetroReport["splits"] {
   const rows = db
     .query<
-      { kind: string; actual: number; cal_p50: number; raw_p50: number; estimand: string; cal_p50_wcet: number; raw_p50_wcet: number },
+      { kind: string; actual: number; cal_p50: number; raw_p50: number; estimand: string; cal_p50_wcet: number; raw_p50_wcet: number; wcet_rate_src: string },
       [string, string]
     >(
       `SELECT t.kind AS kind, o.actual_wcet_at_epoch AS actual,
               e.cal_p50_wcet AS cal_p50, e.raw_p50_wcet AS raw_p50,
-              e.estimand AS estimand, e.cal_p50_wcet AS cal_p50_wcet, e.raw_p50_wcet AS raw_p50_wcet
+              e.estimand AS estimand, e.cal_p50_wcet AS cal_p50_wcet, e.raw_p50_wcet AS raw_p50_wcet,
+              e.wcet_rate_src AS wcet_rate_src
          FROM v_outcome_current o
          JOIN estimate e ON e.eid = o.eid_at_start
          JOIN task t ON t.tid = o.tid
@@ -1441,6 +1450,9 @@ interface EstimateRow {
   refclass_as_of: string | null;
   ref_model: string;
   estimator_model: string;
+  /** v19: the STORED conversion fact {@link bandUnit} reads instead of `cal != raw`. */
+  wcet_rate: number | null;
+  wcet_rate_src: string;
 }
 
 interface ActualRow {
@@ -1558,7 +1570,7 @@ export function board(
                 COALESCE(cal_p50_wcet, 0) AS cal_p50, COALESCE(cal_p90_wcet, 0) AS cal_p90,
                 CASE WHEN refclass_as_of IS NULL THEN 1 ELSE 0 END AS uncalibrated,
                 estimand, raw_p50_wcet, raw_p90_wcet, sp_anchor_id, refclass_as_of,
-                ref_model, estimator_model
+                ref_model, estimator_model, wcet_rate, wcet_rate_src
            FROM estimate
           WHERE eid IN (SELECT MAX(eid) FROM estimate WHERE tid IN (${q}) GROUP BY tid)`,
       )
@@ -1622,6 +1634,8 @@ export function board(
         refclass_as_of: est.refclass_as_of,
         ref_model: est.ref_model,
         estimator_model: est.estimator_model,
+        wcet_rate: est.wcet_rate,
+        wcet_rate_src: est.wcet_rate_src,
       },
       resolveRate,
     );

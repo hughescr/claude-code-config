@@ -45,6 +45,7 @@ const EXPECTED_TABLES = [
   "run_segment",
   "session_model",
   "sp_anchor",
+  "sp_anchor_repair",
   "sweep_census",
   "sweep_state",
   "task",
@@ -71,6 +72,7 @@ const EXPECTED_VIEWS = [
   "v_request_tiered",
   "v_scope_current",
   "v_segment_current",
+  "v_sp_anchor",
   "v_task_actual",
   "v_task_actual_epoch",
   "v_unpriced",
@@ -94,7 +96,11 @@ const EXPECTED_TRIGGERS = [
   "scope_ro_d",
   "scope_ro_u",
   "spa_ro_d",
+  "spa_ro_i",
   "spa_ro_u",
+  "spar_ro_d",
+  "spar_ro_i",
+  "spar_ro_u",
 ];
 
 const EXPECTED_CONFIG_KEYS = [

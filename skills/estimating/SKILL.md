@@ -29,8 +29,13 @@ against one fixed anchor:
   fitted under `v1` is never applied to a band issued under `v2`. Introducing a new anchor is **id
   first, then text** (`est config set sp_anchor_id v2`, then `est config set sp_anchor_text "…"`),
   and **re-wording an id that is already defined is refused** — a re-wording is a redefinition, and
-  the table is append-only so that the text cannot drift away from the id bands point at. Confirm
-  what is in force from `est config` (`estimand`, `sp_anchor_id`, `sp_anchor_text`), or from the
+  the table is append-only so that the text cannot drift away from the id bands point at. Do not
+  leave the id half-moved: `est open` **refuses a points band (exit 2) while the id in force has no
+  definition**, because defining it afterwards would choose what those points meant with the number
+  already on disk. `est anchor` is the registry's own verb — `est anchor list` shows every
+  definition and its state, `est anchor define <id> "…"` states one for an id that is not in force
+  (a legacy anchor named only by old bands) or confirms/corrects one the v18 migration could not
+  vouch for. Confirm what is in force from `est config` (`estimand`, `sp_anchor_id`, `sp_anchor_text`), or from the
   anchor line and the `unit:` line `est refclass` prints. (The `sp_` prefix is load-bearing: `anchor` on its own already means the session/prompt an
   estimate was issued from, an older and unrelated use of the word.) If the anchor is ever redefined,
   points minted under the old one mean a different thing, and the corpus keeps the two apart rather
@@ -185,6 +190,11 @@ Three regimes, none of them a number to copy:
   about. Read them as background, not as evidence.
 - **A calibrated bucket.** You get a multiplier line and no actual-cost distribution — the
   distribution is printed only during global cold start.
+- **`NO MULTIPLIER SHOWN`, beside a bucket count of ten or more.** Points only, and it is not a cold
+  start: comparable work exists, but the newest snapshot was not fitted from *this anchor's* samples
+  alone. Under `story_point` the multiplier **is** the Work-CET-per-point rate, so a rate fitted
+  across an anchor bump is a median of two different-sized points. Treat it as no rate at all — which
+  is what the `points→Work-CET` line above it already says — and size in points regardless.
 
 [Flags, tolerance bands and the rest of the surface →](references/cli-surface.md)
 

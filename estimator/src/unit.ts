@@ -58,7 +58,7 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { anchorTextOf, getConfig } from "./db.ts";
+import { anchorDefinition, anchorTextOf, getConfig } from "./db.ts";
 import { InvariantError } from "./errors.ts";
 import { priceFamily } from "./prices.ts";
 
@@ -121,11 +121,29 @@ export const ANCHOR_UNDEFINED_TEXT = "(no definition recorded)";
 export interface StoryPointAnchor {
   readonly id: string;
   readonly text: string;
+  /**
+   * Is there a `sp_anchor` row for `id` at all? False means `text` is
+   * {@link ANCHOR_UNDEFINED_TEXT} — a placeholder, not a definition — and `est open`
+   * refuses to issue a points band against it (v19).
+   */
+  readonly defined: boolean;
+  /**
+   * Has a human declared or confirmed this definition? False for a definition the
+   * v17 -> v18 step read off the mutable config pair and nobody has vouched for since.
+   * A repair state, not a refusal: it is rendered with a marker and it blocks nothing.
+   */
+  readonly verified: boolean;
 }
 
 export function storyPointAnchor(db: Database): StoryPointAnchor {
   const id = getConfig(db, "sp_anchor_id") ?? DEFAULT_ANCHOR_ID;
-  return { id, text: anchorTextOf(db, id) ?? ANCHOR_UNDEFINED_TEXT };
+  const def = anchorDefinition(db, id);
+  return {
+    id,
+    text: def?.text ?? ANCHOR_UNDEFINED_TEXT,
+    defined: def !== null,
+    verified: def?.verified ?? false,
+  };
 }
 
 // ---------------------------------------------------------------------------

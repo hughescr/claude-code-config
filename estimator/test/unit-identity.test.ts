@@ -322,16 +322,16 @@ describe("est retro fits the window it stamps on the snapshot", () => {
  */
 describe("the story-point anchor registry", () => {
   test("restoring an id restores its definition, not whatever was typed last", async () => {
-    expect(storyPointAnchor(h.db)).toEqual({ id: "v1", text: V1_TEXT });
+    expect(storyPointAnchor(h.db)).toEqual({ id: "v1", text: V1_TEXT, defined: true, verified: true });
 
     expect((await h.cli("config", "set", "sp_anchor_id", "v2")).code).toBe(0);
     expect((await h.cli("config", "set", "sp_anchor_text", "ship one CLI flag with its test")).code).toBe(0);
-    expect(storyPointAnchor(h.db)).toEqual({ id: "v2", text: "ship one CLI flag with its test" });
+    expect(storyPointAnchor(h.db)).toEqual({ id: "v2", text: "ship one CLI flag with its test", defined: true, verified: true });
 
     expect((await h.cli("config", "set", "sp_anchor_id", "v1")).code).toBe(0);
     // Codex's repro landed here with { id: "v1", text: "ship one CLI flag with its test" }
     // — v2-sized bands filed under the v1 scale, arrived at by following the remedy.
-    expect(storyPointAnchor(h.db)).toEqual({ id: "v1", text: V1_TEXT });
+    expect(storyPointAnchor(h.db)).toEqual({ id: "v1", text: V1_TEXT, defined: true, verified: true });
     // The mirror agrees, because it is written from the registry rather than kept beside it.
     expect(
       h.db.query<{ v: string }, []>("SELECT v FROM config WHERE k='sp_anchor_text'").get()!.v,
@@ -575,5 +575,206 @@ describe("schema migration 17 -> 18", () => {
     expect(anchorTextOf(db, "v3")).toBe("the definition in use");
     // And only that one: an id nobody was using does not acquire a definition.
     expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM sp_anchor").get()!.n).toBe(1);
+  });
+
+  /**
+   * v19, defect 2 route (b): a migrated pair is BELIEVED, not established.
+   *
+   * The 17 -> 18 step reads two independently mutable config keys and writes them into
+   * the registry as if the registry had always held them. But `{v1, "<the v2
+   * definition>"}` is a state a v17 file can genuinely be sitting in — it is the exact
+   * corruption `sp_anchor` was built to make unrepresentable — and no migration can tell
+   * that file apart from a correct one. Canonising it launders the corruption into the
+   * one table the whole unit system now trusts.
+   */
+  test("a v17 pair migrates into a repair state, not into an authoritative definition", () => {
+    db.exec(`
+      DROP TRIGGER spa_ro_u;
+      DROP TRIGGER spa_ro_d;
+      DROP TRIGGER spa_ro_i;
+      DROP TABLE sp_anchor_repair;
+      DROP VIEW v_sp_anchor;
+      DROP TABLE sp_anchor;
+      -- Codex's corruption, verbatim: the id says v1 and the text is v2's.
+      UPDATE config SET v = 'v1'                  WHERE k = 'sp_anchor_id';
+      UPDATE config SET v = 'the v2 definition'   WHERE k = 'sp_anchor_text';
+      UPDATE config SET v = '17'                  WHERE k = 'schema_version';
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    const row = db
+      .query<{ origin: string; verified: number; text: string }, []>(
+        "SELECT origin, verified, text FROM v_sp_anchor WHERE id = 'v1'",
+      )
+      .get()!;
+    // The text is still readable — it is the best reading available — but the registry
+    // does not vouch for it, which is the whole difference between v18 and v19.
+    expect(row.text).toBe("the v2 definition");
+    expect(row.origin).toBe("unverified");
+    expect(row.verified).toBe(0);
+    expect(storyPointAnchor(db).verified).toBe(false);
+  });
+
+});
+
+// ---------------------------------------------------------------------------
+// 7 — v19: the registry is not evadable (Codex, defect 2)
+// ---------------------------------------------------------------------------
+
+describe("the anchor registry cannot be walked around", () => {
+  /** Put `h`'s database back into the state the 17 -> 18 step migrates FROM. */
+  function downgradeToV17(text: string): void {
+    h.db.exec(`
+      DROP TRIGGER spa_ro_u;
+      DROP TRIGGER spa_ro_d;
+      DROP TRIGGER spa_ro_i;
+      DROP TRIGGER spar_ro_u;
+      DROP TRIGGER spar_ro_d;
+      DROP TRIGGER spar_ro_i;
+      DROP VIEW v_sp_anchor;
+      DROP TABLE sp_anchor_repair;
+      DROP TABLE sp_anchor;
+      ALTER TABLE estimate DROP COLUMN wcet_rate_src;
+      ALTER TABLE estimate DROP COLUMN wcet_rate;
+      UPDATE config SET v = ${JSON.stringify(text).replace(/'/g, "''")} WHERE k = 'sp_anchor_text';
+      UPDATE config SET v = '17' WHERE k = 'schema_version';
+    `);
+  }
+
+  test("the repair state is exitable, and the correction never edits what was believed", async () => {
+    // Reached the way a live file reaches it — through the migration — so the row under
+    // test is the migration's and not one this test hand-wrote. The next CLI call opens
+    // the file and migrates it forward.
+    downgradeToV17("the v2 definition");
+
+    // `est anchor define` is a WRITING verb, so it migrates the file forward on open —
+    // and the definition it then finds is the migration's unverified one.
+    const r = await h.cli("anchor", "define", "v1", V1_TEXT, "--json");
+    expect(r.code).toBe(0);
+    expect(r.json<{ action: string; verified: boolean }>()).toMatchObject({
+      action: "corrected",
+      verified: true,
+    });
+    // `estimate_identity_repair`'s contract, applied here: the base row still says what
+    // was believed at the time, the ledger carries the correction with its evidence, and
+    // the view projects the effective value.
+    expect(
+      h.db.query<{ text: string }, []>("SELECT text FROM sp_anchor WHERE id='v1'").get()!.text,
+    ).toBe("the v2 definition");
+    const repair = h.db
+      .query<{ text: string; evidence: string }, []>(
+        "SELECT text, evidence FROM sp_anchor_repair WHERE id='v1' ORDER BY seq DESC LIMIT 1",
+      )
+      .get()!;
+    expect(repair.text).toBe(V1_TEXT);
+    expect(JSON.parse(repair.evidence)).toMatchObject({ previous: "the v2 definition" });
+    expect(anchorTextOf(h.db, "v1")).toBe(V1_TEXT);
+    // The mirror follows, so `est config get sp_anchor_text` cannot read back a wording
+    // the registry has moved past.
+    expect(
+      h.db.query<{ v: string }, []>("SELECT v FROM config WHERE k='sp_anchor_text'").get()!.v,
+    ).toBe(V1_TEXT);
+    // And once vouched for it is immovable again — the repair path is not a way around
+    // the refusal that makes the registry worth having.
+    expect((await h.cli("anchor", "define", "v1", "something else entirely")).code).toBe(2);
+  });
+
+  test("a points band under an undefined anchor id is refused", async () => {
+    flipToPoints();
+    // The supported id-then-text order, stopped halfway. `est config set sp_anchor_id`
+    // deliberately allows this gap; what it must not allow is a BAND inside it.
+    expect((await h.cli("config", "set", "sp_anchor_id", "v9")).code).toBe(0);
+    expect(storyPointAnchor(h.db).defined).toBe(false);
+
+    const r = await h.cli(
+      ...openArgs({ subject: "sized against nothing", "raw-p50": 8, "raw-p90": 13 }),
+      "--session", "s1", "--prompt", "p1",
+    );
+    // Exit 2: an invariant refusal. Retyping the arguments cannot fix it.
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("v9");
+    expect(r.err).toContain("no recorded definition");
+    // Nothing was minted, so nothing can acquire its definition retroactively.
+    expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM estimate").get()!.n).toBe(0);
+
+    // Define it and the same command succeeds: this is a gate on the gap, not on v9.
+    expect((await h.cli("config", "set", "sp_anchor_text", "a v9-sized piece of work")).code).toBe(0);
+    const ok = await h.cli(
+      ...openArgs({ subject: "sized against v9", "raw-p50": 8, "raw-p90": 13 }),
+      "--session", "s1", "--prompt", "p1",
+    );
+    expect(ok.code).toBe(0);
+  });
+
+  test("a Work-CET band is untouched by the anchor guard", async () => {
+    // The anti-over-refusal control. No anchor is involved in a Work-CET band, so an
+    // undefined `sp_anchor_id` sitting in config is none of its business.
+    expect((await h.cli("config", "set", "sp_anchor_id", "v9")).code).toBe(0);
+    const r = await h.cli(
+      ...openArgs({ subject: "ordinary work-cet band", "raw-p50": 100_000, "raw-p90": 300_000 }),
+      "--session", "s1", "--prompt", "p1",
+    );
+    expect(r.code).toBe(0);
+  });
+
+  test("INSERT OR REPLACE cannot re-word a definition the delete trigger is guarding", () => {
+    // The idiom, and the reason `spa_ro_u` / `spa_ro_d` alone were decorative: on a
+    // PRIMARY KEY conflict SQLite DELETEs the existing row, and with
+    // `PRAGMA recursive_triggers` OFF — the default, and what `applyPragmas` leaves it
+    // at — that delete fires no trigger at all.
+    expect(() =>
+      h.db
+        .query("INSERT OR REPLACE INTO sp_anchor (id, text, created_at, origin) VALUES (?,?,?,?)")
+        .run("v1", "something else entirely", "2026-07-31T00:00:00Z", "declared"),
+    ).toThrow(/append-only/);
+    expect(anchorTextOf(h.db, "v1")).toBe(V1_TEXT);
+    // The same hole on the repair ledger, closed the same way.
+    h.db
+      .query("INSERT INTO sp_anchor_repair (id, seq, repaired_at, text, evidence) VALUES (?,?,?,?,?)")
+      .run("v1", 1, "2026-07-31T00:00:00Z", "a correction", "{}");
+    expect(() =>
+      h.db
+        .query("INSERT OR REPLACE INTO sp_anchor_repair (id, seq, repaired_at, text, evidence) VALUES (?,?,?,?,?)")
+        .run("v1", 1, "2026-07-31T00:00:00Z", "a different correction", "{}"),
+    ).toThrow(/append-only/);
+  });
+
+  test("a legacy anchor id named only by bands can be defined without moving the unit in force", async () => {
+    // The state a user can reach and could not get out of: a band on disk naming an
+    // anchor whose wording nobody recorded. `est config set sp_anchor_text` can only ever
+    // define the anchor IN FORCE, so the only route was to point `sp_anchor_id` at the
+    // legacy id — redenominating the live unit in order to annotate history.
+    flipToPoints();
+    const r0 = await h.cli(
+      ...openArgs({ subject: "a band from before the registry", "raw-p50": 8, "raw-p90": 13 }),
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(r0.code).toBe(0);
+    // Rewrite the stored anchor to a legacy id, the way a pre-v18 row carries one. (The
+    // band itself is untouched; only which scale it names.)
+    h.db.query("PRAGMA recursive_triggers = OFF").run();
+    h.db.query("DROP TRIGGER est_ro_u").run();
+    h.db.query("UPDATE estimate SET sp_anchor_id = 'v0'").run();
+    h.db
+      .query("CREATE TRIGGER est_ro_u BEFORE UPDATE ON estimate BEGIN SELECT RAISE(ABORT,'append-only'); END")
+      .run();
+    expect(anchorTextOf(h.db, "v0")).toBeNull();
+
+    const listed = (await h.cli("anchor", "--json")).json<{
+      in_force: string;
+      undefined_ids: Array<{ id: string; n: number }>;
+    }>();
+    expect(listed.in_force).toBe("v1");
+    expect(listed.undefined_ids).toEqual([{ id: "v0", n: 1 }]);
+
+    const def = await h.cli("anchor", "define", "v0", "the original point, as remembered", "--json");
+    expect(def.code).toBe(0);
+    expect(anchorTextOf(h.db, "v0")).toBe("the original point, as remembered");
+    // ...and the anchor in force did not move, which is the whole point of a per-id verb.
+    expect(storyPointAnchor(h.db).id).toBe("v1");
+    expect(storyPointAnchor(h.db).text).toBe(V1_TEXT);
   });
 });

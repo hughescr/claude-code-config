@@ -847,10 +847,14 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
         estimand: string;
         scope_seq: number;
         price_epoch: string;
+        // v19: `bandUnscorable` reads the STORED conversion fact, so the baseline SELECT
+        // has to carry it. `BandUnitColumns` requires the column, which is what stops a
+        // future edit dropping it and quietly restoring the `cal != raw` inference.
+        wcet_rate_src: string;
       },
       [number]
     >(
-      "SELECT raw_p50_wcet, raw_p90_wcet, cal_p50_wcet, cal_p90_wcet, estimand, scope_seq, price_epoch FROM estimate WHERE eid = ?",
+      "SELECT raw_p50_wcet, raw_p90_wcet, cal_p50_wcet, cal_p90_wcet, estimand, scope_seq, price_epoch, wcet_rate_src FROM estimate WHERE eid = ?",
     )
     .get(eidAtStart)!;
 

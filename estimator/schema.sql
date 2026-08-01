@@ -136,13 +136,87 @@ CREATE TABLE bucket_def (           -- buckets are DEFINED, not free text (R2)
 -- nobody recorded — an FK would make that unrepairable history unloadable rather than
 -- honestly incomplete. src/unit.ts reads a missing row as "definition unknown" and
 -- declines to compare it, which is the truthful reading.
+--
+-- v19 `origin`: WHERE the text came from, and therefore how much it is worth.
+--
+--  - **`'declared'`** — someone stated this definition for this id through
+--    `est config set sp_anchor_text` / `est anchor define`, and `registerAnchor` refused
+--    to let it move afterwards. Authoritative.
+--  - **`'unverified'`** — BELIEVED, not established. The v17 -> v18 step canonised the
+--    mutable `{config.sp_anchor_id, config.sp_anchor_text}` pair into this table, and that
+--    pair is exactly the artefact this table exists because nobody can trust: the two keys
+--    moved independently, so `{v1, "<the v2 definition>"}` is a state a v17 file can be
+--    sitting in and a migration cannot tell apart from a correct one. Declaring it
+--    authoritative would launder the corruption into the registry, so it lands in an
+--    explicit REPAIR STATE instead.
+--
+-- The way OUT of `'unverified'` is `sp_anchor_repair`, modelled on
+-- `estimate_identity_repair` (below) rather than invented: the row itself is never
+-- touched — `SELECT text FROM sp_anchor` still returns what was believed at the time —
+-- and the correction lives beside it in an append-only ledger that `v_sp_anchor`
+-- projects. Restating the SAME text is a confirmation and is recorded exactly like a
+-- correction: both are a human vouching for the definition, which is the fact that was
+-- missing.
+--
+-- DEFAULT `'unverified'` because that is what an ADD COLUMN can honestly say about a
+-- pre-v19 row: at v18 nothing recorded which rows were declared and which were migrated,
+-- so every one of them is unverified until someone vouches. A fresh file seeds `'v1'`
+-- as `'declared'`, because schema.sql itself is the single source of both the row and
+-- the `sp_anchor_text` seed it must equal.
+-- LAYOUT NOTE, the same one `estimate` carries and for the same reason: `origin` sits
+-- where `ALTER TABLE sp_anchor ADD COLUMN` leaves it in `sqlite_master`, which for a
+-- table whose last column definition is followed by a newline is AFTER that newline and
+-- before the closing paren. `test/unit-identity.test.ts` diffs a migrated file against a
+-- fresh one byte for byte, so tidying this line breaks that test.
 CREATE TABLE sp_anchor (
   id TEXT PRIMARY KEY,              -- human-meaningful and Craig-readable: 'v1', 'v2'
   text TEXT NOT NULL,               -- the work defined to be 1 point, verbatim
   created_at TEXT NOT NULL
-) STRICT, WITHOUT ROWID;
+, origin TEXT NOT NULL DEFAULT 'unverified' CHECK (origin IN ('declared','unverified'))) STRICT, WITHOUT ROWID;
 CREATE TRIGGER spa_ro_u BEFORE UPDATE ON sp_anchor BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER spa_ro_d BEFORE DELETE ON sp_anchor BEGIN SELECT RAISE(ABORT,'append-only'); END;
+-- v19: the third trigger, and the one whose absence made the other two decorative.
+--
+-- `INSERT OR REPLACE INTO sp_anchor …` is the ordinary SQLite idiom for "upsert", and on
+-- a PRIMARY KEY conflict it DELETEs the existing row and INSERTs the new one. That
+-- delete does NOT fire `spa_ro_d`: SQLite only runs triggers for conflict-resolution
+-- deletes when `PRAGMA recursive_triggers` is ON, and it is OFF by default. So one
+-- statement no reviewer would look at twice walked straight through append-only
+-- enforcement and re-worded a definition every stored band points at. Append-only that a
+-- common idiom evades is not enforcement, so the guard moves to the one event that
+-- cannot be routed around: the INSERT itself.
+CREATE TRIGGER spa_ro_i BEFORE INSERT ON sp_anchor
+  WHEN EXISTS (SELECT 1 FROM sp_anchor WHERE id = NEW.id)
+  BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
+-- v19: the APPEND-ONLY correction ledger for `sp_anchor.text`, and a deliberate copy of
+-- `estimate_identity_repair`'s shape rather than a second design for the same problem.
+--
+-- Both tables answer "this was believed at the time, and it is correctable later without
+-- rewriting what was believed": the base row is never touched, the correction is
+-- appended beside it, a view (`v_sp_anchor` / `v_estimate_identity`) projects the
+-- effective value with MAX(seq) winning, and `evidence` is mandatory because a
+-- correction with no stated basis is an assertion and this ledger is exactly where an
+-- assertion must not be able to hide.
+--
+-- Only an `'unverified'` anchor is repairable. A `'declared'` one is refused for the
+-- reason `registerAnchor` gives: bands already point at it, so its meaning cannot move.
+CREATE TABLE sp_anchor_repair (
+  id TEXT NOT NULL REFERENCES sp_anchor(id),
+  seq INTEGER NOT NULL,
+  repaired_at TEXT NOT NULL,
+  text TEXT NOT NULL,               -- the definition as CONFIRMED or CORRECTED
+  evidence TEXT NOT NULL,           -- JSON; mandatory, exactly as estimate_identity_repair's is
+  note TEXT,
+  PRIMARY KEY (id, seq)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER spar_ro_u BEFORE UPDATE ON sp_anchor_repair
+  BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER spar_ro_d BEFORE DELETE ON sp_anchor_repair
+  BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER spar_ro_i BEFORE INSERT ON sp_anchor_repair
+  WHEN EXISTS (SELECT 1 FROM sp_anchor_repair WHERE id = NEW.id AND seq = NEW.seq)
+  BEGIN SELECT RAISE(ABORT,'append-only'); END;
 
 CREATE TABLE estimate (             -- APPEND-ONLY, physically enforced
   eid INTEGER PRIMARY KEY,
@@ -211,6 +285,34 @@ CREATE TABLE estimate (             -- APPEND-ONLY, physically enforced
   -- every reference class. It exists so a future retro CAN partition on it. NULL means
   -- "issued before this column existed, vintage unknown" — never "the current procedure".
   --
+  -- v19 `wcet_rate` / `wcet_rate_src`: WHETHER a points -> Work-CET conversion was applied
+  -- to this row's `cal_*` pair, and at what rate. A STORED FACT, and it replaces an
+  -- inference that was wrong.
+  --
+  -- Until v19 every scoring surface decided the question by comparing two numbers:
+  -- `cal_p50_wcet <> raw_p50_wcet` was read as proof that a rate had converted the band.
+  -- That is not what the inequality means. `est open` resolves the points rate from
+  -- `pointsToWcet`, which is ANCHOR-AWARE and correctly returns nothing for the first
+  -- band under a new anchor — and then fell through to `calibrationFor`, which is NOT
+  -- anchor-aware, and multiplied the band by the OLD anchor's fitted multiplier anyway.
+  -- The row came out with `cal <> raw`, so `bandInWcet` licensed `est close` to record a
+  -- `velocity_cal` and an `in_band` from a rate the system had explicitly refused. The
+  -- inference "degrades to the honest side" only if every path that writes `cal_*` is
+  -- itself honest; it was not, and two numbers cannot say which.
+  --
+  -- So the row records the answer:
+  --   'n/a'        — not a points band; `cal_*` are Work-CET by construction.
+  --   'fitted'     — converted, at the refclass multiplier for this band's own anchor.
+  --   'seed'       — converted, at `config.sp_seed_wcet_per_point`.
+  --   'none'       — points band, NO rate was available: `cal_* = raw_*`, still POINTS,
+  --                  and unscorable. The refusal is the stored value, not a coincidence
+  --                  between two columns.
+  --   'unrecorded' — issued before this column existed. The ONLY state in which the old
+  --                  `cal <> raw` inference is still consulted, because for those rows
+  --                  nothing better was ever written down. Never "no conversion".
+  -- `wcet_rate` is the Work-CET-per-point actually applied, and is non-NULL exactly for
+  -- 'fitted' and 'seed'.
+  --
   -- LAYOUT NOTE: both trailing columns share the `estimator_model` line because that is
   -- byte-for-byte what `ALTER TABLE estimate ADD COLUMN` leaves in `sqlite_master` —
   -- SQLite splices each new column in after the LAST column definition and before its
@@ -218,7 +320,7 @@ CREATE TABLE estimate (             -- APPEND-ONLY, physically enforced
   -- append-only triggers guard every row), so v14 -> v15 and v16 -> v17 are both ADD
   -- COLUMN, and `test/schema.test.ts` asserts a migrated file is byte-identical to a
   -- fresh one. Moving either to its own line breaks that test.
-  estimator_model TEXT NOT NULL, sp_anchor_id TEXT, procedure_version TEXT,    -- velocity history is keyed by this (model churn decay)
+  estimator_model TEXT NOT NULL, sp_anchor_id TEXT, procedure_version TEXT, wcet_rate REAL CHECK (wcet_rate IS NULL OR wcet_rate > 0), wcet_rate_src TEXT NOT NULL DEFAULT 'unrecorded' CHECK (wcet_rate_src IN ('n/a','fitted','seed','none','unrecorded')),    -- velocity history is keyed by this (model churn decay)
   UNIQUE (tid, version),
   FOREIGN KEY (tid, scope_seq) REFERENCES task_scope(tid, seq)
 ) STRICT;
@@ -1336,6 +1438,29 @@ LEFT JOIN estimate_identity_repair r
   ON r.eid = e.eid
  AND r.seq = (SELECT MAX(seq) FROM estimate_identity_repair WHERE eid = e.eid);
 
+-- v19: the EFFECTIVE definition of every story-point anchor — the recorded text with the
+-- newest `sp_anchor_repair` row laid over it. Exactly `v_estimate_identity`'s shape, and
+-- for exactly its reason: the base row records what was believed when it was written and
+-- is never edited, so the correction has to be projected rather than applied.
+--
+-- `verified` is what a caller needs before treating the text as authoritative: 1 when a
+-- human declared the definition up front, or has since vouched for it through the repair
+-- ledger; 0 while it is still the v18 migration's reading of the mutable config pair.
+-- `text_recorded` stays beside it so an audit can see both, which is what makes the
+-- correction reviewable rather than merely applied.
+CREATE VIEW v_sp_anchor AS
+SELECT a.id,
+       a.text AS text_recorded,
+       COALESCE(r.text, a.text) AS text,
+       a.origin,
+       CASE WHEN a.origin = 'declared' OR r.text IS NOT NULL THEN 1 ELSE 0 END AS verified,
+       a.created_at,
+       r.repaired_at
+FROM sp_anchor a
+LEFT JOIN sp_anchor_repair r
+  ON r.id = a.id
+ AND r.seq = (SELECT MAX(seq) FROM sp_anchor_repair WHERE id = a.id);
+
 -- v17: `sp_anchor_id` is projected beside the unit pair, because under 'story_point'
 -- the pair does not finish the job. `velocity_raw` is `actual_wcet / raw_p50`, so with
 -- `raw_p50` in POINTS every sample here is Work-CET per point OF SOME ANCHOR — and a
@@ -1431,7 +1556,7 @@ WHERE s.terminator = 'open'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '18'),
+  ('schema_version',          '19'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.
@@ -1612,6 +1737,13 @@ VALUES ('global', strftime('%Y-%m-%dT%H:%M:%SZ','now'), '{}', NULL, NULL, 1);
 -- config mirrors this row, this row is what every reader resolves. A fixed instant
 -- rather than `now`, so a database migrated to v18 and one built from this file hold the
 -- same row (src/db.ts migration 17 -> 18, rule 3).
-INSERT OR IGNORE INTO sp_anchor (id, text, created_at)
+--
+-- `'declared'` (v19), and this is the one row that earns it without a human typing it:
+-- both the row and the `sp_anchor_text` seed it must equal come from THIS file, so there
+-- is no second, mutable copy for it to have drifted from. A file that arrived here by
+-- migration gets `'unverified'` instead — see the `sp_anchor` comment — because the pair
+-- it was derived from was mutable and a migration cannot tell an edited one from an
+-- untouched one.
+INSERT OR IGNORE INTO sp_anchor (id, text, created_at, origin)
 VALUES ('v1', 'rename a single variable across 3 files in a TypeScript codebase, with no tests to update',
-        '2026-07-31T00:00:00Z');
+        '2026-07-31T00:00:00Z', 'declared');

@@ -1030,6 +1030,9 @@ interface BandRow {
   price_epoch: string;
   refclass_as_of: string | null;
   shrink_w: number;
+  /** v19: the STORED conversion fact this band's `cal_*` pair depends on. */
+  wcet_rate: number | null;
+  wcet_rate_src: string;
 }
 
 /**
@@ -1050,7 +1053,8 @@ export function currentBand(db: Database, tid: string): BandRow | null {
       .query<BandRow, [string]>(
         `SELECT eid, reason, cal_p50_wcet, cal_p90_wcet, raw_p50_wcet, raw_p90_wcet,
                 cal_req_p50, cal_req_p90, active_p50_s, active_p90_s, ref_model, estimand,
-                sp_anchor_id, estimator_model, price_epoch, refclass_as_of, shrink_w
+                sp_anchor_id, estimator_model, price_epoch, refclass_as_of, shrink_w,
+                wcet_rate, wcet_rate_src
            FROM estimate WHERE tid = ? ORDER BY eid DESC LIMIT 1`,
       )
       .get(tid) ?? null
@@ -1142,6 +1146,9 @@ export interface BandUnitRow {
   readonly refclass_as_of: string | null;
   readonly ref_model: string;
   readonly estimator_model: string;
+  /** v19: WHETHER a conversion was applied, and at what rate. See `bandInWcet`. */
+  readonly wcet_rate: number | null;
+  readonly wcet_rate_src: string;
 }
 
 /**
@@ -1155,15 +1162,14 @@ export interface BandUnitRow {
  *     the code that predates story points. This is the hot path — the statusline's
  *     bounded-read budget (P1.9) is not spent on a unit that cannot be points.
  *  2. **`story_point`, converted at `est open`.** A rate existed then, so `cal_*` ARE
- *     Work-CET and every percentage downstream was already correct. Detected from the
- *     row alone: under points the cold-start multipliers are exactly 1.0, so
- *     `cal_p50 === raw_p50` iff nothing converted it. The SOURCE is then read off
- *     `refclass_as_of`, which mirrors `est open`'s own branch exactly — the seed
- *     stands in only while the bucket is uncalibrated (`refclass_as_of IS NULL`), and
- *     a fitted rate IS the refclass multiplier. (A fitted `mult_p50` of exactly 1.0
- *     would read as "unconverted" and degrade to state 3 — the SAFE direction: a rate
- *     of one Work-CET per point is not a number this system can produce, and the cost
- *     of being wrong is an absent percentage rather than a wrong one.)
+ *     Work-CET and every percentage downstream was already correct. Read from the row's
+ *     STORED `wcet_rate` / `wcet_rate_src` since v19, both here and in `bandInWcet`.
+ *     Both facts used to be inferred: "converted" from `cal_p50 !== raw_p50`, and the
+ *     SOURCE from `refclass_as_of IS NULL`. The first inference was wrong in a way that
+ *     let a refused rate be scored (see `bandInWcet`), and the second was wrong whenever
+ *     a seeded band carried a snapshot's `as_of` — it would then report a bootstrapped
+ *     rate as `fitted`. A pre-v19 row has neither column populated and falls back to the
+ *     old readings, which is all the evidence those rows have.
  *  3. **`story_point`, still points.** No rate existed at `est open`. The bridge is
  *     asked again NOW, because a seed may have been set or the bucket may have
  *     calibrated since — a band opened cold does not have to stay unreadable forever.
@@ -1196,8 +1202,17 @@ export function bandUnit(db: Database, row: BandUnitRow, resolve?: PointsRateRes
         p50,
         p90,
         anchor_id: anchor,
-        rate: row.cal_p50_wcet / p50,
-        rate_source: row.refclass_as_of === null ? "seed" : "fitted",
+        // The rate the row RECORDS, falling back to the pre-v19 readings only for rows
+        // that record nothing. `p50 > 0` is guaranteed here: `bandInWcet`'s legacy arm
+        // requires it, and its v19 arms are reached only for a band `est open` converted,
+        // which cannot have a zero raw p50 under `assertPointsQuantile`.
+        rate: row.wcet_rate ?? row.cal_p50_wcet / p50,
+        rate_source:
+          row.wcet_rate_src === "fitted" || row.wcet_rate_src === "seed"
+            ? row.wcet_rate_src
+            : row.refclass_as_of === null
+              ? "seed"
+              : "fitted",
         rate_n: 0,
         converted: "at_open",
       },
