@@ -92,7 +92,15 @@ import {
 import { LOCK_PATH, LockBusyError, withLock } from "./lock.ts";
 import { isoSeconds, setManualPrice, showPrices, sync, type SyncResult } from "./prices.ts";
 import { attributeTasks } from "./attribute.ts";
-import { burnJson, burnRead, classifyOpenError, refreshBurnCache, renderBurn } from "./burn.ts";
+import {
+  BURN_SCHEMA,
+  burnJson,
+  burnRead,
+  classifyOpenError,
+  refreshBurnCache,
+  renderBurn,
+  type BurnJson,
+} from "./burn.ts";
 import { closeTask, healClosedOutcomes, type FinalStatus } from "./close.ts";
 import { closePassMarkerFile, runClosePass } from "./autoclose.ts";
 import { board, retro, type RetroReport } from "./retro.ts";
@@ -127,6 +135,7 @@ import {
   addBlock,
   appendScope,
   bindTask,
+  COLD_START_N,
   InvariantError,
   isoNow,
   isPointsEstimand,
@@ -2836,6 +2845,14 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
                 result.spAnchor === null
                   ? null
                   : { id: result.spAnchor.id, text: result.spAnchor.text },
+              // Beside the anchor because it is the same kind of fact: `sp_anchor` says
+              // what a point WAS when this band was issued, and `procedure_version` says
+              // which instruction produced the quantiles. Both are pinned onto the row
+              // at open time (v17) and both are how a later reader tells a band sized
+              // under one regime from one sized under another. It was recorded and
+              // returned but never emitted, so the only consumer that drives `est open`
+              // — the estimating skill, via `--json` — could not see it.
+              procedure_version: result.procedureVersion,
               rolled_up_from_blocks: result.rolledUpFromBlocks,
               raw: result.raw,
               uncalibrated: result.uncalibrated,
@@ -2898,12 +2915,28 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
                   `)  ·  ${spendLine}`,
               );
             } else {
+              // THE THIRD surface that offers the seed, after `est burn`'s band note and
+              // the retro's `unit_refusal`. It used to offer it in one trailing clause
+              // with no bar attached — "or set the bootstrap with …" — which read as a
+              // co-equal fix on the one surface a person meets while they are still
+              // waiting for a number. Same shape as the siblings, deliberately: "do
+              // nothing" first with its consequence, then the seed named as the
+              // decided-against lever it is, with §13.1 and the bar travelling with it.
               ctx.out(
-                `      no points→Work-CET rate: bucket "${result.bucket}" has ${result.bucketN} completed story-point task(s) (fitting starts at 10)` +
+                `      no points→Work-CET rate: bucket "${result.bucket}" has ${result.bucketN} completed story-point task(s) (fitting starts at ${COLD_START_N})` +
                   ` and config.sp_seed_wcet_per_point is unset for anchor ${result.spAnchor?.id ?? "?"}.` +
-                  ` NO Work-CET and NO Spend-CET forecast is issued — a token figure derived from nothing is worse than none.` +
-                  ` The rate appears on its own once the corpus has 10, or set the bootstrap with` +
-                  ` \`est config set sp_seed_wcet_per_point <n>\` and \`est config set sp_seed_anchor_id ${result.spAnchor?.id ?? "v1"}\`.`,
+                  ` NO Work-CET and NO Spend-CET forecast is issued — a token figure derived from nothing is worse than none.`,
+              );
+              ctx.out(
+                `      do nothing: a FITTED rate appears on its own once the bucket has ${COLD_START_N} completed ` +
+                  `story-point tasks, and the cold start ends with nobody deciding anything.`,
+              );
+              ctx.out(
+                `      no seed is set DELIBERATELY (DECISIONS.md §13.1 — the implied rate is not stable, and a seed ` +
+                  `lives in \`config\`, where it would be fitted against and never resurface as the assumption it is). ` +
+                  `\`est config set sp_seed_wcet_per_point <n>\` + \`sp_seed_anchor_id ${result.spAnchor?.id ?? "v1"}\` ` +
+                  `is Craig's own lever and clears the bar only on ρ(actual, rate) ≈ 0 and rate CV < 0.3 measured over ` +
+                  `≥${COLD_START_N} REAL completed tasks — impatience is not that evidence.`,
               );
             }
           }
@@ -3093,7 +3126,10 @@ function cmdBurn(ctx: Ctx): number {
   // `--refresh` is the live aggregation, and a live aggregation needs a normal
   // connection; the cached path uses the 50 ms read-only one that must fail fast
   // rather than queue behind a sweep.
-  let payload;
+  // Typed at the declaration rather than inferred: the annotation is what makes the
+  // `catch` branch below a checked burn payload instead of a bag of fields that merely
+  // resembles one, and it is why a stale `schema` there is now a compile error.
+  let payload: BurnJson;
   if (refresh) {
     let db: ReturnType<typeof openDb> | null = null;
     try {
@@ -3102,7 +3138,11 @@ function cmdBurn(ctx: Ctx): number {
     } catch (e) {
       // Same classifier the read path uses: a locked file is `db_busy`, and only a
       // genuinely absent or unreadable one is `db_missing`.
-      payload = { schema: 1 as const, active: false as const, as_of: isoNow(), reason: classifyOpenError(e) };
+      // `BURN_SCHEMA`, never a literal: this is the ONE burn payload built outside
+      // `src/burn.ts`, so a hardcoded version here would keep claiming the old shape
+      // after the contract moved — and it is emitted exactly when the database is
+      // locked, the path least likely to be exercised before a consumer hits it.
+      payload = { schema: BURN_SCHEMA, active: false as const, as_of: isoNow(), reason: classifyOpenError(e) };
     } finally {
       db?.close();
     }
@@ -3406,6 +3446,18 @@ function cmdBoard(ctx: Ctx): number {
       limit: optInt(ctx.parsed, "limit", 20),
       now: new Date(),
     });
+    // STILL 1, and the rule that decides it: **a payload's version moves when an
+    // existing key is REMOVED or RETYPED, never when a key is added** — a decoder that
+    // ignores what it does not recognise survives the second and cannot survive the
+    // first. `BoardPhase` gained `blocks_in_points`, `block_points_p50` and
+    // `block_points_p90`, which is purely additive; `block_p50`/`block_p90` were already
+    // `number | null` before that change, so nothing a schema-1 consumer already decodes
+    // has a new shape. (What DID change is which values land in `block_p50` — a points
+    // block now leaves it null instead of parking a points figure in a Work-CET-named
+    // field. That was the field violating its own declared type in spirit, not the type
+    // changing, so it is a bug fix inside the contract rather than a new contract.)
+    // Contrast `BURN_SCHEMA`, at 2 because four `number` fields widened to
+    // `number | null`: a strict decoder had no way to absorb that, and no way to know.
     if (ctx.json) {
       ctx.out(JSON.stringify({ schema: 1, ...r }));
       return 0;

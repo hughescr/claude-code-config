@@ -45,6 +45,7 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { ROOT, openDb } from "../src/db.ts";
+import { bandUnscorable } from "../src/tasks.ts";
 import { overrunMarkerFile, type NudgeKind } from "../src/spool.ts";
 import { maybeSpawnMicrosweep } from "../src/microsweep.ts";
 
@@ -145,14 +146,36 @@ function findBoundTid(sessionId: string): Binding {
  * Best-effort overrun check against burn_cache (P1.9, schema v5). Returns the
  * nudge text once per threshold crossing per task, or null when there is
  * nothing to report — including "the table doesn't exist yet".
+ *
+ * UNIT-GUARDED (v15). `burn_cache.consumed_wcet` is log-derived Work-CET, always;
+ * `estimate.cal_p90_wcet` is Work-CET only when {@link bandUnscorable} says so, and
+ * under `estimand = 'story_point'` with no rate at `est open` it still holds POINTS.
+ * Comparing the two produced a wired, user-facing FALSE ALARM — "consumed 14 vs p90 13
+ * Work-CET" against a thirteen-POINT band — which is the one failure mode this project
+ * refuses: a wrong number that looks right. There is no rate to convert through here
+ * (that is the state), so the only honest answer is to fire NOTHING. The band is not
+ * blown; whether it is blown is undefined, and a hook is not the surface on which to
+ * explain that — `est burn` already says it in full, and this file's contract is
+ * advisory-or-silent.
  */
 function tryOverrunNudge(tid: string): string | null {
   try {
     const db = openDb({ readonly: true, busyTimeoutMs: BUSY_TIMEOUT_MS });
     try {
       const row = db
-        .query<{ consumed_wcet: number; cal_p90_wcet: number; version: number }, [string]>(
-          `SELECT bc.consumed_wcet AS consumed_wcet, e.cal_p90_wcet AS cal_p90_wcet, e.version AS version
+        .query<
+          {
+            consumed_wcet: number;
+            cal_p90_wcet: number;
+            version: number;
+            estimand: string;
+            raw_p50_wcet: number;
+            cal_p50_wcet: number;
+          },
+          [string]
+        >(
+          `SELECT bc.consumed_wcet AS consumed_wcet, e.cal_p90_wcet AS cal_p90_wcet, e.version AS version,
+                  e.estimand AS estimand, e.raw_p50_wcet AS raw_p50_wcet, e.cal_p50_wcet AS cal_p50_wcet
              FROM burn_cache bc
              JOIN estimate e
                ON e.tid = bc.tid
@@ -161,6 +184,11 @@ function tryOverrunNudge(tid: string): string | null {
         )
         .get(tid);
       if (!row || row.cal_p90_wcet <= 0) return null;
+      // The refusal, BEFORE the comparison — not after it, and not as a re-labelling of
+      // the message. `bandUnscorable` is the same predicate `est close` and both retro
+      // scoring panels consult, so a band this hook declines to warn on is exactly a
+      // band nothing else will score either.
+      if (bandUnscorable(row)) return null;
       if (row.consumed_wcet < row.cal_p90_wcet) return null;
 
       // Once per threshold crossing per task (§6.3, P1.10 job 4) — and a `refinement`

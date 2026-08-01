@@ -39,6 +39,7 @@ import {
   PLANT_MARKER,
   COLD_START_N,
 } from "../src/tasks.ts";
+import { BURN_SCHEMA } from "../src/burn.ts";
 import { attributeTasks } from "../src/attribute.ts";
 
 let h: Harness;
@@ -998,25 +999,46 @@ describe("est open — the near-duplicate warning", () => {
 });
 
 describe("P1.0 — cross-cutting", () => {
-  test("every Phase 1 verb's --json is exactly one object carrying schema: 1", async () => {
+  // The version is now PER VERB, not one global number. `est burn` is at 2 because its
+  // `wcet` band fields widened from `number` to `number | null` under v15 (see
+  // BURN_SCHEMA); every other verb's payload only ever gained keys, so every other verb
+  // is still at 1. A single global number would have to either drag eight unchanged
+  // contracts forward or leave `burn` claiming a shape it no longer has.
+  test("every Phase 1 verb's --json is exactly one object carrying its own schema version", async () => {
     const tid = await open();
-    const invocations: string[][] = [
-      ["refclass", "--text", "widget"],
-      ["block", tid, "--phase", "0", "--title", "survey", "--p50", "1", "--p90", "2"],
-      ["bind", tid, "--session", "s4"],
-      ["scope", tid, "--reason", "moved", "--subject", "widget pipeline rewrite v2"],
-      ["burn", tid],
-      ["board"],
-      ["retro", "--dry-run"],
-      ["close", tid, "--force"],
+    const invocations: Array<[string[], number]> = [
+      [["refclass", "--text", "widget"], 1],
+      [["block", tid, "--phase", "0", "--title", "survey", "--p50", "1", "--p90", "2"], 1],
+      [["bind", tid, "--session", "s4"], 1],
+      [["scope", tid, "--reason", "moved", "--subject", "widget pipeline rewrite v2"], 1],
+      [["burn", tid], BURN_SCHEMA],
+      [["board"], 1],
+      [["retro", "--dry-run"], 1],
+      [["close", tid, "--force"], 1],
     ];
-    for (const argv of invocations) {
+    for (const [argv, schema] of invocations) {
       const r = await h.cli(...argv, "--json");
       expect(r.code).toBeLessThanOrEqual(3);
       const lines = r.out.trim().split("\n");
       expect({ verb: argv[0], lines: lines.length }).toEqual({ verb: argv[0], lines: 1 });
-      expect({ verb: argv[0], schema: JSON.parse(r.out).schema }).toEqual({ verb: argv[0], schema: 1 });
+      expect({ verb: argv[0], schema: JSON.parse(r.out).schema }).toEqual({ verb: argv[0], schema });
     }
+  });
+
+  // Codex finding 4, pinned from the CONSUMER's side rather than from ours: the whole
+  // objection was that a schema-1 decoder had no way to know the shape had changed
+  // under it. If `est burn --json` ever goes back to announcing `1` while `wcet.p50`
+  // can be null, this fails.
+  test("the burn payload's widened wcet fields are announced by a version a schema-1 consumer can detect", async () => {
+    expect(BURN_SCHEMA).toBeGreaterThan(1);
+    const r = await h.cli("burn", "--json");
+    expect(r.code).toBe(0);
+    const payload = JSON.parse(r.out) as { schema: number };
+    // What a strict schema-1 decoder does: version-check FIRST, and decline. It never
+    // reaches the field it would otherwise have coerced to 0.
+    const decodeAsSchema1 = (p: { schema: number }): "declined" | "decoded" =>
+      p.schema === 1 ? "decoded" : "declined";
+    expect(decodeAsSchema1(payload)).toBe("declined");
   });
 
   test("diagnostics go to stderr, so --json stdout stays parseable even when rejected", async () => {

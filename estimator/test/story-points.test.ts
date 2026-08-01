@@ -44,6 +44,7 @@ import {
   storyPointAnchor,
 } from "../src/tasks.ts";
 import { attributeTasks } from "../src/attribute.ts";
+import { bandUnit, type BandUnitRow, type PointsRateResolver } from "../src/burn.ts";
 import { retro } from "../src/retro.ts";
 
 let h: Harness;
@@ -402,6 +403,36 @@ describe("pointsToWcet", () => {
     expect(band.wcet_rate).toEqual({ rate: null, source: null, n: 0 });
   });
 
+  // The THIRD seed-remedy surface, pinned the way `est burn`'s band note
+  // (test/burn-points.test.ts) and the retro's `unit_refusal` already are. `est open` is
+  // where a person meets the cold start first and while they are least patient, and it
+  // used to offer the seed in a trailing "or set the bootstrap with …" clause: a
+  // co-equal fix, no §13.1, no bar. Three surfaces, one shape — so the answer cannot
+  // depend on which one you happened to read.
+  test("the no-rate remedy leads with `do nothing`, cites the decision, and states the bar", async () => {
+    flipToPoints();
+    const r = await h.cli(
+      ...openArgs({ subject: "no rate remedy", "raw-p50": 8, "raw-p90": 13 }),
+      "--session", "s1", "--prompt", "p1",
+    );
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("do nothing");
+    expect(r.out).toContain(`${COLD_START_N} completed`);
+    expect(r.out).toContain("no seed is set DELIBERATELY");
+    expect(r.out).toContain("DECISIONS.md §13.1");
+    expect(r.out).toContain("rate CV < 0.3");
+    expect(r.out).toContain(`≥${COLD_START_N} REAL completed tasks`);
+    expect(r.out).toContain("impatience is not that evidence");
+    // "do nothing" comes FIRST: an option listed after the lever is an option nobody
+    // reads, which is exactly how the old phrasing failed. Ordered against the OFFER
+    // (`est config set …`) rather than against the bare key — the diagnosis line names
+    // `config.sp_seed_wcet_per_point` earlier to say it is unset, which is a statement
+    // of fact about the corpus, not an invitation.
+    expect(r.out.indexOf("do nothing")).toBeLessThan(r.out.indexOf("est config set sp_seed_wcet_per_point"));
+    // And the old phrasing is gone, not merely buried — it offered the seed with no bar.
+    expect(r.out).not.toContain("or set the bootstrap with");
+  });
+
   test("a seeded rate produces a labelled Work-CET forecast", async () => {
     flipToPoints();
     h.db.query("UPDATE config SET v = '15000' WHERE k = 'sp_seed_wcet_per_point'").run();
@@ -526,8 +557,27 @@ describe("est block --> the task band is the roll-up", () => {
     return r.json<{ tid: string }>().tid;
   }
 
+  /**
+   * The legitimate shape, and the only one `--from-blocks` admits since the roll-up
+   * became mechanically first-estimate-safe: the phases were sized, an estimate was
+   * issued, and then the phases were RE-sized against a later estimate. The blocks the
+   * roll-up sums therefore hang off eid > MIN(eid), so the band it produces is a real
+   * refinement rather than the decomposition of the opening guess.
+   */
   test("--from-blocks issues the SUM of the block estimates as the task band", async () => {
     const tid = await openTid(true);
+    await h.cli("block", tid, "--phase", "0", "--title", "recon", "--p50", "2", "--p90", "3");
+    await h.cli("block", tid, "--phase", "1", "--title", "build", "--p50", "5", "--p90", "8");
+
+    // The phases turned out bigger. A new estimate, then the re-sized phases against it.
+    const mid = await h.cli(
+      "open", "--tid", tid, "--reason", "refinement",
+      "--raw-p50", "7", "--raw-p90", "11",
+      "--exp-agents", "2", "--exp-wf-phases", "2", "--exp-files-write", "4",
+      "--exp-turns", "6", "--exp-requests", "40",
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(mid.code).toBe(0);
     await h.cli("block", tid, "--phase", "0", "--title", "recon", "--p50", "3", "--p90", "5");
     await h.cli("block", tid, "--phase", "1", "--title", "build", "--p50", "8", "--p90", "13");
 
@@ -693,6 +743,12 @@ describe("schema migration 14 -> 15", () => {
    */
   test("a v14 database migrates to exactly the shape schema.sql builds", () => {
     db.exec(`
+      -- BOTH trailing columns come off, newest first. \`ALTER TABLE ADD COLUMN\` appends
+      -- after the LAST column definition, so a v14 file that still carried v17's
+      -- \`procedure_version\` would come out of the 14 -> 15 step with the two spliced in
+      -- the opposite order to a fresh file — which is precisely the fidelity this test
+      -- exists to catch, but for the wrong reason.
+      ALTER TABLE estimate DROP COLUMN procedure_version;
       ALTER TABLE estimate DROP COLUMN sp_anchor_id;
       DROP VIEW v_task_actual_epoch;
       CREATE VIEW v_task_actual_epoch AS
@@ -715,7 +771,8 @@ describe("schema migration 14 -> 15", () => {
         AND r.origin IN ('main','subagent')
       GROUP BY r.tid;
       DELETE FROM config WHERE k IN
-        ('sp_anchor_id','sp_anchor_text','sp_seed_wcet_per_point','sp_seed_anchor_id','sp_max_points');
+        ('sp_anchor_id','sp_anchor_text','sp_seed_wcet_per_point','sp_seed_anchor_id','sp_max_points',
+         'procedure_version');
       UPDATE config SET v = '14' WHERE k = 'schema_version';
     `);
     // Migration rule 2: a value Craig has already tuned must survive untouched.
@@ -883,7 +940,16 @@ describe("scoring refuses a points band against a Work-CET actual", () => {
     expect(s.coverage_p90).toBeNull();
     expect(s.cov_lo).toBeNull();
     expect(s.cov_hi).toBeNull();
-    expect(r.alerts.join(" ")).toContain("unit_refusal");
+    const alert = r.alerts.find((a) => a.includes("unit_refusal"))!;
+    expect(alert).toBeDefined();
+    // The remedy in `est close`'s exit-2 shape: "do nothing" first, with its consequence,
+    // and the seed named as the decided-against lever it is rather than as a co-equal
+    // fix offered with no bar attached (DECISIONS.md §13.1).
+    expect(alert).toContain("Do nothing");
+    expect(alert).toContain("DECISIONS.md §13.1");
+    expect(alert).toContain("rate CV < 0.3");
+    expect(alert).toContain("not on impatience");
+    expect(alert.indexOf("Do nothing")).toBeLessThan(alert.indexOf("sp_seed_wcet_per_point"));
 
     // `velocity_raw` is Work-CET PER POINT and stays a real measurement, so the
     // raw-denominated origin ratios are computed over the refused row too.
@@ -1084,5 +1150,660 @@ describe("schema migration 15 -> 16", () => {
         )
         .get()!.n,
     ).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 11 — the ANCHOR is enforced, not merely recorded (v17, Codex finding 1)
+// ---------------------------------------------------------------------------
+
+/**
+ * `estimate.sp_anchor_id` was added so that "8 points" stays interpretable: re-wording
+ * the anchor redefines the unit, and a rate fitted per point of the v1 anchor says
+ * nothing about a point of the v2 anchor. The SEED path enforced that from the start
+ * (`sp_seed_anchor_id` must equal the anchor in force). The FITTED path did not — the
+ * anchor was absent from `PointsRateKey`, from `v_velocity`'s projection and from every
+ * check between `refclass` and a caller — so a rate fitted under v1 was handed straight
+ * to a v2 band, `source: "fitted"`, `n: 10`, nothing on screen saying the denominator
+ * had changed underneath it.
+ *
+ * These tests are Codex's repro and its mirror image.
+ */
+describe("a fitted points rate is denominated in an anchor", () => {
+  /** `n` completed 10-point tasks at 20,000 Work-CET each — 2,000 Work-CET per point —
+   *  then a retro, so `pointsToWcet` has a `refclass` snapshot to read back. */
+  async function fitARate(offset: number, asOf?: string): Promise<void> {
+    for (let i = 0; i < COLD_START_N; i += 1) await completed(offset + i, 20_000, 10, 20);
+    const argv = asOf === undefined ? (["retro"] as const) : (["retro", "--as-of", asOf] as const);
+    expect((await h.cli(...argv)).code).toBeLessThanOrEqual(3);
+  }
+
+  test("bumping the anchor COLD-STARTS the rate instead of inheriting the old scale", async () => {
+    flipToPoints();
+    await fitARate(100);
+    // The state Codex reproduced from: ten tasks, one fitted rate, everything correct.
+    // (The rate is a shrunk median of logs, so it lands a float's breadth off 2,000.)
+    const fitted = pointsToWcet(h.db, KEY);
+    expect(fitted.source).toBe("fitted");
+    expect(fitted.n).toBe(COLD_START_N);
+    expect(fitted.rate).toBeCloseTo(2000, 6);
+
+    // One line redefines what a point is.
+    expect((await h.cli("config", "set", "sp_anchor_id", "v2")).code).toBe(0);
+    expect(storyPointAnchor(h.db).id).toBe("v2");
+
+    // Before v17 this still returned { rate: 2000, source: "fitted", n: 10 }: ten tasks
+    // sized against a sentence nobody is using any more, priced as if they were evidence
+    // about the new one. A v2 estimate has to start where the v1 estimates started.
+    expect(pointsToWcet(h.db, KEY)).toEqual({ rate: null, source: null, n: 0 });
+  });
+
+  test("an estimate issued under the new anchor reports NO Work-CET band at all", async () => {
+    flipToPoints();
+    await fitARate(200);
+    await h.cli("config", "set", "sp_anchor_id", "v2");
+
+    turn(h.db, { session: "s-v2", prompt: "p1", at: "2026-03-01T00:00:00Z" });
+    const r = await h.cli(
+      ...openArgs({ subject: "first work under the new anchor", "raw-p50": 8, "raw-p90": 13 }),
+      "--session", "s-v2", "--prompt", "p1", "--json",
+    );
+    expect(r.code).toBe(0);
+    const body = r.json<{
+      band: { p50_wcet: number | null; p90_wcet: number | null; p50_points: number };
+      wcet_rate: { rate: number | null; source: string | null; n: number };
+      sp_anchor: { id: string };
+    }>();
+    expect(body.sp_anchor.id).toBe("v2");
+    expect(body.wcet_rate).toEqual({ rate: null, source: null, n: 0 });
+    // The band that IS issued is the points band, unconverted — never 8 x 2000.
+    expect(body.band.p50_wcet).toBeNull();
+    expect(body.band.p90_wcet).toBeNull();
+    expect(body.band.p50_points).toBe(8);
+  });
+
+  test("a band keeps ITS anchor's rate after the bump, rather than losing it", async () => {
+    flipToPoints();
+    await fitARate(300);
+    await h.cli("config", "set", "sp_anchor_id", "v2");
+
+    // The corpus is still ten v1 tasks and the snapshot is still fitted from exactly
+    // them, so a v1 band is still readable at 2,000 Work-CET per v1 point. The guard is
+    // a denomination check, not a blanket refusal after any config edit.
+    const v1 = pointsToWcet(h.db, { ...KEY, anchorId: "v1" });
+    expect(v1.source).toBe("fitted");
+    expect(v1.n).toBe(COLD_START_N);
+    expect(v1.rate).toBeCloseTo(2000, 6);
+  });
+
+  test("a v1 band is NOT rendered with a rate fitted under v2", async () => {
+    flipToPoints();
+    // The whole corpus is v2 from the outset, so the only fitted rate that exists is a
+    // v2 rate. Asking for a v1 band is asking a question this corpus cannot answer.
+    await h.cli("config", "set", "sp_anchor_id", "v2");
+    await fitARate(400);
+    const v2 = pointsToWcet(h.db, KEY);
+    expect(v2.source).toBe("fitted");
+    expect(v2.rate).toBeCloseTo(2000, 6);
+
+    // Before v17 the anchor was not in the key at all, so this returned the v2 rate:
+    // a v1 band's points multiplied by Work-CET per v2 point.
+    expect(pointsToWcet(h.db, { ...KEY, anchorId: "v1" })).toEqual({
+      rate: null,
+      source: null,
+      n: 0,
+    });
+    // And a row that records NO anchor (pre-v15) is an unknown denomination, never the
+    // current one.
+    expect(pointsToWcet(h.db, { ...KEY, anchorId: null })).toEqual({
+      rate: null,
+      source: null,
+      n: 0,
+    });
+  });
+
+  /** An UNCONVERTED points band on disk — `cal === raw`, which is what says no rate
+   *  existed at `est open` — so `bandUnit` reaches its state-3 branch and asks the
+   *  bridge. Everything but the anchor is held constant. */
+  function storedBand(anchorId: string | null): BandUnitRow {
+    return {
+      estimand: POINTS_ESTIMAND,
+      raw_p50_wcet: 8,
+      raw_p90_wcet: 13,
+      cal_p50_wcet: 8,
+      cal_p90_wcet: 13,
+      sp_anchor_id: anchorId,
+      refclass_as_of: null,
+      ref_model: REF_MODEL,
+      estimator_model: "unknown",
+    };
+  }
+
+  // The rule above was pinned only at `pointsToWcet`, which is not the function any
+  // surface calls. `bandUnit` is — burn, the statusline and every board card go through
+  // it — and it built the key WITHOUT `anchorId`, so it asked for "the rate for the
+  // anchor in force" on behalf of a band that is denominated in whatever it was stored
+  // under. The refusal has to hold through the read path, not just under it.
+  test("a v1 band is not rendered at a v2 rate THROUGH bandUnit", async () => {
+    flipToPoints();
+    // The whole corpus is v2, so the only fitted rate in existence is a v2 rate.
+    await h.cli("config", "set", "sp_anchor_id", "v2");
+    await fitARate(600);
+
+    // Positive control, and it is what makes the refusal below mean something: a v2 band
+    // IS converted, at the rate this corpus actually fitted.
+    const v2 = bandUnit(h.db, storedBand("v2"));
+    expect(v2.points?.converted).toBe("at_read");
+    expect(v2.points?.rate_source).toBe("fitted");
+    expect(v2.p50).toBe(16_000); // 8 points x 2,000 Work-CET per v2 point
+    expect(v2.p90).toBe(26_000);
+
+    // The same band, denominated in v1: no rate exists for a v1 point here, so no
+    // Work-CET figure is issued at all and the points survive as points. This used to
+    // come back as 16,000/26,000 — v1 points priced per v2 point, indistinguishable on
+    // screen from a measurement.
+    const v1 = bandUnit(h.db, storedBand("v1"));
+    expect(v1.p50).toBeNull();
+    expect(v1.p90).toBeNull();
+    expect(v1.points).toEqual({
+      p50: 8,
+      p90: 13,
+      anchor_id: "v1",
+      rate: null,
+      rate_source: null,
+      rate_n: 0,
+      converted: null,
+    });
+
+    // A pre-v15 row records no anchor: an unknown denomination, which is not a licence
+    // to use the current one.
+    const none = bandUnit(h.db, storedBand(null));
+    expect(none.p50).toBeNull();
+    expect(none.points?.rate).toBeNull();
+  });
+
+  // The board memoises the bridge across up to 200 cards per column. Once the anchor is
+  // part of the question, it has to be part of the cache key too, or the first card's
+  // anchor answers for every card behind it — the same mixing, one layer up.
+  test("the board's rate memo is keyed on the anchor, so a v2 card cannot answer for a v1 one", async () => {
+    flipToPoints();
+    await h.cli("config", "set", "sp_anchor_id", "v2");
+    await fitARate(700);
+
+    const seen: Array<string | null | undefined> = [];
+    const resolve: PointsRateResolver = (k) => {
+      seen.push(k.anchorId);
+      return pointsToWcet(h.db, k);
+    };
+    bandUnit(h.db, storedBand("v2"), resolve);
+    bandUnit(h.db, storedBand("v1"), resolve);
+    // The anchor reaches the resolver at all — which is what a cache key can be built
+    // from — and it is the band's, not the one in force.
+    expect(seen).toEqual(["v2", "v1"]);
+  });
+
+  test("a snapshot fitted ACROSS a bump is refused for both anchors", async () => {
+    flipToPoints();
+    for (let i = 0; i < COLD_START_N; i += 1) await completed(500 + i, 20_000, 10, 20);
+    await h.cli("config", "set", "sp_anchor_id", "v2");
+    for (let i = 0; i < COLD_START_N; i += 1) await completed(600 + i, 60_000, 10, 20);
+    // One retro, late enough to have seen every close: `refclass` is keyed on
+    // (as_of, bucket, family, ref_model, estimand) and NOT on the anchor, so this
+    // snapshot's median is a blend of 2,000/point and 6,000/point — a rate per point of
+    // nothing in particular. Both anchors have COLD_START_N samples of their own, so the
+    // count gate alone would pass it; the foreign-sample check is what refuses it.
+    expect((await h.cli("retro", "--as-of", "2030-01-01T00:00:00Z")).code).toBeLessThanOrEqual(3);
+
+    expect(pointsToWcet(h.db, KEY).rate).toBeNull();
+    expect(pointsToWcet(h.db, { ...KEY, anchorId: "v1" }).rate).toBeNull();
+  });
+
+  test("the SEED is gated on the band's anchor, not on the anchor in force", async () => {
+    flipToPoints();
+    await h.cli("config", "set", "sp_seed_wcet_per_point", "15000");
+    await h.cli("config", "set", "sp_seed_anchor_id", "v1");
+    // In force is v1, so a band opened now is a v1 band and the seed applies.
+    expect(pointsToWcet(h.db, KEY)).toEqual({ rate: 15000, source: "seed", n: 0 });
+    // A v2 band is not what the seed was reasoned against, even though nothing about
+    // `config` has changed.
+    expect(pointsToWcet(h.db, { ...KEY, anchorId: "v2" })).toEqual({
+      rate: null,
+      source: null,
+      n: 0,
+    });
+  });
+
+  test("v_velocity carries the anchor, which is what makes the segregation possible", async () => {
+    flipToPoints();
+    await completed(700, 20_000, 10, 20);
+    expect(
+      h.db
+        .query<{ anchor: string | null }, [string]>(
+          "SELECT sp_anchor_id AS anchor FROM v_velocity WHERE estimand = ?",
+        )
+        .get(POINTS_ESTIMAND)!.anchor,
+    ).toBe("v1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 12 — a block's unit comes from its PARENT, not from ambient config
+//      (v17, Codex finding 2)
+// ---------------------------------------------------------------------------
+
+/**
+ * `est block` used to read `config.estimand` and `config.sp_anchor_id` to validate and
+ * label its quantiles, then fetch only the parent `eid`. `estimate_block` stores neither
+ * unit nor anchor and `v_block_accuracy` reads the unit off `estimate.estimand`, so a
+ * Work-CET task blocked after `est config set estimand story_point` acquired an 8/13
+ * POINT block that the shared guard then scored as Work-CET.
+ *
+ * It fires at CUTOVER, on any task open across the flip, which is every task in flight
+ * the moment Craig throws the switch.
+ */
+describe("a block is denominated by the estimate it hangs off", () => {
+  async function openWorkCet(): Promise<string> {
+    const r = await h.cli(
+      ...openArgs({ subject: "open before the cutover", "raw-p50": 200_000, "raw-p90": 600_000 }),
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(r.code).toBe(0);
+    return r.json<{ tid: string }>().tid;
+  }
+
+  test("a POINTS block is refused against a Work-CET parent", async () => {
+    const tid = await openWorkCet();
+    flipToPoints();
+    const r = await h.cli("block", tid, "--phase", "0", "--title", "recon", "--p50", "8", "--p90", "13");
+    // Exit 2: an invariant refusal, not a malformed command line. Retyping the numbers
+    // cannot fix it.
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("work_cet");
+    expect(r.err).toContain(POINTS_ESTIMAND);
+    // And nothing landed: `estimate_block` is append-only, so a stored mismatch would be
+    // permanent.
+    expect(
+      h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM estimate_block").get()!.n,
+    ).toBe(0);
+  });
+
+  test("a Work-CET block is refused against a points parent", async () => {
+    flipToPoints();
+    const r0 = await h.cli(
+      ...openArgs({ subject: "opened in points", "raw-p50": 8, "raw-p90": 13 }),
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(r0.code).toBe(0);
+    const tid = r0.json<{ tid: string }>().tid;
+    h.db.query("UPDATE config SET v = 'work_cet' WHERE k = 'estimand'").run();
+
+    const r = await h.cli(
+      "block", tid, "--phase", "0", "--title", "recon", "--p50", "120000", "--p90", "300000",
+    );
+    expect(r.code).toBe(2);
+    expect(
+      h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM estimate_block").get()!.n,
+    ).toBe(0);
+  });
+
+  test("an ANCHOR bump is refused too — a point of v1 is not a point of v2", async () => {
+    flipToPoints();
+    const r0 = await h.cli(
+      ...openArgs({ subject: "opened against v1", "raw-p50": 8, "raw-p90": 13 }),
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(r0.code).toBe(0);
+    const tid = r0.json<{ tid: string }>().tid;
+    await h.cli("config", "set", "sp_anchor_id", "v2");
+
+    const r = await h.cli("block", tid, "--phase", "0", "--title", "recon", "--p50", "3", "--p90", "5");
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("v1");
+    expect(r.err).toContain("v2");
+  });
+
+  test("the block's reported unit is the PARENT's, not config's", async () => {
+    flipToPoints();
+    const r0 = await h.cli(
+      ...openArgs({ subject: "decomposed", "raw-p50": 8, "raw-p90": 13 }),
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    const tid = r0.json<{ tid: string }>().tid;
+    const r = await h.cli(
+      "block", tid, "--phase", "0", "--title", "recon", "--p50", "3", "--p90", "5", "--json",
+    );
+    expect(r.code).toBe(0);
+    expect(r.json<{ estimand: string }>().estimand).toBe(POINTS_ESTIMAND);
+    expect(r.json<{ spAnchor: { id: string } }>().spAnchor.id).toBe("v1");
+  });
+
+  test("`est open --tid` across a flip is refused rather than re-denominated", async () => {
+    const tid = await openWorkCet();
+    flipToPoints();
+    const r = await h.cli(
+      "open", "--tid", tid, "--reason", "refinement", "--raw-p50", "8", "--raw-p90", "13",
+      "--exp-agents", "1", "--exp-wf-phases", "0", "--exp-files-write", "2",
+      "--exp-turns", "4", "--exp-requests", "20",
+      "--session", "s1", "--prompt", "p1",
+    );
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("work_cet");
+    // Only the baseline row exists: an 8-point band inside a Work-CET task would have
+    // been unrecoverable, `estimate` being append-only.
+    expect(
+      h.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM estimate WHERE tid = ?").get(tid)!.n,
+    ).toBe(1);
+  });
+
+  test("`est open --continue` across a flip is refused — it copies the previous band verbatim", async () => {
+    const tid = await openWorkCet();
+    flipToPoints();
+    // `--continue` re-issues `prev.raw_p50_wcet` unchanged. Under the new estimand those
+    // 200,000 Work-CET would have been stored as 200,000 POINTS (or bounced off
+    // `sp_max_points` with a message about a flag the caller never typed).
+    const r = await h.cli("open", "--continue", tid, "--session", "s1", "--prompt", "p1");
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("estimand");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 13 — `--from-blocks` cannot displace the scored baseline (v17)
+// ---------------------------------------------------------------------------
+
+/**
+ * `--from-blocks` can only land as a re-estimate (it needs `--tid`), and `est close`
+ * fits both the scored baseline and `velocity_raw` from `MIN(eid)`. So rolling the
+ * blocks of the FIRST estimate up into a refinement leaves the coarse opening guess as
+ * both the baseline and the fitting sample, and the decomposition — the number the whole
+ * points estimand exists to capture — is measured by nothing.
+ *
+ * The guard is mechanical rather than advisory, and it cannot catch a genuine
+ * refinement: `estimate_block` is append-only and keyed `(eid, phase_idx)`, so re-sizing
+ * a phase is only possible against a NEW estimate, whose eid is by construction above
+ * `MIN(eid)`.
+ */
+describe("--from-blocks refuses to roll up the first estimate's own blocks", () => {
+  async function openAndBlock(): Promise<string> {
+    flipToPoints();
+    const r = await h.cli(
+      ...openArgs({ subject: "opened coarse", "raw-p50": 8, "raw-p90": 13 }),
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(r.code).toBe(0);
+    const tid = r.json<{ tid: string }>().tid;
+    await h.cli("block", tid, "--phase", "0", "--title", "recon", "--p50", "3", "--p90", "5");
+    await h.cli("block", tid, "--phase", "1", "--title", "build", "--p50", "8", "--p90", "13");
+    return tid;
+  }
+
+  test("the opened-coarse-then-decomposed shape is refused", async () => {
+    const tid = await openAndBlock();
+    const r = await h.cli(
+      "open", "--tid", tid, "--reason", "refinement", "--from-blocks",
+      "--exp-agents", "2", "--exp-wf-phases", "2", "--exp-files-write", "4",
+      "--exp-turns", "6", "--exp-requests", "40",
+      "--session", "s1", "--prompt", "p1",
+    );
+    expect(r.code).toBe(2);
+    expect(r.err).toContain("first estimate");
+    // The remedy names the band, so the caller can state it deliberately if that really
+    // is what they mean.
+    expect(r.err).toContain("11");
+    expect(
+      h.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM estimate WHERE tid = ?").get(tid)!.n,
+    ).toBe(1);
+  });
+
+  test("a genuine later refinement still rolls up", async () => {
+    const tid = await openAndBlock();
+    const mid = await h.cli(
+      "open", "--tid", tid, "--reason", "refinement", "--raw-p50", "11", "--raw-p90", "18",
+      "--exp-agents", "2", "--exp-wf-phases", "2", "--exp-files-write", "4",
+      "--exp-turns", "6", "--exp-requests", "40",
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(mid.code).toBe(0);
+    // The phases were re-sized, which is only expressible against the NEW estimate.
+    await h.cli("block", tid, "--phase", "0", "--title", "recon", "--p50", "5", "--p90", "8");
+    await h.cli("block", tid, "--phase", "1", "--title", "build", "--p50", "13", "--p90", "21");
+    const r = await h.cli(
+      "open", "--tid", tid, "--reason", "refinement", "--from-blocks",
+      "--exp-agents", "2", "--exp-wf-phases", "2", "--exp-files-write", "4",
+      "--exp-turns", "6", "--exp-requests", "40",
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(r.code).toBe(0);
+    expect(r.json<{ raw: { p50: number; p90: number } }>().raw).toEqual({ p50: 18, p90: 29 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 14 — `estimate.procedure_version` (v17)
+// ---------------------------------------------------------------------------
+
+/**
+ * Four things fix what a band means: the model, the prices, the unit, and the
+ * INSTRUCTION that produced the number. The first three were versioned and pinned onto
+ * every row; the fourth was not — and inside the Work-CET era it changed twice in one
+ * day (raw-as-floor, then uncorrected judgement), leaving two different measurements
+ * pooled in one reference class with nothing on the rows to separate them. `estimate` is
+ * append-only, so no later pass could have added the distinction.
+ *
+ * It enters no pooling key today. It only has to be RECORDED.
+ */
+describe("procedure_version", () => {
+  async function openOne(subject: string): Promise<{ tid: string; procedure: string | null }> {
+    const r = await h.cli(
+      ...openArgs({ subject, "raw-p50": 100_000, "raw-p90": 300_000 }),
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(r.code).toBe(0);
+    const tid = r.json<{ tid: string }>().tid;
+    const procedure = h.db
+      .query<{ v: string | null }, [string]>(
+        "SELECT procedure_version AS v FROM estimate WHERE tid = ? ORDER BY eid DESC LIMIT 1",
+      )
+      .get(tid)!.v;
+    return { tid, procedure };
+  }
+
+  test("the value in force is pinned onto the band", async () => {
+    const seeded = h.db
+      .query<{ v: string }, []>("SELECT v FROM config WHERE k = 'procedure_version'")
+      .get()!.v;
+    expect(seeded).not.toBe("");
+    expect((await openOne("first")).procedure).toBe(seeded);
+  });
+
+  test("a later change does not reach back — each band keeps the procedure that made it", async () => {
+    const first = await openOne("under the old procedure");
+    expect((await h.cli("config", "set", "procedure_version", "2026-08-01-decompose-first")).code).toBe(0);
+    const second = await openOne("under the new procedure");
+
+    expect(second.procedure).toBe("2026-08-01-decompose-first");
+    expect(first.procedure).not.toBe(second.procedure);
+    // The point of the column: the old row still says what it always said. `estimate` is
+    // append-only, so this is the ONLY way the distinction could ever exist.
+    expect(
+      h.db
+        .query<{ v: string | null }, [string]>(
+          "SELECT procedure_version AS v FROM estimate WHERE tid = ? ORDER BY eid ASC LIMIT 1",
+        )
+        .get(first.tid)!.v,
+    ).toBe(first.procedure);
+  });
+
+  test("unset means NULL — a vintage nobody stated is not the current one", async () => {
+    h.db.query("UPDATE config SET v = '' WHERE k = 'procedure_version'").run();
+    expect((await openOne("no procedure recorded")).procedure).toBeNull();
+  });
+
+  // Recorded on the row is not the same as VISIBLE. `est open --json` is the estimating
+  // skill's only view of the band it just filed, and the field was computed, carried on
+  // `OpenResult` and written to the database while being dropped on the way out — so the
+  // one consumer that could report which procedure produced a number could not read it.
+  test("`est open --json` emits it, beside the other things that fix what the band means", async () => {
+    const inForce = h.db
+      .query<{ v: string }, []>("SELECT v FROM config WHERE k = 'procedure_version'")
+      .get()!.v;
+    const r = await h.cli(
+      ...openArgs({ subject: "procedure on the wire", "raw-p50": 100_000, "raw-p90": 300_000 }),
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(r.code).toBe(0);
+    const body = r.json<{ procedure_version: string | null; tid: string }>();
+    expect(body.procedure_version).toBe(inForce);
+    // The payload agrees with the row it just wrote — the JSON is a report of what was
+    // stored, not a second computation of it.
+    expect(
+      h.db
+        .query<{ v: string | null }, [string]>(
+          "SELECT procedure_version AS v FROM estimate WHERE tid = ? ORDER BY eid DESC LIMIT 1",
+        )
+        .get(body.tid)!.v,
+    ).toBe(body.procedure_version);
+
+    // Unset is `null` on the wire, not an absent key and not "": a consumer must be able
+    // to tell "no vintage was stated" from "the field is gone".
+    h.db.query("UPDATE config SET v = '' WHERE k = 'procedure_version'").run();
+    const bare = await h.cli(
+      ...openArgs({ subject: "no procedure on the wire", "raw-p50": 100_000, "raw-p90": 300_000 }),
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(bare.code).toBe(0);
+    const parsed = JSON.parse(bare.out) as Record<string, unknown>;
+    expect(Object.hasOwn(parsed, "procedure_version")).toBe(true);
+    expect(parsed.procedure_version).toBeNull();
+  });
+
+  test("it is snapshotted for a Work-CET band too, not only for points", async () => {
+    const wcet = await openOne("work_cet band");
+    expect(wcet.procedure).not.toBeNull();
+    flipToPoints();
+    const r = await h.cli(
+      ...openArgs({ subject: "points band", "raw-p50": 8, "raw-p90": 13 }),
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(r.code).toBe(0);
+    expect(
+      h.db
+        .query<{ v: string | null }, [string]>(
+          "SELECT procedure_version AS v FROM estimate WHERE tid = ?",
+        )
+        .get(r.json<{ tid: string }>().tid)!.v,
+    ).toBe(wcet.procedure);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 15 — schema migration 16 -> 17
+// ---------------------------------------------------------------------------
+
+describe("schema migration 16 -> 17", () => {
+  let dir: string;
+  let db: Database;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "est-sp-migrate17-"));
+    db = openDb({ path: join(dir, "estimator.db") });
+  });
+
+  afterEach(() => {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("a v16 database migrates to exactly the shape schema.sql builds", () => {
+    db.exec(`
+      ALTER TABLE estimate DROP COLUMN procedure_version;
+      DROP VIEW v_velocity;
+      CREATE VIEW v_velocity AS
+      SELECT e.bucket, i.estimator_model, e.price_epoch, e.refclass_as_of,
+             e.ref_model, e.estimand,
+             o.velocity_raw, o.velocity_cal, o.finalized_at,
+             o.wcet_main, o.wcet_sub, o.wcet_aux,
+             o.wcet_main + o.wcet_sub AS wcet_task_effort,
+             e.exp_agents, o.n_agents
+      FROM v_outcome_current o
+      JOIN estimate e ON e.eid = o.eid_at_start
+      JOIN v_estimate_identity i ON i.eid = e.eid
+      WHERE o.scope_changed = 0 AND o.censored = 0 AND o.final_status = 'completed'
+        AND o.unpriced_share = 0 AND o.price_provisional = 0
+        AND o.actual_wcet_at_epoch IS NOT NULL;
+      DELETE FROM config WHERE k = 'procedure_version';
+      UPDATE config SET v = '16' WHERE k = 'schema_version';
+    `);
+    // Migration rule 2: a value Craig has already tuned survives untouched.
+    db.query("UPDATE config SET v='999' WHERE k='shrink_k'").run();
+    const path = join(dir, "estimator.db");
+    db.close();
+
+    db = openDb({ path }); // migrates on open
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(db.query<{ v: string }, []>("SELECT v FROM config WHERE k='shrink_k'").get()?.v).toBe("999");
+    expect(
+      db.query<{ v: string }, []>("SELECT v FROM config WHERE k='procedure_version'").get()?.v,
+    ).toBe("2026-07-31-uncorrected-judgement");
+
+    const freshDir = mkdtempSync(join(tmpdir(), "est-sp-fresh17-"));
+    const fresh = openDb({ path: join(freshDir, "estimator.db") });
+    try {
+      const objects = (d: Database): unknown =>
+        d
+          .query<{ type: string; name: string; sql: string | null }, []>(
+            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+          )
+          .all();
+      expect(objects(db)).toEqual(objects(fresh));
+    } finally {
+      fresh.close();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+  });
+
+  test("the step is idempotent against a file that already has the shape", () => {
+    const path = join(dir, "estimator.db");
+    db.query("UPDATE config SET v = '16' WHERE k = 'schema_version'").run();
+    db.close();
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(
+      db
+        .query<{ n: number }, []>(
+          "SELECT COUNT(*) AS n FROM pragma_table_info('estimate') WHERE name='procedure_version'",
+        )
+        .get()!.n,
+    ).toBe(1);
+  });
+
+  test("a pre-v17 row keeps NULL: the column widens rows, it does not backfill a vintage", () => {
+    // A row that exists BEFORE the column does is of genuinely unknown vintage, and
+    // stamping today's procedure onto it would manufacture the very claim the column
+    // exists to make honestly.
+    db.exec(`
+      ALTER TABLE estimate DROP COLUMN procedure_version;
+      UPDATE config SET v = '16' WHERE k = 'schema_version';
+      INSERT INTO task (tid, kind, status, created_at, anchor_session, anchor_prompt)
+        VALUES ('t-old', 'implement', 'estimating', '2026-01-01T00:00:00Z', 's0', 'p0');
+      INSERT INTO task_scope (tid, seq, ts, subject, description, dod_json, scope_hash, source, reason, diff_summary)
+        VALUES ('t-old', 1, '2026-01-01T00:00:00Z', 'legacy', NULL, '[]', 'h', 'est_open', NULL, NULL);
+      INSERT INTO estimate (tid, version, created_at, reason, scope_seq, raw_p50_wcet, raw_p90_wcet,
+                            exp_agents, exp_wf_phases, exp_files_write, exp_turns, exp_requests,
+                            bucket, bucket_n, refclass_as_of, shrink_w, cal_p50_wcet, cal_p90_wcet,
+                            cal_req_p50, cal_req_p90, price_epoch, ref_model, estimand, estimator_model)
+        VALUES ('t-old', 1, '2026-01-01T00:00:00Z', 'initial', 1, 1000, 3000,
+                1, 0, 1, 1, 1, 'global', 0, NULL, 0, 1000, 3000, 1, 1,
+                '2026-01-01T00:00:00Z', 'claude-sonnet-4-5', 'work_cet', 'unknown');
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(
+      db
+        .query<{ v: string | null }, []>("SELECT procedure_version AS v FROM estimate WHERE tid = 't-old'")
+        .get()!.v,
+    ).toBeNull();
   });
 });

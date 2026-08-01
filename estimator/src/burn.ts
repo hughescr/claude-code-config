@@ -564,15 +564,57 @@ export function isWaitingOnInput(
  */
 export type BurnTarget = "explicit" | "session" | "fallback";
 
+/**
+ * The version of the `est burn --json` payload — and the ONE verb whose `--json`
+ * envelope is no longer P1.0's flat `schema: 1`.
+ *
+ * **Why it moved.** v15 retyped four fields inside `wcet` — `p50`, `p90`, `pct_p50`,
+ * `pct_p90` — from `number` to `number | null`. Every other v15 change to this payload
+ * was genuinely additive (a new key an old reader ignores), and those were shipped
+ * under `schema: 1` correctly. A WIDENING is not additive, however it is described:
+ * schema 1 promised a number in those fields, and a decoder written against that
+ * promise has exactly two ways to meet a null, and both are worse than an error. A
+ * strict decoder (a typed schema, a non-optional deserialiser) REJECTS the whole
+ * payload — for a reason that has nothing to do with the field it choked on. A lenient
+ * one COERCES: `null` becomes `0`, `0%` of the band renders as a measured zero, and a
+ * task that cannot be scored at all reads on screen as a task comfortably inside its
+ * band. That second failure is the exact shape this project refuses — a wrong number
+ * that looks right — and it is not one a consumer can be blamed for.
+ *
+ * **Migration, for an out-of-tree reader.** Check `schema` first; it is the only field
+ * whose meaning is guaranteed across versions.
+ *
+ *  - A reader that PINS `schema === 1` needs no code change and keeps working in the
+ *    only sense that matters: it now declines the payload rather than mis-rendering
+ *    it. That is the intended outcome for anything unmaintained.
+ *  - A reader that wants schema 2 needs ONE change: treat `wcet.p50`, `wcet.p90`,
+ *    `wcet.pct_p50` and `wcet.pct_p90` as nullable, and render nothing — no percentage,
+ *    no bar, no projection, no overrun warning — when they are null, exactly as
+ *    `renderBurn` and `scripts/statusline-burn.ts` do. `wcet.consumed` is never null; it
+ *    is log-derived and always Work-CET. All four go null under exactly one condition,
+ *    a band issued in story points with no points→Work-CET rate, and the band itself is
+ *    then readable in the `points` object.
+ *  - NO KEY WAS ADDED, REMOVED OR RENAMED at the 1→2 boundary and no other field
+ *    changed type, so on a Work-CET corpus — every corpus that predates v15 — a
+ *    schema-2 payload is field-for-field identical to the schema-1 one it replaces.
+ *    The version bump is a claim about what the type says, not about what the bytes
+ *    look like today.
+ *
+ * The other verbs keep `schema: 1`; their payloads did not widen. A per-verb version is
+ * the point of the field — a single global number would either drag eight unchanged
+ * contracts forward or leave this one lying.
+ */
+export const BURN_SCHEMA = 2;
+
 export interface BurnEmpty {
-  schema: 1;
+  schema: typeof BURN_SCHEMA;
   active: false;
   as_of: string;
   reason: EmptyReason;
 }
 
 export interface BurnActive {
-  schema: 1;
+  schema: typeof BURN_SCHEMA;
   active: true;
   as_of: string;
   stale_s: number;
@@ -591,9 +633,15 @@ export interface BurnActive {
    * them is the whole point — the alternative a consumer must never be handed is the
    * POINTS number in a field named after Work-CET, which is a "13" that reads as
    * thirteen tokens against a consumed figure in the tens of thousands. The key set is
-   * unchanged and the meanings are unchanged; a reader that already handled `pct_*`
-   * being 0 for an empty band now handles null for an unconvertible one, and the
-   * points band itself is in {@link BurnActive.points}.
+   * unchanged and the meanings are unchanged, and the points band itself is in
+   * {@link BurnActive.points}.
+   *
+   * **This widening is what moved {@link BURN_SCHEMA} to 2.** It was shipped under
+   * `schema: 1` on the reasoning that a reader "already handling `pct_*` being 0 for an
+   * empty band now handles null" — which is a claim about a reader that was rewritten
+   * to expect null, not about the ones in the field. `number` → `number | null` is a
+   * type a schema-1 decoder is entitled to reject or, far worse, to coerce to 0. See
+   * {@link BURN_SCHEMA} for the migration.
    */
   wcet: {
     consumed: number;
@@ -607,8 +655,9 @@ export interface BurnActive {
    * `'story_point'`, null for every Work-CET band ever issued.
    *
    * ADDITIVE under P2.0's rule (no field removed, none retyped from a consumer's point
-   * of view), so `"schema"` stays `1`. A consumer that does not know about points sees
-   * a new key it can ignore and a `wcet` object that has gone null rather than lying.
+   * of view), so this key did not itself move `"schema"`: a consumer that does not know
+   * about points sees a new key it can ignore. The `wcet` NULLING beside it is a
+   * different matter and did move it — see {@link BURN_SCHEMA}.
    */
   points: BandPoints | null;
   split: { main: number; sub: number; aux: number };
@@ -645,7 +694,7 @@ export interface BurnActive {
    * This is a boolean rather than the literal `true` it was in P1.9, which is an
    * ADDITIVE change under P2.0's rule — no field removed, no field retyped from the
    * consumer's point of view (`scripts/statusline-burn.ts` already reads it as a
-   * truthy test) — so `"schema"` stays 1.
+   * truthy test) — so this key did not move `"schema"` either.
    */
   unvalidated: boolean;
   /**
@@ -665,8 +714,9 @@ export interface BurnActive {
    * All three are well-formed answers at exit 0, on the same rule as every other empty
    * result. ADDITIVE under P2.0's rule — no field removed, none retyped, and a field
    * that was already `object | null` gaining a second object shape is the same widening
-   * `unvalidated` made when it stopped being the literal `true` — so `"schema"` stays
-   * `1`. What it does cost is a re-read of every consumer that DEREFERENCES the object:
+   * `unvalidated` made when it stopped being the literal `true`, and a reader that
+   * already had to handle `null` here was never promised a number — so this key did not
+   * move `"schema"`. What it does cost is a re-read of every consumer that DEREFERENCES the object:
    * `scripts/statusline-burn.ts` and `renderBurn` below both discriminate on
    * `waiting_on_input` (via {@link isWaitingOnInput}) rather than on truthiness. The
    * board (`src/retro.ts`) reads the `burn_cache` COLUMNS instead of this payload, and
@@ -1153,11 +1203,19 @@ export function bandUnit(db: Database, row: BandUnitRow, resolve?: PointsRateRes
       },
     };
   }
+  // `anchorId` is part of the key, not decoration: a rate is Work-CET per point OF SOME
+  // ANCHOR, and this band is on disk, so its denomination is `row.sp_anchor_id` and NOT
+  // the anchor in force. Omitting it — which this call did — meant a v1 band asked for
+  // "the current rate" and got a v2 one wherever the v2 corpus was homogeneous enough to
+  // fit (or wherever `sp_seed_anchor_id` named v2), which is a Work-CET figure at a rate
+  // for a different-sized point. A NULL `sp_anchor_id` (pre-v15) passes through as an
+  // explicit null and gets no rate at all, which is the same refusal by the same rule.
   const bridge = (resolve ?? ((k: PointsRateKey): PointsRate => pointsToWcet(db, k)))({
     bucket: "global",
     estimatorFamily: priceFamily(row.estimator_model),
     refModel: row.ref_model,
     estimand: row.estimand,
+    anchorId: anchor,
   });
   if (bridge.rate === null) {
     return {
@@ -1251,10 +1309,10 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
     live: opts.refresh === true ? "fresh" : "cache",
   });
   const tid = target === "session" && attrib.active_tid !== null ? attrib.active_tid : resolved.tid;
-  if (tid === null) return { schema: 1, active: false, as_of: asOf, reason: "no_open_estimate" };
+  if (tid === null) return { schema: BURN_SCHEMA, active: false, as_of: asOf, reason: "no_open_estimate" };
 
   const band = currentBand(db, tid);
-  if (band === null) return { schema: 1, active: false, as_of: asOf, reason: "no_open_estimate" };
+  if (band === null) return { schema: BURN_SCHEMA, active: false, as_of: asOf, reason: "no_open_estimate" };
 
   const meta = db
     .query<{ kind: string; status: string; subject: string }, [string]>(
@@ -1263,7 +1321,7 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
     )
     .get(tid);
   if (meta === null || meta === undefined) {
-    return { schema: 1, active: false, as_of: asOf, reason: "no_open_estimate" };
+    return { schema: BURN_SCHEMA, active: false, as_of: asOf, reason: "no_open_estimate" };
   }
 
   let consumed: number;
@@ -1346,7 +1404,7 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
       >("SELECT * FROM burn_cache WHERE tid = ?")
       .get(tid);
     if (row === null || row === undefined) {
-      return { schema: 1, active: false, as_of: asOf, reason: "no_cache" };
+      return { schema: BURN_SCHEMA, active: false, as_of: asOf, reason: "no_cache" };
     }
     consumed = row.consumed_wcet ?? 0;
     main = row.wcet_main ?? 0;
@@ -1428,7 +1486,7 @@ export function burnJson(db: Database, opts: BurnJsonOptions = {}): BurnJson {
   if (nUnpriced > 0) warn.push("unpriced");
 
   return {
-    schema: 1,
+    schema: BURN_SCHEMA,
     active: true,
     as_of: cacheAsOf,
     stale_s: staleS,
@@ -1521,12 +1579,12 @@ export function burnRead(dbPath: string, opts: BurnJsonOptions = {}): BurnJson {
   try {
     db = openDb({ path: dbPath, readonly: true, busyTimeoutMs: 50 });
   } catch (e) {
-    return { schema: 1, active: false, as_of: asOf, reason: classifyOpenError(e) };
+    return { schema: BURN_SCHEMA, active: false, as_of: asOf, reason: classifyOpenError(e) };
   }
   try {
     return burnJson(db, opts);
   } catch (e) {
-    return { schema: 1, active: false, as_of: asOf, reason: classifyOpenError(e) };
+    return { schema: BURN_SCHEMA, active: false, as_of: asOf, reason: classifyOpenError(e) };
   } finally {
     db.close();
   }
@@ -1591,10 +1649,20 @@ export function renderBurn(b: BurnJson): string {
   // line so `UNCALIBRATED` stays attached to the headline it qualifies.
   const bandNotes: string[] = [];
   if (pointsUnconverted(b.points)) {
+    // The remedy in `est close`'s exit-2 SHAPE: the first option is "do nothing", and it
+    // states its consequence. Offering the seed as an equal alternative — which this
+    // line used to do, in one clause, with no bar attached — invites the one thing the
+    // project decided against on evidence, and does it on the surface most likely to be
+    // read while impatient. §13.1 lives in a file nothing on this path pointed at, so
+    // the citation travels with the lever.
     bandNotes.push(
-      `      a rate appears once the bucket has ${COLD_START_N} completed story-point tasks, or set the ` +
-        `bootstrap with \`est config set sp_seed_wcet_per_point <n>\` and ` +
-        `\`est config set sp_seed_anchor_id ${b.points?.anchor_id ?? "v1"}\``,
+      `      do nothing: a FITTED rate appears on its own once the bucket has ${COLD_START_N} completed ` +
+        `story-point tasks, and the cold start ends with nobody deciding anything.`,
+      `      no seed is set DELIBERATELY (DECISIONS.md §13.1 — the implied rate is not stable, and a seed ` +
+        `lives in \`config\`, where it would be fitted against and never resurface as the assumption it is). ` +
+        `\`est config set sp_seed_wcet_per_point <n>\` + \`sp_seed_anchor_id ${b.points?.anchor_id ?? "v1"}\` ` +
+        `is Craig's own lever and clears the bar only on ρ(actual, rate) ≈ 0 and rate CV < 0.3 measured over ` +
+        `≥10 REAL completed tasks — impatience is not that evidence.`,
     );
   } else if (q !== "") {
     bandNotes.push(

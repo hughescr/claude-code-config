@@ -65,6 +65,21 @@ import { JOBS_ROOT, jobsRetroPanel, type JobsPanelRow } from "./jobs.ts";
 /** The G-ATTR bar. Below this, the historical corpus is not calibration-grade. */
 export const ATTR_COVERAGE_GATE = 0.7;
 
+/**
+ * The decomposition mandate's threshold, in STORY POINTS — the "~40" that
+ * `skills/estimating/SKILL.md` and `CLAUDE.md` state as a rule.
+ *
+ * Deliberately a constant here and NOT a `config` key. §1.1 puts every tunable in
+ * `config`, but this is not a tunable: it is the *observed* threshold in an
+ * instrument that exists to tell Craig whether the prose rule is being followed. A
+ * config key would let the measurement be moved to meet the corpus, which is the
+ * failure mode the whole retro is built against; and unlike `sp_max_points` (a REFUSAL
+ * bound, which has to be raisable) nothing is refused on the strength of this number.
+ * If the rule's threshold changes, the rule and this constant move together in one
+ * commit — which is exactly the coupling that keeps them from drifting apart.
+ */
+export const DECOMPOSITION_POINTS = 40;
+
 export interface BucketFit {
   bucket: string;
   estimator_family: string;
@@ -157,6 +172,25 @@ export interface DataQualityPanel {
   stale_closed_share: number | null;
   compliance_t1t2: number | null;
   t3_candidates: number;
+  /**
+   * The DECOMPOSITION MANDATE, measured — tasks whose band was issued above
+   * {@link DECOMPOSITION_POINTS} points and which carry no `estimate_block` row at all.
+   *
+   * The rule ("above ~40 points, or across more than one phase, decompose and size the
+   * pieces") arrived stated in five prose places and instrumented in none. This project
+   * already made the opposite choice once, for the same shape of rule: `compliance_t1t2`
+   * exists precisely so a mandate can be WATCHED rather than repeated, and the doctrine
+   * that follows from watching it is to sharpen the wording rather than to gate — which
+   * is a decision the number licenses and prose cannot.
+   *
+   * `decomposition_due` is the denominator (how many bands were even large enough for
+   * the rule to bite) and `decomposition_undecomposed` the violations, because a bare
+   * count answers neither "is this getting worse" nor "is anyone hitting this rule at
+   * all". Both are 0 on a Work-CET corpus: the threshold is in POINTS and only a
+   * `story_point` band is measured against it.
+   */
+  decomposition_due: number;
+  decomposition_undecomposed: number;
   t4_note: string;
   scope_declared_pct: number | null;
   identity_planted_pct: number | null;
@@ -389,8 +423,13 @@ export function retro(
       `unit_refusal: ${u.baseline} baseline, ${u.refinement} refinement, ${u.block_tasks} block-task and ` +
         `${u.blocks} per-block comparison(s) are UNDEFINED, not missing — the band is in story points, ` +
         "the actual is in Work-CET, and no conversion was applied at `est open`. " +
-        "Set `sp_seed_wcet_per_point` + `sp_seed_anchor_id`, or close enough points tasks to fit a rate, " +
-        "and bands issued from then on score normally (`estimate` is append-only, so these never will).",
+        // Same shape as `est close`'s exit-2 remedy and `est burn`'s band note: "do
+        // nothing" first, with its consequence, and the seed named as the decided-against
+        // lever it is rather than as a co-equal fix.
+        "Do nothing: closing points tasks fits a rate by itself, and bands issued from then on score " +
+        "normally (`estimate` is append-only, so these never will). No seed is set DELIBERATELY " +
+        "(DECISIONS.md §13.1); `sp_seed_wcet_per_point` + `sp_seed_anchor_id` clear the bar only on " +
+        "ρ(actual, rate) ≈ 0 and rate CV < 0.3 over ≥10 real completed tasks — not on impatience.",
     );
   }
 
@@ -749,6 +788,30 @@ function qualityPanel(db: Database): DataQualityPanel {
       WHERE r.ended_at IS NULL`,
   );
 
+  // The decomposition mandate, counted. ONE query, two numbers: how many story-point
+  // bands landed above the threshold, and how many of those hung no block off the
+  // estimate they were issued as.
+  //
+  // Measured on the estimate's OWN raw p50 — the band as issued, in points — rather
+  // than on p90 or on a converted figure. The rule is about the size the estimator
+  // committed to at `est open`, and p50 is the number the ladder produces; a p90 test
+  // would fire on any band with a wide tail, which is a different (and unstated) rule.
+  // Blocks are counted against `b.eid`, so a task that was re-estimated and blocked
+  // under an earlier version reads as undecomposed for the CURRENT band — correctly:
+  // `estimate_block` is append-only per eid and a refinement that widened past the
+  // threshold has not been decomposed.
+  const decomp = db
+    .query<{ due: number; missing: number }, [number]>(
+      `SELECT COUNT(*) AS due,
+              SUM(CASE WHEN (SELECT COUNT(*) FROM estimate_block b WHERE b.eid = e.eid) = 0
+                       THEN 1 ELSE 0 END) AS missing
+         FROM estimate e
+        WHERE e.estimand = 'story_point'
+          AND e.raw_p50_wcet > ?
+          AND e.eid = (SELECT MAX(eid) FROM estimate WHERE tid = e.tid)`,
+    )
+    .get(DECOMPOSITION_POINTS);
+
   // Block completeness: a T1 task whose declared phases are all blocked.
   const blockRows = db
     .query<{ tid: string; declared: number; blocked: number }, []>(
@@ -770,6 +833,8 @@ function qualityPanel(db: Database): DataQualityPanel {
     stale_closed_share: ratio(staleClosed, trackedTotal),
     compliance_t1t2: t1t2 > 0 ? 1 - missed / t1t2 : null,
     t3_candidates: countT3Candidates(db),
+    decomposition_due: decomp?.due ?? 0,
+    decomposition_undecomposed: decomp?.missing ?? 0,
     t4_note:
       "T4 (the user asked for a budget) is undetectable without a prompt classifier — a known blind spot, stated (§3.3)",
     scope_declared_pct: ratio(scopeChanged?.declared ?? 0, scopeChanged?.total ?? 0),
@@ -867,6 +932,20 @@ function countT3Candidates(db: Database): number {
  * sample sizes that test cannot pass honestly. Recording the deltas is what makes
  * the eventual decision evidence-driven rather than a guess about which dimension
  * "obviously" matters.
+ *
+ * UNIT-GUARDED (v15), on the same rule as every other scoring surface. The baseline
+ * loss below is `pinball(actual, cal_p50)` — a Work-CET actual against the band's
+ * `cal_*` — so it is defined only where {@link bandUnscorable} says `cal_*` really is
+ * Work-CET. Unguarded, a corpus of unconverted story-point tasks produced a *global*
+ * loss inflated by pure unit confusion and a *split* loss that was not (the
+ * leave-one-out leg refits `actual / raw_p50`, i.e. Work-CET-per-point, and multiplies
+ * it back through `raw_p50`, so it stays in one unit whatever the estimand). The ratio
+ * of the two then read as a near-perfect `pinball_delta` — a confident recommendation
+ * to split a calibration bucket on the strength of nothing at all.
+ *
+ * Dropped rows are dropped BEFORE the `n >= 20` floor, so a corpus that is entirely
+ * unconvertible yields no candidates rather than candidates from a thinner sample: the
+ * floor exists to say "not enough evidence", and unit-confused rows are not evidence.
  */
 function splitCandidates(
   db: Database,
@@ -875,16 +954,21 @@ function splitCandidates(
   gate: number,
 ): RetroReport["splits"] {
   const rows = db
-    .query<{ kind: string; actual: number; cal_p50: number; raw_p50: number }, [string, string]>(
+    .query<
+      { kind: string; actual: number; cal_p50: number; raw_p50: number; estimand: string; cal_p50_wcet: number; raw_p50_wcet: number },
+      [string, string]
+    >(
       `SELECT t.kind AS kind, o.actual_wcet_at_epoch AS actual,
-              e.cal_p50_wcet AS cal_p50, e.raw_p50_wcet AS raw_p50
+              e.cal_p50_wcet AS cal_p50, e.raw_p50_wcet AS raw_p50,
+              e.estimand AS estimand, e.cal_p50_wcet AS cal_p50_wcet, e.raw_p50_wcet AS raw_p50_wcet
          FROM v_outcome_current o
          JOIN estimate e ON e.eid = o.eid_at_start
          JOIN task t ON t.tid = o.tid
         WHERE o.final_status = 'completed' AND o.actual_wcet_at_epoch IS NOT NULL
           AND e.ref_model = ? AND e.estimand = ? AND e.raw_p50_wcet > 0`,
     )
-    .all(refModel, estimand);
+    .all(refModel, estimand)
+    .filter((r) => !bandUnscorable(r));
   if (rows.length < 20) return [];
 
   const globalLoss = meanOf(rows.map((r) => pinball(r.actual, r.cal_p50, 0.5))) ?? 0;
@@ -1058,9 +1142,40 @@ export interface BoardPhase {
   phase_conf: "exact" | "inferred" | "unmapped" | null;
   actual_wcet: number | null;
   n_agents: number;
-  /** From `est block`, if one was declared for this phase; null otherwise. */
+  /**
+   * From `est block`, if one was declared for this phase **and it is in Work-CET**;
+   * null otherwise — including when a block WAS declared but in story points, which is
+   * what {@link BoardPhase.blocks_in_points} distinguishes from "none declared".
+   */
   block_p50: number | null;
   block_p90: number | null;
+  /**
+   * The declared block band as AUTHORED, in story points, when
+   * {@link BoardPhase.blocks_in_points}; null for a Work-CET block band, which lives in
+   * `block_p50`/`block_p90` instead.
+   *
+   * Two fields rather than one pair reused, for the reason `wcet` and `points` are two
+   * objects in {@link import("./burn.ts").BurnActive}: a points figure in a field named
+   * after Work-CET is an `8` that reads as eight tokens beside an actual in the
+   * hundreds. Naming the unit in the key is what makes that impossible.
+   */
+  block_points_p50: number | null;
+  block_points_p90: number | null;
+  /**
+   * `estimate_block` rows for this phase are in STORY POINTS, so `actual_wcet` (always
+   * Work-CET) and the declared block band are in different units and NO comparison
+   * between them is defined — no ratio, no delta, no "over/under".
+   *
+   * This is `blocksInWcet(estimand)` inverted, and deliberately the estimand rather
+   * than `v_block_accuracy.unit_mismatch`: the view's column is 1 only once an actual
+   * has arrived (`estimand = 'story_point' AND pa.wcet IS NOT NULL`), which is the
+   * right refusal for the view's own `actual_wcet` column but would leave a declared
+   * points block sitting in `block_p50` — a Work-CET-named field — for every phase
+   * nothing has run in yet. `est block` stores what it was given and nothing ever
+   * converts an `estimate_block` row, so under points the block side is points
+   * forever, actual or no actual.
+   */
+  blocks_in_points: boolean;
   block_exp_agents: number | null;
 }
 
@@ -1142,6 +1257,13 @@ interface BlockAccuracyRow {
   p50_wcet: number;
   p90_wcet: number;
   exp_agents: number;
+  /** `estimate.estimand`, joined in: `v_block_accuracy` does not project it, and the
+   *  strip cannot decide what unit `p50_wcet`/`p90_wcet` are in without it. */
+  estimand: string;
+  /** The view's OWN refusal, carried rather than recomputed — 1 when it declined to
+   *  publish an actual for this block row on unit grounds. {@link phaseStrips} honours
+   *  it directly: the strip must never render a comparison the view nulled. */
+  unit_mismatch: number;
 }
 
 /**
@@ -1190,6 +1312,9 @@ function phaseStrips(db: Database, tids: readonly string[]): Map<string, BoardPh
         n_agents: 0,
         block_p50: null,
         block_p90: null,
+        block_points_p50: null,
+        block_points_p90: null,
+        blocks_in_points: false,
         block_exp_agents: null,
       };
       forTid.set(idx, entry);
@@ -1224,8 +1349,16 @@ function phaseStrips(db: Database, tids: readonly string[]): Map<string, BoardPh
 
     for (const r of db
       .query<BlockAccuracyRow, string[]>(
-        `SELECT tid, phase_idx, title, p50_wcet, p90_wcet, exp_agents
-           FROM v_block_accuracy WHERE tid IN (${placeholders(chunk.length)})`,
+        // `estimand` is joined in because `v_block_accuracy` does not project it and the
+        // strip cannot route `p50_wcet`/`p90_wcet` to the right field without it;
+        // `unit_mismatch` comes along so the refusal the view already made is CARRIED
+        // rather than re-derived and possibly disagreed with.
+        `SELECT ba.tid AS tid, ba.phase_idx AS phase_idx, ba.title AS title,
+                ba.p50_wcet AS p50_wcet, ba.p90_wcet AS p90_wcet, ba.exp_agents AS exp_agents,
+                ba.unit_mismatch AS unit_mismatch, e.estimand AS estimand
+           FROM v_block_accuracy ba
+           JOIN estimate e ON e.eid = ba.eid
+          WHERE ba.tid IN (${placeholders(chunk.length)})`,
       )
       .all(...chunk)) {
       const p = get(r.tid, r.phase_idx);
@@ -1233,9 +1366,28 @@ function phaseStrips(db: Database, tids: readonly string[]): Map<string, BoardPh
       // hasn't already supplied `workflow_phase.title` (the two should agree, but the
       // authored title is available even before any agent for this phase has run).
       if (p.actual_wcet === null && p.n_agents === 0) p.title = r.title;
-      p.block_p50 = r.p50_wcet;
-      p.block_p90 = r.p90_wcet;
+      // THE UNIT FORK, and the reason this is not a straight assignment. The board was
+      // reading Work-CET actuals from `v_phase_actual` and raw block quantiles from
+      // `v_block_accuracy` and merging them into one entry — which REASSEMBLED, out of
+      // two halves, exactly the comparison `v_block_accuracy` had refused to publish
+      // (it nulls its own `actual_wcet` and raises `unit_mismatch` under points). The
+      // view's null is not an omission to be routed around; it is the answer.
+      //
+      // BOTH conditions, not either: `blocksInWcet` is the shared rule and covers the
+      // phase nothing has run in yet, while `unit_mismatch` is the view's own verdict on
+      // this exact row. If the view ever refuses for a reason the estimand alone does not
+      // capture, the board follows it instead of arguing with it.
       p.block_exp_agents = r.exp_agents;
+      if (blocksInWcet(r.estimand) && r.unit_mismatch === 0) {
+        p.block_p50 = r.p50_wcet;
+        p.block_p90 = r.p90_wcet;
+      } else {
+        p.blocks_in_points = true;
+        p.block_points_p50 = r.p50_wcet;
+        p.block_points_p90 = r.p90_wcet;
+        p.block_p50 = null;
+        p.block_p90 = null;
+      }
     }
   }
 
@@ -1433,7 +1585,13 @@ export function board(
   // resolver rather than the answer.
   const rateCache = new Map<string, PointsRate>();
   const resolveRate = (k: PointsRateKey): PointsRate => {
-    const ck = `${k.bucket}|${k.estimatorFamily}|${k.refModel}|${k.estimand}`;
+    // The ANCHOR is in the cache key because it is in `PointsRateKey`. A board mixing
+    // v1 and v2 cards would otherwise serve whichever anchor's rate was resolved first
+    // to every card after it — the memo turning a per-band question into a per-board
+    // answer, which is the one thing a cache must not do. `undefined` cannot occur here
+    // (`bandUnit` always passes the stored `sp_anchor_id`), so `??` only distinguishes
+    // the NULL-anchor rows, which resolve to no rate anyway.
+    const ck = `${k.bucket}|${k.estimatorFamily}|${k.refModel}|${k.estimand}|${k.anchorId ?? " "}`;
     let hit = rateCache.get(ck);
     if (hit === undefined) {
       hit = pointsToWcet(db, k);

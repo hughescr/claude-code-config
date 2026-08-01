@@ -92,6 +92,12 @@ function seedTask(opts: {
   sessionId: string;
   status?: string;
   calP90?: number;
+  /** v15. `story_point` with `cal === raw` is the UNSCORABLE cold start — the band is
+   *  in points and no rate converted it at `est open`. Defaults to the Work-CET band
+   *  every test above this one assumes. */
+  estimand?: string;
+  rawP50?: number;
+  calP50?: number;
 }): void {
   const db = openDb({ path: dbPath });
   const now = new Date().toISOString();
@@ -118,7 +124,7 @@ function seedTask(opts: {
           opts.tid,
           now,
           "initial",
-          1000,
+          opts.rawP50 ?? 1000,
           opts.calP90,
           1,
           0,
@@ -128,11 +134,11 @@ function seedTask(opts: {
           "global",
           0,
           0,
-          1000,
+          opts.calP50 ?? 1000,
           opts.calP90,
           now,
           "claude-sonnet-4-5",
-          "work_cet",
+          opts.estimand ?? "work_cet",
           "claude-sonnet-4-5",
         ],
       );
@@ -423,6 +429,69 @@ describe("nudge.ts — P1.10 job 4: overrun nudge (burn_cache, schema v5)", () =
       nudge_kind: "overrun",
     });
     expect(existsSync(join(spoolDir, ".overrun-notified.t-bound"))).toBe(true);
+  });
+
+  // v15, and the reason this hook now consults the shared unit guard. `burn_cache
+  // .consumed_wcet` is Work-CET; a story-point band with no rate at `est open` leaves
+  // `cal_p90_wcet` holding POINTS. Comparing them fired a live, user-facing warning
+  // that "consumed 14 vs p90 13 Work-CET" for a THIRTEEN-POINT band — a false alarm on
+  // a wired PostToolUse hook, which is a wrong number that looks right on the surface
+  // Craig cannot opt out of reading.
+  test("never fires an overrun on an unscorable points band, however far consumed runs past it", () => {
+    seedTask({
+      tid: "t-points",
+      sessionId: "bound-session",
+      estimand: "story_point",
+      rawP50: 8,
+      calP50: 8, // cal === raw: nothing converted it, so these are POINTS
+      calP90: 13,
+    });
+    seedBurnCache("t-points", 14); // Codex's repro exactly: 14 Work-CET against 13 points
+
+    const r = runNudge(
+      JSON.stringify({ session_id: "bound-session", tool_name: "Task", tool_input: {} }),
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe("");
+    // Not merely quiet: nothing was recorded as a fired threshold either, so the day a
+    // rate exists the first real crossing still nudges.
+    expect(existsSync(join(spoolDir, ".overrun-notified.t-points"))).toBe(false);
+  });
+
+  test("and not at 100x either — the refusal is about the unit, not about the margin", () => {
+    seedTask({
+      tid: "t-points",
+      sessionId: "bound-session",
+      estimand: "story_point",
+      rawP50: 8,
+      calP50: 8,
+      calP90: 13,
+    });
+    seedBurnCache("t-points", 1_300_000);
+    expect(runNudge(
+      JSON.stringify({ session_id: "bound-session", tool_name: "Task", tool_input: {} }),
+    ).stdout).toBe("");
+  });
+
+  test("a points band that WAS converted at `est open` is scorable and still nudges", () => {
+    // The guard must not swallow every points task: `cal !== raw` means a rate was
+    // applied at issue time, so `cal_p90_wcet` really is Work-CET and the comparison is
+    // defined. Refusing here would be the opposite failure — a real overrun going unsaid.
+    seedTask({
+      tid: "t-converted",
+      sessionId: "bound-session",
+      estimand: "story_point",
+      rawP50: 8,
+      calP50: 24_000, // 3000 Work-CET/point applied at open
+      calP90: 39_000,
+    });
+    seedBurnCache("t-converted", 45_000);
+
+    const r = runNudge(
+      JSON.stringify({ session_id: "bound-session", tool_name: "Task", tool_input: {} }),
+    );
+    expect(r.exitCode).toBe(0);
+    expect(JSON.parse(r.stdout).hookSpecificOutput.additionalContext).toContain("t-converted");
   });
 });
 

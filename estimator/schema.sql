@@ -165,14 +165,26 @@ CREATE TABLE estimate (             -- APPEND-ONLY, physically enforced
   -- and for every row issued before v15; a consumer that needs the anchor must treat
   -- NULL as "not a points band", never as "the current anchor".
   --
-  -- LAYOUT NOTE: `sp_anchor_id` shares its line with `estimator_model` because that is
-  -- byte-for-byte what `ALTER TABLE estimate ADD COLUMN sp_anchor_id TEXT` leaves in
-  -- `sqlite_master` — SQLite splices the new column in after the LAST column
-  -- definition and before its trailing comment. `estimate` cannot be rebuilt (four
-  -- tables reference it and the append-only triggers guard every row), so the v14 ->
-  -- v15 step is an ADD COLUMN, and `test/schema.test.ts` asserts a migrated file is
-  -- byte-identical to a fresh one. Moving this to its own line breaks that test.
-  estimator_model TEXT NOT NULL, sp_anchor_id TEXT,    -- velocity history is keyed by this (model churn decay)
+  -- v17 `procedure_version`: WHICH INSTRUCTION produced this band (config.procedure_version
+  -- as of `est open`). Four things fix what a band means — the model (`estimator_model`),
+  -- the prices (`price_epoch`), the unit (`estimand` + `sp_anchor_id`) and the PROCEDURE
+  -- the estimator was told to follow — and only the fourth was unversioned. Inside the
+  -- Work-CET era the procedure changed twice in one day (raw-as-floor, then uncorrected
+  -- judgement); those samples pool as if they were one measurement, and because `estimate`
+  -- is append-only (est_ro_u / est_ro_d) nothing can separate them after the fact. So the
+  -- vintage is RECORDED here. It is deliberately NOT in any pooling key today: no retro
+  -- has enough rows per procedure to split on, and segregating the corpus now would empty
+  -- every reference class. It exists so a future retro CAN partition on it. NULL means
+  -- "issued before this column existed, vintage unknown" — never "the current procedure".
+  --
+  -- LAYOUT NOTE: both trailing columns share the `estimator_model` line because that is
+  -- byte-for-byte what `ALTER TABLE estimate ADD COLUMN` leaves in `sqlite_master` —
+  -- SQLite splices each new column in after the LAST column definition and before its
+  -- trailing comment. `estimate` cannot be rebuilt (four tables reference it and the
+  -- append-only triggers guard every row), so v14 -> v15 and v16 -> v17 are both ADD
+  -- COLUMN, and `test/schema.test.ts` asserts a migrated file is byte-identical to a
+  -- fresh one. Moving either to its own line breaks that test.
+  estimator_model TEXT NOT NULL, sp_anchor_id TEXT, procedure_version TEXT,    -- velocity history is keyed by this (model churn decay)
   UNIQUE (tid, version),
   FOREIGN KEY (tid, scope_seq) REFERENCES task_scope(tid, seq)
 ) STRICT;
@@ -1290,9 +1302,20 @@ LEFT JOIN estimate_identity_repair r
   ON r.eid = e.eid
  AND r.seq = (SELECT MAX(seq) FROM estimate_identity_repair WHERE eid = e.eid);
 
+-- v17: `sp_anchor_id` is projected beside the unit pair, because under 'story_point'
+-- the pair does not finish the job. `velocity_raw` is `actual_wcet / raw_p50`, so with
+-- `raw_p50` in POINTS every sample here is Work-CET per point OF SOME ANCHOR — and a
+-- rate per point of the v1 anchor says nothing about a point of the v2 anchor, which is
+-- the precise failure `estimate.sp_anchor_id` was added to prevent. `refclass` is not
+-- yet keyed on it (src/retro.ts still fits one snapshot per (bucket, family, ref_model,
+-- estimand)), so `pointsToWcet` in src/tasks.ts does the segregation on THIS column
+-- instead: it counts the samples at the band's own anchor and refuses a fitted rate
+-- whose snapshot could have pooled a foreign anchor. NULL here means a Work-CET band or
+-- a pre-v15 row — under points it reads as "unknown denomination", never as "current".
 CREATE VIEW v_velocity AS
 SELECT e.bucket, i.estimator_model, e.price_epoch, e.refclass_as_of,
        e.ref_model, e.estimand,                          -- the UNIT; never pool across these
+       e.sp_anchor_id,                                   -- the unit's VERSION under 'story_point'
        o.velocity_raw, o.velocity_cal, o.finalized_at,
        o.wcet_main, o.wcet_sub, o.wcet_aux,
        o.wcet_main + o.wcet_sub AS wcet_task_effort,     -- calibrate on THIS, not on the total
@@ -1374,7 +1397,7 @@ WHERE s.terminator = 'open'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '16'),
+  ('schema_version',          '17'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.
@@ -1419,6 +1442,20 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   -- the cutover to corrupt the new corpus, and `estimate` is append-only so it could
   -- never be corrected. Rejected at `est open` / `est block` rather than stored.
   ('sp_max_points',           '1000'),
+  -- The PROCEDURE in force: which instruction the estimator was given, snapshotted onto
+  -- every band as `estimate.procedure_version` exactly as `sp_anchor_id` is (v17). The
+  -- model, the prices and the unit were all versioned; the sentence that produced the
+  -- number was not — and inside the Work-CET era it changed twice in one day, leaving
+  -- two different measurements pooled in one reference class with nothing on the rows to
+  -- tell them apart. Unlike `sp_anchor_id` there is no companion `_text` row, because the
+  -- procedure is the skill (skills/estimating/) and lives in git: so the VALUE has to
+  -- identify the vintage on its own, hence `<date>-<slug>` rather than a bare `v1`. Bump
+  -- it — `est config set procedure_version <date>-<slug>` — whenever the instruction that
+  -- produces `--raw-p50` / `--raw-p90` changes in a way that would move the number.
+  --
+  -- It is NOT in any pooling key today. Recording it is the whole point; partitioning on
+  -- it is a retro's call once there are enough rows per vintage to split.
+  ('procedure_version',       '2026-07-31-uncorrected-judgement'),
   -- PLACEHOLDER: the design does not pin the normaliser family. `est prices --sync`
   -- must produce a model_price row for whatever family this names, or v_wcet yields
   -- NULL wcet. Change with `est config set ref_model <family>`.

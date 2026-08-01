@@ -119,10 +119,14 @@ describe("formatting helpers", () => {
 // board() — the P2.7 additive fields
 // ---------------------------------------------------------------------------
 
-async function openTask(subject: string, extra: string[] = []): Promise<string> {
+async function openTask(
+  subject: string,
+  extra: string[] = [],
+  over: Partial<Record<string, string | number>> = {},
+): Promise<string> {
   const session = `s-${subject}`;
   turn(h.db, { session, prompt: "p1", at: "2026-02-01T00:00:00Z" });
-  const r = await h.cli(...openArgs({ subject }), "--session", session, "--prompt", "p1", "--json", ...extra);
+  const r = await h.cli(...openArgs({ subject, ...over }), "--session", session, "--prompt", "p1", "--json", ...extra);
   expect(r.code).toBe(0);
   return r.json<{ tid: string }>().tid;
 }
@@ -202,6 +206,118 @@ describe("board() — P2.7 per-phase strip", () => {
     const r = board(h.db, { now: new Date() });
     const card = r.columns.flatMap((c) => c.cards).find((c) => c.tid === tid)!;
     expect(card.phases).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v15 — the strip must not reassemble a comparison `v_block_accuracy` refused
+// ---------------------------------------------------------------------------
+
+/**
+ * Codex's finding, reproduced. `v_block_accuracy` deliberately publishes
+ * `{actual_wcet: null, unit_mismatch: 1}` for a block hanging off a story-point
+ * estimate: `estimate_block` rows are POINTS forever (nothing converts them) while the
+ * phase actual is Work-CET. The strip was reading the actual from `v_phase_actual` and
+ * the quantiles from `v_block_accuracy` and merging them into one entry — putting the
+ * refused comparison back together out of its two halves, and rendering `500/8` as
+ * though a phase estimated at 8 had cost sixty times its band.
+ */
+describe("board() — the phase strip honours v_block_accuracy's unit refusal", () => {
+  async function pointsWorkflowCard(): Promise<{
+    tid: string;
+    phases: import("../src/retro.ts").BoardPhase[];
+    report: import("../src/retro.ts").BoardReport;
+  }> {
+    h.db.query("UPDATE config SET v = 'story_point' WHERE k = 'estimand'").run();
+    const tid = await openTask("points wf task", [], { "raw-p50": 8, "raw-p90": 13 });
+    seedWorkflow(tid);
+    expect((await h.cli("block", tid, "--phase", "0", "--title", "survey", "--p50", "8", "--p90", "13")).code).toBe(0);
+    request(h.db, "rq-1", { session: anchorSession(tid), agent: "a1", origin: "subagent", out: 500 });
+    attributeTasks(h.db);
+    const report = board(h.db, { now: new Date("2026-02-01T00:10:00Z") });
+    const card = report.columns.flatMap((c) => c.cards).find((c) => c.tid === tid)!;
+    return { tid, phases: card.phases, report };
+  }
+
+  test("the view really does refuse — this is the null the board must not route around", async () => {
+    const { tid } = await pointsWorkflowCard();
+    const row = h.db
+      .query<{ actual_wcet: number | null; unit_mismatch: number; p50_wcet: number }, [string]>(
+        "SELECT actual_wcet, unit_mismatch, p50_wcet FROM v_block_accuracy WHERE tid = ? AND phase_idx = 0",
+      )
+      .get(tid)!;
+    expect(row).toMatchObject({ actual_wcet: null, unit_mismatch: 1, p50_wcet: 8 });
+  });
+
+  test("the view model carries the points band in a points-named field, never in block_p50", async () => {
+    const { phases } = await pointsWorkflowCard();
+    const p0 = phases.find((p) => p.phase_idx === 0)!;
+    expect(p0.actual_wcet).toBe(500); // a real Work-CET measurement, and it stays
+    expect(p0.blocks_in_points).toBe(true);
+    // The `8` is not lost — it is just not allowed to sit in a Work-CET-named field
+    // where a consumer can divide the actual by it.
+    expect(p0.block_p50).toBeNull();
+    expect(p0.block_p90).toBeNull();
+    expect(p0.block_points_p50).toBe(8);
+    expect(p0.block_points_p90).toBe(13);
+  });
+
+  test("neither renderer draws the ratio: no `500/8` in the HTML or the markdown", async () => {
+    const { report } = await pointsWorkflowCard();
+    const html = renderBoardHtml(report);
+    const md = renderBoardMd(report);
+    for (const out of [html, md]) {
+      expect(out).not.toContain(`${fmtWcet(500)}/${fmtWcet(8)}`);
+      expect(out).toContain("not comparable");
+    }
+    expect(html).toContain("8pt");
+  });
+
+  // The judgement call, written down where it can be re-checked rather than re-derived.
+  // The rule (stated at the emission site in `src/cli.ts`): a payload's version moves
+  // when a key is REMOVED or RETYPED, never when one is added. `BoardPhase` gained three
+  // keys and retyped none — `block_p50`/`block_p90` were already `number | null` — so a
+  // schema-1 decoder still decodes everything it knows about, and is not misled by what
+  // it does not. `est burn` moved to 2 under the opposite condition, and that contrast
+  // is the whole content of the rule.
+  test("the additive phase fields do NOT move board's schema version", async () => {
+    await pointsWorkflowCard();
+    const r = await h.cli("board", "--json");
+    expect(r.code).toBe(0);
+    const body = r.json<{
+      schema: number;
+      columns: Array<{ cards: Array<{ phases: Array<Record<string, unknown>> }> }>;
+    }>();
+    expect(body.schema).toBe(1);
+
+    const p0 = body.columns
+      .flatMap((c) => c.cards)
+      .flatMap((c) => c.phases)
+      .find((p) => p.blocks_in_points === true)!;
+    // Additive: the new keys are on the wire under the unchanged version.
+    expect(Object.hasOwn(p0, "block_points_p50")).toBe(true);
+    expect(Object.hasOwn(p0, "block_points_p90")).toBe(true);
+    expect(p0.block_points_p50).toBe(8);
+    // And nothing was removed or retyped: the keys a schema-1 decoder already reads are
+    // still there, still within `number | null`. It sees "no Work-CET block declared" —
+    // which is TRUE — rather than a points figure wearing a Work-CET name, so the
+    // unbumped version costs an old consumer nothing it was entitled to.
+    expect(Object.hasOwn(p0, "block_p50")).toBe(true);
+    expect(p0.block_p50).toBeNull();
+    expect(p0.block_p90).toBeNull();
+  });
+
+  test("a Work-CET workflow is untouched: the ratio is defined there and still rendered", async () => {
+    const tid = await openTask("wcet wf task");
+    seedWorkflow(tid);
+    expect((await h.cli("block", tid, "--phase", "0", "--title", "survey", "--p50", "100", "--p90", "300")).code).toBe(0);
+    request(h.db, "rq-1", { session: anchorSession(tid), agent: "a1", origin: "subagent", out: 500 });
+    attributeTasks(h.db);
+    const report = board(h.db, { now: new Date("2026-02-01T00:10:00Z") });
+    const card = report.columns.flatMap((c) => c.cards).find((c) => c.tid === tid)!;
+    const p0 = card.phases.find((p) => p.phase_idx === 0)!;
+    expect(p0).toMatchObject({ blocks_in_points: false, block_p50: 100, block_points_p50: null });
+    expect(renderBoardMd(report)).toContain(`${fmtWcet(500)}/${fmtWcet(100)}`);
   });
 });
 

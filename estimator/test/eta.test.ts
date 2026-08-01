@@ -57,6 +57,7 @@ import {
   type SegmentRow,
 } from "../src/eta.ts";
 import {
+  BURN_SCHEMA,
   agentCounts,
   burnJson,
   burnRead,
@@ -844,7 +845,7 @@ describe("est burn --json — the check_back fields (P2.2)", () => {
     const tid = await liveTask(h, fx.session, now);
     const b = burnJson(h.db, { tid, now }) as BurnActive;
 
-    expect(b.schema).toBe(1);
+    expect(b.schema).toBe(BURN_SCHEMA);
     const cb = band(b.check_back);
     expect(cb.basis).toBe("session");
     expect(cb.eta_model).toBe("residual_life");
@@ -1176,7 +1177,7 @@ describe("est burn --json — the check_back fields (P2.2)", () => {
 
 describe("the statusline segment — P2.2", () => {
   const base: BurnActive = {
-    schema: 1,
+    schema: BURN_SCHEMA,
     active: true,
     as_of: "2026-03-01T10:25:00.000Z",
     stale_s: 1,

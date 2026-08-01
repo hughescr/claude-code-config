@@ -32,6 +32,24 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
 /**
  * Must match the config.schema_version seed in schema.sql.
  *
+ * 17 — the ANCHOR is ENFORCED, and the PROCEDURE becomes recordable (Craig 2026-07-31).
+ *     Three things, and no row is read, written or moved:
+ *       - `v_velocity` projects `e.sp_anchor_id`. Under 'story_point' every sample in
+ *         that view is Work-CET PER POINT OF SOME ANCHOR, and the view's own comment has
+ *         always said never to pool across a unit — but the unit's VERSION was not
+ *         projected, so `pointsToWcet` could hand a rate fitted under the v1 anchor to a
+ *         band issued under v2. The seed path already guarded on the anchor
+ *         (`sp_seed_anchor_id`); the fitted path is now consistent with it. `refclass`
+ *         itself is NOT re-keyed: it is written by src/retro.ts, so the segregation is
+ *         done on the read side (src/tasks.ts `pointsToWcet`) against this column until
+ *         the fitting side can carry the anchor into the snapshot.
+ *       - `estimate.procedure_version`, an ADD COLUMN. See the table comment: the model,
+ *         the prices and the unit were versioned, the INSTRUCTION was not. NULL for every
+ *         pre-v17 row, which reads as "vintage unknown" and never as "the current one".
+ *       - one `config` seed, `procedure_version`. Here and not only in schema.sql's seed
+ *         block for the reason v12 documents: P2.0's key set is CLOSED, so a knob the
+ *         code reads but `est config set` refuses is the exact asymmetry it exists to
+ *         prevent.
  * 16 — `v_block_accuracy` REFUSES a cross-unit comparison (Craig 2026-07-31). The SQL half
  *     of one shared guard: `estimate_block.p50_wcet` is stored in whatever
  *     `config.estimand` was at `est block` and is never converted by anything (the table
@@ -195,7 +213,7 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
  *     `v_phase_actual.phase_conf`, auxiliary origin excluded from calibration.
  * 1 — initial R3 §4.2 shape.
  */
-export const SCHEMA_VERSION = "16";
+export const SCHEMA_VERSION = "17";
 
 /**
  * Forward-only, additive migrations, applied by {@link openDb} on a WRITABLE
@@ -1126,6 +1144,60 @@ LEFT JOIN v_phase_actual pa
        ON pa.run_id = r.run_id AND pa.wf_launch_id = r.wf_launch_id
       AND pa.phase_idx = b.phase_idx;
 `,
+  },
+  {
+    from: "16",
+    to: "17",
+    // The anchor becomes enforceable, and the procedure becomes recordable (see the
+    // SCHEMA_VERSION doc comment above).
+    //
+    // The VIEW is replaced, the same straight swap the 5 -> 6, 14 -> 15 and 15 -> 16
+    // steps made: a view holds no rows, so migration rule 2 (no migration drops or
+    // rewrites a ROW) is met by construction. The definition below MUST stay
+    // byte-identical to schema.sql's, because `test/schema.test.ts` diffs
+    // `sqlite_master` between a migrated file and a fresh one. `IF EXISTS` /
+    // `IF NOT EXISTS` for the reason v8/v12/v13/v15/v16 document: SQLite strips the
+    // clause before storing, so idempotence costs nothing in fidelity.
+    //
+    // The COLUMN is in `apply` below, because SQLite has no `ADD COLUMN IF NOT EXISTS`
+    // and rule 3 requires this step to survive a file that already has the shape. The
+    // 14 -> 15 step names that hazard and takes the same route: `estimate` cannot be
+    // rebuilt (four tables reference it, and its append-only triggers exist so its rows
+    // are never copied anywhere), so it is an ADD COLUMN. Nothing in the append-only
+    // spine is read, written or moved — ADD COLUMN widens every existing row with NULL
+    // in place, which is the honest value: a band issued before v17 recorded no
+    // procedure, and its vintage is genuinely unknown.
+    //
+    // The seed is `INSERT OR IGNORE`, so a value Craig has already set is never
+    // restated (migration rule 2).
+    sql: `
+DROP VIEW IF EXISTS v_velocity;
+CREATE VIEW IF NOT EXISTS v_velocity AS
+SELECT e.bucket, i.estimator_model, e.price_epoch, e.refclass_as_of,
+       e.ref_model, e.estimand,                          -- the UNIT; never pool across these
+       e.sp_anchor_id,                                   -- the unit's VERSION under 'story_point'
+       o.velocity_raw, o.velocity_cal, o.finalized_at,
+       o.wcet_main, o.wcet_sub, o.wcet_aux,
+       o.wcet_main + o.wcet_sub AS wcet_task_effort,     -- calibrate on THIS, not on the total
+       e.exp_agents, o.n_agents
+FROM v_outcome_current o
+JOIN estimate e ON e.eid = o.eid_at_start
+JOIN v_estimate_identity i ON i.eid = e.eid              -- v10: the EFFECTIVE identity, not e.*
+WHERE o.scope_changed = 0 AND o.censored = 0 AND o.final_status = 'completed'
+  AND o.unpriced_share = 0 AND o.price_provisional = 0   -- R2: unpriced degrades the ROW
+  AND o.actual_wcet_at_epoch IS NOT NULL;                -- R2: epoch-consistent actuals only
+
+INSERT OR IGNORE INTO config (k, v) VALUES
+  ('procedure_version', '2026-07-31-uncorrected-judgement');
+`,
+    apply: (db: Database): void => {
+      // Written EXACTLY as schema.sql spells it: SQLite splices this text into the
+      // stored `CREATE TABLE estimate`, and a migrated file has to come out
+      // byte-identical to a fresh one.
+      if (!hasColumn(db, "estimate", "procedure_version")) {
+        db.exec("ALTER TABLE estimate ADD COLUMN procedure_version TEXT");
+      }
+    },
   },
 ];
 

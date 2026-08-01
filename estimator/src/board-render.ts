@@ -423,8 +423,21 @@ function phaseStripHtml(phases: readonly BoardPhase[]): string {
     .map((p) => {
       const cls = phaseConfClass(p.phase_conf);
       const actual = p.actual_wcet === null ? "—" : fmtWcet(p.actual_wcet);
-      const block = p.block_p50 === null ? "" : `/${fmtWcet(p.block_p50)}`;
-      return `<span class="phase-chip ${cls}" title="${escapeHtml(p.title)} · phase_conf: ${p.phase_conf ?? "none"}">P${p.phase_idx} ${actual}${block}</span>`;
+      // `/` is the ratio glyph on this card and it may only join two figures in ONE
+      // unit. A points block band therefore gets a separate `· Npt` segment instead:
+      // the declared size is still shown (it is the only estimate this phase has), and
+      // the reader is never invited to read `500/8` as an eight-fold overrun. `pt` is
+      // the legend the board already carries — a size relative to the anchor, never a
+      // token count.
+      const block = p.blocks_in_points
+        ? ` · block ${p.block_points_p50 ?? "?"}pt`
+        : p.block_p50 === null
+          ? ""
+          : `/${fmtWcet(p.block_p50)}`;
+      const why = p.blocks_in_points
+        ? " · block band is in story points — not comparable with a Work-CET actual"
+        : "";
+      return `<span class="phase-chip ${cls}" title="${escapeHtml(p.title)} · phase_conf: ${p.phase_conf ?? "none"}${why}">P${p.phase_idx} ${actual}${block}</span>`;
     })
     .join("");
   return `<div class="phases">${chips}</div>`;
@@ -520,7 +533,16 @@ function cardMd(card: BoardCard): string {
   }
   if (card.phases.length > 0) {
     const phases = card.phases
-      .map((p) => `P${p.phase_idx}:${p.actual_wcet === null ? "—" : fmtWcet(p.actual_wcet)}${p.block_p50 === null ? "" : `/${fmtWcet(p.block_p50)}`}(${p.phase_conf ?? "none"})`)
+      // Same rule as the HTML chip: no `/` across two units. See `phaseStripHtml`.
+      .map((p) => {
+        const actual = p.actual_wcet === null ? "—" : fmtWcet(p.actual_wcet);
+        const conf = p.phase_conf ?? "none";
+        if (p.blocks_in_points) {
+          return `P${p.phase_idx}:${actual}(${conf}; block ${p.block_points_p50 ?? "?"}pt, not comparable)`;
+        }
+        const block = p.block_p50 === null ? "" : `/${fmtWcet(p.block_p50)}`;
+        return `P${p.phase_idx}:${actual}${block}(${conf})`;
+      })
       .join(" ");
     lines.push(`  phases: ${phases}`);
   }

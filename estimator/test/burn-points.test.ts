@@ -29,6 +29,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { makeHarness, openArgs, request, seedPrices, turn, type Harness } from "./support.ts";
 import {
+  BURN_SCHEMA,
   bandUnit,
   burnJson,
   currentBand,
@@ -159,7 +160,7 @@ describe("a points band with NO points→Work-CET rate", () => {
     const b = await noRate();
     // The KEY SET is untouched — this is an extension, not a break (P2.0's rule).
     expect(Object.keys(b.wcet).sort()).toEqual(["consumed", "p50", "p90", "pct_p50", "pct_p90"]);
-    expect(b.schema).toBe(1);
+    expect(b.schema).toBe(BURN_SCHEMA);
     // Consumed is a real measurement and stays.
     expect(b.wcet.consumed).toBe(41_000);
     // The band is not. `8` must never appear in a field named after Work-CET.
@@ -217,6 +218,25 @@ describe("a points band with NO points→Work-CET rate", () => {
     expect(text).not.toMatch(/% of p90/);
     expect(text).not.toContain("█");
     expect(text).not.toContain("░");
+  });
+
+  // The remedy in `est close`'s exit-2 SHAPE, and the reason it changed: this line used
+  // to offer `est config set sp_seed_wcet_per_point` as a co-equal alternative with no
+  // bar attached — inviting, on the most-read surface there is, the one thing the
+  // project decided against on evidence. §13.1's reasoning lived only in an untracked
+  // file nothing on this path pointed at, so the citation now travels with the lever.
+  test("the remedy leads with `do nothing`, cites the decision, and states the bar", async () => {
+    const text = renderBurn(await noRate());
+    expect(text).toContain("do nothing");
+    expect(text).toContain(`${COLD_START_N} completed`);
+    expect(text).toContain("no seed is set DELIBERATELY");
+    expect(text).toContain("DECISIONS.md §13.1");
+    expect(text).toContain("rate CV < 0.3");
+    expect(text).toContain("≥10 REAL completed tasks");
+    expect(text).toContain("impatience is not that evidence");
+    // The `do nothing` clause comes FIRST — an option listed after the lever is an
+    // option nobody reads.
+    expect(text.indexOf("do nothing")).toBeLessThan(text.indexOf("sp_seed_wcet_per_point"));
   });
 
   test("the statusline stays USEFUL: consumed, the band with its unit, and why there is no %", async () => {

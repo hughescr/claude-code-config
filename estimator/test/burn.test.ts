@@ -33,6 +33,7 @@ import {
   aggregateBurn,
   burnJson,
   burnRead,
+  BURN_SCHEMA,
   intervalUnion,
   resolveBurnTarget,
   refreshBurnCache,
@@ -43,6 +44,7 @@ import {
   type BurnEmpty,
 } from "../src/burn.ts";
 import { attributeTasks } from "../src/attribute.ts";
+import { run } from "../src/cli.ts";
 import { openDb, setConfig } from "../src/db.ts";
 import { formatSegment } from "../scripts/statusline-burn.ts";
 
@@ -90,7 +92,7 @@ describe("est burn — P1.9 the empty result", () => {
     const r = await h.cli("burn", "--json");
     expect(r.code).toBe(0);
     const body = r.json<BurnEmpty>();
-    expect(body).toMatchObject({ schema: 1, active: false, reason: "no_open_estimate" });
+    expect(body).toMatchObject({ schema: BURN_SCHEMA, active: false, reason: "no_open_estimate" });
   });
 
   test("an open estimate with no cache row: reason no_cache, exit 0", async () => {
@@ -102,7 +104,7 @@ describe("est burn — P1.9 the empty result", () => {
 
   test("a missing database file is reason db_missing at exit 0, never a stack trace", () => {
     const body = burnRead(join(h.dir, "does-not-exist.db")) as BurnEmpty;
-    expect(body).toMatchObject({ schema: 1, active: false, reason: "db_missing" });
+    expect(body).toMatchObject({ schema: BURN_SCHEMA, active: false, reason: "db_missing" });
   });
 
   test("a file that is not a database at all is still db_missing at exit 0", async () => {
@@ -172,8 +174,35 @@ describe("est burn — P1.9 the empty result", () => {
     }
   });
 
+  test("--refresh against a locked database announces BURN_SCHEMA, never a hardcoded version", async () => {
+    // `est burn --refresh` opens its OWN connection, so it owns its own catch — the one
+    // burn payload assembled outside `src/burn.ts`. It used to build `{ schema: 1 }` by
+    // hand, and nothing covered it, so the literal survived the move to 2: a schema-1
+    // claim about a schema-2 contract, handed to the consumer least able to notice
+    // (the statusline, mid-sweep). The payload is now typed at the declaration, which
+    // makes a stale literal a compile error rather than a thing tests must catch.
+    // The unreadable file rather than an exclusively-locked one: it is the SAME catch
+    // and the same `classifyOpenError` (whose db_busy vs db_missing split is pinned
+    // separately above), reached instantly instead of after the refresh connection's
+    // 5 s `busy_timeout`. What is under test here is the version the catch announces.
+    const path = join(h.dir, "not-a-database.db");
+    await Bun.write(path, "this is not a sqlite file");
+
+    const out: string[] = [];
+    const code = await run(["--db", path, "--lock", join(h.dir, "refresh.lock"), "burn", "--json", "--refresh"], {
+      out: (s) => out.push(s),
+      err: () => {},
+    });
+    expect(code).toBe(0);
+    const body = JSON.parse(out.join("\n")) as BurnEmpty;
+    expect(body).toMatchObject({ schema: BURN_SCHEMA, active: false, reason: "db_missing" });
+    // Stated as the consumer sees it: whatever the constant is, the refresh error path
+    // must never be the one place that disagrees with it.
+    expect(body.schema).not.toBe(1);
+  });
+
   test("the human renderer says nothing-to-show rather than printing a zero band", () => {
-    const text = renderBurn({ schema: 1, active: false, as_of: "2026-01-01T00:00:00Z", reason: "no_cache" });
+    const text = renderBurn({ schema: BURN_SCHEMA, active: false, as_of: "2026-01-01T00:00:00Z", reason: "no_cache" });
     expect(text).toContain("nothing to show");
     expect(text).toContain("no_cache");
   });
@@ -192,7 +221,7 @@ describe("est burn --json — P1.9 the contract", () => {
     expect(r.code).toBe(0);
     expect(r.out.trim().split("\n")).toHaveLength(1);
     const b = r.json<BurnActive>();
-    expect(b.schema).toBe(1);
+    expect(b.schema).toBe(BURN_SCHEMA);
     expect(b.active).toBe(true);
     expect(typeof b.stale_s).toBe("number");
     expect(Object.keys(b.wcet).sort()).toEqual(["consumed", "p50", "p90", "pct_p50", "pct_p90"]);
@@ -511,7 +540,7 @@ describe("the ccstatusline segment — P1.9", () => {
 
   test("renders nothing for every empty result", () => {
     for (const reason of ["no_open_estimate", "no_cache", "db_busy", "db_missing"] as const) {
-      expect(formatSegment({ schema: 1, active: false, as_of: "2026-01-01T00:00:00Z", reason })).toBe("");
+      expect(formatSegment({ schema: BURN_SCHEMA, active: false, as_of: "2026-01-01T00:00:00Z", reason })).toBe("");
     }
   });
 });

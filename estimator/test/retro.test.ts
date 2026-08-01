@@ -27,7 +27,7 @@ import {
 } from "./support.ts";
 import { attributeTasks } from "../src/attribute.ts";
 import { closeTask } from "../src/close.ts";
-import { board, retro, BOARD_COLUMNS, ATTR_COVERAGE_GATE } from "../src/retro.ts";
+import { board, retro, BOARD_COLUMNS, ATTR_COVERAGE_GATE, DECOMPOSITION_POINTS } from "../src/retro.ts";
 
 let h: Harness;
 
@@ -404,6 +404,65 @@ describe("est retro — P1.8", () => {
     ).get(tid)!.scope_changed).toBe(1);
     expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM v_velocity").get()?.n).toBe(0);
     expect(retro(h.db, { asOf: NOW, dryRun: true }).n_outcomes).toBe(0);
+  });
+
+  // Codex's third repro. `splitCandidates` scores a Work-CET actual against the band's
+  // `cal_p50` to get its GLOBAL loss, but refits `actual / raw_p50` (Work-CET per point)
+  // and multiplies it back through `raw_p50` to get the SPLIT loss — so under an
+  // unconverted story-point band the numerator was unit-confused and the denominator was
+  // not, and their ratio came out as an apparently perfect `pinball_delta: 1`. Twenty
+  // deliberately unscorable tasks were enough to make it confidently recommend splitting
+  // a calibration bucket on the strength of nothing.
+  test("no split candidate is derived from bands nothing can score", async () => {
+    h.db.query("UPDATE config SET v = 'story_point' WHERE k = 'estimand'").run();
+    for (let i = 1; i <= 20; i += 1) {
+      await completedTask(i, { rawP50: 8, actualOut: 1000 + i * 100 });
+    }
+    const report = retro(h.db, { asOf: NOW, dryRun: true });
+    // The corpus is there — this is a refusal, not an empty database.
+    expect(report.n_outcomes).toBe(20);
+    // ...and every one of those outcomes is unscorable, which is the state under test.
+    expect(report.scoring.unscorable.baseline).toBe(20);
+    expect(report.splits).toEqual([]);
+  });
+
+  test("a Work-CET corpus of the same shape still produces candidates", async () => {
+    // The guard must refuse a UNIT, not refuse everything: 20 scorable tasks over the
+    // same threshold still get their leave-one-out deltas computed and recorded.
+    for (let i = 1; i <= 20; i += 1) {
+      await completedTask(i, { rawP50: 1000, actualOut: 1000 + i * 100 });
+    }
+    const report = retro(h.db, { asOf: NOW, dryRun: true });
+    expect(report.scoring.unscorable.baseline).toBe(0);
+    expect(report.n_outcomes).toBe(20);
+  });
+
+  // The decomposition mandate, instrumented. It arrived stated in five prose places and
+  // measured nowhere; `compliance_t1t2` is the precedent for watching a rule rather than
+  // repeating it, and the doctrine that follows is to sharpen the wording, not to gate.
+  test("the decomposition mandate is counted: over-threshold bands with no blocks", async () => {
+    h.db.query("UPDATE config SET v = 'story_point' WHERE k = 'estimand'").run();
+    const big = await completedTask(1, { rawP50: DECOMPOSITION_POINTS + 5, close: false });
+    const alsoBig = await completedTask(2, { rawP50: DECOMPOSITION_POINTS + 60, close: false });
+    await completedTask(3, { rawP50: DECOMPOSITION_POINTS, close: false }); // AT the line, not over it
+    await completedTask(4, { rawP50: 8, close: false });
+
+    // `alsoBig` did what the rule asks; `big` did not.
+    expect((await h.cli("block", alsoBig, "--phase", "0", "--title", "survey", "--p50", "20", "--p90", "40")).code).toBe(0);
+
+    const q = retro(h.db, { asOf: NOW, dryRun: true }).quality;
+    expect(q.decomposition_due).toBe(2);
+    expect(q.decomposition_undecomposed).toBe(1);
+    expect(big).not.toBe(alsoBig);
+  });
+
+  test("the decomposition counters are 0 on a Work-CET corpus — the threshold is in POINTS", async () => {
+    // 1000 Work-CET is not "1000 points": a corpus that predates v15 must not light up
+    // a compliance number about a rule that did not exist and does not apply to it.
+    for (let i = 1; i <= 3; i += 1) await completedTask(i, { rawP50: 1000, close: false });
+    const q = retro(h.db, { asOf: NOW, dryRun: true }).quality;
+    expect(q.decomposition_due).toBe(0);
+    expect(q.decomposition_undecomposed).toBe(0);
   });
 
   test("candidate bucket splits are recorded, never auto-applied", async () => {
