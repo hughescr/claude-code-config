@@ -16,6 +16,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { InvariantError } from "./errors.ts";
 
 /** Project root — the directory holding schema.sql, src/, scripts/, gates/. */
 export const ROOT: string = resolve(import.meta.dir, "..");
@@ -32,6 +33,29 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
 /**
  * Must match the config.schema_version seed in schema.sql.
  *
+ * 18 — the anchor's DEFINITION gets a home of its own (Craig 2026-07-31). One table,
+ *     `sp_anchor (id PRIMARY KEY, text, created_at)`, append-only like every other
+ *     ledger here, seeded from the `sp_anchor_id` / `sp_anchor_text` pair already in
+ *     `config`. No row is dropped, rewritten or moved.
+ *
+ *     v15 pinned `estimate.sp_anchor_id` onto every points band so that "8 points" stays
+ *     interpretable, and the whole argument for that column was that re-wording the
+ *     anchor redefines the unit. But the WORDING lived in a second mutable config key
+ *     with nothing tying the two together, so the pair could be driven into a state that
+ *     is simply false: bump the id to `v2`, re-word the text, then restore
+ *     `sp_anchor_id v1`, and the anchor in force reads `{id: 'v1', text: '<the v2
+ *     definition>'}`. Every band issued from then on is sized against the v2 scale and
+ *     filed under v1 — which is exactly the corruption `sp_anchor_id` was added to
+ *     prevent, arrived at through the remedy the refusal itself printed ("restore
+ *     `sp_anchor_id`").
+ *
+ *     A registry makes that state unrepresentable rather than merely detectable: the
+ *     text is a FUNCTION of the id, stored once, and `id` is a PRIMARY KEY on a table
+ *     with `spa_ro_u` / `spa_ro_d`. There is nowhere for a second definition of `v1` to
+ *     live. `config.sp_anchor_text` survives as a MIRROR that `setConfig` maintains, so
+ *     `est config list` still shows the definition in force; every reader goes to
+ *     {@link anchorTextOf}. The one new refusal is re-wording an anchor id that is
+ *     already defined — which is a redefinition, and the remedy is to bump the id.
  * 17 — the ANCHOR is ENFORCED, and the PROCEDURE becomes recordable (Craig 2026-07-31).
  *     Three things, and no row is read, written or moved:
  *       - `v_velocity` projects `e.sp_anchor_id`. Under 'story_point' every sample in
@@ -213,7 +237,7 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
  *     `v_phase_actual.phase_conf`, auxiliary origin excluded from calibration.
  * 1 — initial R3 §4.2 shape.
  */
-export const SCHEMA_VERSION = "17";
+export const SCHEMA_VERSION = "18";
 
 /**
  * Forward-only, additive migrations, applied by {@link openDb} on a WRITABLE
@@ -1199,6 +1223,47 @@ INSERT OR IGNORE INTO config (k, v) VALUES
       }
     },
   },
+  {
+    from: "17",
+    to: "18",
+    // The anchor's DEFINITION gets a home of its own (see the SCHEMA_VERSION doc
+    // comment above).
+    //
+    // One new TABLE plus its two append-only triggers, and one seed row derived from
+    // the pair already in `config`. Nothing existing is read, rewritten or moved:
+    // migration rule 2 holds because the only write is an INSERT into a table that did
+    // not exist a statement ago.
+    //
+    // `IF NOT EXISTS` throughout, for the reason v8/v12/v13/v15/v16/v17 document —
+    // SQLite strips the clause before storing a definition, so rule 3's idempotence
+    // costs nothing in fidelity and `test/schema.test.ts`'s byte-for-byte comparison
+    // against a fresh file still holds.
+    //
+    // The SEED is a SELECT rather than a literal, and that is the whole point of doing
+    // it here instead of in schema.sql alone: a live database's `sp_anchor_text` is
+    // whatever Craig has set it to, and stamping schema.sql's default over it would be
+    // asserting a definition nobody wrote. `created_at` is a fixed instant rather than
+    // `now`, so a migrated file and a fresh one hold the same row and rule 3 stays
+    // testable. Anchor ids that appear only in `estimate.sp_anchor_id` are deliberately
+    // NOT invented a definition here: their text was never recorded anywhere, and
+    // `src/unit.ts` reads an absent row as "definition unknown", which is true.
+    sql: `
+CREATE TABLE IF NOT EXISTS sp_anchor (
+  id TEXT PRIMARY KEY,              -- human-meaningful and Craig-readable: 'v1', 'v2'
+  text TEXT NOT NULL,               -- the work defined to be 1 point, verbatim
+  created_at TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS spa_ro_u BEFORE UPDATE ON sp_anchor BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER IF NOT EXISTS spa_ro_d BEFORE DELETE ON sp_anchor BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
+INSERT OR IGNORE INTO sp_anchor (id, text, created_at)
+SELECT (SELECT v FROM config WHERE k = 'sp_anchor_id'),
+       (SELECT v FROM config WHERE k = 'sp_anchor_text'),
+       '2026-07-31T00:00:00Z'
+ WHERE (SELECT v FROM config WHERE k = 'sp_anchor_id') IS NOT NULL
+   AND COALESCE((SELECT v FROM config WHERE k = 'sp_anchor_text'), '') <> '';
+`,
+  },
 ];
 
 export interface OpenOptions {
@@ -1394,10 +1459,104 @@ export function unvalidatedRetired(db: Database): boolean {
   return getConfig(db, UNVALIDATED_RETIRED_KEY) !== null;
 }
 
-/** Write a config value (upsert). Config is the home of every tunable (§1.1). */
-export function setConfig(db: Database, key: string, value: string): void {
-  db.query("INSERT INTO config (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(
-    key,
-    value,
+// ---------------------------------------------------------------------------
+// the story-point anchor registry (v18)
+// ---------------------------------------------------------------------------
+
+/** `config.sp_anchor_id` — which definition is in force. */
+export const ANCHOR_ID_KEY = "sp_anchor_id";
+/** `config.sp_anchor_text` — a MIRROR of the registry, maintained by {@link setConfig}. */
+export const ANCHOR_TEXT_KEY = "sp_anchor_text";
+
+/**
+ * The work `id` was defined to be one point, or `null` if nobody ever recorded it.
+ *
+ * This is the ONLY read path for an anchor's meaning. `config.sp_anchor_text` is a
+ * mirror kept for `est config list`; it is never consulted, because the entire reason
+ * `sp_anchor` exists is that a second mutable copy of the definition could disagree
+ * with the id it was filed under.
+ *
+ * Lives in `src/db.ts` for the reason {@link UNVALIDATED_RETIRED_KEY} documents: this
+ * file already owns every config accessor and depends on nothing, and `setConfig` — the
+ * registry's only writer — is here.
+ */
+export function anchorTextOf(db: Database, id: string): string | null {
+  const row = db
+    .query<{ text: string }, [string]>("SELECT text FROM sp_anchor WHERE id = ?")
+    .get(id);
+  return row?.text ?? null;
+}
+
+/**
+ * Define an anchor. Append-only, and idempotent on an exact restatement.
+ *
+ * Re-using an id with a DIFFERENT definition is refused, and that refusal is the whole
+ * mechanism: it is what makes `{id: 'v1', text: '<the v2 definition>'}` unrepresentable
+ * rather than merely detectable. Without it the pair is two independent config keys and
+ * the only defence available is a checker that notices afterwards — by which time bands
+ * have been issued against a scale that is not the one they name.
+ *
+ * Exit 2: a re-wording IS a redefinition of the unit, it cannot be undone once bands
+ * exist under it, and the legal path (a new id) is named in the remedy.
+ */
+export function registerAnchor(db: Database, id: string, text: string, now: Date = new Date()): void {
+  const existing = anchorTextOf(db, id);
+  if (existing === text) return;
+  if (existing !== null) {
+    throw new InvariantError(
+      `story-point anchor '${id}' is already defined as ${JSON.stringify(existing)}; ` +
+        `re-wording it to ${JSON.stringify(text)} would redefine what one point means while leaving every band ` +
+        "already issued — and every band issued from now on — claiming the same scale",
+      `bump the id first, then state the definition: \`est config set ${ANCHOR_ID_KEY} <new id>\` ` +
+        `followed by \`est config set ${ANCHOR_TEXT_KEY} "${text}"\`. ` +
+        `Anchor ids are append-only for the same reason \`estimate\` is: '${id}' is what a stored band POINTS AT, ` +
+        "so its meaning cannot move after the fact",
+    );
+  }
+  db.query("INSERT INTO sp_anchor (id, text, created_at) VALUES (?,?,?)").run(
+    id,
+    text,
+    now.toISOString().replace(/\.\d{3}Z$/, "Z"),
   );
+}
+
+/**
+ * Write a config value (upsert). Config is the home of every tunable (§1.1).
+ *
+ * Two keys are not plain tunables and are intercepted here rather than in
+ * `src/cli.ts`'s `est config set`, because `setConfig` is the single writer and a guard
+ * that lives above it is a guard the next caller can walk around:
+ *
+ *  - **`sp_anchor_text`** DEFINES the anchor currently in force. It registers, or it is
+ *    refused as a redefinition ({@link registerAnchor}). It never silently re-words.
+ *  - **`sp_anchor_id`** SELECTS a definition. Pointing at an id nobody has defined is
+ *    allowed — that is the intended middle of `set sp_anchor_id v2` followed by
+ *    `set sp_anchor_text "…"` — and the mirror goes empty to say so, rather than
+ *    keeping the previous anchor's words under the new id's name.
+ *
+ * Both arms and the upsert share one transaction: a mirror that disagreed with the
+ * registry would be the very confusion this table was added to end.
+ */
+export function setConfig(db: Database, key: string, value: string): void {
+  const write = (k: string, v: string): void => {
+    db.query("INSERT INTO config (k,v) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(
+      k,
+      v,
+    );
+  };
+  if (key !== ANCHOR_TEXT_KEY && key !== ANCHOR_ID_KEY) {
+    write(key, value);
+    return;
+  }
+  db.transaction(() => {
+    if (key === ANCHOR_TEXT_KEY) {
+      const id = getConfig(db, ANCHOR_ID_KEY);
+      // An empty text is "clear the mirror", not "define the anchor as nothing".
+      if (id !== null && value.trim() !== "") registerAnchor(db, id, value);
+      write(key, value);
+      return;
+    }
+    write(ANCHOR_ID_KEY, value);
+    write(ANCHOR_TEXT_KEY, anchorTextOf(db, value) ?? "");
+  })();
 }

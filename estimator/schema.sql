@@ -114,6 +114,36 @@ CREATE TABLE bucket_def (           -- buckets are DEFINED, not free text (R2)
 ) STRICT;
 -- seed: ('global', now, '{}', NULL, NULL, 1)
 
+-- v18: WHAT ONE POINT IS, keyed by the id every points band is stamped with.
+--
+-- The definition used to live in `config.sp_anchor_text` beside `config.sp_anchor_id`,
+-- two independently mutable rows with nothing tying them together. That pair can be
+-- driven into a state that is simply FALSE — bump the id to 'v2', re-word the text,
+-- restore `sp_anchor_id v1`, and the anchor in force reads {v1, the v2 definition} —
+-- and the refusal in src/unit.ts was printing "restore sp_anchor_id" as its remedy,
+-- which is how a caller GOT there. A registry makes that unrepresentable instead of
+-- merely detectable: `id` is a PRIMARY KEY, the row is append-only, so the text is a
+-- FUNCTION of the id and there is nowhere for a second definition of 'v1' to live.
+--
+-- Ids stay human-meaningful ('v1', 'v2') on purpose: Craig reads them, and they appear
+-- in `est refclass`, in `est open`'s band line and in every refusal. A content hash
+-- would make desynchronisation impossible too, and would also make the id unreadable
+-- AND would still not let a refusal print the definition it is asking you to restore.
+--
+-- `estimate.sp_anchor_id` deliberately carries NO foreign key here. It is an ADD COLUMN
+-- on an append-only table that cannot be rebuilt (four tables reference `estimate`), and
+-- more importantly a band issued before this table existed may name an id whose text
+-- nobody recorded — an FK would make that unrepairable history unloadable rather than
+-- honestly incomplete. src/unit.ts reads a missing row as "definition unknown" and
+-- declines to compare it, which is the truthful reading.
+CREATE TABLE sp_anchor (
+  id TEXT PRIMARY KEY,              -- human-meaningful and Craig-readable: 'v1', 'v2'
+  text TEXT NOT NULL,               -- the work defined to be 1 point, verbatim
+  created_at TEXT NOT NULL
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER spa_ro_u BEFORE UPDATE ON sp_anchor BEGIN SELECT RAISE(ABORT,'append-only'); END;
+CREATE TRIGGER spa_ro_d BEFORE DELETE ON sp_anchor BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
 CREATE TABLE estimate (             -- APPEND-ONLY, physically enforced
   eid INTEGER PRIMARY KEY,
   tid TEXT NOT NULL REFERENCES task(tid),
@@ -156,7 +186,7 @@ CREATE TABLE estimate (             -- APPEND-ONLY, physically enforced
   ref_model TEXT NOT NULL,          -- config.ref_model as of `est open`
   estimand TEXT NOT NULL,           -- config.estimand as of `est open`
   -- v15 `sp_anchor_id`: WHICH story-point anchor's scale this band is denominated in
-  -- (config.sp_anchor_id / config.sp_anchor_text as of `est open`). A points value is
+  -- (config.sp_anchor_id as of `est open`, naming an `sp_anchor` row). A points value is
   -- meaningless without it — "8 points" says nothing unless you know what 1 point was
   -- defined to be — so it is pinned exactly like price_epoch / ref_model / estimand,
   -- and for the identical reason: re-wording the anchor redefines the unit, and an
@@ -164,6 +194,10 @@ CREATE TABLE estimate (             -- APPEND-ONLY, physically enforced
   -- Craig edited one sentence. NULL for every Work-CET band (no anchor is involved)
   -- and for every row issued before v15; a consumer that needs the anchor must treat
   -- NULL as "not a points band", never as "the current anchor".
+  --
+  -- v18 moved the DEFINITION into `sp_anchor` (append-only, `id` PRIMARY KEY), so this
+  -- column now points at a row rather than at one of two config keys that could disagree
+  -- with each other. No foreign key, deliberately — see the `sp_anchor` comment.
   --
   -- v17 `procedure_version`: WHICH INSTRUCTION produced this band (config.procedure_version
   -- as of `est open`). Four things fix what a band means — the model (`estimator_model`),
@@ -1397,7 +1431,7 @@ WHERE s.terminator = 'open'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '17'),
+  ('schema_version',          '18'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.
@@ -1413,12 +1447,21 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   -- `estimand`, so the old Work-CET corpus and the new points corpus segregate
   -- automatically rather than pooling into one meaningless reference class.
   ('estimand',                'work_cet'),
-  -- The story-point ANCHOR: the fixed piece of work that is defined to be 1 point.
+  -- The story-point ANCHOR IN FORCE: which `sp_anchor` row defines 1 point right now.
   -- Versioned because re-wording it redefines the unit — every band is stamped with
-  -- `estimate.sp_anchor_id`, and a rate fitted under v1 must never be applied to a
-  -- band issued under v2. Change BOTH together (`est config set sp_anchor_text …`
-  -- then `est config set sp_anchor_id v2`); bands already on disk keep their own.
+  -- `estimate.sp_anchor_id`, and a rate fitted under v1 must never be applied to a band
+  -- issued under v2. Bands already on disk keep their own.
+  --
+  -- Introducing a new anchor is ID FIRST, THEN TEXT, and the order is enforced rather
+  -- than advised (v18): `est config set sp_anchor_id v2` points at an id that is not yet
+  -- defined, and `est config set sp_anchor_text "…"` defines it. Re-wording an id that
+  -- IS defined is refused — that is a redefinition, and `sp_anchor` is append-only.
   ('sp_anchor_id',            'v1'),
+  -- A MIRROR of `sp_anchor.text` for the id above, so `est config list` shows the
+  -- definition in force without a reader having to join. `src/db.ts` `setConfig`
+  -- maintains it on both anchor keys and nothing else writes it; every consumer reads
+  -- `sp_anchor` (`anchorTextOf`). It exists because it shipped and scripts read it, NOT
+  -- because the definition lives in two places — that was v17's bug.
   ('sp_anchor_text',          'rename a single variable across 3 files in a TypeScript codebase, with no tests to update'),
   -- The BOOTSTRAPPED points -> Work-CET rate, in Work-CET per point. A CONVENTION, not
   -- a measurement, which is exactly why it lives here beside `shrink_k` and NOT in the
@@ -1564,3 +1607,11 @@ INSERT OR IGNORE INTO config (k, v) VALUES
 
 INSERT OR IGNORE INTO bucket_def (bucket, created_at, dims_json, parent_bucket, split_pinball_gain, active)
 VALUES ('global', strftime('%Y-%m-%dT%H:%M:%SZ','now'), '{}', NULL, NULL, 1);
+
+-- The v1 anchor definition, and it MUST equal the `sp_anchor_text` config seed above:
+-- config mirrors this row, this row is what every reader resolves. A fixed instant
+-- rather than `now`, so a database migrated to v18 and one built from this file hold the
+-- same row (src/db.ts migration 17 -> 18, rule 3).
+INSERT OR IGNORE INTO sp_anchor (id, text, created_at)
+VALUES ('v1', 'rename a single variable across 3 files in a TypeScript codebase, with no tests to update',
+        '2026-07-31T00:00:00Z');

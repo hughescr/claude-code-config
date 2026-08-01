@@ -25,12 +25,17 @@ set. Details:
   every downstream consumer (`estimate.estimand`, `refclass`'s PK, `v_velocity`, `est retro`), so the
   old Work-CET corpus and the new points corpus segregate automatically instead of pooling into one
   meaningless reference class. The price is a fresh cold start, paid deliberately.
-- **The anchor is versioned and pinned per estimate.** `config.sp_anchor_text` is the work defined to
-  be 1 point; `config.sp_anchor_id` (seeded `v1`) names that definition, and `est open` stamps it
-  onto the row as `estimate.sp_anchor_id`. A rate fitted under `v1` must never be applied to a band
-  issued under `v2`, and the column is what enforces it. Change text and id together. The `sp_`
-  prefix distinguishes it from `anchor`, which already means the session/prompt an estimate was
-  issued from.
+- **The anchor is versioned and pinned per estimate.** The `sp_anchor` table (v18, append-only,
+  `id` PRIMARY KEY) holds the work defined to be 1 point; `config.sp_anchor_id` (seeded `v1`) names
+  which row is in force, and `est open` stamps it onto the band as `estimate.sp_anchor_id`. A rate
+  fitted under `v1` must never be applied to a band issued under `v2`, and the column is what
+  enforces it. Introducing a new anchor is **id first, then text** — `est config set sp_anchor_id v2`
+  then `est config set sp_anchor_text "…"` — and **re-wording an id that is already defined is
+  refused** (exit `2`): a re-wording *is* a redefinition, and the registry exists so that the text
+  is a function of the id rather than a second mutable copy that can drift out of step with it.
+  `config.sp_anchor_text` survives as a mirror `est config list` can show; every reader resolves the
+  table. The `sp_` prefix distinguishes it from `anchor`, which already means the session/prompt an
+  estimate was issued from.
 - **The bridge is one function**, `pointsToWcet` (`src/tasks.ts`), with two sources and never a
   third: `fitted` — `velocity_raw` is `actual_wcet / raw_p50`, so with `raw_p50` in points its
   decayed, shrunk median already *is* Work-CET per point, read back out of `refclass.mult_p50` — and

@@ -2217,6 +2217,24 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
   // spans the whole command rather than one per write — `--set --sync` in a single
   // invocation used to take it twice, and a nested `withLock` on the same path could
   // not be re-entered anyway.
+
+  // `--source` is validated HERE, beside `--at`, and for one reason `--at` did not have:
+  // `--set` and `--sync` can arrive in a SINGLE invocation, and this check used to sit
+  // inside the `--sync` branch — after `setManualPrice` had already committed the
+  // `--set` row. So `est prices --set <f> --in … --sync --source bogus` wrote a price
+  // row and then exited 1: a usage refusal, which reads as "nothing happened, fix the
+  // command line and retry", over a database that had already changed. Same shape as
+  // the `--continue` bind in `cmdOpen`, and far less costly only because a price row is
+  // keyed by (family, effective_from) and a retry overwrites it. Every rejection this
+  // command can make is now made before it writes anything.
+  const sourceFlag = flagString(p, "source");
+  const source: "auto" | "live" | "fixture" =
+    sourceFlag === "live" || sourceFlag === "fixture" || sourceFlag === "auto" ? sourceFlag : "auto";
+  if (wantSync && sourceFlag !== null && source !== sourceFlag) {
+    ctx.err(`est prices --source: expected auto|live|fixture, got "${sourceFlag}"`);
+    return 1;
+  }
+
   const writes = setModel !== null || wantSync;
   const body = async (db: Database): Promise<number> => {
     let result: SyncResult | null = null;
@@ -2259,13 +2277,6 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
     }
 
     if (wantSync) {
-      const sourceFlag = flagString(p, "source");
-      const source =
-        sourceFlag === "live" || sourceFlag === "fixture" || sourceFlag === "auto" ? sourceFlag : "auto";
-      if (sourceFlag !== null && source !== sourceFlag) {
-        ctx.err(`est prices --source: expected auto|live|fixture, got "${sourceFlag}"`);
-        return 1;
-      }
       result = await sync(db, { source });
       if (ctx.json) {
         ctx.out(JSON.stringify(result, null, 2));
@@ -2741,7 +2752,23 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
             );
           }
           const session = flagString(p, "session");
-          if (session !== null) bindTask(db, { tid: cont, session, now });
+          // The bind is NOT issued here. It used to be — `bindTask` right on this line,
+          // before `openTask` ran a single one of the checks that can reject a
+          // continuation — and `bindTask` commits in its own `.immediate()`
+          // transaction, so the refusal below could not take it back. A cutover
+          // continuation therefore exited 2, wrote no estimate, and still left
+          // `session -> tid` in `task_alias`; §5.4 reads that alias as the authority it
+          // is and booked the session's NEXT request to the task the system had just
+          // refused to associate it with, `exclusive`, with nothing downstream able to
+          // tell that the association had been denied. A side effect that outlives the
+          // validation which rejects it is worse than a wrong number: it is a wrong
+          // number the ledger cannot distinguish from a real one.
+          //
+          // `openTask` already writes exactly this alias — same key, same
+          // `source: 'est_bind'`, same `now` — inside the SAME `.immediate()`
+          // transaction as the estimate row (its `existingTid !== null` arm), so the
+          // estimate and the binding land together or neither does. The call here was
+          // redundant as well as premature; deleting it is the whole fix.
           const kindRow = db
             .query<{ kind: string }, [string]>("SELECT kind FROM task WHERE tid = ?")
             .get(cont)!;
@@ -2854,6 +2881,13 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
               // — the estimating skill, via `--json` — could not see it.
               procedure_version: result.procedureVersion,
               rolled_up_from_blocks: result.rolledUpFromBlocks,
+              // Beside the count it qualifies, and ALWAYS present (usually null) for the
+              // same reason `near_duplicates` is always present: the estimating skill is
+              // the one caller that drives `est open --json`, so an advisory that existed
+              // only on the human render would be invisible to the only consumer able to
+              // act on it. v18 turned this from a refusal into an observation — the
+              // roll-up lands either way, and nothing here moves the exit code.
+              rollup_notice: result.rollupNotice,
               raw: result.raw,
               uncalibrated: result.uncalibrated,
               plant: result.plant,
@@ -2961,6 +2995,22 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
             );
           }
           ctx.out(`${PLANT_MARKER} ${result.plant.call}`);
+        }
+        // Same contract as the near-duplicate warning below, and for the same reasons:
+        // STDERR, on BOTH render paths, `!ctx.quiet`, and never touching the exit code.
+        //
+        // v18 replaced a refusal with this observation. `--from-blocks` requires `--tid`,
+        // so a roll-up can only ever land as a REFINEMENT, and `est close` scores
+        // `MIN(eid)` — the roll-up was therefore never the measured band and was never
+        // meant to be, which is what made the old mechanical guard unnecessary. What is
+        // still worth saying is that the blocks hang off the FIRST estimate, because that
+        // shape means someone followed the open-coarse-then-decompose advice that has
+        // since been withdrawn. `openTask` wrote the same text to
+        // `anomaly(from_blocks_on_baseline)` inside the estimate's own transaction, so
+        // this line is the interactive surface of a fact the ledger already carries —
+        // not the only record of it, and not something a quiet run loses.
+        if (result.rollupNotice !== null && !ctx.quiet) {
+          ctx.err(`est open: NOTICE — ${result.rollupNotice}`);
         }
         // On STDERR, on BOTH render paths, and never affecting the exit code (P1.0
         // observe-first). Stderr because it is not part of the band contract — the

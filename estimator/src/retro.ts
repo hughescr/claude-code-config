@@ -58,6 +58,7 @@ import {
   type PointsRate,
   type PointsRateKey,
 } from "./tasks.ts";
+import { BandIdentity, type VelocitySample } from "./unit.ts";
 import { priceFamily } from "./prices.ts";
 import { scoreEtaModels, writeEtaRuns, type EtaScore } from "./eta.ts";
 import { JOBS_ROOT, jobsRetroPanel, type JobsPanelRow } from "./jobs.ts";
@@ -278,21 +279,13 @@ export interface RetroReport {
   written: { refclass: number; calib_run: number; eta_run: number };
 }
 
-interface VelocityRow {
-  bucket: string;
-  estimator_model: string;
-  ref_model: string;
-  estimand: string;
-  velocity_raw: number | null;
-  velocity_cal: number | null;
-  finalized_at: string;
-  wcet_main: number;
-  wcet_sub: number;
-  wcet_aux: number;
-  wcet_task_effort: number;
-  exp_agents: number;
-  n_agents: number;
-}
+/**
+ * The `v_velocity` projection, defined once in `src/unit.ts` beside the scope that
+ * selects it. It used to be re-declared here with a narrower column list, which is a
+ * small symptom of the same cause as the window bug below: the fitted row set was
+ * something this file described for itself rather than something it asked for.
+ */
+type VelocityRow = VelocitySample;
 
 function num(db: Database, sql: string, params: string[] = []): number {
   const row = db.query<{ v: number | null }, string[]>(sql).get(...params);
@@ -323,11 +316,28 @@ export function retro(
   const resamples = Number.parseInt(getConfig(db, "boot_resamples") ?? "200", 10);
   const splitGate = Number.parseFloat(getConfig(db, "split_min_pinball_gain") ?? "0.02");
 
-  const rows = db
-    .query<VelocityRow, [string, string]>(
-      "SELECT * FROM v_velocity WHERE ref_model = ? AND estimand = ?",
-    )
-    .all(refModel, estimand);
+  // THE row set, and it is the same expression the guard on this snapshot's output uses
+  // (`src/unit.ts` `SampleScope`, `src/tasks.ts` `pointsToWcet`). Two things changed here
+  // and they are the same change:
+  //
+  //  - `asOf` is now a BOUND. This query used to fit every row in the unit regardless of
+  //    `--as-of`, while `pointsToWcet`'s anchor guard counted only rows finalized before
+  //    the snapshot's own `as_of`. `est retro --as-of 2000-01-01` over ten v1 samples at
+  //    2,000/point and ten v2 at 6,000 — all finalized in 2026 — therefore wrote a mixed
+  //    `n=20` snapshot stamped for the year 2000, and the guard, asking what a year-2000
+  //    snapshot could have seen, correctly found zero foreign samples below it and handed
+  //    the mixture out as a v2 rate. The RETRO was the wrong one: `--as-of T` names the
+  //    instant a snapshot speaks for, `refclass.as_of` is what every consumer reads the
+  //    window off, and a snapshot cannot be fitted on outcomes that had not happened yet.
+  //  - the unit filter is the identity's, not two hand-written equalities.
+  //
+  // `anchor: "any"` is deliberate and unchanged: `refclass` is keyed on
+  // `(as_of, bucket, estimator_family, ref_model, estimand)` and has nowhere to put a
+  // per-anchor snapshot, so the fit still pools anchors and `pointsToWcet` still refuses
+  // to read a pooled snapshot back as a per-anchor rate. The two now disagree about
+  // nothing except that one deliberate thing.
+  const scope = BandIdentity.ambient(db).samples({ asOf });
+  const rows = scope.rows(db, "any");
 
   const ageDays = (ts: string): number =>
     Math.max(0, (now.getTime() - Date.parse(ts)) / 86_400_000);

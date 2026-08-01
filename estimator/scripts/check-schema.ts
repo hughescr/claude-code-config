@@ -44,6 +44,7 @@ const EXPECTED_TABLES = [
   "request",
   "run_segment",
   "session_model",
+  "sp_anchor",
   "sweep_census",
   "sweep_state",
   "task",
@@ -92,6 +93,8 @@ const EXPECTED_TRIGGERS = [
   "rc_ro_u",
   "scope_ro_d",
   "scope_ro_u",
+  "spa_ro_d",
+  "spa_ro_u",
 ];
 
 const EXPECTED_CONFIG_KEYS = [

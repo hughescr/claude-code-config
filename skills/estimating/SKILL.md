@@ -22,13 +22,16 @@ against one fixed anchor:
 - **A point is not a token, a minute, or a dollar.** Nothing on this path asks you to predict any of
   those. Points say how big this work is *next to the anchor*; every absolute quantity is measured
   afterwards from the harness's own logs, never stated by you.
-- **The anchor is versioned and pinned.** The anchor in force is `config.sp_anchor_id` /
-  `config.sp_anchor_text` (seeded `v1`), and `est open` pins the id onto the row it writes as
-  `estimate.sp_anchor_id` — exactly as it snapshots `ref_model` and `price_epoch`. That per-estimate
-  pin is what keeps a historic points band interpretable: a rate fitted under `v1` is never applied
-  to a band issued under `v2`. Confirm what is in force from `est config` (`estimand`,
-  `sp_anchor_id`, `sp_anchor_text`), or from the anchor line and the `unit:` line `est refclass`
-  prints. (The `sp_` prefix is load-bearing: `anchor` on its own already means the session/prompt an
+- **The anchor is versioned and pinned.** The definition lives in the append-only `sp_anchor` table,
+  `config.sp_anchor_id` (seeded `v1`) names which row is in force, and `est open` pins that id onto
+  the row it writes as `estimate.sp_anchor_id` — exactly as it snapshots `ref_model` and
+  `price_epoch`. That per-estimate pin is what keeps a historic points band interpretable: a rate
+  fitted under `v1` is never applied to a band issued under `v2`. Introducing a new anchor is **id
+  first, then text** (`est config set sp_anchor_id v2`, then `est config set sp_anchor_text "…"`),
+  and **re-wording an id that is already defined is refused** — a re-wording is a redefinition, and
+  the table is append-only so that the text cannot drift away from the id bands point at. Confirm
+  what is in force from `est config` (`estimand`, `sp_anchor_id`, `sp_anchor_text`), or from the
+  anchor line and the `unit:` line `est refclass` prints. (The `sp_` prefix is load-bearing: `anchor` on its own already means the session/prompt an
   estimate was issued from, an older and unrelated use of the word.) If the anchor is ever redefined,
   points minted under the old one mean a different thing, and the corpus keeps the two apart rather
   than pooling them.

@@ -25,7 +25,8 @@ set estimand story_point`, and it is Craig's call: no migration runs, nothing is
 history is redenominated.
 
 **The anchor is versioned, and every band is stamped with which version it was sized against.** The
-anchor in force is `config.sp_anchor_id` (seeded `v1`) and `config.sp_anchor_text`; `est open` pins
+anchor in force is `config.sp_anchor_id` (seeded `v1`), naming a row of the append-only `sp_anchor`
+table that holds the definition; `est open` pins
 the id onto the row as `estimate.sp_anchor_id`, exactly as `ref_model` and `price_epoch` are pinned,
 and for the same reason: the unit has to be pinned or the history is meaningless. That column is
 what makes a two-year-old points band still readable — and what stops a rate fitted under `v1` being

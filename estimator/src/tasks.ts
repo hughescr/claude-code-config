@@ -24,8 +24,20 @@ import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { getConfig } from "./db.ts";
+import { InvariantError, UsageError } from "./errors.ts";
 import { priceFamily } from "./prices.ts";
 import { resolveEstimatorIdentity, type EstimatorIdentity } from "./identity.ts";
+import {
+  assertSameUnit,
+  BandIdentity,
+  isPointsEstimand,
+  POINTS_ESTIMAND,
+  storyPointAnchor,
+  type AnchorFilter,
+  type EstimateUnitColumns,
+  type StoryPointAnchor,
+  type UnitRefusalContext,
+} from "./unit.ts";
 import {
   bootstrapQuantileCI,
   multipliers,
@@ -38,27 +50,13 @@ import { unifiedDiff } from "./textdiff.ts";
 // errors — the exit-code contract, as types
 // ---------------------------------------------------------------------------
 
-/** Exit 1: the command was malformed, or the anchor could not be resolved. */
-export class UsageError extends Error {
-  readonly exitCode = 1;
-}
-
 /**
- * Exit 2: the command was well-formed and the operation is NOT PERMITTED.
- *
- * "Exit 2 is the anti-Goodhart code and it must never be retried, worked around, or
- * downgraded to a warning" (P1.0). Its message names the append path that is
- * allowed, so `remedy` is not optional prose — it is the payload.
+ * Defined in `src/errors.ts` and re-exported here, because `src/db.ts` and
+ * `src/unit.ts` both throw them and both are imported BY this module. There is one
+ * definition of each class, so `instanceof` in `src/cli.ts` is unaffected — see the
+ * header of `src/errors.ts` for why the move was forced.
  */
-export class InvariantError extends Error {
-  readonly exitCode = 2;
-  constructor(
-    message: string,
-    readonly remedy: string,
-  ) {
-    super(message);
-  }
-}
+export { InvariantError, UsageError } from "./errors.ts";
 
 export const TASK_KINDS = [
   "research",
@@ -330,6 +328,14 @@ export interface RefclassSnapshot {
  * from a class with zero comparable tasks in the new unit, and nothing anywhere
  * saying the multiplier meant something else. A unit with no snapshot of its own is
  * a cold start, which is a thing this system already knows how to say out loud.
+ *
+ * **This is the one unit-ish lookup that is deliberately NOT a {@link BandIdentity}
+ * query, and the reason is `refclass`'s key rather than an oversight.** `refclass` is
+ * keyed `(as_of, bucket, estimator_family, ref_model, estimand)` — no anchor — so it has
+ * nowhere to put a per-anchor snapshot, and asking for one here would silently return
+ * nothing. The anchor is enforced against the SNAPSHOT instead, in `pointsToWcet`, by
+ * counting the rows it was fitted from; that guard releases on its own the day `refclass`
+ * carries `sp_anchor_id` in its key.
  */
 export function newestRefclass(
   db: Database,
@@ -360,6 +366,17 @@ export interface CalibrationResult {
   multP50: number;
   multP90: number;
   uncalibrated: boolean;
+  /**
+   * WHICH estimator family the snapshot behind these multipliers was fitted over, or
+   * `null` when it is the pooled `'*'` row (or when there is no snapshot).
+   *
+   * Projected because a guard on the snapshot has to count the SAME rows the snapshot
+   * was fitted from, and `newestRefclass` may legitimately answer with a family other
+   * than the caller's. `foreignAnchorSamples` counting across every family was a
+   * refusal for a reason that had nothing to do with the band being priced: one v1
+   * sample from an unrelated model family suppressed a homogeneous ten-sample v2 rate.
+   */
+  snapshotFamily: string | null;
 }
 
 /**
@@ -395,6 +412,7 @@ export function calibrationFor(
       multP50: 1,
       multP90: 1,
       uncalibrated: true,
+      snapshotFamily: null,
     };
   }
   return {
@@ -405,87 +423,34 @@ export function calibrationFor(
     multP50: snap.mult_p50,
     multP90: snap.mult_p90,
     uncalibrated: false,
+    // `'*'` is the POOLED row — it was fitted across families, so a guard on it must
+    // count across families too. `null` means exactly that here.
+    snapshotFamily: snap.estimator_family === "*" ? null : snap.estimator_family,
   };
 }
 
 /**
- * Comparable completed tasks in this bucket, at THIS unit — the honest `bucket_n`.
+ * Comparable completed tasks in this bucket — the honest `bucket_n`.
  *
- * `anchorId` narrows further to one story-point ANCHOR (v17), and is how the points
- * bridge asks "how much completed work is denominated the way this band is". Omit it
- * for the unit-wide count every Work-CET caller has always wanted; a Work-CET row has
- * `sp_anchor_id IS NULL`, so passing an anchor there would correctly count zero.
- *
- * `IS ?` rather than `= ?` because the parameter may be NULL and SQLite's `=` never
- * matches NULL: the count of rows with no anchor recorded is a real question (pre-v15
- * bands) and it has to come back as a count rather than as a silent zero.
+ * `anchor` is `"any"` for the unit-wide count every Work-CET caller has always wanted,
+ * and `"this"` for the points bridge's question: how much completed work is denominated
+ * the way THIS band is, down to the anchor. Which rows either answer admits is
+ * {@link BandIdentity}'s to decide, not this function's — that is the whole point of
+ * routing it through the identity rather than through four string parameters.
  */
 export function liveBucketN(
   db: Database,
+  identity: BandIdentity,
   bucket: string,
-  refModel: string,
-  estimand: string,
-  anchorId?: string | null,
+  anchor: AnchorFilter = "any",
 ): number {
-  if (anchorId === undefined) {
-    return (
-      db
-        .query<{ n: number }, [string, string, string]>(
-          "SELECT COUNT(*) AS n FROM v_velocity WHERE bucket = ? AND ref_model = ? AND estimand = ?",
-        )
-        .get(bucket, refModel, estimand)?.n ?? 0
-    );
-  }
-  return (
-    db
-      .query<{ n: number }, [string, string, string, string | null]>(
-        `SELECT COUNT(*) AS n FROM v_velocity
-          WHERE bucket = ? AND ref_model = ? AND estimand = ? AND sp_anchor_id IS ?`,
-      )
-      .get(bucket, refModel, estimand, anchorId)?.n ?? 0
-  );
-}
-
-/**
- * Completed samples in this bucket/unit that are denominated in a DIFFERENT anchor and
- * that a snapshot taken at `asOf` could therefore have been fitted on.
- *
- * This is the guard `refclass` cannot yet carry itself. A `refclass` row is keyed on
- * `(as_of, bucket, estimator_family, ref_model, estimand)` and is written by
- * `src/retro.ts`, which fits one snapshot per unit over every sample in it — so under
- * 'story_point' a snapshot taken after an anchor bump has v1 and v2 samples pooled into
- * one median, and the resulting "Work-CET per point" is per point of nothing in
- * particular. Non-zero here means exactly that, and `pointsToWcet` then refuses the
- * fitted rate rather than returning a number whose denominator is a mixture.
- *
- * A NULL `sp_anchor_id` counts as foreign: under points it means a band issued before
- * the anchor was recorded, whose denomination nobody can now establish. That is the
- * self-describing reading — never "the current anchor".
- *
- * The window is `finalized_at <= asOf` because that is what the snapshot could have
- * seen; a task closed after the retro ran is not in it. Which also means the guard
- * RELEASES on its own once `src/retro.ts` learns to key a snapshot on the anchor: a
- * snapshot fitted from one anchor's samples will simply have none of the other's below
- * its `as_of`, and this returns 0 without anything here changing.
- */
-function foreignAnchorSamples(
-  db: Database,
-  bucket: string,
-  refModel: string,
-  estimand: string,
-  anchorId: string,
-  asOf: string,
-): number {
-  return (
-    db
-      .query<{ n: number }, [string, string, string, string, string]>(
-        `SELECT COUNT(*) AS n FROM v_velocity
-          WHERE bucket = ? AND ref_model = ? AND estimand = ?
-            AND finalized_at <= ?
-            AND (sp_anchor_id IS NULL OR sp_anchor_id <> ?)`,
-      )
-      .get(bucket, refModel, estimand, asOf, anchorId)?.n ?? 0
-  );
+  // `asOf: null` = no upper bound, and the asymmetry with the FITTED path is deliberate.
+  // This is "how much comparable completed work exists NOW" — the cold-start denominator
+  // — and bounding it by some snapshot's `as_of` would make a band opened today ignore
+  // work that finished since the last retro: a refusal caused by the calendar rather than
+  // by the corpus. The window belongs where a SNAPSHOT is being defended, and here there
+  // is no snapshot.
+  return identity.samples({ asOf: null, bucket }).count(db, anchor);
 }
 
 // ---------------------------------------------------------------------------
@@ -493,51 +458,27 @@ function foreignAnchorSamples(
 // ---------------------------------------------------------------------------
 
 /**
- * The one `config.estimand` value under which a band is RELATIVE rather than absolute.
- *
- * Work-CET turned out to be a unit agents cannot predict: 61.9x spread across models
- * on the same task, with repeated silent 1000x outliers. The same models sized the
- * same work against a fixed anchor to within 1.96x when they decomposed it first. So
- * the estimand becomes "how many times the anchor is this", and the system learns the
- * points -> Work-CET conversion from completed work instead of asking anyone to guess
- * a token count.
- *
- * Everything else about the unit machinery is unchanged and deliberately so: this is a
- * fourth value in a column that is ALREADY a calibration key everywhere
- * (`estimate.estimand`, `refclass`'s primary key, `v_velocity`'s projection, every
- * consumer's filter), so switching to it segregates the new corpus from the old
- * automatically. No history is deleted, and none is redenominated.
+ * The unit vocabulary moved to `src/unit.ts` in v18, where the identity value that
+ * compares two units also lives, and is re-exported here so every existing importer
+ * (`src/burn.ts`, `src/close.ts`, `scripts/nudge.ts`, the tests) is unaffected. There
+ * is one definition of each name.
  */
-export const POINTS_ESTIMAND = "story_point";
-
-export function isPointsEstimand(estimand: string): boolean {
-  return estimand === POINTS_ESTIMAND;
-}
+export {
+  ANCHOR_UNDEFINED_TEXT,
+  BandIdentity,
+  IDENTITY_COMPONENTS,
+  isPointsEstimand,
+  POINTS_ESTIMAND,
+  storyPointAnchor,
+  type EstimateUnitColumns,
+  type IdentityComponent,
+  type SampleScope,
+  type StoryPointAnchor,
+  type VelocitySample,
+} from "./unit.ts";
 
 /** Fallback ceiling when `config.sp_max_points` is missing or unreadable. */
 export const DEFAULT_MAX_POINTS = 1000;
-
-/**
- * The story-point ANCHOR in force: the work defined to be 1 point, and its version.
- *
- * The id is what gets pinned onto every band (`estimate.sp_anchor_id`). The text is
- * what the estimator is shown. They move together — re-wording the text without
- * bumping the id silently redefines every future point while leaving history claiming
- * the same scale.
- */
-export interface StoryPointAnchor {
-  readonly id: string;
-  readonly text: string;
-}
-
-export function storyPointAnchor(db: Database): StoryPointAnchor {
-  return {
-    id: getConfig(db, "sp_anchor_id") ?? "v1",
-    text:
-      getConfig(db, "sp_anchor_text") ??
-      "rename a single variable across 3 files in a TypeScript codebase, with no tests to update",
-  };
-}
 
 /** `config.sp_max_points`, or {@link DEFAULT_MAX_POINTS}. Always >= 1. */
 export function maxPoints(db: Database): number {
@@ -637,18 +578,25 @@ export interface PointsRateKey {
  * between a `refclass` multiplier and a caller:
  *
  *  - at least {@link COLD_START_N} completed tasks at THIS band's anchor
- *    ({@link liveBucketN} with `anchorId`) — the same threshold every other multiplier
+ *    ({@link liveBucketN} with `"this"`) — the same threshold every other multiplier
  *    obeys, applied to the sample that is actually comparable; and
- *  - no foreign-anchor sample inside the snapshot's own window
- *    ({@link foreignAnchorSamples}) — because `refclass` is not keyed on the anchor and
- *    a snapshot fitted across a bump is a median of two different units.
+ *  - no foreign-anchor sample inside the snapshot's own row set — because `refclass` is
+ *    not keyed on the anchor and a snapshot fitted across a bump is a median of two
+ *    different units.
  *
- * The consequence is deliberate and worth stating: **an anchor bump is a cold start for
- * the whole bucket**, not just for bands issued after it, and it stays one until
- * `src/retro.ts` can fit a snapshot per anchor. That is the same trade the rest of this
- * file makes — a refused number rather than a wrong one — and the escape is the one
- * cold starts have always had: `est config set sp_seed_wcet_per_point <n>` together
- * with `est config set sp_seed_anchor_id <new anchor>`.
+ * **That second condition is scoped to the snapshot, not to the corpus (v18).** It counts
+ * the rows the snapshot could actually have been fitted from: `cal.snapshotFamily`
+ * (pooled `'*'` widens to every family) and `cal.refclassAsOf` as the window. Counting
+ * across every family instead made an unrelated model's single v1 sample suppress a
+ * homogeneous ten-sample v2 rate — a refusal justified by a row that was never in the
+ * fit, which is a wrong refusal rather than a conservative one.
+ *
+ * The consequence of the remaining refusal is deliberate and worth stating: **an anchor
+ * bump is a cold start for the whole bucket**, not just for bands issued after it, and it
+ * stays one until `src/retro.ts` can fit a snapshot per anchor. That is the same trade the
+ * rest of this file makes — a refused number rather than a wrong one — and the escape is
+ * the one cold starts have always had: `est config set sp_seed_wcet_per_point <n>`
+ * together with `est config set sp_seed_anchor_id <new anchor>`.
  *
  * Otherwise `{ rate: null, source: null }`. **A rate is never invented** — the caller's
  * obligation is to print no Work-CET figure at all, not to fall back to 1.0, because a
@@ -662,14 +610,22 @@ export interface PointsRateKey {
 export function pointsToWcet(db: Database, key: PointsRateKey): PointsRate {
   if (!isPointsEstimand(key.estimand)) return { rate: null, source: null, n: 0 };
 
-  const anchor = storyPointAnchor(db);
   // Omitted means "a band being issued now", whose anchor can only be the one in force.
   // An explicit `null` is a stored row that records no anchor: an unknown denomination,
   // and there is no honest rate for one.
-  const bandAnchor = key.anchorId === undefined ? anchor.id : key.anchorId;
+  const bandAnchor = key.anchorId === undefined ? storyPointAnchor(db).id : key.anchorId;
   if (bandAnchor === null) return { rate: null, source: null, n: 0 };
 
-  const anchorN = liveBucketN(db, key.bucket, key.refModel, key.estimand, bandAnchor);
+  // The band's OWN identity, not the ambient one: this may be pricing a v1 row while v2
+  // is in force. Built once here and used for both the count and the guard, so the two
+  // cannot drift apart the way `liveBucketN` and `foreignAnchorSamples` did.
+  const identity = BandIdentity.ofEstimate(db, {
+    ref_model: key.refModel,
+    estimand: key.estimand,
+    sp_anchor_id: bandAnchor,
+  });
+
+  const anchorN = liveBucketN(db, identity, key.bucket, "this");
   if (anchorN >= COLD_START_N) {
     const cal = calibrationFor(
       db,
@@ -684,14 +640,13 @@ export function pointsToWcet(db: Database, key: PointsRateKey): PointsRate {
       cal.multP50 > 0 &&
       Number.isFinite(cal.multP50) &&
       cal.refclassAsOf !== null &&
-      foreignAnchorSamples(
-        db,
-        key.bucket,
-        key.refModel,
-        key.estimand,
-        bandAnchor,
-        cal.refclassAsOf,
-      ) === 0
+      identity
+        .samples({
+          asOf: cal.refclassAsOf,
+          bucket: key.bucket,
+          estimatorFamily: cal.snapshotFamily,
+        })
+        .count(db, "foreign") === 0
     ) {
       return { rate: cal.multP50, source: "fitted", n: cal.bucketN };
     }
@@ -779,59 +734,51 @@ export function blocksInWcet(estimand: string): boolean {
   return !isPointsEstimand(estimand);
 }
 
-/** What an already-issued band is denominated in — the pair that has to be honoured. */
-export interface RecordedUnit {
-  /** Human name of the row being honoured, for the refusal message. */
-  readonly what: string;
-  /** `estimate.estimand` of that row. */
-  readonly estimand: string;
-  /** `estimate.sp_anchor_id` of that row; NULL for a Work-CET band. */
-  readonly anchorId: string | null;
-  /** The verb being refused, for the remedy. */
-  readonly verb: string;
+/**
+ * The unit an existing `estimate` row is denominated in, with its eid — the answer both
+ * write paths that hang a row off an estimate have to honour.
+ *
+ * `which` is the whole reason this is one function rather than two inline SELECTs:
+ *
+ *  - **`"baseline"`** (`MIN(eid)`) is what a RE-ESTIMATE must match. `est close` scores
+ *    `MIN(eid)` and `v_velocity` joins on `eid_at_start`, so the baseline is what fixes
+ *    the task's denomination for every measurement ever made of it.
+ *  - **`"latest"`** (`MAX(eid)`) is what a BLOCK must match, because `addBlock` hangs the
+ *    row off `MAX(eid)`.
+ *
+ * The SELECT names all three unit columns because {@link EstimateUnitColumns} requires
+ * all three. That is the type doing the work: the version of this lookup that shipped
+ * selected `estimand, sp_anchor_id` and silently let a `ref_model` flip through.
+ */
+export function recordedUnitOf(
+  db: Database,
+  tid: string,
+  which: "baseline" | "latest",
+): { eid: number; identity: BandIdentity } | null {
+  const row = db
+    .query<{ eid: number } & EstimateUnitColumns, [string]>(
+      `SELECT eid, ref_model, estimand, sp_anchor_id FROM estimate WHERE tid = ?
+        ORDER BY eid ${which === "baseline" ? "ASC" : "DESC"} LIMIT 1`,
+    )
+    .get(tid);
+  if (row === null || row === undefined) return null;
+  return { eid: row.eid, identity: BandIdentity.ofEstimate(db, row) };
 }
 
 /**
  * REFUSE to write a row into an estimate whose unit the ambient config no longer agrees
- * with (v17).
+ * with (v17; whole-identity since v18).
  *
- * Everything that hangs off an existing `estimate` — a block, a re-estimate, a roll-up —
- * inherits that estimate's denomination, because that is the band it rolls up into and
- * the band `est close` will score. `config.estimand` and `config.sp_anchor_id` are
- * MUTABLE and flipping them is a one-line command Craig is expected to run; so reading
- * the unit from config at write time means any task open across the flip silently
- * acquires a second denomination. `estimate` and `estimate_block` are both append-only,
- * so the mixed row could never be corrected, and every downstream key carries the unit
- * as if the row were homogeneous.
- *
- * REFUSAL rather than reinterpretation, and the asymmetry is the point: converting would
- * require a rate this system may not have, and relabelling would move a number between
- * units without touching it. Exit **2** — an invariant refusal, not a malformed command
- * line — because retyping the arguments cannot fix it.
+ * The rule and its justification live on {@link assertSameUnit} in `src/unit.ts`. This is
+ * the two-argument convenience every caller in this file wants: resolve the ambient
+ * identity, compare it to the recorded one, WHOLE.
  */
-export function assertAmbientUnitMatches(db: Database, row: RecordedUnit): void {
-  const ambient = getConfig(db, "estimand") ?? "work_cet";
-  if (ambient !== row.estimand) {
-    throw new InvariantError(
-      `${row.what} is denominated in '${row.estimand}', but config.estimand is now '${ambient}': ` +
-        `\`${row.verb}\` would store a '${ambient}' number under a '${row.estimand}' band, and both tables are append-only`,
-      `finish this task in the unit it was opened in — \`est config set estimand ${row.estimand}\` — ` +
-        "or close it and open the new work fresh under the new estimand. A task's unit is fixed at its first estimate; " +
-        "nothing converts a band after the fact",
-    );
-  }
-  if (!isPointsEstimand(row.estimand)) return;
-  const inForce = storyPointAnchor(db);
-  if (row.anchorId !== inForce.id) {
-    throw new InvariantError(
-      `${row.what} is denominated against story-point anchor '${row.anchorId ?? "(none recorded)"}', ` +
-        `but config.sp_anchor_id is now '${inForce.id}': a point of one anchor is not a point of the other, ` +
-        `so \`${row.verb}\` would mix two scales inside one append-only band`,
-      `restore the anchor this task was sized under — \`est config set sp_anchor_id ${row.anchorId ?? "<the old id>"}\` — ` +
-        "or close the task and re-open it under the new anchor. Bands already on disk keep their own anchor; " +
-        "they are never re-denominated",
-    );
-  }
+export function assertAmbientUnitMatches(
+  db: Database,
+  recorded: BandIdentity,
+  ctx: UnitRefusalContext,
+): void {
+  assertSameUnit(recorded, BandIdentity.ambient(db), ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -981,6 +928,18 @@ export interface OpenResult {
   wcetRate: PointsRate;
   /** Set when `--from-blocks` produced the raw band: how many blocks were summed. */
   rolledUpFromBlocks: number | null;
+  /**
+   * ADVISORY (v18): the `--from-blocks` roll-up summed blocks hanging off this task's
+   * FIRST estimate, which is the "opened coarse, then decomposed" shape the canonical
+   * order exists to replace. Null otherwise.
+   *
+   * Not an error and not a refusal — `est close` scores `MIN(eid)`, so a refinement was
+   * never the measured band and this one is not either. It is recorded because the shape
+   * says someone followed guidance that has since been withdrawn. Also written to
+   * `anomaly(kind='from_blocks_on_baseline')`, which is what makes it visible in
+   * `est census` without any renderer having to cooperate.
+   */
+  rollupNotice: string | null;
   plant: { marker: string; call: string };
   /**
    * OPEN tasks in the SAME anchor session whose subject overlaps this one — see
@@ -1253,6 +1212,11 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
   const dodJson = JSON.stringify(dod);
   const description = input.description ?? null;
 
+  // The unit this band is being issued in, as ONE value. `refModel` / `estimand` /
+  // `spAnchor` below are the same three facts spelled out for the report and the
+  // messages; the row's columns are written from `unit` itself ({@link
+  // BandIdentity.bindEstimate}), so what is stored and what is compared cannot diverge.
+  const unit = BandIdentity.ambient(db);
   const refModel = getConfig(db, "ref_model") ?? "claude-sonnet-4-5";
   const estimand = getConfig(db, "estimand") ?? "work_cet";
   const points = isPointsEstimand(estimand);
@@ -1277,18 +1241,12 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
   // scores `MIN(eid)` and `v_velocity` joins on `eid_at_start`, so the baseline is what
   // fixes the task's denomination for every measurement made of it.
   if (input.tid !== null && input.tid !== undefined) {
-    const baseline = db
-      .query<{ eid: number; estimand: string; sp_anchor_id: string | null }, [string]>(
-        "SELECT eid, estimand, sp_anchor_id FROM estimate WHERE tid = ? ORDER BY eid ASC LIMIT 1",
-      )
-      .get(input.tid);
+    const baseline = recordedUnitOf(db, input.tid, "baseline");
     // An unknown tid is not this guard's refusal to make: the resolution below says so
     // with the remedy that fits.
-    if (baseline !== null && baseline !== undefined) {
-      assertAmbientUnitMatches(db, {
+    if (baseline !== null) {
+      assertAmbientUnitMatches(db, baseline.identity, {
         what: `task ${input.tid}'s baseline estimate (eid=${baseline.eid})`,
-        estimand: baseline.estimand,
-        anchorId: baseline.sp_anchor_id,
         verb: "est open --tid",
       });
     }
@@ -1299,6 +1257,7 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
   let rawP50 = input.rawP50;
   let rawP90 = input.rawP90;
   let rolledUpFromBlocks: number | null = null;
+  let rollupNotice: string | null = null;
   if (input.fromBlocks === true) {
     if (input.tid === null || input.tid === undefined) {
       throw new UsageError(
@@ -1315,32 +1274,38 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
         `--from-blocks: tid ${input.tid} has no block estimates to roll up; run \`est block ${input.tid} --phase <i> --title … --p50 … --p90 …\` first`,
       );
     }
-    // FIRST-ESTIMATE-WINS, enforced rather than advised (v17). `blockRollup` sums the
-    // blocks of `MAX(eid)`; when that is also `MIN(eid)`, the only blocks this task has
-    // ever had hang off the estimate `est close` scores — so the roll-up is not a
-    // refinement of anything, it is the "opened coarse, then decomposed" shape, and it
-    // leaves the coarse opening guess as BOTH the scored baseline and the sample
-    // `velocity_raw` (and therefore the points -> Work-CET rate) is fitted from. The
-    // refinement lands where nothing measures it.
+    // A NOTICE, not a refusal, and the v17 guard that stood here is deleted rather than
+    // repaired (v18). It rejected when `rollup.eid === MIN(eid)`, and it was wrong in
+    // BOTH directions:
     //
-    // The test is exact rather than heuristic, and it cannot catch a genuine refinement:
-    // `estimate_block` is append-only and keyed `(eid, phase_idx)`, so re-sizing a phase
-    // is only possible against a NEW estimate. Any task whose phases were really re-sized
-    // therefore has its blocks on some eid > MIN(eid), and passes.
+    //  - it fired on a legitimately newly-discovered phase blocked onto the first
+    //    estimate, which is a real refinement and the one shape `--from-blocks` is FOR;
+    //  - and it missed the shape it was written for. An ordinary `est open --continue`
+    //    creates eid2, so a task's first-ever blocks attach to `MAX(eid)` = eid2, sail
+    //    past a `MAX != MIN` test, and `est close` still scores the coarse eid1 baseline.
+    //
+    // The premise was mistaken too. `--from-blocks` requires `--tid`, so it can only ever
+    // land as a REFINEMENT, and a refinement is by design never the scored baseline —
+    // `est close` fits from `MIN(eid)` and that is deliberate ("first-estimate-wins" is
+    // what makes baseline accuracy a real measurement). A roll-up landing as a refinement
+    // was therefore never going to be the baseline and was never supposed to be. The
+    // actual defect was the CLI ADVERTISING open-coarse-then-roll-up as the way to
+    // decompose, and that was fixed where it belonged: in the guidance.
+    //
+    // What survives is the observation itself, because blocks sitting on `MIN(eid)` does
+    // indicate someone followed the old advice — recorded as an anomaly (visible in
+    // `est census`) and returned on {@link OpenResult.rollupNotice}. Nothing about the
+    // band, the write or the exit code depends on it.
     const baselineEid =
       db
         .query<{ eid: number | null }, [string]>("SELECT MIN(eid) AS eid FROM estimate WHERE tid = ?")
         .get(input.tid)?.eid ?? null;
     if (rollup.eid === baselineEid) {
-      throw new InvariantError(
-        `--from-blocks: tid ${input.tid}'s ${rollup.blocks} block(s) hang off its FIRST estimate (eid=${rollup.eid}), ` +
-          "so this roll-up is not a refinement — it is the decomposition of the opening guess, and `est close` scores " +
-          `the first estimate, so the guess would stay the baseline and the ${rollup.p50}/${rollup.p90} sum would be measured by nothing`,
-        "the canonical order is: size each phase, SUM them YOURSELF, `est open` ONCE with that sum, then `est block` per phase. " +
-          "This task is already open, so the roll-up cannot be recovered into its baseline; issue the refinement explicitly with " +
-          `\`est open --tid ${input.tid} --reason refinement --raw-p50 ${rollup.p50} --raw-p90 ${rollup.p90} …\` if you mean to state that band, ` +
-          "and use --from-blocks after a later estimate whose phases you re-sized",
-      );
+      rollupNotice =
+        `--from-blocks rolled up ${rollup.blocks} block(s) hanging off this task's FIRST estimate (eid=${rollup.eid}). ` +
+        "`est close` scores the first estimate, so this refinement's " +
+        `${rollup.p50}/${rollup.p90} sum is recorded but is not the band accuracy is measured against. ` +
+        "The canonical order is: size each phase, SUM them yourself, `est open` ONCE with that sum, then `est block` per phase.";
     }
     rawP50 = rollup.p50;
     rawP90 = rollup.p90;
@@ -1493,7 +1458,7 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
   const estFamily = identity.family;
 
   const bucket = "global";
-  const liveN = liveBucketN(db, bucket, refModel, estimand);
+  const liveN = liveBucketN(db, unit, bucket);
   const cal = calibrationFor(db, bucket, estFamily, refModel, estimand, liveN);
 
   // The points -> Work-CET bridge, resolved once and used by everything below.
@@ -1592,7 +1557,7 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
       }
     }
 
-    db.query(INSERT_ESTIMATE_SQL).run({
+    const estimateParams: Record<string, unknown> = {
       $tid: tid,
       $version: version,
       $created_at: ts,
@@ -1614,17 +1579,19 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
       $cal_req_p50: calReqP50,
       $cal_req_p90: calReqP90,
       $price_epoch: priceEpoch,
-      $ref_model: refModel,
-      $estimand: estimand,
       $estimator_model: estModel,
-      // NULL for a Work-CET band: no anchor was involved, and writing the current one
-      // anyway would claim a denomination this row does not have.
-      $sp_anchor_id: spAnchor?.id ?? null,
       // Pinned for EVERY estimand, unlike the anchor: the procedure that produced a
       // Work-CET band is exactly as much a part of what that band means as the procedure
       // behind a points band. NULL only when nobody has stated one.
       $procedure_version: procedureVersion,
-    } as never);
+    };
+    // `$ref_model`, `$estimand` and `$sp_anchor_id` come from the identity rather than
+    // from three separate locals, so the row is stamped with exactly the value the
+    // comparison will later read. `sp_anchor_id` is NULL for a Work-CET band because
+    // `BandIdentity.ambient` carries no anchor for one: no anchor was involved, and
+    // writing the current one anyway would claim a denomination this row does not have.
+    unit.bindEstimate(estimateParams);
+    db.query(INSERT_ESTIMATE_SQL).run(estimateParams as never);
 
     // `est open --continue <tid> --session <sid>`: bind the resumed or forked session
     // to this task. Additive, like the mint path — the session may already be hosting
@@ -1639,6 +1606,10 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
         $source: "est_bind",
       } as never);
     }
+
+    // Inside the same transaction as the estimate it describes: an advisory that
+    // outlived a rolled-back write would point at a band that does not exist.
+    if (rollupNotice !== null) writeAnomaly(db, ts, "from_blocks_on_baseline", rollupNotice, tid);
   }).immediate();
 
   const eid = db.query<{ eid: number }, [string, number]>(
@@ -1687,6 +1658,7 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
     points: points ? { p50: Math.round(rawP50), p90: Math.round(rawP90) } : null,
     wcetRate,
     rolledUpFromBlocks,
+    rollupNotice,
     plant: {
       marker: PLANT_MARKER,
       call: `TaskUpdate({ taskId: "<n>", metadata: { est_tid: "${tid}" } })`,
@@ -1796,26 +1768,22 @@ export function addBlock(db: Database, input: BlockInput): BlockResult {
   // under a Work-CET parent — and `v_block_accuracy` (schema.sql), which reads the unit
   // off `estimate.estimand`, then treated it as scorable Work-CET. The shared guard
   // could not see the mismatch because nothing on the block row recorded one.
-  const est = db
-    .query<{ eid: number; estimand: string; sp_anchor_id: string | null }, [string]>(
-      "SELECT eid, estimand, sp_anchor_id FROM estimate WHERE tid = ? ORDER BY eid DESC LIMIT 1",
-    )
-    .get(input.tid);
-  if (est === null || est === undefined) {
+  const parent = recordedUnitOf(db, input.tid, "latest");
+  if (parent === null) {
     throw new InvariantError(
       `tid ${input.tid} has no estimate to block against`,
       "run `est open` first — block estimates roll up to a task band, they never replace one",
     );
   }
-  const eid = est.eid;
-  const estimand = est.estimand;
-  const points = isPointsEstimand(estimand);
-  assertAmbientUnitMatches(db, {
+  const eid = parent.eid;
+  assertAmbientUnitMatches(db, parent.identity, {
     what: `estimate eid=${eid} (tid ${input.tid})`,
-    estimand,
-    anchorId: est.sp_anchor_id,
     verb: "est block",
   });
+  // Only reachable once the identities agree WHOLE, so reading the estimand back off
+  // config here is not a second source of truth — it is the same one, checked.
+  const estimand = getConfig(db, "estimand") ?? "work_cet";
+  const points = isPointsEstimand(estimand);
   const spAnchor = points ? storyPointAnchor(db) : null;
   if (points) {
     assertPointsQuantile(db, "--p50", Math.round(input.p50));
@@ -2361,7 +2329,7 @@ export function refclass(
   }));
 
   const snap = newestRefclass(db, bucket, estFamily, refModel, estimand);
-  const liveN = liveBucketN(db, bucket, refModel, estimand);
+  const liveN = liveBucketN(db, BandIdentity.ambient(db), bucket);
   const n = snap?.n ?? liveN;
   const uncalibrated = snap === null || n < COLD_START_N;
 

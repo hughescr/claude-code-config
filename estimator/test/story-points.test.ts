@@ -1508,22 +1508,120 @@ describe("a block is denominated by the estimate it hangs off", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 13 — `--from-blocks` cannot displace the scored baseline (v17)
+// 12b — a REFUSED `--continue` binds nothing
 // ---------------------------------------------------------------------------
 
 /**
- * `--from-blocks` can only land as a re-estimate (it needs `--tid`), and `est close`
- * fits both the scored baseline and `velocity_raw` from `MIN(eid)`. So rolling the
- * blocks of the FIRST estimate up into a refinement leaves the coarse opening guess as
- * both the baseline and the fitting sample, and the decomposition — the number the whole
- * points estimand exists to capture — is measured by nothing.
+ * The refusal above is only half a refusal if the session binding survives it.
  *
- * The guard is mechanical rather than advisory, and it cannot catch a genuine
- * refinement: `estimate_block` is append-only and keyed `(eid, phase_idx)`, so re-sizing
- * a phase is only possible against a NEW estimate, whose eid is by construction above
- * `MIN(eid)`.
+ * `est open --continue <tid> --session <sid>` used to bind the session in `cmdOpen`,
+ * BEFORE `openTask` ran the checks that can reject the continuation — and `bindTask`
+ * commits in its own `.immediate()` transaction, so the refusal could not take it
+ * back. A cutover continuation therefore exited 2, wrote no estimate, and still left
+ * `sid -> tid` in `task_alias`; §5.4 then read that alias as the authority it is and
+ * booked the session's next request to the task the system had just refused to
+ * associate it with, `exclusive`, with nothing downstream able to tell.
+ *
+ * The bind belongs to `openTask`, which already writes it inside the same
+ * `.immediate()` transaction as the estimate row (the `existingTid !== null` arm), so
+ * the two land together or not at all. These two tests are the pair: refused binds
+ * nothing, accepted still binds.
  */
-describe("--from-blocks refuses to roll up the first estimate's own blocks", () => {
+describe("a refused `--continue` leaves no binding behind", () => {
+  async function openWorkCet(session = "s1"): Promise<string> {
+    const r = await h.cli(
+      ...openArgs({ subject: "open before the cutover", "raw-p50": 200_000, "raw-p90": 600_000 }),
+      "--session", session, "--prompt", "p1", "--json",
+    );
+    expect(r.code).toBe(0);
+    return r.json<{ tid: string }>().tid;
+  }
+
+  const sessionAliases = (session: string): string[] =>
+    h.db
+      .query<{ tid: string }, [string]>(
+        "SELECT tid FROM task_alias WHERE id_kind = 'session' AND session_id = ?",
+      )
+      .all(session)
+      .map((r) => r.tid);
+
+  test("the rejected continuation writes no alias, and the next request is not booked to it", async () => {
+    const tid = await openWorkCet("s1");
+    flipToPoints();
+
+    // The fork: a NEW session resumes the pre-cutover task.
+    turn(h.db, { session: "s2", prompt: "q1", at: "2026-01-01T01:00:00Z", durationMs: 1000 });
+    const r = await h.cli("open", "--continue", tid, "--session", "s2", "--prompt", "q1");
+    expect(r.code).toBe(2);
+
+    // No estimate was appended — the baseline is still the only row.
+    expect(
+      h.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM estimate WHERE tid = ?").get(tid)!.n,
+    ).toBe(1);
+    // ...and no binding either. This is the assertion the bug failed.
+    expect(sessionAliases("s2")).toEqual([]);
+
+    // The consequence, stated end to end: s2's spend falls to the residual rather than
+    // to the task the continuation was refused for.
+    request(h.db, "r-s2", { session: "s2", prompt: "q1", out: 1000, ts: "2026-01-01T01:00:01Z" });
+    attributeTasks(h.db);
+    const req = h.db
+      .query<{ tid: string | null; attr: string }, [string]>(
+        "SELECT tid, attr FROM request WHERE request_id = ?",
+      )
+      .get("r-s2")!;
+    expect(req.tid).toBeNull();
+    expect(req.attr).not.toBe("exclusive");
+  });
+
+  test("an ACCEPTED `--continue` still binds the resuming session", async () => {
+    const tid = await openWorkCet("s1");
+    // No flip: the continuation is legitimate and must land BOTH halves.
+    turn(h.db, { session: "s2", prompt: "q1", at: "2026-01-01T01:00:00Z", durationMs: 1000 });
+    const r = await h.cli("open", "--continue", tid, "--session", "s2", "--prompt", "q1", "--json");
+    expect(r.code).toBe(0);
+    expect(
+      h.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM estimate WHERE tid = ?").get(tid)!.n,
+    ).toBe(2);
+    expect(sessionAliases("s2")).toEqual([tid]);
+
+    // And the binding is live: the fork's request books to the task.
+    request(h.db, "r-s2", { session: "s2", prompt: "q1", out: 1000, ts: "2026-01-01T01:00:01Z" });
+    attributeTasks(h.db);
+    expect(
+      h.db
+        .query<{ tid: string | null }, [string]>("SELECT tid FROM request WHERE request_id = ?")
+        .get("r-s2")!.tid,
+    ).toBe(tid);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 13 — `--from-blocks` NOTICES the old shape; it does not refuse it (v18)
+// ---------------------------------------------------------------------------
+
+/**
+ * v17 added a mechanical guard here — reject when the rolled-up blocks belong to
+ * `MIN(eid)` — and v18 DELETES it rather than repairing it, because it was wrong in both
+ * directions:
+ *
+ *  - it missed the shape it was written for. An ordinary `est open --continue` creates
+ *    eid2, so a task's first-ever blocks attach to `MAX(eid)` = eid2 and sail straight
+ *    past a `MAX != MIN` test, while `est close` still scores the coarse eid1 baseline;
+ *  - and it fired on a legitimately newly-discovered phase blocked onto eid1, which is a
+ *    real refinement and the one shape `--from-blocks` exists for.
+ *
+ * The premise was wrong too. `--from-blocks` requires `--tid`, so it can only ever land
+ * as a REFINEMENT, and a refinement is by design never the scored baseline — `est close`
+ * fits from `MIN(eid)` on purpose, because first-estimate-wins is what makes baseline
+ * accuracy a real measurement. A roll-up landing as a refinement was never going to be
+ * the baseline and was never supposed to be. The actual defect was the CLI advertising
+ * open-coarse-then-roll-up as the way to decompose, and that was fixed as guidance.
+ *
+ * What is left is a NON-BLOCKING notice, because blocks sitting on `MIN(eid)` does
+ * indicate someone followed the withdrawn advice.
+ */
+describe("--from-blocks notices the opened-coarse shape without refusing it", () => {
   async function openAndBlock(): Promise<string> {
     flipToPoints();
     const r = await h.cli(
@@ -1537,22 +1635,85 @@ describe("--from-blocks refuses to roll up the first estimate's own blocks", () 
     return tid;
   }
 
-  test("the opened-coarse-then-decomposed shape is refused", async () => {
-    const tid = await openAndBlock();
-    const r = await h.cli(
+  const rollUp = (tid: string, ...extra: string[]): Promise<{ code: number; err: string; json<T>(): T }> =>
+    h.cli(
       "open", "--tid", tid, "--reason", "refinement", "--from-blocks",
       "--exp-agents", "2", "--exp-wf-phases", "2", "--exp-files-write", "4",
       "--exp-turns", "6", "--exp-requests", "40",
-      "--session", "s1", "--prompt", "p1",
-    );
-    expect(r.code).toBe(2);
-    expect(r.err).toContain("first estimate");
-    // The remedy names the band, so the caller can state it deliberately if that really
-    // is what they mean.
-    expect(r.err).toContain("11");
+      "--session", "s1", "--prompt", "p1", ...extra,
+    ) as never;
+
+  test("the roll-up lands, and the shape is recorded rather than rejected", async () => {
+    const tid = await openAndBlock();
+    const r = await rollUp(tid, "--json");
+    expect(r.code).toBe(0);
+    expect(r.json<{ raw: { p50: number; p90: number } }>().raw).toEqual({ p50: 11, p90: 18 });
+    // The refinement exists...
     expect(
       h.db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM estimate WHERE tid = ?").get(tid)!.n,
-    ).toBe(1);
+    ).toBe(2);
+    // ...and so does the notice, in the ledger where `est census` will show it.
+    const anomaly = h.db
+      .query<{ detail: string }, [string]>(
+        "SELECT detail FROM anomaly WHERE kind = 'from_blocks_on_baseline' AND tid = ?",
+      )
+      .get(tid);
+    expect(anomaly?.detail).toContain("FIRST estimate");
+  });
+
+  /**
+   * The direction the v17 guard got backwards. A phase discovered mid-task is blocked
+   * onto whatever estimate is current — which, for a task that has only ever had one, is
+   * `MIN(eid)`. That is a genuine re-sizing and the guard rejected it outright.
+   */
+  test("a newly-discovered phase on the first estimate rolls up instead of being refused", async () => {
+    const tid = await openAndBlock();
+    await h.cli("block", tid, "--phase", "2", "--title", "the phase nobody saw coming", "--p50", "5", "--p90", "8");
+    const r = await rollUp(tid, "--json");
+    expect(r.code).toBe(0);
+    expect(r.json<{ raw: { p50: number; p90: number } }>().raw).toEqual({ p50: 16, p90: 26 });
+  });
+
+  /**
+   * The direction the v17 guard MISSED. `--continue` mints eid2 without any blocks of its
+   * own; the first-ever blocks then attach to eid2, so `MAX != MIN` holds and the guard
+   * passed — while `est close` still scored the coarse eid1 baseline. A guard that admits
+   * exactly the case it was written to catch is not a guard.
+   */
+  test("the shape the old guard let through is the same shape, and it still rolls up", async () => {
+    flipToPoints();
+    const opened = await h.cli(
+      ...openArgs({ subject: "opened coarse then continued", "raw-p50": 8, "raw-p90": 13 }),
+      "--session", "s1", "--prompt", "p1", "--json",
+    );
+    expect(opened.code).toBe(0);
+    const tid = opened.json<{ tid: string }>().tid;
+    // eid2, with no blocks yet.
+    expect((await h.cli("open", "--continue", tid, "--session", "s1", "--prompt", "p1")).code).toBe(0);
+    await h.cli("block", tid, "--phase", "0", "--title", "recon", "--p50", "3", "--p90", "5");
+    await h.cli("block", tid, "--phase", "1", "--title", "build", "--p50", "8", "--p90", "13");
+
+    const r = await rollUp(tid, "--json");
+    expect(r.code).toBe(0);
+    expect(r.json<{ raw: { p50: number; p90: number } }>().raw).toEqual({ p50: 11, p90: 18 });
+    // No notice: the blocks are not on MIN(eid), which is exactly why the mechanical test
+    // could never see this case.
+    expect(
+      h.db
+        .query<{ n: number }, [string]>(
+          "SELECT COUNT(*) AS n FROM anomaly WHERE kind = 'from_blocks_on_baseline' AND tid = ?",
+        )
+        .get(tid)!.n,
+    ).toBe(0);
+    // And `est close` still scores eid1 — which is the fact that made the guard
+    // unnecessary, not the fact that made it needed.
+    expect(
+      h.db.query<{ eid: number }, [string]>("SELECT MIN(eid) AS eid FROM estimate WHERE tid = ?").get(tid)!.eid,
+    ).toBe(
+      h.db
+        .query<{ eid: number }, [string]>("SELECT eid FROM estimate WHERE tid = ? AND version = 1")
+        .get(tid)!.eid,
+    );
   });
 
   test("a genuine later refinement still rolls up", async () => {
@@ -1567,14 +1728,76 @@ describe("--from-blocks refuses to roll up the first estimate's own blocks", () 
     // The phases were re-sized, which is only expressible against the NEW estimate.
     await h.cli("block", tid, "--phase", "0", "--title", "recon", "--p50", "5", "--p90", "8");
     await h.cli("block", tid, "--phase", "1", "--title", "build", "--p50", "13", "--p90", "21");
-    const r = await h.cli(
-      "open", "--tid", tid, "--reason", "refinement", "--from-blocks",
+    const r = await rollUp(tid, "--json");
+    expect(r.code).toBe(0);
+    expect(r.json<{ raw: { p50: number; p90: number } }>().raw).toEqual({ p50: 18, p90: 29 });
+  });
+
+  /**
+   * The notice reaches BOTH surfaces or it reaches nobody who matters. The estimating
+   * skill drives `est open --json` and never reads the human render; a person at a
+   * terminal reads the human render and never parses the JSON. `anomaly` catches neither
+   * of them at the moment they are deciding what to do.
+   */
+  test("the notice is emitted on stderr AND in --json, and the exit code is untouched", async () => {
+    const tid = await openAndBlock();
+    const r = await rollUp(tid, "--json");
+    // Advisory, so: still 0. This is the whole difference from the v17 refusal.
+    expect(r.code).toBe(0);
+    const notice = r.json<{ rollup_notice: string | null }>().rollup_notice;
+    expect(notice).not.toBeNull();
+    expect(notice).toContain("FIRST estimate");
+    // Stderr carries the same text, prefixed like every other `est open` advisory, and
+    // stdout stays the single parseable object the `--json` contract promises.
+    expect(r.err).toContain("est open: NOTICE");
+    expect(r.err).toContain("FIRST estimate");
+    expect(() => r.json<Record<string, unknown>>()).not.toThrow();
+    // ...and the ledger has it too, which is what `est census` reads.
+    expect(
+      h.db
+        .query<{ n: number }, [string]>(
+          "SELECT COUNT(*) AS n FROM anomaly WHERE kind = 'from_blocks_on_baseline' AND tid = ?",
+        )
+        .get(tid)!.n,
+    ).toBe(1);
+  });
+
+  test("the HUMAN render emits it too — the surface a person is actually looking at", async () => {
+    const tid = await openAndBlock();
+    const r = await rollUp(tid);
+    expect(r.code).toBe(0);
+    expect(r.err).toContain("est open: NOTICE");
+    expect(r.err).toContain("canonical order");
+  });
+
+  /**
+   * The other direction, which is what makes the notice mean anything: a roll-up whose
+   * blocks hang off a LATER estimate is an ordinary re-sizing, and saying nothing about
+   * it is the point. A notice on every roll-up would be noise the reader learns to skip.
+   */
+  test("a roll-up above the baseline emits no notice on either surface", async () => {
+    const tid = await openAndBlock();
+    const mid = await h.cli(
+      "open", "--tid", tid, "--reason", "refinement", "--raw-p50", "11", "--raw-p90", "18",
       "--exp-agents", "2", "--exp-wf-phases", "2", "--exp-files-write", "4",
       "--exp-turns", "6", "--exp-requests", "40",
       "--session", "s1", "--prompt", "p1", "--json",
     );
+    expect(mid.code).toBe(0);
+    await h.cli("block", tid, "--phase", "0", "--title", "recon", "--p50", "5", "--p90", "8");
+    await h.cli("block", tid, "--phase", "1", "--title", "build", "--p50", "13", "--p90", "21");
+
+    const r = await rollUp(tid, "--json");
     expect(r.code).toBe(0);
-    expect(r.json<{ raw: { p50: number; p90: number } }>().raw).toEqual({ p50: 18, p90: 29 });
+    expect(r.json<{ rollup_notice: string | null }>().rollup_notice).toBeNull();
+    expect(r.err).not.toContain("est open: NOTICE");
+    expect(
+      h.db
+        .query<{ n: number }, [string]>(
+          "SELECT COUNT(*) AS n FROM anomaly WHERE kind = 'from_blocks_on_baseline' AND tid = ?",
+        )
+        .get(tid)!.n,
+    ).toBe(0);
   });
 });
 
