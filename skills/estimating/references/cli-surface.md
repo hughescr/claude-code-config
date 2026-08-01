@@ -17,16 +17,19 @@ and `est open --json` is what this skill drives — so its shape is not yours to
 ## Verbs you may use
 
 - **`est refclass`** — read-only, takes no lock, **always exits 0**; an empty class is a valid
-  answer. Flags: `--text "<subject>"` (FTS5 over completed tasks), `--kind`, `--limit`, `--fanout`
+  answer. Its footer states the unit in force — `ref_model`, `estimand` and the story-point anchor —
+  which is the cheapest way to confirm you are sizing against the current anchor. Flags:
+  `--text "<subject>"` (FTS5 over completed tasks), `--kind`, `--limit`, `--fanout`
   (a tolerance band, half to double, minimum ±2), `--session` / `--prompt` (the anchor — pass the
   same pair you will pass to `est open`, so the calibration shown here is the one the band gets
   stamped with), `--full` (writes the unbudgeted form to `spool/` and prints the path).
 - **`est bind <tid>`** — `[--session <sid>] [--task <n>] [--run <runId>] [--agent <agentId>]`.
   Attaches a harness identity to a task after the fact. This is how a resumed session, a workflow
   run, or a sub-agent gets its spend booked to the right tid.
-- **`est burn [<tid>]`** — `[--session <sid>] [--refresh]`. Consumption against the band. Read-only,
-  never writes, always exits 0. With no tid it guesses the most recently touched open task and says
-  so. Its `check back ~Nm` line is session-scoped Claude-active time to the next human-input
+- **`est burn [<tid>]`** — `[--session <sid>] [--refresh]`. Consumption against the band, expressed
+  as a share of p50 and p90 wherever a points→Work-CET conversion exists to compare the measured
+  actual against. Read-only, never writes, always exits 0. With no tid it guesses the most recently
+  touched open task and says so. Its `check back ~Nm` line is session-scoped Claude-active time to the next human-input
   boundary, never token-derived, and it flags itself when the model is on probation. Its projection
   is linear and crude by construction: it answers "will this blow the band in the next hour", not
   "when will this finish".
@@ -47,8 +50,9 @@ and `est open --json` is what this skill drives — so its shape is not yours to
 
 | key | value | what it governs |
 |---|---|---|
-| `ref_model` | `claude-sonnet-4-5` | the Work-CET normaliser |
-| `estimand` | `work_cet` | which counters the unit includes |
+| `ref_model` | `claude-sonnet-4-5` | the Work-CET normaliser — applied to the measured actual, never to your band |
+| `estimand` | *read it* | the denomination the raw band is stated in. Story points today; velocity is never pooled across two of these, so the old Work-CET corpus sits beside the new one and never mixes with it |
+| `anchor_id` | *read it* | which story-point anchor definition an estimate was sized against. Pinned per estimate like `ref_model` and `price_epoch`; a redefinition changes what historic points mean |
 | `shrink_k` | 10 | the `k` in the shrinkage weight `n / (n + k)` — how far a calibrated bucket's own median is pulled toward the global one |
 | `velocity_half_life_days` | 30 | decay on the velocity sample |
 | `quiesce_main_min` | 60 | the close gate's quiet window |

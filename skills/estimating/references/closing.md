@@ -78,7 +78,12 @@ est retro --dry-run
 ```
 
 `--dry-run` computes and prints without writing back, and is the right default habit while the
-corpus is small. The retro:
+corpus is small.
+
+The band you issued is in **story points** and the actual is in **Work-CET**, so every score below
+is computed after the fitted points→Work-CET conversion, inside one `(ref_model, estimand)`
+partition. Nothing is scored across the unit change: Work-CET-denominated estimates from before it
+stay in their own partition and never enter these panels. The retro:
 
 - fits `mult_p50` / `mult_p90` per bucket from the decay-weighted log-velocity sample and writes
   them back to `refclass`;

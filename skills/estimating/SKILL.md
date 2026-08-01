@@ -1,6 +1,6 @@
 ---
 name: estimating
-description: Record a calibrated token estimate before starting substantial work, using the `est` CLI. Use at the start of the anchoring turn — prompt read, plan formed, nothing launched — whenever the planned work involves a Workflow launch, two or more Task/agent launches, three or more orchestrator turns toward one goal, or the user asked for an estimate or a budget. Also use to add per-phase workflow block estimates before launching, to re-estimate by refinement or scope change, and to close and score a task on completion. Not for lookups, single-file edits, or one background agent on an errand.
+description: Record a calibrated story-point estimate before starting substantial work, using the `est` CLI. Use at the start of the anchoring turn — prompt read, plan formed, nothing launched — whenever the planned work involves a Workflow launch, two or more Task/agent launches, three or more orchestrator turns toward one goal, or the user asked for an estimate or a budget. Also use to add per-phase workflow block estimates before launching, to re-estimate by refinement or scope change, and to close and score a task on completion. Not for lookups, single-file edits, or one background agent on an errand.
 ---
 
 # Estimating
@@ -13,27 +13,32 @@ actually happened. Under a minute of friction. Nothing here blocks anything.
 
 ## What you are estimating
 
-`--raw-p50` and `--raw-p90` are **Work-CET**: price-weighted `output + cache_creation` tokens,
-normalised by a reference model's output price. Confirm the current reference model and estimand
-from `est config` (`ref_model`, `estimand`) or from the `unit:` line `est refclass` prints — as of
-this writing, `work_cet` normalised by `claude-sonnet-4-5` output tokens.
+`--raw-p50` and `--raw-p90` are **story points** — positive integers on a relative scale, sized
+against one fixed anchor:
 
-- **Output on the reference model is 1:1.** One Work-CET ≈ one output token on the reference model,
-  so you can reason straight from the tokens you expect to produce. Work on a pricier model counts
-  for more per token, a cheaper one less — so fanning out to a cheap tier grows Work-CET more slowly
-  than it grows raw tokens.
-- **Cache creation counts; input and cache_read do not.** Genuinely-new context entering an agent's
-  window is work; re-reading context it already holds is not. So this is not "total tokens" and not
-  the bill — the Spend-CET forecast `est open` prints is explicitly a **lower bound**.
-  [The formula, and why those counters →](references/unit-and-calibration.md)
+> **1 story point = rename a single variable across 3 files in a TypeScript codebase, with no tests
+> to update.**
 
-> **`--raw-p50` and `--raw-p90` are your own honest judgement, handed over uncorrected.** Treat them
-> as story points: you say what the work looks like from here, the system measures `actual /
-> raw_p50` and learns the scaling. Learning that scaling is its job and not yours. So **never pad,
-> shade, or round toward a number that looks better** — a padded raw number is not a safer estimate,
-> it is a corrupted measurement, and it corrupts the multiplier fitted from it for every future
-> estimate too. Being consistent across estimates matters more than being right about any one of
-> them.
+- **A point is not a token, a minute, or a dollar.** Nothing on this path asks you to predict any of
+  those. Points say how big this work is *next to the anchor*; every absolute quantity is measured
+  afterwards from the harness's own logs, never stated by you.
+- **The anchor is versioned and pinned.** `est open` snapshots `anchor_id` onto the estimate exactly
+  as it snapshots `ref_model` and `price_epoch`. Confirm the current one from `est config`
+  (`anchor_id`, `estimand`) or from the `unit:` line `est refclass` prints. If the anchor is ever
+  redefined, points minted under the old one mean a different thing, and the corpus keeps the two
+  apart rather than pooling them.
+- **Work-CET still exists — as the actual, never as your estimate.** Work-CET is computed from the
+  logs, and the system fits a points→Work-CET rate per bucket. Where a rate exists, `est open`
+  converts and shows it beside the points; where it does not, it shows points alone. Either way you
+  never predict it.
+  [The unit, the anchor, and why the estimand changed →](references/unit-and-calibration.md)
+
+> **`--raw-p50` and `--raw-p90` are your own honest judgement, handed over uncorrected.** You say
+> what the work looks like from here; the system measures `actual_wcet / raw_p50` and fits the
+> points→Work-CET rate itself. That fit is its job and not yours. So **never pad, shade, or round
+> toward a number that looks better** — a padded raw number is not a safer estimate, it is a
+> corrupted measurement, and it corrupts the rate fitted from it for every future estimate too.
+> Being consistent across estimates matters more than being right about any one of them.
 
 ## When this applies
 
@@ -58,78 +63,88 @@ existing estimate, ask your orchestrator rather than minting a tid yourself.
 
 ## How to arrive at a number
 
-Derive it from the unit, bottom-up. Work-CET is `output + cache_creation`, price-weighted — both of
-those are quantities you can reason about directly from the plan you just formed, without consulting
-anything.
+By comparison, not by arithmetic. The only question is how big this work is next to things of known
+size — the anchor, and the blocks you have sized before.
 
-**1. List the work units.** Every sub-agent you plan to launch, every workflow phase, and the
-orchestrator itself — your own reading, planning and between-phase review turns are real spend
-inside the window. This list is also your `exp_*` drivers, so write it down once and reuse it.
+**1. Place it against the anchor.** How many anchor-sized units of work is this? Not multiplied out
+literally — read it the way you would read "a bit more than a morning" against "a bit more than an
+hour". The anchor exists so that everyone sizing anything is reading off the same ruler.
 
-**2. Per unit, how many output tokens?** What will this agent actually emit — tool calls, edits,
-reasoning, its final report? A tightly-scoped agent that reads three files and returns a short
-verdict emits a few thousand; one that writes several files and iterates emits tens of thousands.
+**2. Pick a rung; do not compute one.** 1 · 2 · 3 · 5 · 8 · 13 · 20 · 40. The gaps widen on purpose:
+at 13, the difference between 13 and 14 is precision you do not have, and the ladder is what stops
+you manufacturing it. Round to the nearest rung and move on.
 
-**3. Per unit, how much cache creation?** Cache creation is context entering that agent's window for
-the first time: the prompt you hand it, the files it reads, the tool results it accumulates.
-Re-reads of context it already holds are `cache_read` and cost nothing here. A fresh agent creates
-roughly its peak context once; a long agent that keeps opening new files creates more.
+**3. Compare against what you have already sized.** The second half of any relative scale is your
+own history — "bigger than the docs pass I called 8, smaller than the migration I called 40". Your
+recent bands are visible in `est board`.
 
-**4. Weight each unit by its model tier.** `weight_out = usd_out(model) / usd_out(ref_model)` and
-`weight_cw = usd_cw(model) / usd_out(ref_model)`. The reference tier's output weight is 1.0 by
-definition; a top-tier model's is several times that, a cheap tier's a fraction. Cache creation is
-priced off the input side, so its weight is a small fraction of the same model's output weight.
+**4. If it will not sit on a rung, split it.** Two far-apart rungs both feeling right, or the work
+resisting comparison at all, means the whole task is the wrong unit — not that you should stare
+harder. Split it and size the pieces. Above ~40 points that is mandatory; see below.
 
-**5. Sum. That sum is your `--raw-p50`.**
+**5. `--raw-p90` is your own honest bad case, in points, on the same ladder.** Not p50 times a
+habitual constant. Name what actually goes wrong on work of this shape — an agent needs a second
+pass, a phase gets re-run, the search is wider than anyone thought — and size *that* world. During
+cold start the calibrator's multipliers are exactly 1.0, so the number you write is the number that
+is shown; do not narrow it because it looks embarrassing.
 
-**6. `--raw-p90` is your own honest bad case, priced the same way.** Not p50 times a habitual
-constant. Name what actually goes wrong on work of this shape — an agent needs a second pass, a
-phase gets re-run, the search is wider than anyone thought — and cost that world with the same
-arithmetic. During cold start the calibrator's multipliers are exactly 1.0, so the number you write
-is the number that is shown; do not narrow it because it looks embarrassing.
-
-**7. Reconcile with the drivers you are about to commit.** State `exp_agents`, `exp_wf_phases`,
+**6. Reconcile with the drivers you are about to commit.** State `exp_agents`, `exp_wf_phases`,
 `exp_files_write`, `exp_turns`, `exp_requests` as numbers and check they tell the same story as the
-band — 12 agents against a 200k p50 is a contradiction, and the retro will find it. These are
+band — twelve agents against a 5-point p50 is a contradiction, and the retro will find it. These are
 audited against actuals, and they are what let a miss be *diagnosed* (orchestrator vs sub-agent)
 rather than merely recorded.
 
-**8. Watch it.** `est burn` mid-task is the feedback loop: consumption against the band, as a share
-of p50 and p90. Blowing past p50 while the work is visibly half-done means `est open --tid <tid>
---reason refinement`, not silence.
+**7. Watch it.** `est burn` mid-task is the feedback loop: consumption against the band, as a share
+of p50 and p90 wherever a points→Work-CET conversion exists to compare against. Blowing past p50
+while the work is visibly half-done means `est open --tid <tid> --reason refinement`, not silence.
 
-### Worked example — illustrative numbers, not corpus data
+### Decomposition is mandatory for large work
 
-A diff review: three reviewer agents on the reference tier, one judge on a top tier, plus the
-orchestrator. Suppose the price table gives output weights 1.0 (reference tier) and 5.0 (top tier),
-and cache-creation weights 0.25 and 1.25 respectively.
+Whole-task sizing decays as the task grows — a single number for a large piece of work does not
+reliably grasp its scale, and no amount of care fixes that from the outside. So it is a rule, not
+advice:
 
-| unit | output | cache creation | Work-CET |
-|---|---|---|---|
-| reviewer × 3 | 6,000 each | 40,000 each | 3 × (6,000·1.0 + 40,000·0.25) = 48,000 |
-| judge × 1 | 8,000 | 60,000 | 8,000·5.0 + 60,000·1.25 = 115,000 |
-| orchestrator, 6 turns | 12,000 total | 90,000 total | 12,000·1.0 + 90,000·0.25 = 34,500 |
+**If the band would land above ~40 points, or the work spans a workflow with more than one phase,
+decompose it before you state any number.**
 
-`--raw-p50 200000` (rounded from 197,500). For p90: the bad case here is one reviewer round
-repeated and the judge needing a second pass — another 48,000 + 115,000 — so `--raw-p90 360000`.
+- Split into phase-sized blocks: one per declared workflow phase, or one per coherent chunk of work
+  if there is no workflow.
+- Size each block on the ladder, by the same comparison as above.
+- **The task band is the sum of the block bands** — p50 is the sum of block p50s, p90 the sum of
+  block p90s. Do not also form a whole-task guess and reconcile the two; the sum *is* the estimate.
+- Then record the blocks with `est block` (see [Workflow blocks](#workflow-blocks)), which requires
+  the tid, so the order is: size blocks → sum → `est open` with the sum → `est block` each.
+
+Work that sits comfortably on a rung at or below 40 and has no phases is still estimated whole. Do
+not manufacture blocks for it.
+
+### Worked example — illustrative, not corpus data
+
+A three-phase workflow: survey the call sites, land the change, review it. Sized separately: 5 · 20
+· 8, so `--raw-p50 33`. The p90s are per-block and are not all the same story — the survey is what
+it is (5), the change is where a second pass lives (40), review may need a re-run (13) — so
+`--raw-p90 58`. Then `est block --phase 0/1/2` records the three, and each phase gets scored on its
+own afterwards.
 
 ### What `est refclass` is for, and what it is not
 
-Run it first, every time, and read it. It confirms the unit, it frames your `--kind` and `--fanout`,
-and if your number lands an order of magnitude away from everything it shows, that is worth a second
-look at your decomposition.
+Run it first, every time, and read it. It confirms the unit and the anchor, it frames your `--kind`
+and `--fanout`, and if your number lands far from everything it shows, that is worth a second look
+at your decomposition.
 
 **It is a sanity check, not an anchor. Do not replace your number with one derived from its rows.**
-Two reasons, and the second is the one that matters: the `actual` in a row is the **whole task** —
-orchestrator, sub-agents and auxiliary spend together — so `actual / fanout` is not a cost per agent
+Two reasons, and the second is the one that matters: a row's `actual` is the **whole task** —
+orchestrator, sub-agents and auxiliary spend together — so `actual / fanout` is not a per-agent size
 and adding orchestrator turns on top of it double-counts them; and an estimate copied out of
-observed actuals is no longer an independent reading of your own judgement, which is the only thing
-this system exists to collect. This is deliberate. Do not restore the anchoring.
+observed history is no longer an independent reading of your own judgement, which is the only thing
+this system exists to collect. Points make those rows genuinely comparable in a way the old unit
+never was, which makes the temptation stronger rather than weaker. This is deliberate. Do not
+restore the anchoring.
 
 Three regimes, none of them a number to copy:
 
 - **No matching rows.** It says so and exits 0 — an empty reference class is a valid answer. Your
-  decomposition stands on its own.
+  sizing stands on its own.
 - **Rows with the `these matches are the UNFILTERED class` note.** No completed task ran at a
   comparable fan-out, so those rows are explicitly *not* comparable on the dimension you asked
   about. Read them as background, not as evidence.
@@ -147,12 +162,13 @@ Three regimes, none of them a number to copy:
    est refclass --kind <research|design|implement|refactor|debug|review|ops> \
                 --fanout <planned agent count> --text "<subject>"
    ```
-2. **Drivers, then band** — the `exp_*` numbers, then `raw_p50` / `raw_p90`.
+2. **Drivers, then band** — the `exp_*` numbers, then `raw_p50` / `raw_p90` in points (summed from
+   blocks when decomposition applies).
 3. **`est open`** — mints the tid and applies calibration:
 
    ```
    est open --kind <k> --subject <text> [--description <text>] [--dod <json|@file>] \
-            --raw-p50 <n> --raw-p90 <n> \
+            --raw-p50 <points> --raw-p90 <points> \
             --exp-agents <n> --exp-wf-phases <n> --exp-files-write <n> \
             --exp-turns <n> --exp-requests <n>
    ```
@@ -177,31 +193,34 @@ Three regimes, none of them a number to copy:
    **Issue that call verbatim** when a Task-tool task exists — `est` cannot write Task metadata, you
    are the only actor who can, and the planted key stitches the task together across sessions. No
    Task-tool task → skip it; the tid stands alone.
-6. **Show one line to the user** — Work-CET p50/p90, request band, spend forecast: whatever `est
-   open` printed and nothing it did not (there is no active-time band; do not invent one). That line
-   is the entire user-facing friction. Do not narrate the ceremony.
+6. **Show one line to the user** — the p50/p90 points and whatever else `est open` actually printed:
+   nothing it did not. There is no active-time band; and until a points→Work-CET rate exists for the
+   bucket there is no Work-CET or spend line either. Do not invent one. That line is the entire
+   user-facing friction. Do not narrate the ceremony.
 
 If `est` errors or is unavailable, say so in one clause and get on with the work. **Never fabricate
 a band to satisfy the ceremony.**
 
 ## Workflow blocks
 
-For any **T1** task, one estimate per declared `meta.phases` entry, **written before the launch**,
-in addition to the task-level band. Derive each block the same way — it is the same decomposition,
-sliced by phase instead of summed.
+For any **T1** task, one estimate per declared `meta.phases` entry, **written before the launch**.
 
 ```
-est block <tid> --phase <i> --title <t> --p50 <n> --p90 <n> [--exp-agents <n>] [--model <m>]
+est block <tid> --phase <i> --title <t> --p50 <points> --p90 <points> [--exp-agents <n>] [--model <m>]
 ```
 
-- **`--phase` is 0-BASED** — the `phases[]` array index. A 1-based value silently mis-joins every
+- **Blocks are the primary estimate for large work.** When decomposition applies — above ~40 points,
+  or more than one phase — the task band **is** the sum of the blocks, and the blocks are where the
+  judgement actually happened. Only for small single-phase work is the task band an independent
+  number that blocks merely check.
+- **`--phase` is 0-BASED** — for a workflow, the `phases[]` array index; for a non-workflow
+  decomposition, your own block's position numbered from 0. A 1-based value silently mis-joins every
   block estimate to the wrong phase: it fails nothing and reports nothing, it just makes the numbers
   wrong.
 - **Every `agent()` call carries `label` and `phase`.** These are what make per-phase attribution
   possible at all; unlabelled or unphased workflow agents are reported as a data-quality defect.
-- **Roll-up, not replacement.** Blocks roll up beside the task band as a consistency check; the
-  **task band stays the calibrated number**, and it is what the user sees and what accuracy is
-  judged against.
+- **`est block` needs an estimate to attach to**, so `est open` comes first even though its band was
+  derived from the blocks you had already sized.
 
 Appending is the only revision: a duplicate `(estimate, phase)` is rejected.
 
@@ -214,6 +233,10 @@ Append, never edit. Two reasons in ordinary use, and they are **not** interchang
 - **`est scope <tid> --reason <text>`, then `est open --tid <tid> --reason scope_change`** — the
   goal itself moved. The task is **removed** from velocity stats, so it is not available by
   assertion: `est scope` refuses a no-op and `est open` verifies the scope actually advanced.
+
+Re-estimating means re-sizing on the same ladder against the same anchor — re-pointing a story, not
+adjusting a forecast toward what you have now spent. If the decomposition changed, re-size the
+blocks and re-sum.
 
 Baseline accuracy is always judged against the **first** estimate; a refinement never becomes the
 baseline. (`--reason recalibration` also exists — see
@@ -257,7 +280,7 @@ you must never do. `--force` is Craig's tool, never yours.
 
 ## References
 
-- `references/unit-and-calibration.md` — Work-CET's formula, the calibration pipeline, why nothing gates, why this skill's own spend is excluded, and the open question about p90.
+- `references/unit-and-calibration.md` — the story point and its anchor, points→Work-CET velocity, the calibration pipeline, why the estimand changed, why nothing gates, why this skill's own spend is excluded, and the open question about p90.
 - `references/re-estimation.md` — the three reasons in full, the exit-2 rationale, the two 2026-07-30 near-duplicate incidents.
 - `references/closing.md` — the quiescence gate, right-censoring, `--accept` verification, reopening after a sweep close, how the retro scores.
 - `references/cli-surface.md` — every verb outside the ceremony, global flags, the tunable constants.

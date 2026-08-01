@@ -17,8 +17,15 @@ Re-estimation is append-only: a new `estimate` row, a new version, nothing edite
 
 Baseline accuracy is **always** judged against the **first** estimate (`eid_at_start`). A
 refinement never becomes the baseline — that is what makes "the cone of uncertainty narrows" a
-measurement rather than a slogan. It is also agile's re-pointing rule, unchanged: you may re-point
-a story, and the burn-up still remembers what you originally said.
+measurement rather than a slogan. It is agile's re-pointing rule, and under a story-point estimand
+it is that rule literally: you may re-point a story, and the burn-up still remembers what you
+originally said.
+
+Re-pointing means re-sizing against the same anchor on the same ladder — a fresh reading of how big
+the work now looks. It is **not** an adjustment toward what has already been spent; the whole
+mechanism depends on the new number being another independent judgement. Where the task was
+decomposed, re-size the blocks and re-sum rather than nudging the total, and append the new blocks
+against the new estimate.
 
 `recalibration` is rare in practice. Use it when the estimate itself has not changed but the
 multipliers have — for instance a long-running task opened during cold start that you want re-banded

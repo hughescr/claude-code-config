@@ -143,7 +143,9 @@ CREATE TABLE estimate (             -- APPEND-ONLY, physically enforced
   -- The UNIT this band is denominated in, snapshotted at `est open` alongside the
   -- vintage. price_epoch alone pins the RATES but not the DEFINITION of a CET:
   -- config.ref_model is the normaliser's family and config.estimand chooses which
-  -- counters are summed ('out' | 'work_cet' | 'out_cw_in', §4.1). Either can be
+  -- counters are summed ('out' | 'work_cet' | 'out_cw_in', §4.1) — or, since v15,
+  -- names 'story_point', under which the BAND is relative (points against a fixed
+  -- anchor) while the ACTUAL is still Work-CET (out+cw). Either can be
   -- changed with `est config set` at any time, and a band issued in
   -- sonnet-4-5-output-equivalents is simply not comparable to one issued in
   -- opus-5-output-equivalents. Without these two columns a config flip would mix
@@ -153,7 +155,24 @@ CREATE TABLE estimate (             -- APPEND-ONLY, physically enforced
   -- an outlier, and blending them corrupts the multipliers rather than widening them.
   ref_model TEXT NOT NULL,          -- config.ref_model as of `est open`
   estimand TEXT NOT NULL,           -- config.estimand as of `est open`
-  estimator_model TEXT NOT NULL,    -- velocity history is keyed by this (model churn decay)
+  -- v15 `sp_anchor_id`: WHICH story-point anchor's scale this band is denominated in
+  -- (config.sp_anchor_id / config.sp_anchor_text as of `est open`). A points value is
+  -- meaningless without it — "8 points" says nothing unless you know what 1 point was
+  -- defined to be — so it is pinned exactly like price_epoch / ref_model / estimand,
+  -- and for the identical reason: re-wording the anchor redefines the unit, and an
+  -- unpinned anchor would silently redenominate every historical band the moment
+  -- Craig edited one sentence. NULL for every Work-CET band (no anchor is involved)
+  -- and for every row issued before v15; a consumer that needs the anchor must treat
+  -- NULL as "not a points band", never as "the current anchor".
+  --
+  -- LAYOUT NOTE: `sp_anchor_id` shares its line with `estimator_model` because that is
+  -- byte-for-byte what `ALTER TABLE estimate ADD COLUMN sp_anchor_id TEXT` leaves in
+  -- `sqlite_master` — SQLite splices the new column in after the LAST column
+  -- definition and before its trailing comment. `estimate` cannot be rebuilt (four
+  -- tables reference it and the append-only triggers guard every row), so the v14 ->
+  -- v15 step is an ADD COLUMN, and `test/schema.test.ts` asserts a migrated file is
+  -- byte-identical to a fresh one. Moving this to its own line breaks that test.
+  estimator_model TEXT NOT NULL, sp_anchor_id TEXT,    -- velocity history is keyed by this (model churn decay)
   UNIQUE (tid, version),
   FOREIGN KEY (tid, scope_seq) REFERENCES task_scope(tid, seq)
 ) STRICT;
@@ -1151,16 +1170,28 @@ LEFT JOIN v_phase_actual pa
 -- arrive inside the right reference class wearing the right name and quietly mix
 -- currencies, which is precisely what the snapshot columns exist to prevent.
 --
--- An `estimand` outside the three §4.1 values yields NULL rather than a work_cet
+-- An `estimand` outside the values below yields NULL rather than a work_cet
 -- number wearing an unknown label: NULL is what v_velocity's
 -- `actual_wcet_at_epoch IS NOT NULL` filter already excludes, so a typo costs the
 -- corpus rows instead of corrupting them.
+--
+-- v15, and the ONE place the story-point estimand is not simply another currency:
+-- 'story_point' names the unit of the BAND, not of the ACTUAL. A point is a relative
+-- size against config.sp_anchor_text; there is no such thing as a log-derived point,
+-- so the actual for a points band is measured in Work-CET (out+cw) exactly as before.
+-- That is what makes `outcome.velocity_raw = actual_wcet / raw_p50` come out as
+-- Work-CET-PER-POINT the moment raw_p50 is in points, which is the entire learning
+-- signal for the points -> Work-CET bridge. Without this branch the CASE would fall
+-- through to NULL, `actual_wcet_at_epoch IS NOT NULL` would drop every completed
+-- story-point task out of v_velocity, and the corpus would never learn a rate at all
+-- — silently, since a missing row looks exactly like work nobody has finished yet.
 CREATE VIEW v_task_actual_epoch AS
 SELECT r.tid,
   SUM(CAST((CASE e.estimand
-              WHEN 'out'       THEN r.out_tok*pe.usd_out
-              WHEN 'work_cet'  THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw
-              WHEN 'out_cw_in' THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw + r.in_tok*pe.usd_in
+              WHEN 'out'         THEN r.out_tok*pe.usd_out
+              WHEN 'work_cet'    THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw
+              WHEN 'out_cw_in'   THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw + r.in_tok*pe.usd_in
+              WHEN 'story_point' THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw
             END) / rf.usd_out AS INTEGER)) AS wcet_at_epoch,
   e.price_epoch, e.eid AS eid_at_start
 FROM v_request_live r
@@ -1320,11 +1351,51 @@ WHERE s.terminator = 'open'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '14'),
+  ('schema_version',          '15'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.
+  --
+  -- v15 adds a FOURTH value, 'story_point', and it is not a fourth counter set — it
+  -- changes what an ESTIMATE is denominated in while leaving the ACTUAL alone. Agents
+  -- predict Work-CET badly (61.9x cross-model spread, repeated silent 1000x outliers)
+  -- and relative size well (1.96x when decomposed), so under 'story_point' the band is
+  -- points against `sp_anchor_text` and the system LEARNS the points -> Work-CET rate
+  -- from actuals (see `pointsToWcet` in src/tasks.ts). The cutover is
+  -- `est config set estimand story_point`, it is CRAIG'S CALL, and nothing about it
+  -- deletes or rewrites history: every downstream key and filter already carries
+  -- `estimand`, so the old Work-CET corpus and the new points corpus segregate
+  -- automatically rather than pooling into one meaningless reference class.
   ('estimand',                'work_cet'),
+  -- The story-point ANCHOR: the fixed piece of work that is defined to be 1 point.
+  -- Versioned because re-wording it redefines the unit — every band is stamped with
+  -- `estimate.sp_anchor_id`, and a rate fitted under v1 must never be applied to a
+  -- band issued under v2. Change BOTH together (`est config set sp_anchor_text …`
+  -- then `est config set sp_anchor_id v2`); bands already on disk keep their own.
+  ('sp_anchor_id',            'v1'),
+  ('sp_anchor_text',          'rename a single variable across 3 files in a TypeScript codebase, with no tests to update'),
+  -- The BOOTSTRAPPED points -> Work-CET rate, in Work-CET per point. A CONVENTION, not
+  -- a measurement, which is exactly why it lives here beside `shrink_k` and NOT in the
+  -- append-only spine: `estimate`, `estimate_block`, `outcome` and `refclass` hold
+  -- things that were predicted or observed, and a number somebody reasoned their way
+  -- to is neither. Storing it as an `estimate` row would put a fabricated prediction
+  -- into the corpus the calibrator fits; storing it as an `outcome` would invent an
+  -- actual. `pointsToWcet` reports `source: "seed"` when it falls back to this, so a
+  -- forecast built on it is never mistaken for one built on completed work.
+  --
+  -- EMPTY means unset, and unset means `pointsToWcet` returns `rate: null` and no
+  -- Work-CET figure is printed at all. A rate is never invented.
+  ('sp_seed_wcet_per_point',  ''),
+  -- WHICH anchor the seed above was reasoned against. The seed is ignored (treated as
+  -- unset) unless this equals `sp_anchor_id`: a rate per point of the v1 anchor says
+  -- nothing about a point of the v2 anchor, and silently carrying it across an anchor
+  -- change is the precise failure `estimate.sp_anchor_id` exists to prevent.
+  ('sp_seed_anchor_id',       ''),
+  -- Sanity ceiling on a points band, in points. A "band" of 2,400,000 points is a
+  -- Work-CET number typed under the wrong estimand — the single most likely way for
+  -- the cutover to corrupt the new corpus, and `estimate` is append-only so it could
+  -- never be corrected. Rejected at `est open` / `est block` rather than stored.
+  ('sp_max_points',           '1000'),
   -- PLACEHOLDER: the design does not pin the normaliser family. `est prices --sync`
   -- must produce a model_price row for whatever family this names, or v_wcet yields
   -- NULL wcet. Change with `est config set ref_model <family>`.

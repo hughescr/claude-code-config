@@ -32,6 +32,24 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
 /**
  * Must match the config.schema_version seed in schema.sql.
  *
+ * 15 — STORY POINTS become an available estimand (Craig 2026-07-31). Three things, and
+ *     no row is read, written or moved:
+ *       - `estimate.sp_anchor_id`, an ADD COLUMN. Points are meaningless without the
+ *         anchor that defined "1", so the anchor id is pinned onto every band exactly
+ *         as `price_epoch` / `ref_model` / `estimand` already are. NULL for every
+ *         Work-CET band and for every pre-v15 row, which reads as "not a points band".
+ *       - `v_task_actual_epoch` gains a `WHEN 'story_point'` branch mapping to the
+ *         work_cet counter set. The estimand names the unit of the BAND; the ACTUAL is
+ *         always log-derived Work-CET. Without the branch the CASE falls to NULL and
+ *         `v_velocity`'s `actual_wcet_at_epoch IS NOT NULL` filter would drop every
+ *         completed story-point task, so the corpus could never learn a rate.
+ *       - five `config` seeds: `sp_anchor_id`, `sp_anchor_text`,
+ *         `sp_seed_wcet_per_point`, `sp_seed_anchor_id`, `sp_max_points`. Seeded here
+ *         and not only in schema.sql for the reason v12 documents: P2.0's key set is
+ *         CLOSED, so a knob the code reads but `est config set` refuses is precisely
+ *         the asymmetry the closed set exists to prevent.
+ *     `estimand` itself is NOT flipped. The cutover is `est config set estimand
+ *     story_point` and it is Craig's call.
  * 14 — the SWEEPER CLOSE PASS becomes real (P1.7/§6.2, Craig 2026-07-30). §6.2's gate has
  *     always refused a premature close with "leave it for the sweeper", and no sweeper
  *     close pass existed — so the population it named (work that finished, session gone,
@@ -166,7 +184,7 @@ export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
  *     `v_phase_actual.phase_conf`, auxiliary origin excluded from calibration.
  * 1 — initial R3 §4.2 shape.
  */
-export const SCHEMA_VERSION = "14";
+export const SCHEMA_VERSION = "15";
 
 /**
  * Forward-only, additive migrations, applied by {@link openDb} on a WRITABLE
@@ -194,6 +212,31 @@ export interface Migration {
   readonly from: string;
   readonly to: string;
   readonly sql: string;
+  /**
+   * Run inside the SAME transaction, immediately after `sql`, for the one thing SQL
+   * cannot express idempotently: **ADD COLUMN**.
+   *
+   * Rule 3 above requires every step to survive being applied to a file that already
+   * has the new shape but an older version marker, and the 6 -> 7 step already spells
+   * out why that matters — "ADD COLUMN — with no `IF NOT EXISTS` in SQLite — is not
+   * [safe]". `burn_cache` could dodge it by being droppable; `estimate` cannot be
+   * rebuilt at all (four tables reference it, and its append-only triggers exist
+   * precisely so its rows are never copied anywhere). So the guard moves from SQL to
+   * TypeScript: read `PRAGMA table_info`, add the column only when it is absent.
+   *
+   * This is NOT an escape hatch for arbitrary migration logic. It may only do what a
+   * `CREATE … IF NOT EXISTS` would do if SQLite offered one: never touch a row,
+   * never read the append-only spine (rule 2), and be a no-op on a second run.
+   */
+  readonly apply?: (db: Database) => void;
+}
+
+/** True when `table` already has `column` — the ADD COLUMN idempotence guard. */
+export function hasColumn(db: Database, table: string, column: string): boolean {
+  return db
+    .query<{ name: string }, []>(`PRAGMA table_info(${table})`)
+    .all()
+    .some((c) => c.name === column);
 }
 
 export const MIGRATIONS: readonly Migration[] = [
@@ -968,6 +1011,82 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   ('close_blocked_after_h',       '24');
 `,
   },
+  {
+    from: "14",
+    to: "15",
+    // Story points become an available estimand (see the SCHEMA_VERSION doc comment).
+    //
+    // The view is replaced, not altered: a view holds no rows, so this is the same
+    // straight replacement the 5 -> 6 step made, and the definition below MUST stay
+    // byte-identical to schema.sql's — `test/schema.test.ts` diffs `sqlite_master`
+    // between a migrated file and a fresh one. `IF EXISTS` / `IF NOT EXISTS` for the
+    // reason the v8, v12 and v13 steps document (SQLite strips the clause before
+    // storing, so fidelity costs nothing).
+    //
+    // The COLUMN is in `apply` below rather than here, because SQLite has no
+    // `ADD COLUMN IF NOT EXISTS` and rule 3 requires this step to survive a file that
+    // already has the shape. The 6 -> 7 step names that hazard explicitly and dodged it
+    // by rebuilding `burn_cache`; `estimate` has no such escape — `estimate_block`,
+    // `estimate_identity_repair`, `outcome` and `task_scope`'s consumers all reference
+    // it, and its append-only triggers exist so that its rows are never copied
+    // anywhere. Nothing in the append-only spine is read, written or moved: ADD COLUMN
+    // widens every existing row with NULL in place, which is the honest value — a band
+    // issued before v15 was not denominated against any anchor.
+    sql: `
+DROP VIEW IF EXISTS v_task_actual_epoch;
+CREATE VIEW IF NOT EXISTS v_task_actual_epoch AS
+SELECT r.tid,
+  SUM(CAST((CASE e.estimand
+              WHEN 'out'         THEN r.out_tok*pe.usd_out
+              WHEN 'work_cet'    THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw
+              WHEN 'out_cw_in'   THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw + r.in_tok*pe.usd_in
+              WHEN 'story_point' THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw
+            END) / rf.usd_out AS INTEGER)) AS wcet_at_epoch,
+  e.price_epoch, e.eid AS eid_at_start
+FROM v_request_live r
+JOIN estimate e ON e.eid = (SELECT MIN(eid) FROM estimate WHERE tid = r.tid)
+-- Same per-request context tier as v_priced, but resolved AT THE EPOCH rather than
+-- at the request's own ts: reusing v_request_tiered here would pick a companion
+-- family that may not exist at price_epoch, and this INNER JOIN would then drop the
+-- request silently instead of pricing it. The \`NOT LIKE '%]'\` guard is the same
+-- one v_request_tiered carries and for the same reason: a bracketed family's own
+-- row already carries the long-context rate.
+JOIN model_price pe
+  ON pe.family = CASE WHEN (r.in_tok + r.cw_tok + r.cr_tok) > 200000
+                       AND r.model_family NOT LIKE '%]'
+                       AND EXISTS (SELECT 1 FROM model_price hi
+                                    WHERE hi.family = r.model_family || '@above_200k'
+                                      AND hi.effective_from <= e.price_epoch)
+                      THEN r.model_family || '@above_200k'
+                      ELSE r.model_family END
+ AND pe.effective_from = (SELECT MAX(effective_from) FROM model_price
+                          WHERE family = pe.family AND effective_from <= e.price_epoch)
+-- The normaliser. \`e.ref_model\`, not config: the whole view is an INNER JOIN to
+-- \`estimate\`, so the snapshot is always available and config could only ever be a
+-- late substitute for it.
+JOIN model_price rf ON rf.family = e.ref_model
+ AND rf.effective_from = (SELECT MAX(effective_from) FROM model_price
+                          WHERE family = rf.family AND effective_from <= e.price_epoch)
+WHERE r.tid IS NOT NULL AND r.attr <> 'overhead'
+  AND r.origin IN ('main','subagent')   -- task effort only; 'auxiliary' excluded (§4.6)
+GROUP BY r.tid;
+
+INSERT OR IGNORE INTO config (k, v) VALUES
+  ('sp_anchor_id',           'v1'),
+  ('sp_anchor_text',         'rename a single variable across 3 files in a TypeScript codebase, with no tests to update'),
+  ('sp_seed_wcet_per_point', ''),
+  ('sp_seed_anchor_id',      ''),
+  ('sp_max_points',          '1000');
+`,
+    apply: (db: Database): void => {
+      // The column definition is written EXACTLY as schema.sql spells it, because
+      // SQLite splices this text into the stored `CREATE TABLE estimate` and the
+      // migrated file has to come out byte-identical to a fresh one.
+      if (!hasColumn(db, "estimate", "sp_anchor_id")) {
+        db.exec("ALTER TABLE estimate ADD COLUMN sp_anchor_id TEXT");
+      }
+    },
+  },
 ];
 
 export interface OpenOptions {
@@ -1128,6 +1247,9 @@ export function migrate(db: Database, version: string): string {
       const observed = schemaVersion(db);
       if (observed !== step.from) return;
       db.exec(step.sql);
+      // Same transaction, so a step whose column half succeeds and whose version bump
+      // does not is not a state this database can be left in.
+      step.apply?.(db);
       db.query("UPDATE config SET v=? WHERE k='schema_version'").run(step.to);
     }).immediate();
     const reached = schemaVersion(db);

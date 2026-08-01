@@ -129,7 +129,11 @@ import {
   bindTask,
   InvariantError,
   isoNow,
+  isPointsEstimand,
   openTask,
+  POINTS_ESTIMAND,
+  pointsToWcet,
+  storyPointAnchor,
   parseDod,
   PLANT_MARKER,
   refclass,
@@ -201,7 +205,9 @@ export const COMMAND_FLAGS: Record<Command, FlagSpec> = {
   },
   "repair-identity": { booleans: ["apply", "dry-run"], values: [] },
   open: {
-    booleans: [],
+    // `--from-blocks`: take the raw band from SUM(estimate_block) instead of from
+    // --raw-p50/--raw-p90. For decomposed work the decomposition IS the estimate.
+    booleans: ["from-blocks"],
     values: [
       "kind",
       "subject",
@@ -2375,8 +2381,46 @@ async function cmdCensus(ctx: Ctx): Promise<number> {
       )
       .all();
 
+    // The story-point panel (v15). The SEED lives in `config`, not in the append-only
+    // spine, precisely because it is a convention rather than an observation — which
+    // makes it invisible to every ledger query in this report. So it is surfaced here
+    // explicitly, beside the corpus it is standing in for, with a live/stale verdict:
+    // a seed whose anchor no longer matches the anchor in force is dead weight, and a
+    // dead seed that still looks set is exactly how a stale rate gets trusted.
+    const spEstimand = getConfig(db, "estimand") ?? "work_cet";
+    const spAnchor = storyPointAnchor(db);
+    const spSeedRaw = (getConfig(db, "sp_seed_wcet_per_point") ?? "").trim();
+    const spSeedAnchor = getConfig(db, "sp_seed_anchor_id") ?? "";
+    const spSeedNum = spSeedRaw === "" ? null : Number(spSeedRaw);
+    const spRate = pointsToWcet(db, {
+      bucket: "global",
+      estimatorFamily: "*",
+      refModel: getConfig(db, "ref_model") ?? "claude-sonnet-4-5",
+      estimand: spEstimand,
+    });
+    const spEstimates =
+      db
+        .query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM estimate WHERE estimand = ?")
+        .get(POINTS_ESTIMAND)?.n ?? 0;
+    const storyPoints = {
+      estimand_in_force: spEstimand,
+      active: isPointsEstimand(spEstimand),
+      anchor: spAnchor,
+      estimate_rows: spEstimates,
+      seed: {
+        wcet_per_point: spSeedNum !== null && Number.isFinite(spSeedNum) && spSeedNum > 0 ? spSeedNum : null,
+        anchor_id: spSeedAnchor === "" ? null : spSeedAnchor,
+        // A seed is only usable against the anchor it was reasoned for.
+        live: spSeedNum !== null && Number.isFinite(spSeedNum) && spSeedNum > 0 && spSeedAnchor === spAnchor.id,
+        source: "config" as const,
+      },
+      rate: { rate: spRate.rate, source: spRate.source, n: spRate.n },
+    };
+
     if (ctx.json) {
-      ctx.out(JSON.stringify({ root, live, db: counts, anomalies, history }, null, 2));
+      ctx.out(
+        JSON.stringify({ root, live, db: counts, anomalies, history, story_points: storyPoints }, null, 2),
+      );
       return 0;
     }
 
@@ -2399,6 +2443,26 @@ async function cmdCensus(ctx: Ctx): Promise<number> {
       ctx.out(renderTable(["kind", "n"], anomalies.map((a) => [a.kind, num(a.n)])).replace(/^/gm, "  "));
       ctx.out("");
     }
+    ctx.out(
+      `story points (estimand in force: ${storyPoints.estimand_in_force}${storyPoints.active ? "" : " — points NOT active"})`,
+    );
+    ctx.out(`  anchor ${storyPoints.anchor.id}: "${storyPoints.anchor.text}" = 1 point`);
+    ctx.out(`  ${num(storyPoints.estimate_rows)} estimate row(s) denominated in points`);
+    ctx.out(
+      storyPoints.seed.wcet_per_point === null
+        ? "  seed rate: unset (config.sp_seed_wcet_per_point) — a bootstrap is a CONVENTION and lives in config, never in the append-only ledger"
+        : `  seed rate: ${num(Math.round(storyPoints.seed.wcet_per_point))} Work-CET/point for anchor ${storyPoints.seed.anchor_id ?? "?"}` +
+          ` — ${storyPoints.seed.live ? "LIVE" : `IGNORED (it was reasoned for anchor ${storyPoints.seed.anchor_id ?? "?"}, and ${storyPoints.anchor.id} is in force)`}` +
+          `; stored in config, NOT as an estimate or an outcome — it was reasoned to, not predicted and not observed`,
+    );
+    ctx.out(
+      storyPoints.rate.rate === null
+        ? "  effective points→Work-CET rate: NONE — `est open` issues no Work-CET or Spend-CET forecast"
+        : `  effective points→Work-CET rate: ${num(Math.round(storyPoints.rate.rate))} Work-CET/point (${storyPoints.rate.source}` +
+          (storyPoints.rate.source === "fitted" ? `, n=${storyPoints.rate.n}` : "") +
+          ")",
+    );
+    ctx.out("");
     ctx.out(`sweep_census (last ${history.length}; §5.8 expects vanished = 0 while both pruners are stood down)`);
     if (history.length === 0) {
       ctx.out("  (no sweeps recorded yet — run `est sweep`)");
@@ -2694,17 +2758,34 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
         } else {
           const tid = flagString(p, "tid");
           const kind = flagString(p, "kind");
+          // `--from-blocks` IS the band, so the two quantile flags are not merely
+          // optional — supplying them alongside it states a second, different number
+          // for the same thing, and the whole point of the roll-up is that there is
+          // only one. Refused rather than silently overridden.
+          const fromBlocks = flagBool(p, "from-blocks");
           if (tid === null && (kind === null || !(TASK_KINDS as readonly string[]).includes(kind))) {
             throw new UsageError(`--kind is required and must be one of: ${TASK_KINDS.join(" | ")}`);
           }
-          for (const f of NUMERIC_OPEN_FLAGS) requireFlag(p, f);
+          for (const f of NUMERIC_OPEN_FLAGS) {
+            if (fromBlocks && (f === "raw-p50" || f === "raw-p90")) {
+              if (flagString(p, f) !== null) {
+                throw new UsageError(
+                  `--from-blocks takes the band from the SUM of this task's block estimates, so --${f} must not also be given; ` +
+                    "a roll-up and a parallel guess for the same task are two answers to one question",
+                );
+              }
+              continue;
+            }
+            requireFlag(p, f);
+          }
           result = openTask(db, {
             kind: (kind ?? "implement") as TaskKind,
             subject: tid === null ? requireFlag(p, "subject") : (flagString(p, "subject") ?? ""),
             description: flagString(p, "description"),
             dod: parseDod(flagString(p, "dod")),
-            rawP50: requireInt(p, "raw-p50"),
-            rawP90: requireInt(p, "raw-p90"),
+            fromBlocks,
+            rawP50: fromBlocks ? 0 : requireInt(p, "raw-p50"),
+            rawP90: fromBlocks ? 0 : requireInt(p, "raw-p90"),
             expAgents: requireInt(p, "exp-agents"),
             expWfPhases: requireInt(p, "exp-wf-phases"),
             expFilesWrite: requireInt(p, "exp-files-write"),
@@ -2727,8 +2808,15 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
               version: result.version,
               reason: result.reason,
               band: {
-                p50_wcet: result.band.p50,
-                p90_wcet: result.band.p90,
+                // NULL under `story_point` when there is no points -> Work-CET rate.
+                // `p50_wcet: 8` for an 8-point band would be a token count derived from
+                // nothing, and a consumer has no way to tell it from a real one — so
+                // the field goes absent rather than wrong, and `points` below carries
+                // the band the estimator actually issued.
+                p50_wcet: result.band.wcetAvailable ? result.band.p50 : null,
+                p90_wcet: result.band.wcetAvailable ? result.band.p90 : null,
+                p50_points: result.points?.p50 ?? null,
+                p90_points: result.points?.p90 ?? null,
                 req_p50: result.band.reqP50,
                 req_p90: result.band.reqP90,
                 active_p50_s: result.band.activeP50S,
@@ -2736,6 +2824,19 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
                 spend_usd_p50: result.band.spendUsdP50,
                 spend_usd_p90: result.band.spendUsdP90,
               },
+              // The bridge, stated rather than implied: `rate` null means no Work-CET
+              // figure was issued at all, and `source` distinguishes a rate fitted from
+              // n completed tasks from a bootstrapped convention.
+              wcet_rate: {
+                rate: result.wcetRate.rate,
+                source: result.wcetRate.source,
+                n: result.wcetRate.n,
+              },
+              sp_anchor:
+                result.spAnchor === null
+                  ? null
+                  : { id: result.spAnchor.id, text: result.spAnchor.text },
+              rolled_up_from_blocks: result.rolledUpFromBlocks,
               raw: result.raw,
               uncalibrated: result.uncalibrated,
               plant: result.plant,
@@ -2769,12 +2870,48 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
           ctx.out(
             `${result.minted ? "opened" : `re-estimated (${result.reason}, v${result.version})`} ${result.tid}`,
           );
-          ctx.out(
-            `band  ${num(result.band.p50)} / ${num(result.band.p90)} Work-CET` +
-              `  ·  requests ${result.band.reqP50}–${result.band.reqP90}` +
-              `  ·  active time: not predicted yet (§7.3 — the model has not beaten its baseline)` +
-              `  ·  Spend-CET forecast ${usd(result.band.spendUsdP50)}–${usd(result.band.spendUsdP90)} (a LOWER bound: input and cache_read are excluded from Work-CET)`,
-          );
+          const spendLine = `Spend-CET forecast ${usd(result.band.spendUsdP50)}–${usd(result.band.spendUsdP90)} (a LOWER bound: input and cache_read are excluded from Work-CET)`;
+          if (result.points === null) {
+            ctx.out(
+              `band  ${num(result.band.p50)} / ${num(result.band.p90)} Work-CET` +
+                `  ·  requests ${result.band.reqP50}–${result.band.reqP90}` +
+                `  ·  active time: not predicted yet (§7.3 — the model has not beaten its baseline)` +
+                `  ·  ${spendLine}`,
+            );
+          } else {
+            // The POINTS band is the headline, because it is the thing that was
+            // actually estimated. Work-CET and Spend-CET are derived, and they appear
+            // only when something real derived them.
+            ctx.out(
+              `band  ${num(result.points.p50)} / ${num(result.points.p90)} points` +
+                ` (anchor ${result.spAnchor?.id ?? "?"}: "${result.spAnchor?.text ?? ""}" = 1 point)` +
+                `  ·  requests ${result.band.reqP50}–${result.band.reqP90}` +
+                `  ·  active time: not predicted yet (§7.3 — the model has not beaten its baseline)`,
+            );
+            if (result.band.wcetAvailable && result.wcetRate.rate !== null) {
+              ctx.out(
+                `      Work-CET forecast ${num(result.band.p50)} / ${num(result.band.p90)}` +
+                  ` at ${num(Math.round(result.wcetRate.rate))} Work-CET/point (${result.wcetRate.source}` +
+                  (result.wcetRate.source === "fitted"
+                    ? `, n=${result.wcetRate.n} completed story-point task(s)`
+                    : ", a bootstrapped convention — NOT measured from completed work") +
+                  `)  ·  ${spendLine}`,
+              );
+            } else {
+              ctx.out(
+                `      no points→Work-CET rate: bucket "${result.bucket}" has ${result.bucketN} completed story-point task(s) (fitting starts at 10)` +
+                  ` and config.sp_seed_wcet_per_point is unset for anchor ${result.spAnchor?.id ?? "?"}.` +
+                  ` NO Work-CET and NO Spend-CET forecast is issued — a token figure derived from nothing is worse than none.` +
+                  ` The rate appears on its own once the corpus has 10, or set the bootstrap with` +
+                  ` \`est config set sp_seed_wcet_per_point <n>\` and \`est config set sp_seed_anchor_id ${result.spAnchor?.id ?? "v1"}\`.`,
+              );
+            }
+          }
+          if (result.rolledUpFromBlocks !== null) {
+            ctx.out(
+              `      band is the ROLL-UP of ${result.rolledUpFromBlocks} block estimate(s), not a separate guess (--from-blocks)`,
+            );
+          }
           ctx.out(
             result.uncalibrated
               ? `      UNCALIBRATED — bucket "${result.bucket}" has ${result.bucketN} comparable completed task(s); calibration starts at 10. This is your raw band, unchanged.`
@@ -2840,9 +2977,17 @@ async function cmdBlock(ctx: Ctx): Promise<number> {
         });
         if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...r }));
         else if (!ctx.quiet) {
+          const unit = isPointsEstimand(r.estimand) ? "points" : "Work-CET";
           ctx.out(
-            `block ${r.phaseIdx} "${r.title}" → ${num(r.p50)} / ${num(r.p90)} Work-CET (eid ${r.eid}, ${r.blocksSoFar}` +
+            `block ${r.phaseIdx} "${r.title}" → ${num(r.p50)} / ${num(r.p90)} ${unit} (eid ${r.eid}, ${r.blocksSoFar}` +
               `${r.declaredPhases === null ? "" : `/${r.declaredPhases}`} block(s) recorded)`,
+          );
+          // The roll-up, after every block: for decomposed work the SUM is the estimate,
+          // so it has to be visible while it is being built rather than only once it is
+          // committed. `est retro` has always scored the task band against this number.
+          ctx.out(
+            `      roll-up so far  ${num(r.rollup.p50)} / ${num(r.rollup.p90)} ${unit} over ${r.rollup.blocks} block(s)` +
+              ` — commit it as the task band with \`est open --tid ${r.tid} --reason refinement --from-blocks\``,
           );
           if (r.declaredPhases !== null && r.blocksSoFar < r.declaredPhases) {
             ctx.out(
@@ -3073,12 +3218,31 @@ function cmdRefclass(ctx: Ctx): number {
       return 0;
     }
     const lines: string[] = [];
+    // Step 1 of the ceremony is the only place the estimator is told what "1" means, so
+    // under story points the anchor leads. Every row and the distribution below are
+    // already filtered to `r.estimand` (src/tasks.ts) — a Work-CET actual sitting next
+    // to a points band would be two units in one table with nothing saying so.
+    if (r.sp_anchor !== null) {
+      lines.push(
+        `anchor ${r.sp_anchor.id}: "${r.sp_anchor.text}" = 1 point. ` +
+          `Size the work RELATIVE to that; decompose first, then sum — that is what took the ` +
+          `cross-model spread from 61.9× to 1.96×.`,
+      );
+      lines.push(
+        r.wcet_rate.rate === null
+          ? `  points→Work-CET: NO RATE YET (no fitted rate, no seed). A points band will be issued with no Work-CET or Spend-CET forecast.`
+          : `  points→Work-CET: ${num(Math.round(r.wcet_rate.rate))} Work-CET/point (${r.wcet_rate.source}` +
+            (r.wcet_rate.source === "fitted" ? `, n=${r.wcet_rate.n}` : ", bootstrapped") +
+            `)`,
+      );
+    }
+    const rawUnit = r.sp_anchor === null ? "raw p50" : "raw p50 (pts)";
     if (r.matches.length === 0) {
       lines.push(`no completed task matches "${text}" — an empty reference class is a valid answer, not a failure`);
     } else {
       lines.push(
         renderTable(
-          ["subject", "kind", "fanout", "raw p50", "actual", "velocity"],
+          ["subject", "kind", "fanout", rawUnit, "actual", "velocity"],
           r.matches.map((m) => [
             m.subject.length > 48 ? `${m.subject.slice(0, 47)}…` : m.subject,
             m.kind,
@@ -3123,7 +3287,11 @@ function cmdRefclass(ctx: Ctx): number {
           `×${(r.bucket.mult_p90 ?? 1).toFixed(2)} p90${ci(r.bucket.boot_p90)} · snapshot ${r.bucket.as_of}`,
       );
     }
-    lines.push(`unit: ${r.estimand} normalised by ${r.ref_model} output tokens`);
+    lines.push(
+      r.sp_anchor === null
+        ? `unit: ${r.estimand} normalised by ${r.ref_model} output tokens`
+        : `unit: ${r.estimand} (band in points against anchor ${r.sp_anchor.id}; actuals in Work-CET normalised by ${r.ref_model} output tokens, so "velocity" above reads as Work-CET per point)`,
+    );
 
     let text_ = lines.join("\n");
     if (flagBool(p, "full")) {
@@ -3861,15 +4029,27 @@ repair-identity (the append-only correction path for the estimator identity):
 open:
   --kind <research|design|implement|refactor|debug|review|ops>
   --subject <t> [--description <t>] [--dod <json|@file>]
-  --raw-p50 <n> --raw-p90 <n>        Work-CET band; your uncorrected guess, never pre-corrected
+  --raw-p50 <n> --raw-p90 <n>        the band; your uncorrected guess, never pre-corrected.
+                          UNIT = config.estimand. Under 'work_cet' (etc.) these are Work-CET
+                          tokens. Under 'story_point' they are whole POINTS in
+                          [1, config.sp_max_points], relative to config.sp_anchor_text —
+                          a Work-CET-scale number typed under story points is REFUSED (exit 1),
+                          because the estimate table is append-only and could never be corrected.
   --exp-agents <n> --exp-wf-phases <n> --exp-files-write <n> --exp-turns <n> --exp-requests <n>
   [--tid <tid> --reason refinement|scope_change|recalibration]   append a re-estimate
+  [--from-blocks]         with --tid: take the band from SUM(this task's block estimates)
+                          instead of --raw-p50/--raw-p90, which must then be omitted. For
+                          decomposed work the decomposition IS the estimate; a whole-task
+                          number issued beside it is a second, worse guess.
   [--session <sid>] [--prompt <promptId>]
   --continue <tid>        sugar: bind this session and append a refinement
 
 block <tid>:
   --phase <i>             0-BASED — the phases[] index, NOT workflowProgress.phaseIndex
   --title <t> --p50 <n> --p90 <n> [--exp-agents <n>] [--model <m>]
+                          Same unit and same bound as est open — blocks roll UP into the
+                          task band, so they are denominated in whatever it is. Every block
+                          prints the roll-up so far; est open --tid <tid> --from-blocks commits it.
 
 bind <tid>:               [--session <sid>] [--task <n>] [--run <runId>] [--agent <agentId>]
 scope <tid>:              --reason <text> [--subject <t>] [--description <t>] [--dod <json|@file>]

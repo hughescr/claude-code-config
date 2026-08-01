@@ -841,13 +841,17 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
     .query<
       {
         raw_p50_wcet: number;
+        raw_p90_wcet: number;
         cal_p50_wcet: number;
         cal_p90_wcet: number;
+        estimand: string;
         scope_seq: number;
         price_epoch: string;
       },
       [number]
-    >("SELECT raw_p50_wcet, cal_p50_wcet, cal_p90_wcet, scope_seq, price_epoch FROM estimate WHERE eid = ?")
+    >(
+      "SELECT raw_p50_wcet, raw_p90_wcet, cal_p50_wcet, cal_p90_wcet, estimand, scope_seq, price_epoch FROM estimate WHERE eid = ?",
+    )
     .get(eidAtStart)!;
 
   const actual = db
@@ -1023,12 +1027,34 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
   // `actual_wcet` — the estimate and its actual must be computed under ONE price
   // vintage, or a ref-model price change mid-task appears as a velocity shift with
   // no cause.
+  //
+  // `velocity_raw` is the LEARNING SIGNAL and is always meaningful: under `work_cet`
+  // it is a dimensionless over/under ratio, and under `story_point` — where raw_p50 is
+  // a number of points — it is Work-CET PER POINT, which is exactly what `est retro`
+  // fits into the multiplier `pointsToWcet` reads back. Nothing about it changes here.
   const velocityRaw =
     actualAtEpoch !== null && baseline.raw_p50_wcet > 0 ? actualAtEpoch / baseline.raw_p50_wcet : null;
+
+  // `velocity_cal` and `in_band` are different: both compare the actual against the
+  // CALIBRATED band, and that comparison is only legal when the calibrated band is in
+  // Work-CET. Under `story_point` it usually is — `cal = raw × Work-CET-per-point` —
+  // but when `est open` found no rate at all, from either the fitted path or the seed,
+  // both multipliers were 1.0 and `cal_*` are still POINTS. Scoring 60,000 Work-CET
+  // against a p90 of 13 would then record a wild overrun and a velocity in the
+  // thousands for a task that may have landed exactly on its estimate, and the
+  // coverage panel would read the early points corpus as a catastrophe. NULL is the
+  // honest answer, and it is one the schema already admits: both columns are nullable
+  // and every consumer already handles a missing value.
+  const bandInPoints =
+    baseline.estimand === "story_point" &&
+    baseline.cal_p50_wcet === baseline.raw_p50_wcet &&
+    baseline.cal_p90_wcet === baseline.raw_p90_wcet;
   const velocityCal =
-    actualAtEpoch !== null && baseline.cal_p50_wcet > 0 ? actualAtEpoch / baseline.cal_p50_wcet : null;
+    !bandInPoints && actualAtEpoch !== null && baseline.cal_p50_wcet > 0
+      ? actualAtEpoch / baseline.cal_p50_wcet
+      : null;
   const inBand =
-    actualAtEpoch === null ? null : actualAtEpoch <= baseline.cal_p90_wcet ? 1 : 0;
+    bandInPoints || actualAtEpoch === null ? null : actualAtEpoch <= baseline.cal_p90_wcet ? 1 : 0;
 
   const censored = status === "abandoned" || status === "deleted" ? 1 : 0;
   const revision =

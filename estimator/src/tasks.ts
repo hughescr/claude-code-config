@@ -425,6 +425,162 @@ export function liveBucketN(
 }
 
 // ---------------------------------------------------------------------------
+// story points (v15) — the RELATIVE estimand, and the bridge back to Work-CET
+// ---------------------------------------------------------------------------
+
+/**
+ * The one `config.estimand` value under which a band is RELATIVE rather than absolute.
+ *
+ * Work-CET turned out to be a unit agents cannot predict: 61.9x spread across models
+ * on the same task, with repeated silent 1000x outliers. The same models sized the
+ * same work against a fixed anchor to within 1.96x when they decomposed it first. So
+ * the estimand becomes "how many times the anchor is this", and the system learns the
+ * points -> Work-CET conversion from completed work instead of asking anyone to guess
+ * a token count.
+ *
+ * Everything else about the unit machinery is unchanged and deliberately so: this is a
+ * fourth value in a column that is ALREADY a calibration key everywhere
+ * (`estimate.estimand`, `refclass`'s primary key, `v_velocity`'s projection, every
+ * consumer's filter), so switching to it segregates the new corpus from the old
+ * automatically. No history is deleted, and none is redenominated.
+ */
+export const POINTS_ESTIMAND = "story_point";
+
+export function isPointsEstimand(estimand: string): boolean {
+  return estimand === POINTS_ESTIMAND;
+}
+
+/** Fallback ceiling when `config.sp_max_points` is missing or unreadable. */
+export const DEFAULT_MAX_POINTS = 1000;
+
+/**
+ * The story-point ANCHOR in force: the work defined to be 1 point, and its version.
+ *
+ * The id is what gets pinned onto every band (`estimate.sp_anchor_id`). The text is
+ * what the estimator is shown. They move together — re-wording the text without
+ * bumping the id silently redefines every future point while leaving history claiming
+ * the same scale.
+ */
+export interface StoryPointAnchor {
+  readonly id: string;
+  readonly text: string;
+}
+
+export function storyPointAnchor(db: Database): StoryPointAnchor {
+  return {
+    id: getConfig(db, "sp_anchor_id") ?? "v1",
+    text:
+      getConfig(db, "sp_anchor_text") ??
+      "rename a single variable across 3 files in a TypeScript codebase, with no tests to update",
+  };
+}
+
+/** `config.sp_max_points`, or {@link DEFAULT_MAX_POINTS}. Always >= 1. */
+export function maxPoints(db: Database): number {
+  const raw = getConfig(db, "sp_max_points");
+  const n = raw === null ? Number.NaN : Number(raw);
+  return Number.isFinite(n) && n >= 1 ? Math.trunc(n) : DEFAULT_MAX_POINTS;
+}
+
+/**
+ * Reject a points quantile that is not a points quantile.
+ *
+ * The failure this exists for is exact and it is the likeliest way the cutover
+ * corrupts the new corpus: an estimator that has not noticed the estimand moved types
+ * `--raw-p50 2400000`, which is a plausible Work-CET number and an absurd number of
+ * points. `estimate` is append-only, so the row could never be corrected — the whole
+ * bucket's fitted rate would be dragged three orders of magnitude off by one row that
+ * nobody could delete.
+ *
+ * Exit **1**, not 2: this is a malformed command line — a flag value outside the range
+ * the active unit admits — and not an operation the system refuses to perform. Exit 2
+ * stays reserved for the invariant refusals (P1.0), which must never be retried; this
+ * one is fixed by retyping the number.
+ */
+export function assertPointsQuantile(db: Database, flag: string, value: number): void {
+  const cap = maxPoints(db);
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 1 || value > cap) {
+    throw new UsageError(
+      `${flag} must be a whole number of story points in [1, ${cap}]; got ${value}. ` +
+        `config.estimand is '${POINTS_ESTIMAND}', so this flag is a SIZE RELATIVE TO THE ANCHOR ` +
+        `("${storyPointAnchor(db).text}" = 1 point) — not a token count. ` +
+        (value > cap
+          ? "A value this large is almost certainly a Work-CET figure typed under the wrong estimand; " +
+            "`estimate` is append-only, so it is refused rather than stored. " +
+            "Raise `est config set sp_max_points <n>` only if the work really is that many times the anchor."
+          : "A band of zero points is not a size."),
+    );
+  }
+}
+
+/** What {@link pointsToWcet} knows about the points -> Work-CET conversion. */
+export interface PointsRate {
+  /** Work-CET per point, or `null` when there is no honest basis for one. */
+  readonly rate: number | null;
+  /** Where `rate` came from. `null` exactly when `rate` is null. */
+  readonly source: "fitted" | "seed" | null;
+  /**
+   * Completed comparable tasks BEHIND the rate. Non-zero only for `"fitted"` — a seed
+   * is a convention reasoned to, backed by no observations, and reporting a sample
+   * size for it would be the exact overclaim the two sources exist to distinguish.
+   */
+  readonly n: number;
+}
+
+export interface PointsRateKey {
+  readonly bucket: string;
+  readonly estimatorFamily: string;
+  readonly refModel: string;
+  readonly estimand: string;
+}
+
+/**
+ * The ONE bridge from a story-point band to Work-CET. Every consumer uses this.
+ *
+ * Two sources, in order, and never a third:
+ *
+ *  1. **`"fitted"`** — the normal path, and not a new calibrator. `velocity_raw` is
+ *     already `actual_wcet_at_epoch / raw_p50` (src/close.ts), so the instant
+ *     `raw_p50` is denominated in points that ratio IS Work-CET per point; the retro
+ *     fits its decayed, shrunk median into `refclass.mult_p50` exactly as before, and
+ *     this function reads that snapshot through {@link calibrationFor}. Which means
+ *     the cold-start rule is inherited rather than reinvented: below
+ *     {@link COLD_START_N} completed points tasks there is no fitted rate, for the
+ *     same reason there is no multiplier.
+ *  2. **`"seed"`** — the bootstrap, from `config.sp_seed_wcet_per_point`. Available
+ *     only while (1) is not, and only when `config.sp_seed_anchor_id` matches the
+ *     anchor in force: a rate per point of the v1 anchor says nothing about a point of
+ *     the v2 anchor.
+ *
+ * Otherwise `{ rate: null, source: null }`. **A rate is never invented** — the caller's
+ * obligation is to print no Work-CET figure at all, not to fall back to 1.0, because a
+ * band of "8" rendered as 8 Work-CET is a number derived from nothing wearing the
+ * units of a measurement.
+ *
+ * Returns `rate: null` for a non-points estimand too. Under `work_cet` the band is
+ * already Work-CET and there is nothing to convert; a caller that got a number back
+ * would double-apply the multipliers.
+ */
+export function pointsToWcet(db: Database, key: PointsRateKey): PointsRate {
+  if (!isPointsEstimand(key.estimand)) return { rate: null, source: null, n: 0 };
+
+  const liveN = liveBucketN(db, key.bucket, key.refModel, key.estimand);
+  const cal = calibrationFor(db, key.bucket, key.estimatorFamily, key.refModel, key.estimand, liveN);
+  if (!cal.uncalibrated && cal.multP50 > 0 && Number.isFinite(cal.multP50)) {
+    return { rate: cal.multP50, source: "fitted", n: cal.bucketN };
+  }
+
+  const anchor = storyPointAnchor(db);
+  const seedAnchor = getConfig(db, "sp_seed_anchor_id") ?? "";
+  if (seedAnchor !== anchor.id) return { rate: null, source: null, n: 0 };
+  const raw = getConfig(db, "sp_seed_wcet_per_point") ?? "";
+  if (raw.trim() === "") return { rate: null, source: null, n: 0 };
+  const seed = Number(raw);
+  if (!Number.isFinite(seed) || seed <= 0) return { rate: null, source: null, n: 0 };
+  return { rate: seed, source: "seed", n: 0 };
+}
+
+// ---------------------------------------------------------------------------
 // `est open`
 // ---------------------------------------------------------------------------
 
@@ -433,6 +589,7 @@ export interface OpenInput {
   subject: string;
   description?: string | null;
   dod?: DodItem[];
+  /** Under `estimand = 'story_point'` these are POINTS; otherwise Work-CET. */
   rawP50: number;
   rawP90: number;
   expAgents: number;
@@ -445,9 +602,55 @@ export interface OpenInput {
   session?: string | null;
   prompt?: string | null;
   now?: Date;
+  /**
+   * Take the raw band from the SUM of this task's block estimates instead of from
+   * `rawP50`/`rawP90` (P1.2 promoted, v15). Requires `tid` — blocks hang off an
+   * estimate, so there has to be one to roll up. See {@link blockRollup}.
+   */
+  fromBlocks?: boolean;
+}
+
+/**
+ * The roll-up of a task's block estimates against its CURRENT estimate.
+ *
+ * For work big enough to be decomposed, the decomposition IS the estimate: summing
+ * per-phase sizes is the thing agents do 1.96x-consistently, and a separate
+ * whole-task number issued beside it is a second, worse guess that then disagrees with
+ * its own parts. `est retro`'s block panel has always compared the task band against
+ * `SUM(estimate_block.p50_wcet)` — `--from-blocks` is what makes them equal BY
+ * CONSTRUCTION rather than by luck.
+ *
+ * p90 is summed too, not root-sum-squared. Summing p90s assumes the phases overrun
+ * together, which is pessimistic if they are independent — and they are not: the
+ * things that blow a phase (the codebase is bigger than it looked, the approach was
+ * wrong) blow the next one as well. It is also the only choice that stays honest under
+ * calibration, since the multipliers are fitted to whatever rule produced the raw
+ * band; a rule that varied per task would be unfittable.
+ */
+export function blockRollup(
+  db: Database,
+  tid: string,
+): { p50: number; p90: number; blocks: number; eid: number } | null {
+  const eid = db
+    .query<{ eid: number | null }, [string]>("SELECT MAX(eid) AS eid FROM estimate WHERE tid = ?")
+    .get(tid)?.eid ?? null;
+  if (eid === null) return null;
+  const agg = db
+    .query<{ n: number; p50: number | null; p90: number | null }, [number]>(
+      "SELECT COUNT(*) AS n, SUM(p50_wcet) AS p50, SUM(p90_wcet) AS p90 FROM estimate_block WHERE eid = ?",
+    )
+    .get(eid);
+  if (agg === null || agg === undefined || agg.n === 0) return null;
+  return { p50: agg.p50 ?? 0, p90: agg.p90 ?? 0, blocks: agg.n, eid };
 }
 
 export interface Band {
+  /**
+   * The calibrated band, in Work-CET — EXCEPT under `story_point` with no available
+   * rate, where it is the raw points band unchanged (multipliers of 1.0, exactly as a
+   * Work-CET cold start) and `wcetAvailable` is false. A renderer must not print these
+   * as tokens without checking that flag.
+   */
   p50: number;
   p90: number;
   /** Both ends or neither: an uncalibrated request band is the raw guess, labelled. */
@@ -457,6 +660,12 @@ export interface Band {
   activeP90S: number | null;
   spendUsdP50: number | null;
   spendUsdP90: number | null;
+  /**
+   * False only under `story_point` when {@link pointsToWcet} found no rate. Then
+   * `p50`/`p90` are still points, `spendUsd*` are null, and the honest output is to say
+   * there is no Work-CET forecast — not to print one derived from nothing.
+   */
+  wcetAvailable: boolean;
 }
 
 export interface OpenResult {
@@ -484,6 +693,19 @@ export interface OpenResult {
   priceEpoch: string;
   refclassAsOf: string | null;
   anchor: Anchor;
+  /**
+   * The STORY-POINT anchor pinned onto this band, or null for a Work-CET band. Not to
+   * be confused with `anchor` above, which is the session/prompt the estimate was
+   * issued from — an unrelated, older use of the word that this field deliberately
+   * does not shadow.
+   */
+  spAnchor: StoryPointAnchor | null;
+  /** The raw band restated as points, or null when the estimand is not `story_point`. */
+  points: { p50: number; p90: number } | null;
+  /** What the points -> Work-CET bridge had to offer. All-null for a Work-CET band. */
+  wcetRate: PointsRate;
+  /** Set when `--from-blocks` produced the raw band: how many blocks were summed. */
+  rolledUpFromBlocks: number | null;
   plant: { marker: string; call: string };
   /**
    * OPEN tasks in the SAME anchor session whose subject overlaps this one — see
@@ -697,7 +919,7 @@ INSERT INTO estimate (
   bucket, bucket_n, refclass_as_of, shrink_w,
   cal_p50_wcet, cal_p90_wcet, cal_req_p50, cal_req_p90,
   active_p50_s, active_p90_s, active_model,
-  price_epoch, ref_model, estimand, estimator_model
+  price_epoch, ref_model, estimand, estimator_model, sp_anchor_id
 ) VALUES (
   $tid, $version, $created_at, $reason, $scope_seq,
   $raw_p50, $raw_p90,
@@ -705,7 +927,7 @@ INSERT INTO estimate (
   $bucket, $bucket_n, $refclass_as_of, $shrink_w,
   $cal_p50, $cal_p90, $cal_req_p50, $cal_req_p90,
   NULL, NULL, NULL,
-  $price_epoch, $ref_model, $estimand, $estimator_model
+  $price_epoch, $ref_model, $estimand, $estimator_model, $sp_anchor_id
 )
 `;
 
@@ -756,21 +978,54 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
   const dodJson = JSON.stringify(dod);
   const description = input.description ?? null;
 
+  const refModel = getConfig(db, "ref_model") ?? "claude-sonnet-4-5";
+  const estimand = getConfig(db, "estimand") ?? "work_cet";
+  const points = isPointsEstimand(estimand);
+  const spAnchor = points ? storyPointAnchor(db) : null;
+  const priceEpoch = currentPriceEpoch(db, now);
+
+  // `--from-blocks`: the band IS the decomposition. Resolved before every band check
+  // below, so a rolled-up band is validated exactly as a typed one is.
+  let rawP50 = input.rawP50;
+  let rawP90 = input.rawP90;
+  let rolledUpFromBlocks: number | null = null;
+  if (input.fromBlocks === true) {
+    if (input.tid === null || input.tid === undefined) {
+      throw new UsageError(
+        "--from-blocks requires --tid: block estimates hang off an estimate, so there has to be one to roll up. " +
+          "The sequence is `est open` (the first, coarse band) -> `est block` per phase -> " +
+          "`est open --tid <tid> --reason refinement --from-blocks`",
+      );
+    }
+    const rollup = blockRollup(db, input.tid);
+    if (rollup === null) {
+      throw new UsageError(
+        `--from-blocks: tid ${input.tid} has no block estimates to roll up; run \`est block ${input.tid} --phase <i> --title … --p50 … --p90 …\` first`,
+      );
+    }
+    rawP50 = rollup.p50;
+    rawP90 = rollup.p90;
+    rolledUpFromBlocks = rollup.blocks;
+  }
+
   // Before anything is resolved, minted or written: an inverted band is not an
   // uncertainty band. `estimate` is append-only (est_ro_u / est_ro_d), so a row
   // whose p90 sits below its p50 could never be corrected in place — it would sit
   // in the corpus forever, scored against an actual by a coverage check that reads
   // p90 as the upper edge. The only guards here used to be `Math.max(0, …)`.
-  if (input.rawP90 < input.rawP50) {
+  if (rawP90 < rawP50) {
     throw new UsageError(
-      `--raw-p90 (${input.rawP90}) must be >= --raw-p50 (${input.rawP50}): a p90 below the p50 is not an uncertainty band, ` +
+      `--raw-p90 (${rawP90}) must be >= --raw-p50 (${rawP50}): a p90 below the p50 is not an uncertainty band, ` +
         "and `estimate` is append-only, so the row could never be corrected",
     );
   }
 
-  const refModel = getConfig(db, "ref_model") ?? "claude-sonnet-4-5";
-  const estimand = getConfig(db, "estimand") ?? "work_cet";
-  const priceEpoch = currentPriceEpoch(db, now);
+  // The unit sanity bound (v15). Only under `story_point`, because only there is the
+  // magnitude of the number itself evidence about which unit the estimator was in.
+  if (points) {
+    assertPointsQuantile(db, "--raw-p50", Math.round(rawP50));
+    assertPointsQuantile(db, "--raw-p90", Math.round(rawP90));
+  }
 
   const existingTid = input.tid ?? null;
   let anchor: Anchor;
@@ -902,16 +1157,55 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
   const liveN = liveBucketN(db, bucket, refModel, estimand);
   const cal = calibrationFor(db, bucket, estFamily, refModel, estimand, liveN);
 
-  const calP50 = Math.max(0, Math.round(input.rawP50 * cal.multP50));
-  const calP90 = Math.max(0, Math.round(input.rawP90 * cal.multP90));
+  // The points -> Work-CET bridge, resolved once and used by everything below.
+  //
+  // Under `work_cet` this is all-null and NOTHING changes: `cal.multP50` has always
+  // been the ratio that turns a raw band into a calibrated one, and it still is.
+  //
+  // Under `story_point` the SAME multiplier is already the rate — `velocity_raw` is
+  // `actual_wcet / raw_p50`, so with `raw_p50` in points its shrunk median is
+  // Work-CET per point — which is why the fitted path needs no new arithmetic at all:
+  // `raw * multP50` is exactly "points times Work-CET-per-point". The one addition is
+  // the SEED: when the bucket is too cold for a fitted rate but a bootstrapped one
+  // exists, it stands in for both multipliers rather than letting the 1.0 cold-start
+  // identity silently emit a points number labelled Work-CET.
+  const wcetRate = pointsToWcet(db, {
+    bucket,
+    estimatorFamily: estFamily,
+    refModel,
+    estimand,
+  });
+  const seeded = wcetRate.source === "seed" && wcetRate.rate !== null;
+  const multP50 = seeded ? wcetRate.rate! : cal.multP50;
+  // The seed is a single rate, not a distribution, so it converts BOTH ends: the band
+  // width then comes from the estimator's own points spread, unwidened. That is the
+  // honest reading of a bootstrap — it says how big a point is, and nothing about how
+  // wrong estimators are — and the `source: "seed"` label is what stops it being read
+  // as a calibrated envelope.
+  const multP90 = seeded ? wcetRate.rate! : cal.multP90;
+  // False ONLY under story points with no rate from either source. Then the two
+  // numbers below are the raw points, unconverted, and every renderer must say so
+  // instead of printing them as tokens.
+  const wcetAvailable = !points || wcetRate.rate !== null;
+
+  const calP50 = Math.max(0, Math.round(rawP50 * multP50));
+  const calP90 = Math.max(0, Math.round(rawP90 * multP90));
   // The request band is calibrated exactly like the WCET band, including when there
   // is no reference class: `calibrationFor` returns multipliers of 1.0 for a cold
   // start, so both ends are then the raw guess and the `uncalibrated` flag carries
   // the caveat. It used to write the raw guess into p50 and NULL into p90, which
   // handed P1.9's `requests: {n, p50, p90}` contract a half-populated band — an
   // asymmetry no consumer could render and the WCET band never had.
-  const calReqP50 = Math.max(0, Math.round(input.expRequests * cal.multP50));
-  const calReqP90 = Math.max(0, Math.round(input.expRequests * cal.multP90));
+  //
+  // NOT under story points, though. `expRequests` is an absolute count of API calls in
+  // any estimand, but under `story_point` the multiplier it was being scaled by has
+  // become Work-CET-PER-POINT — a number in the tens of thousands — so applying it
+  // here would turn "about 5 requests" into a forecast of 75,000. The request band is
+  // therefore the raw driver, unscaled, until a request-specific calibration exists.
+  const reqMult50 = points ? 1 : cal.multP50;
+  const reqMult90 = points ? 1 : cal.multP90;
+  const calReqP50 = Math.max(0, Math.round(input.expRequests * reqMult50));
+  const calReqP90 = Math.max(0, Math.round(input.expRequests * reqMult90));
 
   db.transaction(() => {
     if (existingTid === null) {
@@ -965,8 +1259,8 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
       $created_at: ts,
       $reason: reason,
       $scope_seq: scopeSeq,
-      $raw_p50: Math.max(0, Math.round(input.rawP50)),
-      $raw_p90: Math.max(0, Math.round(input.rawP90)),
+      $raw_p50: Math.max(0, Math.round(rawP50)),
+      $raw_p90: Math.max(0, Math.round(rawP90)),
       $exp_agents: input.expAgents,
       $exp_wf_phases: input.expWfPhases,
       $exp_files_write: input.expFilesWrite,
@@ -984,6 +1278,9 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
       $ref_model: refModel,
       $estimand: estimand,
       $estimator_model: estModel,
+      // NULL for a Work-CET band: no anchor was involved, and writing the current one
+      // anyway would claim a denomination this row does not have.
+      $sp_anchor_id: spAnchor?.id ?? null,
     } as never);
 
     // `est open --continue <tid> --session <sid>`: bind the resumed or forked session
@@ -1012,7 +1309,7 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
     reason,
     minted: existingTid === null,
     scopeSeq,
-    raw: { p50: Math.round(input.rawP50), p90: Math.round(input.rawP90) },
+    raw: { p50: Math.round(rawP50), p90: Math.round(rawP90) },
     band: {
       p50: calP50,
       p90: calP90,
@@ -1024,8 +1321,13 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
       // figure from tokens, which is the refuted chain this whole design replaced.
       activeP50S: null,
       activeP90S: null,
-      spendUsdP50: spendForecast(db, calP50, refModel, priceEpoch),
-      spendUsdP90: spendForecast(db, calP90, refModel, priceEpoch),
+      // Spend-CET is a price applied to a TOKEN count. With no rate, calP50/calP90 are
+      // points, and pricing them would produce a confident dollar figure for a quantity
+      // that is not money-shaped at all — the exact "token figure derived from nothing"
+      // this estimand switch exists to stop.
+      spendUsdP50: wcetAvailable ? spendForecast(db, calP50, refModel, priceEpoch) : null,
+      spendUsdP90: wcetAvailable ? spendForecast(db, calP90, refModel, priceEpoch) : null,
+      wcetAvailable,
     },
     uncalibrated: cal.uncalibrated,
     bucket: cal.bucket,
@@ -1037,6 +1339,10 @@ export function openTask(db: Database, input: OpenInput): OpenResult {
     priceEpoch,
     refclassAsOf: cal.refclassAsOf,
     anchor,
+    spAnchor,
+    points: points ? { p50: Math.round(rawP50), p90: Math.round(rawP90) } : null,
+    wcetRate,
+    rolledUpFromBlocks,
     plant: {
       marker: PLANT_MARKER,
       call: `TaskUpdate({ taskId: "<n>", metadata: { est_tid: "${tid}" } })`,
@@ -1094,6 +1400,16 @@ export interface BlockResult {
   p90: number;
   declaredPhases: number | null;
   blocksSoFar: number;
+  /** The unit these block quantiles are in — `estimand` as of this call. */
+  estimand: string;
+  /** The story-point anchor in force, or null under a Work-CET estimand. */
+  spAnchor: StoryPointAnchor | null;
+  /**
+   * The roll-up so far: what `est open --tid <tid> --reason refinement --from-blocks`
+   * would issue as the task band right now. Shown after every block so the sum is
+   * visible while it is still being built, rather than only once it is committed.
+   */
+  rollup: { p50: number; p90: number; blocks: number };
 }
 
 export const MAX_PHASE_IDX = 64;
@@ -1122,6 +1438,15 @@ export function addBlock(db: Database, input: BlockInput): BlockResult {
       `--p90 (${input.p90}) must be >= --p50 (${input.p50}): a p90 below the p50 is not an uncertainty band, ` +
         "and `estimate_block` is append-only, so the row could never be corrected",
     );
+  }
+  // A block is denominated in whatever the task band is denominated in — it rolls UP
+  // into it — so it takes the same unit and the same sanity bound (v15).
+  const estimand = getConfig(db, "estimand") ?? "work_cet";
+  const points = isPointsEstimand(estimand);
+  const spAnchor = points ? storyPointAnchor(db) : null;
+  if (points) {
+    assertPointsQuantile(db, "--p50", Math.round(input.p50));
+    assertPointsQuantile(db, "--p90", Math.round(input.p90));
   }
   const est = db
     .query<{ eid: number }, [string]>("SELECT MAX(eid) AS eid FROM estimate WHERE tid = ?")
@@ -1189,6 +1514,7 @@ export function addBlock(db: Database, input: BlockInput): BlockResult {
   const blocksSoFar =
     db.query<{ n: number }, [number]>("SELECT COUNT(*) AS n FROM estimate_block WHERE eid = ?").get(eid)
       ?.n ?? 0;
+  const rollup = blockRollup(db, input.tid);
 
   return {
     tid: input.tid,
@@ -1199,6 +1525,9 @@ export function addBlock(db: Database, input: BlockInput): BlockResult {
     p90: Math.round(input.p90),
     declaredPhases,
     blocksSoFar,
+    estimand,
+    spAnchor,
+    rollup: { p50: rollup?.p50 ?? 0, p90: rollup?.p90 ?? 0, blocks: rollup?.blocks ?? blocksSoFar },
   };
 }
 
@@ -1469,6 +1798,19 @@ export interface RefclassResult {
   ref_model: string;
   estimand: string;
   /**
+   * Under `story_point`, the anchor the estimator is being asked to size against —
+   * step 1 of the ceremony is where "1 point = this" has to be on screen, or the
+   * number typed at step 7 is relative to nothing. Null under a Work-CET estimand.
+   */
+  sp_anchor: StoryPointAnchor | null;
+  /**
+   * What a points band would be converted at, if anything. Shown here because the
+   * honest answer at cold start is "there is no rate yet", and an estimator should
+   * learn that BEFORE it commits a number rather than from the absence of a line in
+   * the output afterwards. All-null under a Work-CET estimand.
+   */
+  wcet_rate: PointsRate;
+  /**
    * The estimator identity this bucket line was looked up under, and WHICH leg of the
    * resolution order produced it. `est open` a moment later must report the same pair —
    * a test pins exactly that, because the two disagreeing is the failure this whole
@@ -1708,6 +2050,8 @@ export function refclass(
     cold_distribution: cold,
     ref_model: refModel,
     estimand,
+    sp_anchor: isPointsEstimand(estimand) ? storyPointAnchor(db) : null,
+    wcet_rate: pointsToWcet(db, { bucket, estimatorFamily: estFamily, refModel, estimand }),
     estimator_model: identity.model,
     estimator_method: identity.method,
   };

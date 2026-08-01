@@ -51,15 +51,15 @@ jq, httpie, gh, bat, diff-so-fancy, hyperfine, tree, watch, ag, parallel, awscli
 
 ---
 
-## Token estimation
+## Effort estimation
 
 Estimate substantial work before starting it. Substantial = ANY of: **T1** a `Workflow` launch;
 **T2** ≥2 `Task`/agent launches; **T3** ≥3 orchestrator turns toward one goal; **T4** I asked for
 an estimate or budget. Exempt: one background agent on an errand, lookups, single-file edits.
 
 Invoke the **estimating** skill at the anchoring turn — prompt read, plan formed, nothing launched.
-It carries the method for deriving the p50/p90 **Work-CET** band; `est open` prints the band and the
-`TaskUpdate` call planting `est_tid`, which you issue verbatim. The raw band is your uncorrected
-judgement: never pad it, never self-report tokens. For a `Workflow`, `est block` per `meta.phases`
-entry, and every `agent()` gets a `label` and 0-based `phase`. Re-estimate by appending (`--reason
-refinement`; `est scope` first if the goal moved). `est` is `bun run ~/.claude/estimator/src/cli.ts`.
+It sizes the work as a p50/p90 **story-point** band against a fixed anchor — never tokens, cost or
+time. Above ~40 points or more than one phase, decompose and sum: `est block` per `meta.phases`
+entry, every `agent()` carrying its 0-based `phase`. `est open` prints the band and the `TaskUpdate`
+planting `est_tid` — issue it verbatim. Never pad the raw band, never self-report spend. Re-estimate
+by appending (`est scope` first if the goal moved). `est` is `bun run ~/.claude/estimator/src/cli.ts`.
