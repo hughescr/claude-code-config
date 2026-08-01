@@ -57,10 +57,9 @@ Estimate substantial work before starting it. Substantial = ANY of: **T1** a `Wo
 **T2** ≥2 `Task`/agent launches; **T3** ≥3 orchestrator turns toward one goal; **T4** I asked for
 an estimate or budget. Exempt: one background agent on an errand, lookups, single-file edits.
 
-Invoke the **estimating** skill at the anchoring turn — prompt read, plan formed, nothing launched.
-It sizes the work as a p50/p90 **story-point** band against a fixed anchor — never tokens, cost or
-time. Above ~40 points or more than one phase, decompose and sum: `est block` per `meta.phases`
-entry, every `agent()` carrying its 0-based `phase`; `est open --tid <tid> --reason refinement
---from-blocks` commits the block sum as the band if you did not open with it. `est open` prints the band and the `TaskUpdate`
-planting `est_tid` — issue it verbatim. Never pad the raw band, never self-report spend. Re-estimate
-by appending (`est scope` first if the goal moved). `est` is `bun run ~/.claude/estimator/src/cli.ts`.
+Invoke the **estimating** skill at the anchoring turn: plan formed, nothing launched. The band is
+p50/p90 **story points** against a fixed anchor, never tokens, cost or time. Above ~40 points or
+more than one phase, decompose and open once with the sum, then `est block` per `meta.phases` entry
+with a 0-based `phase` on every `agent()`. `est open` prints the band and a `TaskUpdate` planting
+`est_tid`; issue it verbatim. Never pad the band, never self-report spend. Re-estimate by appending,
+`est scope` first if the goal moved. `est` is `bun run ~/.claude/estimator/src/cli.ts`.

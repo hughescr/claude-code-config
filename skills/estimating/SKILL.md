@@ -129,21 +129,23 @@ decompose it before you state any number.**
 - Then record the blocks with `est block` (see [Workflow blocks](#workflow-blocks)), which needs a
   tid to attach to.
 
-`est block` requires an existing estimate, so there are exactly two orders the CLI supports, and
-they are not equivalent:
+`est block` requires an existing estimate, so the order matters — and there is only one right one:
 
-**A — sum it yourself, then open once (prefer this).** Size the blocks → add them up → `est open
---raw-p50 <sum> --raw-p90 <sum>` → `est block` each. One estimate, and the **baseline** — the row
-every accuracy number is scored against, and the row the points→Work-CET rate is fitted from — is
-the decomposed sum.
+**Size each phase → sum them yourself → `est open` ONCE with that sum → `est block` per phase.**
+That is the canonical order, in the CLI's own words. The blocks *record* the decomposition for
+per-phase attribution; they do not replace a band that was already the decomposed number.
 
-**B — open coarse, block, then commit the roll-up with `--from-blocks`.** `est open` with a first
-band → `est block` each phase (every block prints the roll-up so far) → `est open --tid <tid>
---reason refinement --from-blocks`, which takes p50 and p90 from `SUM(estimate_block)` so the task
-band equals its parts *by construction* rather than by your arithmetic. Use it when the
-decomposition only became clear after opening, or when it changed. **Know what it costs:** the
-baseline stays the coarse pre-decomposition number, and that is the number the corpus fits — the
-roll-up is scored as a refinement, beside the baseline, never as it.
+The reason is one clause: **`est close` scores the first estimate.** Baseline accuracy is fitted
+from `MIN(eid)`, and so is `velocity_raw` — and therefore the points→Work-CET rate. So opening with
+a coarse whole-task guess and rolling the blocks up afterwards leaves that coarse guess as *both*
+the scored baseline and the sample the rate is fitted from. That is precisely the whole-task number
+decomposition exists to avoid, and doing it that way defeats this rule silently.
+
+**`--from-blocks` is a refinement lever, not a way to open.** It requires `--tid`, so it can only
+ever land as a re-estimate. Reach for it when you genuinely re-sized the phases mid-task and the
+block set under the current estimate is now the truth: `est open --tid <tid> --reason refinement
+--from-blocks` takes p50 and p90 from `SUM(estimate_block)`, so the total cannot drift from its
+parts and you are not retyping arithmetic the rows already hold.
 
 Work that sits comfortably on a rung at or below 40 and has no phases is still estimated whole. Do
 not manufacture blocks for it.
@@ -249,22 +251,18 @@ est block <tid> --phase <i> --title <t> --p50 <points> --p90 <points> [--exp-age
   wrong.
 - **Every `agent()` call carries `label` and `phase`.** These are what make per-phase attribution
   possible at all; unlabelled or unphased workflow agents are reported as a data-quality defect.
-- **`est block` needs an estimate to attach to**, so `est open` comes first even though its band was
-  derived from the blocks you had already sized. Its refusal says so: *"block estimates roll up to a
-  task band, they never replace one"* — still true under `--from-blocks`, which makes the task band
-  the roll-up rather than abolishing it.
-- **Every block prints the roll-up so far** and names the command that commits it:
-
-  ```
-  est open --tid <tid> --reason refinement --from-blocks
-  ```
-
-  It takes the band from `SUM(estimate_block)` for this task's current estimate. It **refuses**
-  three things: without `--tid` (exit 1 — blocks hang off an estimate, so there has to be one to
-  roll up); alongside `--raw-p50` or `--raw-p90` (exit 1 — a roll-up and a parallel guess are two
-  answers to one question, and it will not silently pick one); and on a tid with no blocks yet
-  (exit 1, naming `est block`).
-
+- **`est block` needs an estimate to attach to**, so `est open` comes first — with the sum of the
+  blocks you have already sized. Its refusal says so: *"block estimates roll up to a task band, they
+  never replace one"*.
+- **Every block prints the roll-up so far**, which *should converge on the band this task was opened
+  with*. That is the check the line exists for. If it has genuinely moved, the line names the remedy
+  — `est open --tid <tid> --reason refinement` — and it deliberately does not advertise
+  `--from-blocks` from inside the blocking loop.
+- **`--from-blocks` refuses three things**, all exit 1: without `--tid` (blocks hang off an
+  estimate, so there has to be one to roll up — which is exactly what confines it to being a
+  refinement); alongside `--raw-p50` or `--raw-p90` (a roll-up and a parallel guess are two answers
+  to one question, and it will not silently pick one); and on a tid with no blocks yet, naming
+  `est block`.
 - **Blocks attach to the task's latest estimate, and the roll-up reads that same one.** So a
   `--from-blocks` refinement mints a fresh estimate with **no** blocks under it: running it twice in
   a row fails, and re-blocking after any re-estimate means issuing every block again against the new

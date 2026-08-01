@@ -26,8 +26,16 @@ the work now looks. It is **not** an adjustment toward what has already been spe
 mechanism depends on the new number being another independent judgement. Where the task was
 decomposed, re-size the blocks and re-sum rather than nudging the total, and append the new blocks
 against the new estimate — blocks attach to a task's *latest* estimate, so a re-estimate starts them
-from empty. Once they are all in, `est open --tid <tid> --reason refinement --from-blocks` will take
-the band from `SUM(estimate_block)` so the total cannot drift from its parts.
+from empty.
+
+`--from-blocks` belongs here and only here. It requires `--tid`, so it can only ever land as a
+re-estimate — which is why it is a refinement lever and **not** how decomposed work is opened. A
+task is opened with the sum you computed yourself (see [SKILL.md](../SKILL.md)); `est close` scores
+the **first** estimate, so a coarse open followed by a `--from-blocks` roll-up would leave the
+coarse guess as the baseline and as the sample `velocity_raw` is fitted from. Where you genuinely
+re-sized the phases mid-task and the block set under the current estimate is the new truth, `est
+open --tid <tid> --reason refinement --from-blocks` takes the band from `SUM(estimate_block)` so the
+total cannot drift from its parts.
 
 `recalibration` is rare in practice. Use it when the estimate itself has not changed but the
 multipliers have — for instance a long-running task opened during cold start that you want re-banded
