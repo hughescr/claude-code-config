@@ -14,7 +14,11 @@
     "OTEL_METRICS_INCLUDE_VERSION": "true",
     "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "false"
   },
-  "includeCoAuthoredBy": false,
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
+  },
   "permissions": {
     "allow": [
       "WebSearch",
@@ -47,6 +51,11 @@
             "type": "command",
             "command": "${HOME}/.claude/hooks/block-temp-planning-files.sh",
             "if": "Bash(*<<*)",
+            "timeout": 5000
+          },
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/git-guard.sh",
             "timeout": 5000
           }
         ]
@@ -102,6 +111,22 @@
             "type": "command",
             "command": "${HOME}/.claude/estimator/scripts/session-start-hook.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/inject-main-context.sh",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/inject-subagent-context.sh",
+            "timeout": 5000
           }
         ]
       }
