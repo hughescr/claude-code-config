@@ -1,7 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "cleanupPeriodDays": 365,
-  "includeCoAuthoredBy": false,
   "env": {
     "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
     "OTEL_METRICS_EXPORTER": "otlp",
@@ -15,6 +14,7 @@
     "OTEL_METRICS_INCLUDE_VERSION": "true",
     "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "false"
   },
+  "includeCoAuthoredBy": false,
   "permissions": {
     "allow": [
       "WebSearch",
@@ -38,7 +38,6 @@
     "ask": [],
     "defaultMode": "auto"
   },
-  "model": "fable",
   "hooks": {
     "PreToolUse": [
       {
@@ -234,5 +233,6 @@
   },
   "feedbackSurveyState": {
     "lastShownTime": 1754119602031
-  }
+  },
+  "model": "claude-fable-5[1m]"
 }
