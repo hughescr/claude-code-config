@@ -14,7 +14,7 @@ Personal Claude Code configuration with plugin-based architecture, custom hooks,
 
 ```
 /plugin marketplace add hughescr/claude-code-config
-/plugin install resin-print-prep@hughescr
+/plugin install resin-print-prep@craigs-claude-plugins
 ```
 
 The marketplace manifest lives at `.claude-plugin/marketplace.json` and lists every plugin in `my-plugins/`.

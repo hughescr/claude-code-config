@@ -4,7 +4,9 @@
 set -euo pipefail
 
 INPUT="$(cat)"
-CMD="$(echo "$INPUT" | jq -r '.tool_input.command // empty')"
+# jq parse failure = no opinion, not an unpredictable non-blocking error
+# (set -e would otherwise exit nonzero) — same pattern as approve-plugin-skills.sh
+CMD="$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)" || exit 0
 
 if [[ -z "$CMD" ]]; then
   exit 0
@@ -51,7 +53,9 @@ if echo "$CMD" | grep -Eq "${GIT}restore\\b"; then
 fi
 
 # 3. `git reset --hard`, any form (with or without a following ref).
-if echo "$CMD" | grep -Eq "${GIT}reset\\b" && echo "$CMD" | grep -Eq -- '--hard\b'; then
+#    Exact-token match: \b would treat '-' as a boundary and also deny
+#    non-flags like `--hard-not-really`.
+if echo "$CMD" | grep -Eq "${GIT}reset\\b" && echo "$CMD" | grep -Eq -- '--hard($|[[:space:]])'; then
   deny "git reset --hard discards working-tree and index changes."
 fi
 

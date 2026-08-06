@@ -1,6 +1,6 @@
 #!/bin/bash
 # Only allow mktemp and codex-*.sh scripts.
-# The command is split on shell separators (;, &&, ||, |, newline) and EVERY
+# The command is split on shell separators (;, &, &&, |, ||, newline) and EVERY
 # subcommand must anchor-match the allowlist — a substring match would let
 # e.g. `rm -rf ~; echo codex-start.sh` through.
 INPUT=$(cat)
@@ -15,8 +15,10 @@ DECISION
 
 [ -z "$COMMAND" ] && deny
 
-# Split into subcommands on ; && || | and newlines
-SUBCOMMANDS=$(printf '%s' "$COMMAND" | awk '{gsub(/\|\||&&|;|\|/, "\n"); print}')
+# Split into subcommands on ; & && | || and newlines. A single & (background
+# operator) is a separator too — the character class covers it, and the runs
+# it turns && / || into just yield empty subcommands, which are skipped.
+SUBCOMMANDS=$(printf '%s' "$COMMAND" | awk '{gsub(/[;&|]/, "\n"); print}')
 
 checked_any=false
 while IFS= read -r sub; do
@@ -29,6 +31,17 @@ while IFS= read -r sub; do
   # Command/process substitution can smuggle arbitrary execution into an
   # otherwise-allowed subcommand
   if [[ "$sub" == *'$('* ]] || [[ "$sub" == *'`'* ]] || [[ "$sub" == *'<('* ]] || [[ "$sub" == *'>('* ]]; then
+    deny
+  fi
+
+  # Redirection can create/overwrite/read arbitrary files; the codex wrapper
+  # scripts never need shell redirection, so deny any of > >> <
+  if [[ "$sub" == *'>'* ]] || [[ "$sub" == *'<'* ]]; then
+    deny
+  fi
+
+  # A `..` path segment can traverse out of the allowed /tmp/claude prefix
+  if [[ "$sub" =~ (^|/|[[:space:]])\.\.(/|[[:space:]]|$) ]]; then
     deny
   fi
 
