@@ -7,11 +7,22 @@
 #   2. .claude-mixins file in project root (one per line, # for comments)
 #
 # Priority: env var > marker file
-# Priority for mixin plugins: ./.claude/ > ~/.claude/
+# Priority for mixin plugins: ./.claude/plugins/ > ~/.claude/my-plugins/
 # Auto-detected: javascript (via package.json), typescript (via tsconfig.json or package.json),
 #                hugo (via hugo.toml or config.toml with Hugo directories)
+#
+# Launches the natively installed claude binary, running "claude update" first
+# (best-effort: offline/slow update never blocks launch).
 
 set -euo pipefail
+
+# Native claude binary (npm global install via homebrew node)
+CLAUDE_BIN=/opt/homebrew/bin/claude
+if [[ ! -x "$CLAUDE_BIN" ]]; then
+    echo "claude-smart: claude binary not found at $CLAUDE_BIN" >&2
+    echo "claude-smart: install with: npm install -g @anthropic-ai/claude-code" >&2
+    exit 1
+fi
 
 # Build up a set of plugin directories to load
 PLUGIN_DIRS=()
@@ -37,19 +48,19 @@ fi
 
 # Load plugins based on detection (order matters: generic → hugo → js → ts)
 if [[ "$has_package_json" == "true" ]]; then
-    [[ -d ~/.claude/plugins/generic-dev ]] && PLUGIN_DIRS+=(~/.claude/plugins/generic-dev)
+    [[ -d ~/.claude/my-plugins/generic-dev ]] && PLUGIN_DIRS+=(~/.claude/my-plugins/generic-dev)
 fi
 
 # Load Hugo plugin if Hugo config detected
 if [[ "$has_hugo_config" == "true" ]]; then
-    [[ -d ~/.claude/plugins/hugo ]] && PLUGIN_DIRS+=(~/.claude/plugins/hugo)
+    [[ -d ~/.claude/my-plugins/hugo ]] && PLUGIN_DIRS+=(~/.claude/my-plugins/hugo)
 fi
 
 if [[ "$has_package_json" == "true" ]]; then
-    [[ -d ~/.claude/plugins/javascript ]] && PLUGIN_DIRS+=(~/.claude/plugins/javascript)
+    [[ -d ~/.claude/my-plugins/javascript ]] && PLUGIN_DIRS+=(~/.claude/my-plugins/javascript)
 
     if [[ "$is_typescript" == "true" ]]; then
-        [[ -d ~/.claude/plugins/typescript ]] && PLUGIN_DIRS+=(~/.claude/plugins/typescript)
+        [[ -d ~/.claude/my-plugins/typescript ]] && PLUGIN_DIRS+=(~/.claude/my-plugins/typescript)
     fi
 fi
 
@@ -69,12 +80,12 @@ elif [[ -f ".claude-mixins" ]]; then
     done < .claude-mixins
 fi
 
-# Add mixin plugin directories if they exist (local .claude/plugins takes priority over ~/.claude/plugins)
+# Add mixin plugin directories if they exist (local .claude/plugins takes priority over ~/.claude/my-plugins)
 for mixin in "${MIXINS[@]}"; do
     if [[ -d "./.claude/plugins/${mixin}" ]]; then
         PLUGIN_DIRS+=("./.claude/plugins/${mixin}")
-    elif [[ -d ~/.claude/plugins/${mixin} ]]; then
-        PLUGIN_DIRS+=(~/.claude/plugins/${mixin})
+    elif [[ -d ~/.claude/my-plugins/${mixin} ]]; then
+        PLUGIN_DIRS+=(~/.claude/my-plugins/${mixin})
     fi
 done
 
@@ -86,6 +97,12 @@ for dir in "${PLUGIN_DIRS[@]}"; do
     [[ -d "$dir" ]] && CLAUDE_FLAGS+=(--plugin-dir "$dir")
 done
 
-# Execute via bunx (always fetch latest)
-# Don't use exec so trap cleanup can run
-bunx --force -p @anthropic-ai/claude-code-darwin-arm64 claude "${CLAUDE_FLAGS[@]}" "$@"
+# Self-update before launch (best-effort: never block on failure or slowness)
+if command -v timeout &>/dev/null; then
+    timeout 60 "$CLAUDE_BIN" update || echo "claude-smart: update failed or timed out; launching installed version" >&2
+else
+    "$CLAUDE_BIN" update || echo "claude-smart: update failed; launching installed version" >&2
+fi
+
+# Launch the native binary
+exec "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" "$@"
