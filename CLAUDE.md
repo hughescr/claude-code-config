@@ -16,4 +16,4 @@ jq, httpie, gh, bat, diff-so-fancy, hyperfine, tree, watch, ag, parallel, awscli
 
 ---
 
-Destructive git commands (`git checkout --`, `git restore`, `git reset --hard`, `git clean`) are blocked by a PreToolUse hook; undo your own edits by editing.
+Destructive git commands are blocked by a PreToolUse hook: `git checkout -- <path>`, `git restore` (except the pure `--staged` unstage form), `git reset --hard`, and `git clean` with a force flag (dry runs allowed); undo your own edits by editing.
