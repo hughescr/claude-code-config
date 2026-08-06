@@ -42,25 +42,30 @@ else
   exit 0
 fi
 
-# Check if this plugin exists in known locations:
-# 1. User's authored plugins: ~/.claude/plugins/<plugin_name>/
-# 2. Cached plugins: ~/.claude/plugins/cache/<marketplace>/<plugin_name>/
+# Sanitize the extracted plugin name: it is interpolated into filesystem
+# paths below, so anything but a single path-safe token (no slashes, no
+# dot segments, nothing outside [A-Za-z0-9_-]) gets no opinion from this hook.
+if [[ ! "$plugin_name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+  exit 0
+fi
+
+# Auto-approve only plugins Craig authored/installed himself:
+# 1. Post-migration home: ~/.claude/my-plugins/<plugin_name>/
+# 2. Transitional legacy location: ~/.claude/plugins/<plugin_name>/
+#    (direct subdirectories only, excluding infrastructure dirs)
+# Marketplace/cache dirs (~/.claude/plugins/cache, ~/.claude/plugins/
+# marketplaces) are NOT approval evidence — a skill whose plugin exists
+# only there falls through to a normal permission prompt.
 
 found=false
 
-# Check authored plugins (direct subdirectories, excluding cache)
-if [ -d "$HOME/.claude/plugins/$plugin_name" ] && [ "$plugin_name" != "cache" ]; then
+if [ -d "$HOME/.claude/my-plugins/$plugin_name" ]; then
   found=true
-fi
-
-# Check cached plugins from any marketplace
-if [ "$found" = false ]; then
-  for marketplace_dir in "$HOME/.claude/plugins/cache"/*/; do
-    if [ -d "${marketplace_dir}${plugin_name}" ]; then
-      found=true
-      break
-    fi
-  done
+elif [ -d "$HOME/.claude/plugins/$plugin_name" ]; then
+  case "$plugin_name" in
+    cache|marketplaces|repos|data) : ;; # infrastructure dirs, not plugins
+    *) found=true ;;
+  esac
 fi
 
 if [ "$found" = true ]; then

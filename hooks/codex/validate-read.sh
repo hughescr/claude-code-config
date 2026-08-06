@@ -1,10 +1,11 @@
 #!/bin/bash
 # Block Read calls that don't match allowed codex patterns
 INPUT=$(cat)
-FILE_PATH=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null) || FILE_PATH=""
+FILE_PATH=$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null) || FILE_PATH=""
 
-# Allow: /tmp/claude/codex-query.* (query files)
-if [[ "$FILE_PATH" =~ ^/tmp/claude/codex-query\. ]]; then
+# Allow: /tmp/claude/codex-query.* (query files; /private/tmp is the macOS
+# canonical alias for /tmp)
+if [[ "$FILE_PATH" =~ ^(/private)?/tmp/claude/codex-query\. ]]; then
   echo '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow"}}'
   exit 0
 fi
