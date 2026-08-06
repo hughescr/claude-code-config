@@ -11,43 +11,38 @@
   "plugins": [
     {
       "name": "resin-print-prep",
-      "source": "./plugins/resin-print-prep",
+      "source": "./my-plugins/resin-print-prep",
       "description": "Prep 3D meshes for resin printing in Blender (via Blender MCP): repair, orient, scale, error-bounded decimation, verified STL export"
     },
     {
       "name": "javascript",
-      "source": "./plugins/javascript",
+      "source": "./my-plugins/javascript",
       "description": "JavaScript/Node.js development tools - npm packages and Bun runtime"
     },
     {
       "name": "typescript",
-      "source": "./plugins/typescript",
+      "source": "./my-plugins/typescript",
       "description": "TypeScript-specific development tools - type checking, strict mode, and TSDoc"
     },
     {
       "name": "generic-dev",
-      "source": "./plugins/generic-dev",
+      "source": "./my-plugins/generic-dev",
       "description": "Generic development tools for any coding project - symbol editing, documentation, and code navigation"
     },
     {
       "name": "hugo",
-      "source": "./plugins/hugo",
+      "source": "./my-plugins/hugo",
       "description": "Hugo static site development plugin with agents for template development, content management, asset pipeline, and AWS deployment"
     },
     {
       "name": "duckdb",
-      "source": "./plugins/duckdb",
+      "source": "./my-plugins/duckdb",
       "description": "DuckDB MCP server for data analysis"
     },
     {
       "name": "tmux",
-      "source": "./plugins/tmux",
+      "source": "./my-plugins/tmux",
       "description": "Tmux MCP server integration for terminal multiplexer support"
-    },
-    {
-      "name": "humanizer",
-      "source": "./plugins/humanizer",
-      "description": "Remove signs of AI-generated writing from text. Based on Wikipedia's 'Signs of AI writing' guide."
     }
   ]
 }

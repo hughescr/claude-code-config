@@ -1,6 +1,3 @@
-[submodule "plugins/humanizer/skills/humanizer"]
-	path = plugins/humanizer/skills/humanizer
-	url = https://github.com/blader/humanizer.git
 [submodule "skills/model-selection"]
 	path = skills/model-selection
 	url = git@github.com:tkellogg/model-selection.git
