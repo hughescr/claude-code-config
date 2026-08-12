@@ -1,302 +1,510 @@
 /**
- * G-ATTR — Phase 0 pre-build gate (design R3 §1.1, §5.4, §8).
+ * G-ATTR — the LIVE re-gate (design/GATE-LIVE-SEMANTICS.md, "GLS" below).
  *
- * Question: is sticky last-touched attribution feasible on the REAL corpus?
- * Threshold: `exclusive ∪ sticky` token coverage < 70% ⇒ escalate before Phase 1.
+ * Question: does the pipeline that is ACTUALLY RUNNING — `src/attribute.ts`, over
+ * `est`-opened tasks, reading the DB's own `request.attr` — attribute enough Work-CET
+ * to tasks to license calibration? Threshold: `exclusive ∪ sticky` Work-CET coverage
+ * < 70% ⇒ P2.11 (calibration maturation) stays deferred.
  *
- * This is NOT a re-run of the original `attr2.py` probe. That probe measured at
- * REQUEST grain, counted `ambiguous` inside its headline "coverage" figure, and
- * silently dropped every session that contained no task events. This script
- * reimplements the measurement against the R3 §5.3–§5.4 definitions:
+ * This is a REWRITE, not a re-run of the 2026-07-28 gate (`gates/g-attr.json`, frozen;
+ * never overwritten by this file). That gate measured a hypothesis — R3's sticky
+ * last-touched rule, inferred from the harness `TaskCreate`/`TaskUpdate` stream — on a
+ * corpus with no `est` ceremony in it. Every one of its defining choices is now
+ * contradicted by the shipped pass (GLS §0):
  *
- *   - TURN grain. The attribution unit is one main-transcript turn
- *     (session_id, promptId); §5.4's rules are stated "per main-transcript turn".
- *   - Sub-agent tokens inherit their LAUNCHING TURN's class (§5.3), which is
- *     what makes the measurement meaningful at all — sub-agents are ~79% of
- *     spend, and `attr2.py` never opened a single sub-agent transcript.
- *   - "Touched" includes TaskCreate, not just TaskUpdate statusChanges (§5.4).
- *   - "Open" is R3's "open tracked task": created and not yet completed/deleted.
- *     The original probe's in_progress-only definition is kept as a variant,
- *     because §1.1 records that 46.7% of completions skip `in_progress`.
- *   - Coverage = exclusive ∪ sticky ONLY. `ambiguous` and `pre_task` are
- *     residuals, per §5.4's "the 17.2% residual is a named number".
- *   - Dedup is MAX per (request_id, counter) (§5.2) plus the message_id
- *     sidechain-replay pass. Getting this wrong is an 8.4–18.3× undercount.
+ *   - the candidate task set is `task_alias`, not every harness `TaskCreate` (GLS D6);
+ *   - `sticky` has no writer in `src/attribute.ts` at all — it is carried in the
+ *     `Attr` union and in this gate's predicates for when one arrives, and is
+ *     reported as identically zero until then (GLS §7.1);
+ *   - the headline is `request.attr`, the column calibration actually reads, not a
+ *     second implementation of the turn walk built to grade it (GLS D1/D2).
  *
- * Read-only on the corpus. Writes nothing but its own stdout/JSON.
+ * **What changed from the July script, decision by decision:**
  *
- * Usage:  bun run gates/g-attr.ts [--json out.json] [--limit N]
+ *  - D1/D2 — headline = `request.attr` in the live DB. The transcript recompute is
+ *    DROPPED as a coverage variant (two implementations of one rule is two answers,
+ *    and the second is untested); transcripts are still read, but only for the X1
+ *    ingest-completeness cross-check below.
+ *  - D3 — denominator = tracked sessions, `origin IN ('main','subagent')`, non-replay,
+ *    non-overhead (`src/retro.ts`'s `attrBaseFilter`, exported and imported here so the
+ *    number that licenses calibration is defined exactly once).
+ *  - D4 — currency = priced Work-CET (`v_wcet.wcet`), because that is what
+ *    `v_task_actual`/calibration consume; unweighted counters are a sensitivity row.
+ *  - D5 — window = `--since` (default: the story-point cutover, 2026-08-01), reported
+ *    per epoch when `--hook-merge <ts>` is given.
+ *  - D6-D8 — the candidate set is `task_alias`, not a harness todo census; the gate
+ *    reports the task-population census (opened/finalized/still-open/alias mix/never
+ *    attributed) instead of todo-list hygiene.
+ *  - D9 — `coverage_ex_hook` (a shadow copy with `source='hook'` aliases deleted, then
+ *    `attributeTasks` re-run — never a contaminated "does the tid match" query, GLS
+ *    §3/HOOK-BINDING-SPEC §9.3 V7) and `hook_lift = live − ex_hook`. PASS additionally
+ *    requires `hook_bind_conflict = 0` and `alias_split_identity = 0`.
+ *  - D10 — staleness is measured at the SHIPPED config, plus a small sensitivity grid
+ *    over `attr_stale_turns`/`attr_stale_minutes`, each on its own temp copy, plus
+ *    `stale_closed_share`.
+ *  - D11-D12 — the 2026-07 ladder is FROZEN. `--legacy-r3` reproduces it verbatim on
+ *    today's corpus (unrelated to the live headline); the live series' first
+ *    comparable point is `E′` (bridge rung, printed alongside the live ladder).
+ *  - D14 — PASS prints the licensing text verbatim; it licenses nothing about the
+ *    binder, nothing about velocity alone, and nothing about `ambiguous` (L3 vs L4 are
+ *    both reported, and disagreeing is the open, blocking question GLS §5 names).
+ *
+ * **Read-only over the live DB and transcripts.** The live DB is opened
+ * `readonly: true` and never written; every recompute that needs to WRITE (the D9
+ * shadow, the D10 grid) runs against a `VACUUM INTO` temp copy, made once per run and
+ * deleted before exit. Writes nothing but its own stdout and, if `--json <path>` is
+ * given, that one file — never `gates/g-attr.json`, the 2026-07-28 baseline.
+ *
+ * Usage:
+ *   bun run gates/g-attr.ts [--db path] [--since ISO] [--hook-merge ISO]
+ *                           [--json out.json] [--skip-x1] [--limit-sessions N]
+ *   bun run gates/g-attr.ts --legacy-r3 [--json out.json] [--limit N]   # frozen 2026-07 ladder
  */
 
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync, copyFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { openDb, getConfig, setConfig, DB_PATH } from "../src/db.ts";
+import { attributeTasks, attrWindow } from "../src/attribute.ts";
+import { attrBaseFilter, ATTR_COVERAGE_CLASSES, ATTR_COVERAGE_GATE } from "../src/retro.ts";
 import { discoverCorpus, type SessionCorpus } from "../src/discover.ts";
 import { ingestSession, readJsonl, type RequestRow } from "../src/ingest.ts";
-// `TranscriptLine` is declared in segment.ts; ingest.ts only imports it, so
-// sourcing it from there compiled by luck and stopped when the re-export went.
 import { TurnSegmenter, type TranscriptLine } from "../src/segment.ts";
 
+const CUTOVER_DEFAULT = "2026-08-01T00:00:00Z";
+
 // ---------------------------------------------------------------------------
-// currencies
+// small local helpers
+// ---------------------------------------------------------------------------
+
+function num(db: Database, sql: string, params: (string | number)[] = []): number {
+  const row = db.query<{ v: number | null }, (string | number)[]>(sql).get(...params);
+  return row?.v ?? 0;
+}
+
+function ratio(part: number, whole: number): number {
+  return whole > 0 ? part / whole : 0;
+}
+
+function flag(argv: string[], name: string): string | undefined {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// D1-D5: the live headline, computed straight off `v_wcet`/`request.attr`
+// ---------------------------------------------------------------------------
+
+export interface AttrWindowArg {
+  since: string;
+  /** Exclusive — a half-open window, so `[cutover, hook-merge)` + `[hook-merge, now]` tile. */
+  until?: string;
+}
+
+export interface ClassTotals {
+  exclusive: number;
+  sticky: number;
+  ambiguous: number;
+  pre_task: number;
+  none: number;
+  overhead: number;
+  total: number;
+}
+
+function zeroTotals(): ClassTotals {
+  return { exclusive: 0, sticky: 0, ambiguous: 0, pre_task: 0, none: 0, overhead: 0, total: 0 };
+}
+
+const COVERAGE_KEYS: readonly (keyof ClassTotals)[] = ATTR_COVERAGE_CLASSES;
+
+function coverageNumerator(t: ClassTotals): number {
+  let n = 0;
+  for (const k of COVERAGE_KEYS) n += t[k];
+  return n;
+}
+
+/** `SUM(<expr>)` grouped by `attr`, over an arbitrary WHERE clause on `v_wcet`. */
+function classTotalsExpr(
+  db: Database,
+  expr: string,
+  whereSql: string,
+  params: (string | number)[],
+): ClassTotals {
+  const rows = db
+    .query<{ attr: string; v: number | null }, (string | number)[]>(
+      `SELECT attr, SUM(${expr}) AS v FROM v_wcet WHERE ${whereSql} GROUP BY attr`,
+    )
+    .all(...params);
+  const t = zeroTotals();
+  const byClass = t as unknown as Record<string, number>;
+  for (const r of rows) {
+    const v = r.v ?? 0;
+    if (r.attr in t) byClass[r.attr] = v;
+    t.total += v;
+  }
+  return t;
+}
+
+function classTotals(db: Database, whereSql: string, params: (string | number)[]): ClassTotals {
+  return classTotalsExpr(db, "wcet", whereSql, params);
+}
+
+export interface Headline {
+  window: AttrWindowArg;
+  /** L0 — all window Work-CET, tracked AND untracked sessions, all origins, `replay` excluded. */
+  L0: ClassTotals;
+  /** L1 — L0 restricted to tracked sessions (GLS D3's re-base). */
+  L1: ClassTotals;
+  /** L2 — the calibration-eligible base (GLS D3): + non-overhead, origins main/subagent. */
+  L2: ClassTotals;
+  /** L3 — `exclusive ∪ sticky` over L2. THE HEADLINE. */
+  coverage_pct: number;
+  /** L4 — L3 + `ambiguous` over L2 — what `v_task_actual` actually sums today (GLS §5 cl.4). */
+  ambiguous_incl_pct: number;
+  /** E′ — the one rung comparable to 2026-07's 18.7% (GLS D12): `exclusive ∪ sticky`
+   *  over L0's whole-window denominator, live attribution rule. */
+  e_prime_pct: number;
+}
+
+export function computeHeadline(db: Database, w: AttrWindowArg): Headline {
+  const untilClause = w.until !== undefined ? " AND ts < ?" : "";
+  const winParams: (string | number)[] = w.until !== undefined ? [w.since, w.until] : [w.since];
+
+  const L0 = classTotals(db, `ts >= ?${untilClause} AND attr <> 'replay'`, winParams);
+  const L1 = classTotals(
+    db,
+    `ts >= ?${untilClause} AND attr <> 'replay'
+       AND session_id IN (SELECT DISTINCT session_id FROM task_alias WHERE session_id <> '')`,
+    winParams,
+  );
+  const base = attrBaseFilter(w);
+  const L2 = classTotals(db, base.sql, base.params);
+
+  return {
+    window: w,
+    L0,
+    L1,
+    L2,
+    coverage_pct: 100 * ratio(coverageNumerator(L2), L2.total),
+    ambiguous_incl_pct: 100 * ratio(coverageNumerator(L2) + L2.ambiguous, L2.total),
+    e_prime_pct: 100 * ratio(coverageNumerator(L0), L0.total),
+  };
+}
+
+function summarizeTotals(t: ClassTotals): Record<string, number> {
+  const pct = (n: number): number => 100 * ratio(n, t.total);
+  return {
+    total_wcet: t.total,
+    exclusive_pct: pct(t.exclusive),
+    sticky_pct: pct(t.sticky),
+    ambiguous_pct: pct(t.ambiguous),
+    pre_task_pct: pct(t.pre_task),
+    none_pct: pct(t.none),
+    overhead_pct: pct(t.overhead),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// D4: currency sensitivity — priced Work-CET is the headline, counters are variants
+// ---------------------------------------------------------------------------
+
+export interface CurrencyPoint {
+  coverage_pct: number;
+  total: number;
+}
+
+export function currencySensitivity(db: Database, w: AttrWindowArg): Record<string, CurrencyPoint> {
+  const base = attrBaseFilter(w);
+  const exprs: Record<string, string> = {
+    wcet_priced: "wcet",
+    out_plus_cw: "out_tok + cw_tok",
+    in_out_cw: "in_tok + out_tok + cw_tok",
+    out_only: "out_tok",
+  };
+  const out: Record<string, CurrencyPoint> = {};
+  for (const [name, expr] of Object.entries(exprs)) {
+    const t = classTotalsExpr(db, expr, base.sql, base.params);
+    out[name] = { coverage_pct: 100 * ratio(coverageNumerator(t), t.total), total: t.total };
+  }
+  const reqRows = db
+    .query<{ attr: string; n: number }, (string | number)[]>(
+      `SELECT attr, COUNT(*) AS n FROM v_wcet WHERE ${base.sql} GROUP BY attr`,
+    )
+    .all(...base.params);
+  let covReq = 0;
+  let totReq = 0;
+  for (const r of reqRows) {
+    totReq += r.n;
+    if ((COVERAGE_KEYS as readonly string[]).includes(r.attr)) covReq += r.n;
+  }
+  out.request_count = { coverage_pct: 100 * ratio(covReq, totReq), total: totReq };
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// by origin / by model family — the reweighting-sensitivity panel
+// ---------------------------------------------------------------------------
+
+export interface DimensionPoint {
+  key: string;
+  coverage_pct: number;
+  share_pct: number;
+  total: number;
+}
+
+export function byDimension(
+  db: Database,
+  dim: "origin" | "model_family",
+  w: AttrWindowArg,
+): DimensionPoint[] {
+  const base = attrBaseFilter(w);
+  const rows = db
+    .query<{ k: string; attr: string; v: number }, (string | number)[]>(
+      `SELECT ${dim} AS k, attr, SUM(wcet) AS v FROM v_wcet WHERE ${base.sql} GROUP BY ${dim}, attr`,
+    )
+    .all(...base.params);
+  const byKey = new Map<string, ClassTotals>();
+  for (const r of rows) {
+    let t = byKey.get(r.k);
+    if (t === undefined) {
+      t = zeroTotals();
+      byKey.set(r.k, t);
+    }
+    const bc = t as unknown as Record<string, number>;
+    if (r.attr in t) bc[r.attr] = r.v;
+    t.total += r.v;
+  }
+  const grand = [...byKey.values()].reduce((a, t) => a + t.total, 0);
+  return [...byKey.entries()]
+    .map(([key, t]) => ({
+      key,
+      coverage_pct: 100 * ratio(coverageNumerator(t), t.total),
+      share_pct: 100 * ratio(t.total, grand),
+      total: t.total,
+    }))
+    .sort((a, b) => b.total - a.total);
+}
+
+// ---------------------------------------------------------------------------
+// D7: task population census — over `task_alias`, not harness todo hygiene
+// ---------------------------------------------------------------------------
+
+export interface TaskCensus {
+  opened_in_window: number;
+  finalized_in_window: number;
+  still_open_now: number;
+  never_attributed_pct: number;
+  alias_counts: Array<{ id_kind: string; source: string; n: number }>;
+}
+
+export function taskCensus(db: Database, w: AttrWindowArg): TaskCensus {
+  const untilClause = w.until !== undefined ? " AND created_at < ?" : "";
+  const winParams: (string | number)[] = w.until !== undefined ? [w.since, w.until] : [w.since];
+
+  // One query, batched: for every task OPENED in the window, whether it has since
+  // reached a non-reopened outcome and whether any (non-replay) request ever named it.
+  const rows = db
+    .query<{ tid: string; finalized: number; n_req: number }, (string | number)[]>(
+      `SELECT t.tid AS tid,
+              (SELECT COUNT(*) FROM v_outcome_current o
+                WHERE o.tid = t.tid AND o.final_status <> 'reopened') AS finalized,
+              (SELECT COUNT(*) FROM request r WHERE r.tid = t.tid AND r.attr <> 'replay') AS n_req
+         FROM task t WHERE t.created_at >= ?${untilClause}`,
+    )
+    .all(...winParams);
+
+  const finUntil = w.until !== undefined ? " AND finalized_at < ?" : "";
+  const finalizedInWindow = num(
+    db,
+    `SELECT COUNT(DISTINCT tid) AS v FROM v_outcome_current
+      WHERE final_status <> 'reopened' AND finalized_at >= ?${finUntil}`,
+    winParams,
+  );
+
+  const opened = rows.length;
+  const stillOpen = rows.filter((r) => r.finalized === 0).length;
+  const neverAttributed = rows.filter((r) => r.n_req === 0).length;
+
+  const aliasRows = db
+    .query<{ id_kind: string; source: string; n: number }, []>(
+      "SELECT id_kind, source, COUNT(*) AS n FROM task_alias GROUP BY id_kind, source ORDER BY id_kind, source",
+    )
+    .all();
+
+  return {
+    opened_in_window: opened,
+    finalized_in_window: finalizedInWindow,
+    still_open_now: stillOpen,
+    never_attributed_pct: 100 * ratio(neverAttributed, opened),
+    alias_counts: aliasRows,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// D9: anomaly preconditions and the hook-lift precondition text
+// ---------------------------------------------------------------------------
+
+export interface AnomalyPreconditions {
+  hook_bind_conflict: number;
+  alias_split_identity: number;
+}
+
+export function anomalyPreconditions(db: Database): AnomalyPreconditions {
+  const rows = db
+    .query<{ kind: string; n: number }, []>(
+      "SELECT kind, COUNT(*) AS n FROM anomaly WHERE kind IN ('hook_bind_conflict','alias_split_identity') GROUP BY kind",
+    )
+    .all();
+  const m = new Map(rows.map((r) => [r.kind, r.n]));
+  return {
+    hook_bind_conflict: m.get("hook_bind_conflict") ?? 0,
+    alias_split_identity: m.get("alias_split_identity") ?? 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// D9/D10: temp-copy machinery. Never writes the live DB — every mutation below
+// runs against a `VACUUM INTO` copy, and the copy is discarded before this
+// process exits.
 // ---------------------------------------------------------------------------
 
 /**
- * Work-CET is price-weighted (§4.1), but this corpus is dominated by model ids
- * that no public price table carries (`claude-fable-5`, `claude-sonnet-5`,
- * `claude-opus-5`, `claude-opus-4-8`), so a weighted headline here would be
- * mostly invented. Coverage is a SHARE, and a share only moves under
- * reweighting if the attribution class correlates with the model mix — so the
- * headline is the unweighted Work-CET counter pair, and the per-family class
- * breakdown printed at the end is what tests the reweighting sensitivity
- * directly.
+ * `VACUUM INTO` a temp copy of the live DB. Takes a PATH, not the already-open
+ * `db` handle: `openDb({ readonly: true })` additionally sets `PRAGMA query_only
+ * = ON` (`src/db.ts`'s "belt to the connection flag's braces"), which blocks
+ * `VACUUM INTO` too, so this opens its own short-lived connection with only the
+ * SQLite-level `SQLITE_OPEN_READONLY` flag — still structurally incapable of
+ * writing the SOURCE file (verified: this is the same mechanism `sqlite3
+ * -readonly db.sqlite "VACUUM INTO ..."` uses), and closed immediately after.
  */
-const CURRENCIES = {
-  wcet_unweighted: (r: Counters) => r.out + r.cw,
-  attr2_in_out_cw: (r: Counters) => r.in + r.out + r.cw,
-  out_only: (r: Counters) => r.out,
-  requests: () => 1,
-} as const;
+function vacuumInto(dbPath: string, destPath: string): void {
+  const quoted = destPath.replace(/'/g, "''");
+  const src = new Database(dbPath, { readonly: true });
+  try {
+    src.exec(`VACUUM INTO '${quoted}'`);
+  } finally {
+    src.close();
+  }
+}
 
-type CurrencyName = keyof typeof CURRENCIES;
-const CURRENCY_NAMES = Object.keys(CURRENCIES) as CurrencyName[];
+function withTempCopy<T>(masterPath: string, fn: (db: Database) => T): T {
+  const dir = mkdtempSync(join(tmpdir(), "g-attr-live-"));
+  const copyPath = join(dir, "copy.db");
+  try {
+    copyFileSync(masterPath, copyPath);
+    const db = new Database(copyPath);
+    try {
+      return fn(db);
+    } finally {
+      db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
-interface Counters {
+/**
+ * D9 / HOOK-BINDING-SPEC §9.3 V7 — the uncontaminated hook-lift check. A hook alias
+ * contributes a `boundSpan` and a bound-agent touch that reset the bound task's
+ * `quietTurns` on every turn it covers, so a query that asks "does the hook's tid
+ * match the turn walk's answer" is graded by an answer the hook partly created. The
+ * only clean comparison is a turn walk that never saw a hook alias at all: delete
+ * every `source='hook'` row on a throwaway copy and let `attributeTasks` recompute
+ * every claim from scratch.
+ */
+export function coverageExHook(masterPath: string, w: AttrWindowArg): number {
+  return withTempCopy(masterPath, (db) => {
+    db.exec("DELETE FROM task_alias WHERE source = 'hook'");
+    attributeTasks(db);
+    return computeHeadline(db, w).coverage_pct;
+  });
+}
+
+export interface StaleGridPoint {
+  turns: number;
+  minutes: number;
+  coverage_pct: number;
+}
+
+/**
+ * D10 — the staleness free parameter, gridded rather than tuned. Each point is its
+ * own temp copy (never the live DB, never the master shared with other points, since
+ * `attributeTasks` mutates `tid`/`attr` in place).
+ */
+export function stalenessGrid(
+  masterPath: string,
+  w: AttrWindowArg,
+  turnsGrid: readonly number[],
+  minutesGrid: readonly number[],
+): StaleGridPoint[] {
+  const out: StaleGridPoint[] = [];
+  for (const turns of turnsGrid) {
+    for (const minutes of minutesGrid) {
+      const coverage_pct = withTempCopy(masterPath, (db) => {
+        setConfig(db, "attr_stale_turns", String(turns));
+        setConfig(db, "attr_stale_minutes", String(minutes));
+        attributeTasks(db);
+        return computeHeadline(db, w).coverage_pct;
+      });
+      out.push({ turns, minutes, coverage_pct });
+    }
+  }
+  return out;
+}
+
+/** D10 — the `pre_task` mass that falls INSIDE some bound task's window: spend the
+ *  staleness rule closed off, as distinct from genuinely pre-task spend. */
+export function staleClosedShare(db: Database, w: AttrWindowArg): number {
+  const untilClause = w.until !== undefined ? " AND v.ts < ?" : "";
+  const winParams: (string | number)[] = w.until !== undefined ? [w.since, w.until] : [w.since];
+  const stale = num(
+    db,
+    `SELECT SUM(v.wcet) AS v FROM v_wcet v
+      WHERE v.attr = 'pre_task' AND v.ts >= ?${untilClause}
+        AND EXISTS (SELECT 1 FROM task t JOIN task_alias a
+                       ON a.tid = t.tid AND a.session_id = v.session_id
+                     WHERE v.ts >= t.created_at)`,
+    winParams,
+  );
+  const base = attrBaseFilter(w);
+  const denom = num(db, `SELECT SUM(wcet) AS v FROM v_wcet WHERE ${base.sql}`, base.params);
+  return 100 * ratio(stale, denom);
+}
+
+// ---------------------------------------------------------------------------
+// X1 — ingest completeness cross-check (GLS D2): "is the DB's request set the
+// corpus's request set?" The one failure mode a DB-only headline cannot see —
+// spend that never arrived is invisible in `request.attr`.
+// ---------------------------------------------------------------------------
+
+interface DedupCounters {
   in: number;
   out: number;
   cw: number;
   cr: number;
 }
 
-/** One deduped request, compacted down to what the gate actually needs. */
-interface Req extends Counters {
+interface DedupReq extends DedupCounters {
   request_id: string;
   message_id: string | null;
   is_sidechain: number;
-  session_id: string;
-  prompt_id: string | null;
   origin: string;
-  model_family: string;
-  attribution_skill: string | null;
+  prompt_id: string | null;
   replay: boolean;
 }
 
-// ---------------------------------------------------------------------------
-// task events — the §5.4 "touch" stream
-// ---------------------------------------------------------------------------
-
-type TaskEventKind = "create" | "status" | "touch";
-
-interface TaskEvent {
-  ts: string;
-  taskId: string;
-  kind: TaskEventKind;
-  to: string | null;
-}
-
-function str(v: unknown): string | null {
-  return typeof v === "string" && v.length > 0 ? v : null;
-}
-
-/**
- * Second, cheap pass over ONE main transcript for task lifecycle events and turn
- * starts. Main transcripts are the small half of the corpus (sub-agent files
- * dominate the bytes), so re-reading them rather than threading a new field
- * through `ingest.ts` costs little and keeps the gate from touching shipped code.
- *
- * Shapes verified live on this corpus:
- *   TaskCreate → toolUseResult.task = {id, subject}
- *   TaskUpdate → toolUseResult = {success, taskId, updatedFields, statusChange:{from,to}}
- *   TaskUpdate with no status edit → same, minus `statusChange` (a touch, not a transition)
- */
-async function readTaskStream(
-  path: string,
-): Promise<{ events: TaskEvent[]; turnStarts: Map<string, string> }> {
-  const events: TaskEvent[] = [];
-  const turnStarts = new Map<string, string>();
-  const seg = new TurnSegmenter(null);
-
-  await readJsonl(path, (raw) => {
-    const line = JSON.parse(raw) as TranscriptLine;
-    seg.push(line);
-
-    const ts = str(line.timestamp);
-    if (ts === null) return;
-
-    const promptId = seg.currentPromptId;
-    if (promptId !== null) {
-      const prev = turnStarts.get(promptId);
-      if (prev === undefined || ts < prev) turnStarts.set(promptId, ts);
-    }
-
-    if (line.type !== "user") return;
-    const tur = line.toolUseResult;
-    if (tur === null || typeof tur !== "object") return;
-    const r = tur as Record<string, unknown>;
-
-    const task = r.task;
-    if (task !== null && typeof task === "object") {
-      const id = str((task as Record<string, unknown>).id);
-      if (id !== null) {
-        events.push({ ts, taskId: id, kind: "create", to: "pending" });
-        return;
-      }
-    }
-
-    const sc = r.statusChange;
-    if (sc !== null && typeof sc === "object") {
-      const s = sc as Record<string, unknown>;
-      const id = str(r.taskId) ?? str(s.taskId);
-      if (id !== null) {
-        events.push({
-          ts,
-          taskId: id,
-          kind: "status",
-          to: str(s.to) ?? str(s.toStatus) ?? str(s.status),
-        });
-        return;
-      }
-    }
-
-    // A TaskUpdate that edited something other than status still TOUCHES the task.
-    if (Array.isArray(r.updatedFields)) {
-      const id = str(r.taskId);
-      if (id !== null) events.push({ ts, taskId: id, kind: "touch", to: null });
-    }
-  });
-
-  return { events, turnStarts };
-}
-
-// ---------------------------------------------------------------------------
-// attribution (§5.4)
-// ---------------------------------------------------------------------------
-
-type AttrClass = "overhead" | "exclusive" | "sticky" | "ambiguous" | "pre_task";
-
-/** How "open" is defined. R3's wording is D1; `attr2.py` implemented D2. */
-type OpenDef = "r3_not_closed" | "in_progress_only";
-
-const CLOSED = new Set(["completed", "deleted", "cancelled", "canceled"]);
-
-interface TurnInfo {
-  promptId: string;
-  startedAt: string;
-  events: TaskEvent[];
-}
-
-interface ClassifiedTurn {
-  promptId: string;
-  /** class under end-of-turn evaluation — the §5.4 anchor_prompt semantics. */
-  cls: AttrClass;
-  /** class under start-of-turn evaluation — sensitivity variant. */
-  clsAtStart: AttrClass;
-}
-
-/**
- * Walk one session's turns in time order, maintaining the open set and the
- * last-touched task, and label each turn.
- *
- * End-of-turn is primary: §5.4 says attribution windows open at
- * `task.anchor_prompt`, i.e. the turn that CREATES a task is inside that task's
- * actual, which only holds if the turn's own task events count toward it.
- */
-function classifySession(
-  turns: TurnInfo[],
-  openDef: OpenDef,
-  openSizeOut?: Map<string, number>,
-): ClassifiedTurn[] {
-  const open: string[] = []; // insertion-ordered; membership set is small
-  let lastTouched: string | null = null;
-
-  const isOpening = (e: TaskEvent): boolean =>
-    openDef === "r3_not_closed"
-      ? e.kind === "create" || (e.to !== null && !CLOSED.has(e.to))
-      : e.to === "in_progress";
-
-  const isClosing = (e: TaskEvent): boolean =>
-    openDef === "r3_not_closed"
-      ? e.to !== null && CLOSED.has(e.to)
-      : e.kind === "status" && e.to !== "in_progress";
-
-  const apply = (e: TaskEvent): void => {
-    if (isClosing(e)) {
-      const i = open.indexOf(e.taskId);
-      if (i >= 0) open.splice(i, 1);
-    } else if (isOpening(e)) {
-      if (!open.includes(e.taskId)) open.push(e.taskId);
-    }
-    // Every event is a touch, including a pure metadata edit and a close.
-    lastTouched = e.taskId;
-  };
-
-  const label = (): AttrClass => {
-    if (open.length === 1) return "exclusive";
-    if (open.length > 1) return "ambiguous";
-    return lastTouched === null ? "pre_task" : "sticky";
-  };
-
-  const out: ClassifiedTurn[] = [];
-  for (const t of turns) {
-    const clsAtStart = label();
-    for (const e of t.events) apply(e);
-    openSizeOut?.set(t.promptId, open.length);
-    out.push({ promptId: t.promptId, cls: label(), clsAtStart });
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// accumulation
-// ---------------------------------------------------------------------------
-
-type Bucket = Record<CurrencyName, number>;
-
-function zeroBucket(): Bucket {
-  return { wcet_unweighted: 0, attr2_in_out_cw: 0, out_only: 0, requests: 0 };
-}
-
-function addTo(b: Bucket, r: Counters): void {
-  for (const n of CURRENCY_NAMES) b[n] += CURRENCIES[n](r);
-}
-
-class Tally {
-  readonly byClass = new Map<string, Bucket>();
-  total: Bucket = zeroBucket();
-
-  add(cls: string, r: Counters): void {
-    let b = this.byClass.get(cls);
-    if (b === undefined) {
-      b = zeroBucket();
-      this.byClass.set(cls, b);
-    }
-    addTo(b, r);
-    addTo(this.total, r);
-  }
-
-  share(cls: string | string[], cur: CurrencyName): number {
-    const keys = Array.isArray(cls) ? cls : [cls];
-    const denom = this.total[cur];
-    if (denom === 0) return 0;
-    let n = 0;
-    for (const k of keys) n += this.byClass.get(k)?.[cur] ?? 0;
-    return (100 * n) / denom;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// dedup (§5.2) — MAX per (request_id, counter), then the message_id replay pass
-// ---------------------------------------------------------------------------
-
-function upsertMax(into: Map<string, Req>, row: RequestRow): void {
+/** MAX per `(request_id, counter)` (§5.2) — a request re-ingested from a second copy
+ *  of the same transcript (munged project dirs) must not double the counters. */
+function upsertMax(into: Map<string, DedupReq>, row: RequestRow): void {
   const cur = into.get(row.request_id);
   if (cur === undefined) {
     into.set(row.request_id, {
       request_id: row.request_id,
       message_id: row.message_id,
       is_sidechain: row.is_sidechain,
-      session_id: row.session_id,
-      prompt_id: row.prompt_id,
       origin: row.origin,
-      model_family: row.model_family,
-      attribution_skill: row.attribution_skill,
+      prompt_id: row.prompt_id,
       in: row.in_tok,
       out: row.out_tok,
       cw: row.cw_tok,
@@ -309,13 +517,12 @@ function upsertMax(into: Map<string, Req>, row: RequestRow): void {
   cur.out = Math.max(cur.out, row.out_tok);
   cur.cw = Math.max(cur.cw, row.cw_tok);
   cur.cr = Math.max(cur.cr, row.cr_tok);
-  // first-seen wins on identity fields (fork stability, §5.2)
   if (cur.prompt_id === null && row.prompt_id !== null) cur.prompt_id = row.prompt_id;
 }
 
-/** ccusage's tie-break, verbatim from §5.2. Marks losers `replay`. */
-function markSidechainReplays(reqs: Map<string, Req>): number {
-  const byMessage = new Map<string, Req[]>();
+/** ccusage's sidechain-replay tie-break (§5.2), verbatim. Marks losers `replay`. */
+function markSidechainReplays(reqs: Map<string, DedupReq>): number {
+  const byMessage = new Map<string, DedupReq[]>();
   for (const r of reqs.values()) {
     if (r.message_id === null) continue;
     const list = byMessage.get(r.message_id);
@@ -345,72 +552,608 @@ function markSidechainReplays(reqs: Map<string, Req>): number {
   return marked;
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
-
-interface SessionSummary {
-  sessionId: string;
-  taskEvents: number;
-  distinctTasks: number;
-  /** Tasks that reached a terminal status — the rest stay "open" forever. */
-  closedTasks: number;
-  maxOpen: number;
-  turns: number;
-  wcet: number;
+export interface JoinQualityX1 {
+  sessions: number;
+  transcript_unique_requests: number;
+  db_unique_requests: number;
+  unjoined_subagent_pct: number;
+  malformed_lines: number;
+  truncated_tails: number;
+  sidechain_replays_marked: number;
 }
 
-async function main(): Promise<void> {
-  const argv = Bun.argv.slice(2);
-  const jsonAt = argv.indexOf("--json");
-  const jsonOut = jsonAt >= 0 ? argv[jsonAt + 1] : null;
-  const limitAt = argv.indexOf("--limit");
-  const limit = limitAt >= 0 ? Number(argv[limitAt + 1]) : Infinity;
+export async function ingestCompleteness(db: Database, limit: number = Infinity): Promise<JoinQualityX1> {
+  const corpus = discoverCorpus();
+  const sessions = corpus.sessions.slice(0, limit);
+  const requests = new Map<string, DedupReq>();
+  let malformed = 0;
+  let truncated = 0;
+  for (const session of sessions) {
+    const batch = await ingestSession(session);
+    for (const row of batch.requests) upsertMax(requests, row);
+    malformed += batch.stats.malformed;
+    truncated += batch.stats.truncatedTail;
+  }
+  const replays = markSidechainReplays(requests);
+
+  let subagentTotal = 0;
+  let subagentUnjoined = 0;
+  let uniqueLive = 0;
+  for (const r of requests.values()) {
+    if (r.replay) continue;
+    uniqueLive += 1;
+    if (r.origin === "subagent") {
+      subagentTotal += 1;
+      if (r.prompt_id === null) subagentUnjoined += 1;
+    }
+  }
+
+  const dbCount = num(db, "SELECT COUNT(*) AS v FROM request WHERE attr <> 'replay'");
+
+  return {
+    sessions: sessions.length,
+    transcript_unique_requests: uniqueLive,
+    db_unique_requests: dbCount,
+    unjoined_subagent_pct: 100 * ratio(subagentUnjoined, subagentTotal),
+    malformed_lines: malformed,
+    truncated_tails: truncated,
+    sidechain_replays_marked: replays,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// D14: verdict + the licence text, printed verbatim on PASS
+// ---------------------------------------------------------------------------
+
+export type Verdict = "PASS" | "ESCALATE";
+
+export function verdictOf(headlinePct: number, preconds: AnomalyPreconditions): Verdict {
+  if (headlinePct < ATTR_COVERAGE_GATE * 100) return "ESCALATE";
+  if (preconds.hook_bind_conflict !== 0 || preconds.alias_split_identity !== 0) return "ESCALATE";
+  return "PASS";
+}
+
+const D14_TEXT = [
+  "Coverage >= 70% on the live window re-opens P2.11: calibration maturation",
+  "(bootstrap CIs, shrinkage tuning, model-family decay, pinball-gated splits) is no",
+  "longer deferred, and the live G-ATTR re-gate -- the Phase 1 exit criterion -- is met.",
+  "",
+  "It licenses NOTHING ELSE:",
+  " 1. Not a retro-fit licence. The historical corpus stays cost-history-only; no",
+  "    multiplier may be fitted to pre-cutover attribution.",
+  " 2. Not sufficient for velocity. Calibration additionally needs >=10",
+  "    estimated-then-scored tasks -- coverage is a corpus-quality condition, not a",
+  "    sample-size one. Both must hold.",
+  " 3. Not a validation of the binder. A pass with a large hook_lift and an unclean",
+  "    anomaly ledger (hook_bind_conflict / alias_split_identity nonzero) is a fail --",
+  "    enforced above, not left to this text.",
+  " 4. A licence over `exclusive` spend only. `v_task_actual` sums every attr except",
+  "    `overhead`, so `ambiguous` is ALREADY inside the actuals calibration would fit.",
+  "    L3 vs L4 above is the open, blocking question: before any multiplier moves,",
+  "    either the actuals views exclude `ambiguous`, or the design is corrected to",
+  "    admit it and coverage is restated as exclusive+sticky+ambiguous.",
+].join("\n");
+
+// ---------------------------------------------------------------------------
+// live main
+// ---------------------------------------------------------------------------
+
+interface LiveReport {
+  generated_at: string;
+  elapsed_ms: number;
+  db: string;
+  window: { since: string; hook_merge: string | null };
+  headline: {
+    coverage_pct: number;
+    threshold_pct: number;
+    exclusive_pct: number;
+    sticky_pct: number;
+    ambiguous_pct: number;
+  };
+  ladder: {
+    L0_all_window: Record<string, number>;
+    L1_tracked_sessions: Record<string, number>;
+    L2_calibration_eligible_base: Record<string, number>;
+    L3_headline_coverage_pct: number;
+    L4_plus_ambiguous_pct: number;
+    E_prime_bridge_to_2026_07_pct: number;
+  };
+  epochs: { pre_hook_merge: Headline; post_hook_merge: Headline } | null;
+  coverage_ex_hook_pct: number | null;
+  hook_lift_pct: number | null;
+  hook_aliases_present: boolean;
+  staleness_grid: StaleGridPoint[];
+  stale_closed_share_pct: number;
+  task_census: TaskCensus;
+  by_origin: DimensionPoint[];
+  by_model_family: DimensionPoint[];
+  currency_sensitivity: Record<string, CurrencyPoint>;
+  anomaly_preconditions: AnomalyPreconditions;
+  join_quality_x1: JoinQualityX1 | null;
+  verdict: Verdict;
+  licenses: string | null;
+}
+
+/**
+ * Runs the whole live gate against an already-open `Database`. Exported so tests can
+ * drive it against a fixture DB without going through `openDb`/CLI argv parsing; the
+ * caller owns `db`'s lifecycle (open + close) either way.
+ */
+export async function runLive(
+  db: Database,
+  opts: {
+    dbLabel?: string;
+    since?: string;
+    hookMerge?: string;
+    skipX1?: boolean;
+    ingestLimit?: number;
+  } = {},
+): Promise<LiveReport> {
+  const t0 = Date.now();
+  const since = opts.since ?? CUTOVER_DEFAULT;
+  const now = new Date().toISOString();
+
+  const headline = computeHeadline(db, { since });
+  const epochs =
+    opts.hookMerge !== undefined
+      ? {
+          pre_hook_merge: computeHeadline(db, { since, until: opts.hookMerge }),
+          post_hook_merge: computeHeadline(db, { since: opts.hookMerge, until: now }),
+        }
+      : null;
+
+  const census = taskCensus(db, { since });
+  const preconds = anomalyPreconditions(db);
+  const staleShare = staleClosedShare(db, { since });
+  const origins = byDimension(db, "origin", { since });
+  const families = byDimension(db, "model_family", { since });
+  const currencies = currencySensitivity(db, { since });
+  const hadHookAliases = num(db, "SELECT COUNT(*) AS v FROM task_alias WHERE source='hook'") > 0;
+
+  // The master temp copy: one VACUUM INTO of the live DB, reused as the pristine base
+  // for every mutating recompute below (cheap `cp` per grid point, not a second
+  // VACUUM INTO per point).
+  const workDir = mkdtempSync(join(tmpdir(), "g-attr-live-master-"));
+  const masterPath = join(workDir, "master.db");
+  let exHookPct: number;
+  let grid: StaleGridPoint[];
+  try {
+    vacuumInto(db.filename, masterPath);
+    exHookPct = coverageExHook(masterPath, { since });
+    const w = attrWindow(db);
+    const curTurns = w.maxQuietTurns;
+    const curMinutes = w.staleMs / 60_000;
+    const turnsGrid = [...new Set([Math.max(1, curTurns - 2), curTurns, curTurns + 3])].sort(
+      (a, b) => a - b,
+    );
+    const minutesGrid = [
+      ...new Set([Math.max(15, Math.round(curMinutes / 2)), Math.round(curMinutes), curMinutes * 2]),
+    ].sort((a, b) => a - b);
+    grid = stalenessGrid(masterPath, { since }, turnsGrid, minutesGrid);
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+
+  const x1 = opts.skipX1 === true ? null : await ingestCompleteness(db, opts.ingestLimit ?? Infinity);
+
+  const verdict = verdictOf(headline.coverage_pct, preconds);
+
+  return {
+    generated_at: now,
+    elapsed_ms: Date.now() - t0,
+    db: opts.dbLabel ?? DB_PATH,
+    window: { since, hook_merge: opts.hookMerge ?? null },
+    headline: {
+      coverage_pct: headline.coverage_pct,
+      threshold_pct: ATTR_COVERAGE_GATE * 100,
+      exclusive_pct: 100 * ratio(headline.L2.exclusive, headline.L2.total),
+      sticky_pct: 100 * ratio(headline.L2.sticky, headline.L2.total),
+      ambiguous_pct: 100 * ratio(headline.L2.ambiguous, headline.L2.total),
+    },
+    ladder: {
+      L0_all_window: summarizeTotals(headline.L0),
+      L1_tracked_sessions: summarizeTotals(headline.L1),
+      L2_calibration_eligible_base: summarizeTotals(headline.L2),
+      L3_headline_coverage_pct: headline.coverage_pct,
+      L4_plus_ambiguous_pct: headline.ambiguous_incl_pct,
+      E_prime_bridge_to_2026_07_pct: headline.e_prime_pct,
+    },
+    epochs,
+    coverage_ex_hook_pct: exHookPct,
+    hook_lift_pct: headline.coverage_pct - exHookPct,
+    hook_aliases_present: hadHookAliases,
+    staleness_grid: grid,
+    stale_closed_share_pct: staleShare,
+    task_census: census,
+    by_origin: origins,
+    by_model_family: families,
+    currency_sensitivity: currencies,
+    anomaly_preconditions: preconds,
+    join_quality_x1: x1,
+    verdict,
+    licenses: verdict === "PASS" ? D14_TEXT : null,
+  };
+}
+
+function pct(x: number): string {
+  return x.toFixed(1).padStart(5) + "%";
+}
+
+function printLiveReport(r: LiveReport): void {
+  const L = (s: string): void => {
+    process.stdout.write(s + "\n");
+  };
+  L("=== G-ATTR — live re-gate (design/GATE-LIVE-SEMANTICS.md) ===");
+  L(`db: ${r.db}  window: ${r.window.since} .. ${r.window.hook_merge ?? "(no epoch split)"}  (${r.elapsed_ms} ms)`);
+  L("");
+  L("headline — priced Work-CET, live request.attr, D3 base population:");
+  L(`  exclusive        ${pct(r.headline.exclusive_pct)}`);
+  L(`  sticky           ${pct(r.headline.sticky_pct)}`);
+  L(`  ------------------------`);
+  L(`  COVERAGE         ${pct(r.headline.coverage_pct)}   (threshold ${r.headline.threshold_pct.toFixed(0)}%)`);
+  L(`  ambiguous        ${pct(r.headline.ambiguous_pct)}`);
+  L("");
+  L("ladder:");
+  L(`  L0 all window Work-CET ............... total ${r.ladder.L0_all_window.total_wcet}`);
+  L(`  L1 + tracked sessions only ........... total ${r.ladder.L1_tracked_sessions.total_wcet}`);
+  L(`  L2 + non-overhead, main/subagent ..... total ${r.ladder.L2_calibration_eligible_base.total_wcet}`);
+  L(`  L3 exclusive∪sticky / L2 == HEADLINE . ${pct(r.ladder.L3_headline_coverage_pct)}`);
+  L(`  L4 + ambiguous / L2 ................... ${pct(r.ladder.L4_plus_ambiguous_pct)}`);
+  L(`  E′ bridge to 2026-07 (exclusive∪sticky / L0) ${pct(r.ladder.E_prime_bridge_to_2026_07_pct)}`);
+  L("");
+  L("hook lift (D9) — coverage with vs without source='hook' aliases, uncontaminated shadow run:");
+  L(
+    `  coverage_ex_hook ${pct(r.coverage_ex_hook_pct ?? 0)}   hook_lift ${((r.hook_lift_pct ?? 0) >= 0 ? "+" : "") + (r.hook_lift_pct ?? 0).toFixed(1)}pp` +
+      (r.hook_aliases_present ? "" : "   (no source='hook' aliases yet — lift is 0 by construction)"),
+  );
+  L(
+    `  anomaly preconditions: hook_bind_conflict=${r.anomaly_preconditions.hook_bind_conflict}  alias_split_identity=${r.anomaly_preconditions.alias_split_identity}`,
+  );
+  L("");
+  L("staleness sensitivity grid (D10):");
+  for (const g of r.staleness_grid) {
+    L(`  turns=${String(g.turns).padStart(2)}  minutes=${String(g.minutes).padStart(4)}  coverage ${pct(g.coverage_pct)}`);
+  }
+  L(`  stale_closed_share (pre_task inside a bound window) ${pct(r.stale_closed_share_pct)}`);
+  L("");
+  L("task census (D7 — task_alias population, not harness todo hygiene):");
+  L(
+    `  opened_in_window=${r.task_census.opened_in_window}  finalized_in_window=${r.task_census.finalized_in_window}  ` +
+      `still_open_now=${r.task_census.still_open_now}  never_attributed=${pct(r.task_census.never_attributed_pct)}`,
+  );
+  for (const a of r.task_census.alias_counts) {
+    L(`    alias ${a.id_kind.padEnd(14)} source=${a.source.padEnd(10)} n=${a.n}`);
+  }
+  L("");
+  L("currency sensitivity:");
+  for (const [name, p] of Object.entries(r.currency_sensitivity)) {
+    L(`  ${name.padEnd(14)} coverage ${pct(p.coverage_pct)}  total ${p.total}`);
+  }
+  L("");
+  L("by origin:");
+  for (const o of r.by_origin) L(`  ${o.key.padEnd(10)} ${pct(o.share_pct)} of base   coverage ${pct(o.coverage_pct)}`);
+  L("");
+  L("by model family:");
+  for (const f of r.by_model_family) {
+    if (f.share_pct < 0.05) continue;
+    L(`  ${f.key.padEnd(26)} ${pct(f.share_pct)} of base   coverage ${pct(f.coverage_pct)}`);
+  }
+  if (r.join_quality_x1 !== null) {
+    L("");
+    L("X1 — ingest completeness cross-check (transcripts vs DB, GLS D2):");
+    L(
+      `  sessions=${r.join_quality_x1.sessions}  transcript_unique=${r.join_quality_x1.transcript_unique_requests}  ` +
+        `db_unique(non-replay)=${r.join_quality_x1.db_unique_requests}`,
+    );
+    L(
+      `  unjoined_subagent ${pct(r.join_quality_x1.unjoined_subagent_pct)}  malformed=${r.join_quality_x1.malformed_lines}  ` +
+        `truncated=${r.join_quality_x1.truncated_tails}  sidechain_replays=${r.join_quality_x1.sidechain_replays_marked}`,
+    );
+  }
+  L("");
+  L(`VERDICT: ${r.verdict}`);
+  if (r.licenses !== null) {
+    L("");
+    L(r.licenses);
+  }
+}
+
+async function runLiveMain(argv: string[]): Promise<void> {
+  const dbPath = flag(argv, "--db") ?? DB_PATH;
+  const since = flag(argv, "--since") ?? CUTOVER_DEFAULT;
+  const hookMerge = flag(argv, "--hook-merge");
+  const jsonOut = flag(argv, "--json");
+  const limitFlag = flag(argv, "--limit-sessions");
+  const ingestLimit = limitFlag !== undefined ? Number(limitFlag) : Infinity;
+  const skipX1 = argv.includes("--skip-x1");
+
+  const live = openDb({ path: dbPath, readonly: true });
+  let report: LiveReport;
+  try {
+    report = await runLive(live, { dbLabel: dbPath, since, hookMerge, skipX1, ingestLimit });
+  } finally {
+    live.close();
+  }
+
+  printLiveReport(report);
+  if (jsonOut !== undefined) {
+    await Bun.write(jsonOut, JSON.stringify(report, null, 2));
+    process.stderr.write(`wrote ${jsonOut}\n`);
+  }
+}
+
+// ===========================================================================
+// --legacy-r3 — the FROZEN 2026-07 ladder (GLS D11), unrelated to the live
+// headline above and retained ONLY to reproduce `gates/g-attr.json`'s numbers
+// on today's transcript corpus. Do not read this as G-ATTR's answer: the
+// task grain here (harness `TaskCreate`) is exactly what D6 forbids for the
+// live measurement.
+// ===========================================================================
+
+interface LegacyCounters {
+  in: number;
+  out: number;
+  cw: number;
+  cr: number;
+}
+
+const LEGACY_CURRENCIES = {
+  wcet_unweighted: (r: LegacyCounters) => r.out + r.cw,
+  attr2_in_out_cw: (r: LegacyCounters) => r.in + r.out + r.cw,
+  out_only: (r: LegacyCounters) => r.out,
+  requests: () => 1,
+} as const;
+type LegacyCurrencyName = keyof typeof LEGACY_CURRENCIES;
+const LEGACY_CURRENCY_NAMES = Object.keys(LEGACY_CURRENCIES) as LegacyCurrencyName[];
+
+interface LegacyReq extends LegacyCounters {
+  request_id: string;
+  message_id: string | null;
+  is_sidechain: number;
+  session_id: string;
+  prompt_id: string | null;
+  origin: string;
+  model_family: string;
+  attribution_skill: string | null;
+  replay: boolean;
+}
+
+type LegacyTaskEventKind = "create" | "status" | "touch";
+interface LegacyTaskEvent {
+  ts: string;
+  taskId: string;
+  kind: LegacyTaskEventKind;
+  to: string | null;
+}
+
+function lstr(v: unknown): string | null {
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+async function readTaskStream(
+  path: string,
+): Promise<{ events: LegacyTaskEvent[]; turnStarts: Map<string, string> }> {
+  const events: LegacyTaskEvent[] = [];
+  const turnStarts = new Map<string, string>();
+  const seg = new TurnSegmenter(null);
+
+  await readJsonl(path, (raw) => {
+    const line = JSON.parse(raw) as TranscriptLine;
+    seg.push(line);
+
+    const ts = lstr(line.timestamp);
+    if (ts === null) return;
+
+    const promptId = seg.currentPromptId;
+    if (promptId !== null) {
+      const prev = turnStarts.get(promptId);
+      if (prev === undefined || ts < prev) turnStarts.set(promptId, ts);
+    }
+
+    if (line.type !== "user") return;
+    const tur = line.toolUseResult;
+    if (tur === null || typeof tur !== "object") return;
+    const r = tur as Record<string, unknown>;
+
+    const task = r.task;
+    if (task !== null && typeof task === "object") {
+      const id = lstr((task as Record<string, unknown>).id);
+      if (id !== null) {
+        events.push({ ts, taskId: id, kind: "create", to: "pending" });
+        return;
+      }
+    }
+
+    const sc = r.statusChange;
+    if (sc !== null && typeof sc === "object") {
+      const s = sc as Record<string, unknown>;
+      const id = lstr(r.taskId) ?? lstr(s.taskId);
+      if (id !== null) {
+        events.push({
+          ts,
+          taskId: id,
+          kind: "status",
+          to: lstr(s.to) ?? lstr(s.toStatus) ?? lstr(s.status),
+        });
+        return;
+      }
+    }
+
+    if (Array.isArray(r.updatedFields)) {
+      const id = lstr(r.taskId);
+      if (id !== null) events.push({ ts, taskId: id, kind: "touch", to: null });
+    }
+  });
+
+  return { events, turnStarts };
+}
+
+type LegacyAttrClass = "overhead" | "exclusive" | "sticky" | "ambiguous" | "pre_task";
+const LEGACY_CLOSED = new Set(["completed", "deleted", "cancelled", "canceled"]);
+
+interface LegacyTurnInfo {
+  promptId: string;
+  startedAt: string;
+  events: LegacyTaskEvent[];
+}
+interface LegacyClassifiedTurn {
+  promptId: string;
+  cls: LegacyAttrClass;
+}
+
+function classifySession(turns: LegacyTurnInfo[]): LegacyClassifiedTurn[] {
+  const open: string[] = [];
+  let lastTouched: string | null = null;
+
+  const isOpening = (e: LegacyTaskEvent): boolean =>
+    e.kind === "create" || (e.to !== null && !LEGACY_CLOSED.has(e.to));
+  const isClosing = (e: LegacyTaskEvent): boolean => e.to !== null && LEGACY_CLOSED.has(e.to);
+
+  const apply = (e: LegacyTaskEvent): void => {
+    if (isClosing(e)) {
+      const i = open.indexOf(e.taskId);
+      if (i >= 0) open.splice(i, 1);
+    } else if (isOpening(e)) {
+      if (!open.includes(e.taskId)) open.push(e.taskId);
+    }
+    lastTouched = e.taskId;
+  };
+
+  const label = (): LegacyAttrClass => {
+    if (open.length === 1) return "exclusive";
+    if (open.length > 1) return "ambiguous";
+    return lastTouched === null ? "pre_task" : "sticky";
+  };
+
+  const out: LegacyClassifiedTurn[] = [];
+  for (const t of turns) {
+    for (const e of t.events) apply(e);
+    out.push({ promptId: t.promptId, cls: label() });
+  }
+  return out;
+}
+
+class LegacyTally {
+  readonly byClass = new Map<string, Record<LegacyCurrencyName, number>>();
+  total: Record<LegacyCurrencyName, number> = zeroLegacyBucket();
+
+  add(cls: string, r: LegacyCounters): void {
+    let b = this.byClass.get(cls);
+    if (b === undefined) {
+      b = zeroLegacyBucket();
+      this.byClass.set(cls, b);
+    }
+    addToLegacy(b, r);
+    addToLegacy(this.total, r);
+  }
+
+  share(cls: string | string[], cur: LegacyCurrencyName): number {
+    const keys = Array.isArray(cls) ? cls : [cls];
+    const denom = this.total[cur];
+    if (denom === 0) return 0;
+    let n = 0;
+    for (const k of keys) n += this.byClass.get(k)?.[cur] ?? 0;
+    return (100 * n) / denom;
+  }
+}
+function zeroLegacyBucket(): Record<LegacyCurrencyName, number> {
+  return { wcet_unweighted: 0, attr2_in_out_cw: 0, out_only: 0, requests: 0 };
+}
+function addToLegacy(b: Record<LegacyCurrencyName, number>, r: LegacyCounters): void {
+  for (const n of LEGACY_CURRENCY_NAMES) b[n] += LEGACY_CURRENCIES[n](r);
+}
+
+function legacyUpsertMax(into: Map<string, LegacyReq>, row: RequestRow): void {
+  const cur = into.get(row.request_id);
+  if (cur === undefined) {
+    into.set(row.request_id, {
+      request_id: row.request_id,
+      message_id: row.message_id,
+      is_sidechain: row.is_sidechain,
+      session_id: row.session_id,
+      prompt_id: row.prompt_id,
+      origin: row.origin,
+      model_family: row.model_family,
+      attribution_skill: row.attribution_skill,
+      in: row.in_tok,
+      out: row.out_tok,
+      cw: row.cw_tok,
+      cr: row.cr_tok,
+      replay: false,
+    });
+    return;
+  }
+  cur.in = Math.max(cur.in, row.in_tok);
+  cur.out = Math.max(cur.out, row.out_tok);
+  cur.cw = Math.max(cur.cw, row.cw_tok);
+  cur.cr = Math.max(cur.cr, row.cr_tok);
+  if (cur.prompt_id === null && row.prompt_id !== null) cur.prompt_id = row.prompt_id;
+}
+
+function legacyMarkReplays(reqs: Map<string, LegacyReq>): number {
+  const byMessage = new Map<string, LegacyReq[]>();
+  for (const r of reqs.values()) {
+    if (r.message_id === null) continue;
+    const list = byMessage.get(r.message_id);
+    if (list === undefined) byMessage.set(r.message_id, [r]);
+    else list.push(r);
+  }
+  let marked = 0;
+  for (const list of byMessage.values()) {
+    if (list.length < 2) continue;
+    let winner = list[0]!;
+    for (const c of list.slice(1)) {
+      const better =
+        c.is_sidechain !== winner.is_sidechain
+          ? c.is_sidechain < winner.is_sidechain
+          : c.in + c.out + c.cw + c.cr !== winner.in + winner.out + winner.cw + winner.cr
+            ? c.in + c.out + c.cw + c.cr > winner.in + winner.out + winner.cw + winner.cr
+            : c.request_id < winner.request_id;
+      if (better) winner = c;
+    }
+    for (const r of list) {
+      if (r !== winner) {
+        r.replay = true;
+        marked += 1;
+      }
+    }
+  }
+  return marked;
+}
+
+async function runLegacyR3(argv: string[]): Promise<void> {
+  const jsonOut = flag(argv, "--json");
+  const limitFlag = flag(argv, "--limit");
+  const limit = limitFlag !== undefined ? Number(limitFlag) : Infinity;
 
   const t0 = Date.now();
   const corpus = discoverCorpus();
   const sessions = corpus.sessions.slice(0, limit);
   process.stderr.write(
-    `discovered ${corpus.sessions.length} sessions, ${corpus.census.files} files, ` +
-      `${(corpus.census.bytes / 1e6).toFixed(0)} MB in ${Date.now() - t0} ms\n`,
+    `[legacy-r3] discovered ${corpus.sessions.length} sessions, ${corpus.census.files} files, ` +
+      `${(corpus.census.bytes / 1e6).toFixed(0)} MB\n`,
   );
 
-  // Turn class, keyed `${sessionId}|${promptId}`, for each open-definition
-  // and each evaluation point.
-  const clsR3 = new Map<string, AttrClass>();
-  const clsR3Start = new Map<string, AttrClass>();
-  const clsInProg = new Map<string, AttrClass>();
-  const openSizeR3 = new Map<string, number>();
-  const openSizeInProg = new Map<string, number>();
+  const cls = new Map<string, LegacyAttrClass>();
   const sessionsWithNoTasks = new Set<string>();
-  const sessionSummaries: SessionSummary[] = [];
-
-  const requests = new Map<string, Req>();
-  let ingestAnomalies = 0;
+  const requests = new Map<string, LegacyReq>();
   let malformed = 0;
   let truncated = 0;
 
-  let done = 0;
   for (const session of sessions) {
-    await processSession(session);
-    done += 1;
-    if (done % 25 === 0) process.stderr.write(`  ${done}/${sessions.length} sessions\r`);
+    await processLegacySession(session);
   }
-  process.stderr.write(`\n`);
 
-  async function processSession(session: SessionCorpus): Promise<void> {
-    // --- task stream + turn starts, from every main transcript of the session --
-    const events: TaskEvent[] = [];
-    const seenEvent = new Set<string>();
+  async function processLegacySession(session: SessionCorpus): Promise<void> {
+    const events: LegacyTaskEvent[] = [];
+    const seen = new Set<string>();
     const turnStarts = new Map<string, string>();
     for (const path of session.mainTranscripts) {
       const { events: evs, turnStarts: ts } = await readTaskStream(path);
       for (const e of evs) {
-        // A session can be written under several munged project dirs (§5.1);
-        // identical events must not be replayed into the state machine twice.
         const k = `${e.ts}|${e.taskId}|${e.kind}|${e.to ?? ""}`;
-        if (seenEvent.has(k)) continue;
-        seenEvent.add(k);
+        if (seen.has(k)) continue;
+        seen.add(k);
         events.push(e);
       }
       for (const [p, t] of ts) {
@@ -420,400 +1163,110 @@ async function main(): Promise<void> {
     }
     events.sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
 
-    // --- turns in time order, each carrying the events that fall inside it ----
-    const ordered = [...turnStarts.entries()].sort((a, b) =>
-      a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0,
-    );
-    const turns: TurnInfo[] = ordered.map(([promptId, startedAt]) => ({
+    const ordered = [...turnStarts.entries()].sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+    const turns: LegacyTurnInfo[] = ordered.map(([promptId, startedAt]) => ({
       promptId,
       startedAt,
       events: [],
     }));
-    // Assign each event to the last turn that had already started. Events before
-    // any turn attach to the first turn, so pre-prompt hook activity is not lost.
     let ti = 0;
     for (const e of events) {
       while (ti + 1 < turns.length && turns[ti + 1]!.startedAt <= e.ts) ti += 1;
       if (turns.length > 0) turns[ti]!.events.push(e);
     }
-
     if (events.length === 0) sessionsWithNoTasks.add(session.sessionId);
 
-    const sizeR3 = new Map<string, number>();
-    for (const c of classifySession(turns, "r3_not_closed", sizeR3)) {
-      clsR3.set(`${session.sessionId}|${c.promptId}`, c.cls);
-      clsR3Start.set(`${session.sessionId}|${c.promptId}`, c.clsAtStart);
-    }
-    for (const [p, n] of sizeR3) openSizeR3.set(`${session.sessionId}|${p}`, n);
+    for (const c of classifySession(turns)) cls.set(`${session.sessionId}|${c.promptId}`, c.cls);
 
-    const sizeIP = new Map<string, number>();
-    for (const c of classifySession(turns, "in_progress_only", sizeIP)) {
-      clsInProg.set(`${session.sessionId}|${c.promptId}`, c.cls);
-    }
-    for (const [p, n] of sizeIP) openSizeInProg.set(`${session.sessionId}|${p}`, n);
-
-    // --- requests (main + every sub-agent), via the shipped ingest ------------
     const batch = await ingestSession(session);
-    for (const row of batch.requests) upsertMax(requests, row);
-    ingestAnomalies += batch.anomalies.length;
+    for (const row of batch.requests) legacyUpsertMax(requests, row);
     malformed += batch.stats.malformed;
     truncated += batch.stats.truncatedTail;
-
-    let wcet = 0;
-    for (const r of batch.requests) wcet += r.out_tok + r.cw_tok;
-    const closed = new Set(
-      events.filter((e) => e.to !== null && CLOSED.has(e.to)).map((e) => e.taskId),
-    );
-    sessionSummaries.push({
-      sessionId: session.sessionId,
-      taskEvents: events.length,
-      distinctTasks: new Set(events.map((e) => e.taskId)).size,
-      closedTasks: closed.size,
-      maxOpen: Math.max(0, ...[...sizeR3.values()]),
-      turns: turns.length,
-      wcet,
-    });
   }
 
-  const replays = markSidechainReplays(requests);
+  const replays = legacyMarkReplays(requests);
 
-  // --- roll up ---------------------------------------------------------------
-  const all = new Tally(); // R3 open-def, end-of-turn, WHOLE corpus
-  const start = new Tally(); // R3 open-def, start-of-turn
-  const inprog = new Tally(); // in_progress-only open-def (attr2.py's)
-  const taskBearing = new Tally(); // R3, restricted to sessions with >=1 task event
-  const byOrigin = new Map<string, Tally>();
-  const byFamily = new Map<string, Tally>();
+  const all = new LegacyTally();
+  const ladderC = new LegacyTally(); // + sub-agent tokens, in_progress-style def not reproduced here
+  const attr2 = new LegacyTally(); // main-only, task-bearing sessions
 
-  const attr2 = new Tally(); // faithful `attr2.py` replication
-  /** Ladder rung C: all origins, task-bearing sessions, in_progress-only def. */
-  const ladderC = new Tally();
-  const openHistR3 = new Tally();
-  const openHistIP = new Tally();
-
-  let unjoined = zeroBucket(); // no promptId, or a promptId with no turn
-  let unjoinedSub = zeroBucket();
-  let replayed = zeroBucket();
-  let overheadSkill = 0;
-
-  const classOf = (m: Map<string, AttrClass>, r: Req): AttrClass | null => {
+  const classOf = (r: LegacyReq): LegacyAttrClass | null => {
     if (r.prompt_id === null) return null;
-    return m.get(`${r.session_id}|${r.prompt_id}`) ?? null;
+    return cls.get(`${r.session_id}|${r.prompt_id}`) ?? null;
   };
 
   for (const r of requests.values()) {
-    if (r.replay) {
-      addTo(replayed, r);
-      continue;
-    }
-    if (r.attribution_skill === "estimating") overheadSkill += 1;
-
-    const c = classOf(clsR3, r);
+    if (r.replay) continue;
+    const c = classOf(r);
     if (c === null) {
-      addTo(unjoined, r);
-      if (r.origin === "subagent") addTo(unjoinedSub, r);
-      // §5.4 rule 3's floor: an unjoinable request is pre_task, never NULL.
       all.add("pre_task", r);
-      if (!sessionsWithNoTasks.has(r.session_id)) taskBearing.add("pre_task", r);
-      start.add("pre_task", r);
-      inprog.add("pre_task", r);
     } else {
       all.add(c, r);
-      if (!sessionsWithNoTasks.has(r.session_id)) taskBearing.add(c, r);
-      start.add(classOf(clsR3Start, r) ?? "pre_task", r);
-      inprog.add(classOf(clsInProg, r) ?? "pre_task", r);
     }
-
-    let o = byOrigin.get(r.origin);
-    if (o === undefined) byOrigin.set(r.origin, (o = new Tally()));
-    o.add(c ?? "pre_task", r);
-
-    let f = byFamily.get(r.model_family);
-    if (f === undefined) byFamily.set(r.model_family, (f = new Tally()));
-    f.add(c ?? "pre_task", r);
-
-    // Faithful replication of the original `attr2.py`, for the 82.8/26.5/45.9
-    // comparison: MAIN transcripts only (its glob never reached sub-agent dirs),
-    // task-bearing sessions only, in_progress-only open-def.
+    if (!sessionsWithNoTasks.has(r.session_id)) ladderC.add(c ?? "pre_task", r);
     if (r.origin === "main" && !sessionsWithNoTasks.has(r.session_id)) {
-      attr2.add(classOf(clsInProg, r) ?? "pre_task", r);
+      attr2.add(c ?? "pre_task", r);
     }
-    if (!sessionsWithNoTasks.has(r.session_id)) {
-      ladderC.add(classOf(clsInProg, r) ?? "pre_task", r);
-    }
-
-    // How many tasks were open, token-weighted — this is what explains a large
-    // `ambiguous` share, and whether it is a definition artefact or real WIP.
-    const n3 = r.prompt_id === null ? null : (openSizeR3.get(`${r.session_id}|${r.prompt_id}`) ?? null);
-    openHistR3.add(n3 === null ? "unjoined" : n3 >= 6 ? "6+" : String(n3), r);
-    const nI = r.prompt_id === null ? null : (openSizeInProg.get(`${r.session_id}|${r.prompt_id}`) ?? null);
-    openHistIP.add(nI === null ? "unjoined" : nI >= 6 ? "6+" : String(nI), r);
-  }
-
-  // tokens living in sessions that never created or touched a single task
-  const zeroTaskSession = zeroBucket();
-  for (const r of requests.values()) {
-    if (!r.replay && sessionsWithNoTasks.has(r.session_id)) addTo(zeroTaskSession, r);
   }
 
   const COV = ["exclusive", "sticky"];
-  const cur: CurrencyName = "wcet_unweighted";
+  const cur: LegacyCurrencyName = "wcet_unweighted";
 
   const report = {
     generated_at: new Date().toISOString(),
     elapsed_ms: Date.now() - t0,
+    note: "FROZEN 2026-07 ladder reproduction (design/GATE-LIVE-SEMANTICS.md D11) — not the live headline",
     corpus: {
-      root: corpus.root,
       sessions: sessions.length,
       files: corpus.census.files,
       bytes: corpus.census.bytes,
-      oldest_mtime: corpus.census.oldestMtime,
-      discovery_anomalies: corpus.anomalies.length,
-      ingest_anomalies: ingestAnomalies,
-      malformed_lines: malformed,
-      truncated_tails: truncated,
       unique_requests: requests.size,
       sidechain_replays_marked: replays,
-      requests_with_estimating_skill: overheadSkill,
+      malformed_lines: malformed,
+      truncated_tails: truncated,
     },
     headline: {
-      currency: cur,
       coverage_pct: all.share(COV, cur),
       exclusive_pct: all.share("exclusive", cur),
       sticky_pct: all.share("sticky", cur),
       ambiguous_pct: all.share("ambiguous", cur),
       pre_task_pct: all.share("pre_task", cur),
-      zero_open_pct: all.share(["sticky", "pre_task"], cur),
-      zero_task_session_pct: (100 * zeroTaskSession[cur]) / all.total[cur],
-      zero_task_sessions: sessionsWithNoTasks.size,
     },
-    variants: {
-      task_bearing_sessions_only: {
-        coverage_pct: taskBearing.share(COV, cur),
-        exclusive_pct: taskBearing.share("exclusive", cur),
-        zero_open_pct: taskBearing.share(["sticky", "pre_task"], cur),
-        ambiguous_pct: taskBearing.share("ambiguous", cur),
-      },
-      start_of_turn_evaluation: {
-        coverage_pct: start.share(COV, cur),
-        exclusive_pct: start.share("exclusive", cur),
-      },
-      in_progress_only_open_def: {
-        coverage_pct: inprog.share(COV, cur),
-        exclusive_pct: inprog.share("exclusive", cur),
-        ambiguous_pct: inprog.share("ambiguous", cur),
-      },
-      attr2_headline_incl_ambiguous: all.share([...COV, "ambiguous"], cur),
-    },
-    /** The original probe, reproduced on its own terms (§ header comment). */
-    attr2_replication: {
-      note: "main transcripts only, task-bearing sessions only, in_progress-only open-def, in+out+cw",
-      headline_coverage_incl_ambiguous_pct: attr2.share(
-        ["exclusive", "sticky", "ambiguous"],
-        "attr2_in_out_cw",
-      ),
-      strict_exclusive_pct: attr2.share("exclusive", "attr2_in_out_cw"),
-      sticky_pct: attr2.share("sticky", "attr2_in_out_cw"),
-      ambiguous_pct: attr2.share("ambiguous", "attr2_in_out_cw"),
-      pre_task_pct: attr2.share("pre_task", "attr2_in_out_cw"),
-      zero_open_pct: attr2.share(["sticky", "pre_task"], "attr2_in_out_cw"),
-      /** Coverage as R3 defines it (exclusive ∪ sticky), on the probe's data. */
-      r3_coverage_pct: attr2.share(COV, "attr2_in_out_cw"),
-    },
-    /**
-     * Why the headline is not 82.8%, one correction at a time. Every rung is
-     * `exclusive ∪ sticky` in Work-CET (out+cw); only the stated change differs
-     * from the rung above it.
-     */
     ladder: {
-      A_attr2_own_headline_incl_ambiguous: attr2.share(
-        [...COV, "ambiguous"],
-        "attr2_in_out_cw",
-      ),
+      A_attr2_own_headline_incl_ambiguous: attr2.share(["exclusive", "sticky", "ambiguous"], "attr2_in_out_cw"),
       B_same_data_r3_coverage_def: attr2.share(COV, cur),
       C_plus_subagent_tokens: ladderC.share(COV, cur),
-      D_plus_zero_task_sessions: inprog.share(COV, cur),
-      E_plus_r3_open_def_HEADLINE: all.share(COV, cur),
+      E_r3_open_def_HEADLINE: all.share(COV, cur),
     },
-    open_task_histogram: {
-      r3_not_closed: Object.fromEntries(
-        [...openHistR3.byClass].map(([k, b]) => [k, (100 * b[cur]) / openHistR3.total[cur]]),
-      ),
-      in_progress_only: Object.fromEntries(
-        [...openHistIP.byClass].map(([k, b]) => [k, (100 * b[cur]) / openHistIP.total[cur]]),
-      ),
-    },
-    currencies: Object.fromEntries(
-      CURRENCY_NAMES.map((c) => [
-        c,
-        {
-          coverage_pct: all.share(COV, c),
-          exclusive_pct: all.share("exclusive", c),
-          zero_open_pct: all.share(["sticky", "pre_task"], c),
-          total: all.total[c],
-        },
-      ]),
-    ),
-    by_origin: Object.fromEntries(
-      [...byOrigin].map(([k, t]) => [
-        k,
-        {
-          coverage_pct: t.share(COV, cur),
-          exclusive_pct: t.share("exclusive", cur),
-          share_of_corpus_pct: (100 * t.total[cur]) / all.total[cur],
-          total: t.total[cur],
-        },
-      ]),
-    ),
-    by_model_family: Object.fromEntries(
-      [...byFamily]
-        .sort((a, b) => b[1].total[cur] - a[1].total[cur])
-        .map(([k, t]) => [
-          k,
-          {
-            coverage_pct: t.share(COV, cur),
-            share_of_corpus_pct: (100 * t.total[cur]) / all.total[cur],
-          },
-        ]),
-    ),
-    join_quality: {
-      unjoined_pct: (100 * unjoined[cur]) / all.total[cur],
-      unjoined_subagent_pct: (100 * unjoinedSub[cur]) / all.total[cur],
-      replay_excluded_pct: (100 * replayed[cur]) / (all.total[cur] + replayed[cur]),
-    },
-    task_hygiene: (() => {
-      const bearing = sessionSummaries.filter((s) => s.taskEvents > 0);
-      const created = bearing.reduce((a, s) => a + s.distinctTasks, 0);
-      const closed = bearing.reduce((a, s) => a + s.closedTasks, 0);
-      return {
-        task_bearing_sessions: bearing.length,
-        tasks_created: created,
-        tasks_ever_closed: closed,
-        never_closed_pct: created === 0 ? 0 : (100 * (created - closed)) / created,
-        median_tasks_per_bearing_session: bearing.length === 0
-          ? 0
-          : bearing.map((s) => s.distinctTasks).sort((a, b) => a - b)[
-              Math.floor(bearing.length / 2)
-            ]!,
-        max_simultaneously_open: Math.max(0, ...bearing.map((s) => s.maxOpen)),
-      };
-    })(),
-    top_sessions: sessionSummaries
-      .sort((a, b) => b.wcet - a.wcet)
-      .slice(0, 15)
-      .map((s) => ({ ...s, sessionId: s.sessionId.slice(0, 8) })),
-    verdict: all.share(COV, cur) < 70 ? "ESCALATE" : "PASS",
+    verdict: all.share(COV, cur) < ATTR_COVERAGE_GATE * 100 ? "ESCALATE" : "PASS",
   };
 
-  const pct = (x: number): string => x.toFixed(1).padStart(5) + "%";
   const L = (s: string): void => {
     process.stdout.write(s + "\n");
   };
-
-  L("=== G-ATTR — sticky attribution feasibility (R3 §5.4), turn grain ===");
-  L(
-    `corpus: ${report.corpus.sessions} sessions, ${report.corpus.files} files, ` +
-      `${(report.corpus.bytes / 1e6).toFixed(0)} MB, ${report.corpus.unique_requests} unique requests` +
-      ` (${report.elapsed_ms} ms)`,
-  );
-  L("");
-  L("headline — Work-CET (out+cw), whole corpus, end-of-turn, R3 open-def:");
-  L(`  exclusive        ${pct(report.headline.exclusive_pct)}`);
-  L(`  sticky           ${pct(report.headline.sticky_pct)}`);
-  L(`  ------------------------`);
-  L(`  COVERAGE         ${pct(report.headline.coverage_pct)}   (threshold 70%)`);
-  L(`  ambiguous        ${pct(report.headline.ambiguous_pct)}`);
-  L(`  pre_task         ${pct(report.headline.pre_task_pct)}`);
-  L(`  zero-open        ${pct(report.headline.zero_open_pct)}`);
-  L(
-    `  zero-task-session${pct(report.headline.zero_task_session_pct)}   ` +
-      `(${report.headline.zero_task_sessions}/${report.corpus.sessions} sessions)`,
-  );
-  L("");
-  L("variants:");
-  L(
-    `  task-bearing sessions only : coverage ${pct(report.variants.task_bearing_sessions_only.coverage_pct)}  ` +
-      `exclusive ${pct(report.variants.task_bearing_sessions_only.exclusive_pct)}  ` +
-      `zero-open ${pct(report.variants.task_bearing_sessions_only.zero_open_pct)}`,
-  );
-  L(
-    `  start-of-turn evaluation   : coverage ${pct(report.variants.start_of_turn_evaluation.coverage_pct)}  ` +
-      `exclusive ${pct(report.variants.start_of_turn_evaluation.exclusive_pct)}`,
-  );
-  L(
-    `  in_progress-only open-def  : coverage ${pct(report.variants.in_progress_only_open_def.coverage_pct)}  ` +
-      `exclusive ${pct(report.variants.in_progress_only_open_def.exclusive_pct)}  ` +
-      `ambiguous ${pct(report.variants.in_progress_only_open_def.ambiguous_pct)}`,
-  );
-  L(`  attr2 headline (cov+ambig) : ${pct(report.variants.attr2_headline_incl_ambiguous)}`);
-  L("");
-  L("attr2.py replication (main-only, task-bearing sessions, in_progress def, in+out+cw):");
-  L(
-    `  its headline (cov+ambig)   ${pct(report.attr2_replication.headline_coverage_incl_ambiguous_pct)}` +
-      `   [original: 82.8%]`,
-  );
-  L(`  strict exclusive           ${pct(report.attr2_replication.strict_exclusive_pct)}   [original: 26.5%]`);
-  L(`  zero-open                  ${pct(report.attr2_replication.zero_open_pct)}   [original: 45.9%]`);
-  L(`  R3 coverage on its data    ${pct(report.attr2_replication.r3_coverage_pct)}`);
-  L("");
-  L("decomposition ladder (coverage = exclusive ∪ sticky unless noted):");
-  L(`  A  attr2.py's own headline, incl. ambiguous ....... ${pct(report.ladder.A_attr2_own_headline_incl_ambiguous)}`);
-  L(`  B  same data, R3 coverage def (drop ambiguous) .... ${pct(report.ladder.B_same_data_r3_coverage_def)}`);
-  L(`  C  + sub-agent tokens (82% of corpus) ............. ${pct(report.ladder.C_plus_subagent_tokens)}`);
-  L(`  D  + sessions with no tasks at all ................ ${pct(report.ladder.D_plus_zero_task_sessions)}`);
-  L(`  E  + R3 "open = not closed" def  == HEADLINE ...... ${pct(report.ladder.E_plus_r3_open_def_HEADLINE)}`);
-  L("");
-  L("open-task count when a token was spent (token-weighted %):");
-  for (const [defName, hist] of Object.entries(report.open_task_histogram)) {
-    const entries = Object.entries(hist as Record<string, number>).sort((a, b) =>
-      a[0].localeCompare(b[0], undefined, { numeric: true }),
-    );
-    L(`  ${defName.padEnd(16)} ` + entries.map(([k, v]) => `${k}:${v.toFixed(1)}%`).join("  "));
-  }
-  L("");
-  L("currency sensitivity:");
-  for (const c of CURRENCY_NAMES) {
-    const v = report.currencies[c] as { coverage_pct: number; exclusive_pct: number };
-    L(`  ${c.padEnd(18)} coverage ${pct(v.coverage_pct)}  exclusive ${pct(v.exclusive_pct)}`);
-  }
-  L("");
-  L("by origin:");
-  for (const [k, v] of Object.entries(report.by_origin)) {
-    const o = v as { coverage_pct: number; share_of_corpus_pct: number };
-    L(
-      `  ${k.padEnd(10)} ${pct(o.share_of_corpus_pct)} of corpus   coverage ${pct(o.coverage_pct)}`,
-    );
-  }
-  L("");
-  L("by model family (reweighting sensitivity):");
-  for (const [k, v] of Object.entries(report.by_model_family)) {
-    const f = v as { coverage_pct: number; share_of_corpus_pct: number };
-    if (f.share_of_corpus_pct < 0.05) continue;
-    L(`  ${k.padEnd(26)} ${pct(f.share_of_corpus_pct)} of corpus   coverage ${pct(f.coverage_pct)}`);
-  }
-  L("");
-  L("task hygiene (why `ambiguous` is so large):");
-  L(
-    `  ${report.task_hygiene.task_bearing_sessions} task-bearing sessions, ` +
-      `${report.task_hygiene.tasks_created} tasks created, ` +
-      `${report.task_hygiene.never_closed_pct.toFixed(1)}% never reached a terminal status`,
-  );
-  L(
-    `  median ${report.task_hygiene.median_tasks_per_bearing_session} tasks/session, ` +
-      `max ${report.task_hygiene.max_simultaneously_open} open at once`,
-  );
-  L("");
-  L("join quality:");
-  L(`  unjoined (no turn)   ${pct(report.join_quality.unjoined_pct)}`);
-  L(`  ...of which subagent ${pct(report.join_quality.unjoined_subagent_pct)}`);
-  L(`  sidechain replays    ${pct(report.join_quality.replay_excluded_pct)} excluded`);
-  L("");
+  L("=== G-ATTR --legacy-r3 — frozen 2026-07 ladder reproduction ===");
+  L(`corpus: ${report.corpus.sessions} sessions, ${report.corpus.unique_requests} unique requests`);
+  L(`  COVERAGE ${pct(report.headline.coverage_pct)}  exclusive ${pct(report.headline.exclusive_pct)}  sticky ${pct(report.headline.sticky_pct)}`);
+  L(`  ambiguous ${pct(report.headline.ambiguous_pct)}  pre_task ${pct(report.headline.pre_task_pct)}`);
   L(`VERDICT: ${report.verdict}`);
 
-  if (jsonOut !== undefined && jsonOut !== null) {
+  if (jsonOut !== undefined) {
     await Bun.write(jsonOut, JSON.stringify(report, null, 2));
     process.stderr.write(`wrote ${jsonOut}\n`);
   }
 }
 
-await main();
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  const argv = Bun.argv.slice(2);
+  if (argv.includes("--legacy-r3")) {
+    await runLegacyR3(argv);
+    return;
+  }
+  await runLiveMain(argv);
+}
+
+if (import.meta.main) {
+  await main();
+}

@@ -143,6 +143,9 @@ export interface RequestSpec {
   skill?: string | null;
   attr?: string;
   durationMs?: number | null;
+  /** Pre-attributed rows (skipping `attributeTasks`) — a gate/aggregation test that
+   *  seeds `request.attr` directly rather than driving the attribution pass. */
+  tid?: string | null;
 }
 
 /** One priced request. `out`/`cw` are what Work-CET is made of (§4.1). */
@@ -153,7 +156,7 @@ export function request(db: Database, id: string, spec: RequestSpec = {}): void 
                           agent_id, run_id, wf_launch_id, model, model_family,
                           attribution_agent, attribution_skill, ts,
                           in_tok, out_tok, cw_tok, cr_tok, duration_ms, tid, attr)
-     VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+     VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     `msg-${id}`,
@@ -172,6 +175,7 @@ export function request(db: Database, id: string, spec: RequestSpec = {}): void 
     spec.cw ?? 0,
     spec.cr ?? 0,
     spec.durationMs ?? null,
+    spec.tid ?? null,
     spec.attr ?? "none",
   );
 }

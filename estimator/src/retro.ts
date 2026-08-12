@@ -66,6 +66,46 @@ import { JOBS_ROOT, jobsRetroPanel, type JobsPanelRow } from "./jobs.ts";
 /** The G-ATTR bar. Below this, the historical corpus is not calibration-grade. */
 export const ATTR_COVERAGE_GATE = 0.7;
 
+/** Classes counted as attributed for calibration purposes (design/GATE-LIVE-SEMANTICS.md
+ *  D3). `sticky` has no writer in `src/attribute.ts` today (D1's rewrite rationale) and
+ *  is carried here only so a future writer does not have to touch this predicate too. */
+export const ATTR_COVERAGE_CLASSES = ["exclusive", "sticky"] as const;
+
+/**
+ * D3 (design/GATE-LIVE-SEMANTICS.md) — the base population the live G-ATTR headline
+ * and this file's coverage numbers must share, so the number that licenses
+ * calibration is defined once. Two definitions of it is the July failure (a
+ * `sticky`-inclusive number nobody's code ever computed) repeating itself in a new
+ * column.
+ *
+ * Returned as `{sql, params}` — a WHERE-clause fragment over `v_wcet` — rather than
+ * executed here, because the gate runs it against database copies (the `source='hook'`
+ * shadow, the staleness sensitivity grid) this file never opens. `until` is exclusive,
+ * matching half-open epoch windows (`[cutover, hook-merge)`, `[hook-merge, now]`).
+ *
+ * Deliberately NOT plugged into `qualityPanel`'s own `coverage_tracked` below: that
+ * query's denominator additionally admits `replay`/`overhead`/`auxiliary` origin, which
+ * is wrong in the same way this predicate corrects, but re-basing it is a follow-up
+ * (design/GATE-LIVE-SEMANTICS.md §7.2), not this export's job — changing what `retro.ts`
+ * itself reports is a behaviour change the live G-ATTR re-gate does not require.
+ */
+export function attrBaseFilter(w: { since: string; until?: string }): {
+  sql: string;
+  params: string[];
+} {
+  const params: string[] = [w.since];
+  let sql = `ts >= ?
+    AND origin IN ('main','subagent')
+    AND attr <> 'replay'
+    AND attr <> 'overhead'
+    AND session_id IN (SELECT DISTINCT session_id FROM task_alias WHERE session_id <> '')`;
+  if (w.until !== undefined) {
+    sql += ` AND ts < ?`;
+    params.push(w.until);
+  }
+  return { sql, params };
+}
+
 /**
  * The decomposition mandate's threshold, in STORY POINTS — the "~40" that
  * `skills/estimating/SKILL.md` and `CLAUDE.md` state as a rule.
