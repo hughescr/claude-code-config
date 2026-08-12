@@ -204,6 +204,11 @@
     "network": {
       "allowAllUnixSockets": true,
       "allowLocalBinding": true
+    },
+    "filesystem": {
+      "allowWrite": [
+        "~/Library/Caches/Mozilla.sccache"
+      ]
     }
   },
   "alwaysThinkingEnabled": true,
