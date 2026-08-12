@@ -1504,6 +1504,8 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     requests: attribution.requests_assigned,
     by_attr: attribution.by_attr,
   };
+  // HOOK-BINDING-SPEC.md §5.2, §9.4 A1: `alias_split_identity` must stay 0.
+  pendingAnomalies.push(...attribution.anomalies);
 
   // v10: give estimates whose EFFECTIVE estimator family is still the repairable
   // `'unknown'` sentinel a concrete one, by APPENDING to `estimate_identity_repair`.

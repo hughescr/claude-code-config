@@ -44,6 +44,7 @@
 
 import type { Database } from "bun:sqlite";
 import { getConfig } from "./db.ts";
+import type { IngestAnomaly } from "./ingest.ts";
 
 export interface AttributionResult {
   tasks: number;
@@ -53,6 +54,14 @@ export interface AttributionResult {
   runs_assigned: number;
   requests_assigned: number;
   by_attr: Record<string, number>;
+  /**
+   * HOOK-BINDING-SPEC.md §5.2: `alias_split_identity` (ALERTING) — one
+   * `(id_kind, local_id)` identity held under more than one `session_id` with more
+   * than one `tid`. The caller (`src/cli.ts` `runSweep`) is responsible for pushing
+   * these into `pendingAnomalies` and inserting them through `insertAnomalies`, same
+   * as every other anomaly source this pass's caller already collects.
+   */
+  anomalies: IngestAnomaly[];
 }
 
 interface TaskRow {
@@ -251,6 +260,7 @@ export function attributeTasks(db: Database): AttributionResult {
       runs_assigned: 0,
       requests_assigned: 0,
       by_attr: {},
+      anomalies: [],
     };
   }
   const taskById = new Map(tasks.map((t) => [t.tid, t]));
@@ -268,6 +278,7 @@ export function attributeTasks(db: Database): AttributionResult {
       runs_assigned: 0,
       requests_assigned: 0,
       by_attr: {},
+      anomalies: [],
     };
   }
 
@@ -299,18 +310,58 @@ export function attributeTasks(db: Database): AttributionResult {
   }
 
   // --- direct bindings -----------------------------------------------------
-  const agentBinding = new Map<string, string>();
-  const runBinding = new Map<string, string>();
+  // HOOK-BINDING-SPEC.md §5.2 (REV2). `ux_alias_exclusive` is
+  // `(id_kind, session_id, local_id)` — SESSION-SCOPED (`schema.sql:104-105`) — so two
+  // DIFFERENT sessions may legally each hold a row for the same agent/run id. Reading
+  // an unordered `SELECT` into a `Map` the way this loop used to made the LAST row
+  // read the silent winner, which is both nondeterministic (attribution could churn
+  // between sweeps on the very same data) and blind to the case that actually matters:
+  // two sessions naming two DIFFERENT tids for one identity is a split of that
+  // identity's spend across two actuals, and it deserves an ALERTING anomaly, not a
+  // coin flip. Grouped by identity first, so the split can be DETECTED (not merely
+  // resolved) in one pass.
+  const agentGroups = new Map<string, AliasRow[]>();
+  const runGroups = new Map<string, AliasRow[]>();
   const sessionTasks = new Map<string, string[]>();
   for (const a of aliases) {
-    if (a.id_kind === "agent") agentBinding.set(a.local_id, a.tid);
-    else if (a.id_kind === "workflow_run") runBinding.set(a.local_id, a.tid);
-    else if (a.id_kind === "session") {
+    if (a.id_kind === "session") {
       const list = sessionTasks.get(a.session_id);
       if (list === undefined) sessionTasks.set(a.session_id, [a.tid]);
       else if (!list.includes(a.tid)) list.push(a.tid);
+      continue;
     }
+    const groups = a.id_kind === "agent" ? agentGroups : a.id_kind === "workflow_run" ? runGroups : null;
+    if (groups === null) continue;
+    const g = groups.get(a.local_id);
+    if (g === undefined) groups.set(a.local_id, [a]);
+    else g.push(a);
   }
+
+  const splitAnomalies: IngestAnomaly[] = [];
+  const resolveIdentityGroups = (groups: Map<string, AliasRow[]>, idKindLabel: string): Map<string, string> => {
+    const binding = new Map<string, string>();
+    for (const [localId, rows] of groups) {
+      const distinctTids = new Set(rows.map((r) => r.tid));
+      let winner = rows[0]!;
+      if (distinctTids.size > 1) {
+        // Deterministic: lowest session_id wins, tid breaks the tie. Never query
+        // order — the whole point is that this answer cannot depend on it.
+        for (const r of rows) {
+          if (r.session_id < winner.session_id || (r.session_id === winner.session_id && r.tid < winner.tid)) {
+            winner = r;
+          }
+        }
+        splitAnomalies.push({
+          kind: "alias_split_identity",
+          detail: `${idKindLabel} identity is bound to more than one tid across different sessions (identity-wide check)`,
+        });
+      }
+      binding.set(localId, winner.tid);
+    }
+    return binding;
+  };
+  const agentBinding = resolveIdentityGroups(agentGroups, "agent");
+  const runBinding = resolveIdentityGroups(runGroups, "workflow_run");
 
   const boundSessions = [...sessionTasks.keys()];
   const placeholders = (n: number): string => new Array(n).fill("?").join(",");
@@ -865,5 +916,6 @@ export function attributeTasks(db: Database): AttributionResult {
     runs_assigned: runTid.size,
     requests_assigned: updates.length,
     by_attr: byAttr,
+    anomalies: splitAnomalies,
   };
 }
