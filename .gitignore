@@ -68,3 +68,5 @@ estimator/DECISIONS.md
 # dependencies are still zero; `bun.lock` IS committed, so `bun run typecheck`
 # reproduces exactly the compiler the last recorded run used.
 estimator/node_modules/
+daemon-auth-cooldown
+daemon-auth-status.json
