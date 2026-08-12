@@ -208,7 +208,8 @@
     },
     "filesystem": {
       "allowWrite": [
-        "~/Library/Caches/Mozilla.sccache"
+        "~/Library/Caches/Mozilla.sccache",
+        "~/.claude/estimator-data"
       ]
     }
   },

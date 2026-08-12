@@ -53,18 +53,6 @@ gh-pr-status-cache.json
 # directory to ignore instead of one entry per artifact, and `git clean` in the
 # checkout can never touch the corpus.
 estimator-data/
-# Pre-split entries, kept until the live corpus is actually moved to the sibling
-# estimator-data/ dir above (cutover, not part of this change). Until that move
-# lands, ~/.claude/estimator/estimator.db and friends still exist at these old
-# in-checkout paths — dropping these lines here would make the live DB, spool
-# and backups untracked-AND-unignored in a public repo. Remove only once the
-# cutover confirms nothing writes to these old paths any more.
-estimator/estimator.db*
-estimator/spool/
-estimator/backups/
-estimator/sweep.lock
-estimator/board.html
-estimator/board.md
 # gate probes: the .ts scanners are code and committed; everything they PRODUCE is
 # corpus-derived data and stays local — this repo is public (decision 11: no
 # estimate/actual/spend data, no prompt or conversation content, ever)
