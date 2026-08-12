@@ -914,25 +914,85 @@ export interface TaskAttribState {
  * `est open` itself makes the task active by the touch clock meanwhile. `live: "fresh"`
  * opts into the live count, and is for `--refresh` — the live path by contract.
  */
-export function taskAttribState(
+/**
+ * One open task aliased to `session`, with attribution's own liveness verdict.
+ *
+ * HOOK-BINDING-SPEC.md §3.0: the spawn-time question — "which open tasks are still
+ * absorbing work in this session" — is already answered here for the statusline, and
+ * the module doc for {@link attrRetired} says a third implementation is forbidden. The
+ * hook (`scripts/nudge.ts` job 0) is the second reader, so this is now an exported
+ * function rather than logic folded inline into `taskAttribState`.
+ */
+export interface ActiveTask {
+  tid: string;
+  touched: number;
+  active: boolean;
+}
+
+/**
+ * Every OPEN task aliased to `opts.session`, each with attribution's own liveness
+ * verdict (`attrRetired`, `src/attribute.ts`) — exactly what {@link taskAttribState}
+ * used to compute inline, now shared with the hook.
+ *
+ * `opts.live` defaults to `"cache"`, the statusline's own contract: the forbidden read
+ * is a live `agent_run` count, and the hook must never pay for it on Craig's hot path
+ * either (HOOK-BINDING-SPEC.md §3.0).
+ *
+ * `opts.openAt`, REV2: when given, drops any candidate whose OWN window (the same one
+ * `attributeTasks` computes per task, `src/attribute.ts:288-299`) did not contain that
+ * instant — `task.created_at <= openAt` and `(finalized_at IS NULL OR finalized_at >
+ * openAt OR final_status = 'reopened')`. This is what stops a task minted AFTER a
+ * backdated spawn instant, or one already finalized before it, from winning an
+ * `exact`-grade hook binding for a spawn that predates or postdates its own existence
+ * (HOOK-BINDING-SPEC.md §3.1). The liveness verdict itself remains the CACHED one; a
+ * task that went quiet between `openAt` and `now` is conservatively dropped, which can
+ * only remove a candidate — never add a wrongly-live one.
+ */
+export function activeTasks(
   db: Database,
   opts: {
-    tid?: string | null;
-    session?: string | null;
+    session: string;
     now?: Date;
     live?: "cache" | "fresh";
-  } = {},
-): TaskAttribState {
-  const empty: TaskAttribState = { state: "none", pending_close: 0, active_tid: null };
-  const session = resolveSession(opts.session);
-  if (session === null) return empty;
-
-  const bound = db
+    openAt?: Date;
+  },
+): ActiveTask[] {
+  const session = opts.session;
+  let bound = db
     .query<{ tid: string }, [string]>("SELECT DISTINCT tid FROM task_alias WHERE session_id = ?")
     .all(session)
     .map((r) => r.tid)
     .filter((tid) => isOpenTask(db, tid));
-  if (bound.length === 0) return empty;
+  if (bound.length === 0) return [];
+
+  if (opts.openAt !== undefined) {
+    const openAtMs = opts.openAt.getTime();
+    const parseMs = (ts: string | null): number => {
+      if (ts === null) return Number.NaN;
+      const t = Date.parse(ts);
+      return Number.isFinite(t) ? t : Number.NaN;
+    };
+    const windowRow = db.prepare<
+      { created_at: string; finalized_at: string | null; final_status: string | null },
+      [string]
+    >(
+      `SELECT t.created_at AS created_at, o.finalized_at AS finalized_at, o.final_status AS final_status
+         FROM task t LEFT JOIN v_outcome_current o ON o.tid = t.tid
+        WHERE t.tid = ?`,
+    );
+    bound = bound.filter((tid) => {
+      const row = windowRow.get(tid);
+      if (row === null || row === undefined) return false;
+      const created = parseMs(row.created_at);
+      if (Number.isFinite(created) && created > openAtMs) return false;
+      if (row.finalized_at !== null && row.final_status !== "reopened") {
+        const fin = parseMs(row.finalized_at);
+        if (Number.isFinite(fin) && fin <= openAtMs) return false;
+      }
+      return true;
+    });
+    if (bound.length === 0) return [];
+  }
 
   const win = attrWindow(db);
   const nowMs = (opts.now ?? new Date()).getTime();
@@ -960,12 +1020,7 @@ export function taskAttribState(
     "SELECT created_at FROM task WHERE tid = ?",
   );
 
-  // Memoised: the state, the chosen task and the pending count all ask about the same
-  // tids, and this runs on the statusline's read path at a >= 5 s cadence forever.
-  const decided = new Map<string, { active: boolean; touched: number }>();
-  const assess = (tid: string): { active: boolean; touched: number } => {
-    const was = decided.get(tid);
-    if (was !== undefined) return was;
+  return bound.map((tid) => {
     const lastTs = lastTurn.get(session, tid)?.ts ?? null;
     // No attributed turn yet means the window has only just opened, so the task's own
     // mint time stands in for the touch — the same substitution the turn walk makes
@@ -982,30 +1037,42 @@ export function taskAttribState(
       live > 0 ||
       openTurnTid === tid ||
       !attrRetired(win, touched, nowMs, quietTurns);
-    const out = { active, touched: Number.isFinite(touched) ? touched : 0 };
-    decided.set(tid, out);
-    return out;
-  };
+    return { tid, active, touched: Number.isFinite(touched) ? touched : 0 };
+  });
+}
 
-  const active = bound.filter((tid) => assess(tid).active);
+export function taskAttribState(
+  db: Database,
+  opts: {
+    tid?: string | null;
+    session?: string | null;
+    now?: Date;
+    live?: "cache" | "fresh";
+  } = {},
+): TaskAttribState {
+  const empty: TaskAttribState = { state: "none", pending_close: 0, active_tid: null };
+  const session = resolveSession(opts.session);
+  if (session === null) return empty;
+
+  const assessed = activeTasks(db, { session, now: opts.now, live: opts.live });
+  if (assessed.length === 0) return empty;
+
+  const active = assessed.filter((a) => a.active);
   if (active.length === 0) {
-    return { state: "quiet", pending_close: bound.length, active_tid: null };
+    return { state: "quiet", pending_close: assessed.length, active_tid: null };
   }
+  const byTid = new Map(active.map((a) => [a.tid, a]));
   // The caller's own task wins when it is one of the active ones — an explicit `--tid`
   // must not be silently answered about a different task. Otherwise the most recently
   // touched, with `tid` breaking ties so two same-instant tasks resolve the same way
   // on every render (uuidv7 sorts by mint time).
   const chosen =
-    opts.tid !== null && opts.tid !== undefined && active.includes(opts.tid)
+    opts.tid !== null && opts.tid !== undefined && byTid.has(opts.tid)
       ? opts.tid
-      : active.reduce((a, b) => {
-          const ta = assess(a).touched;
-          const tb = assess(b).touched;
-          return tb > ta || (tb === ta && b > a) ? b : a;
-        });
+      : active.reduce((a, b) => (b.touched > a.touched || (b.touched === a.touched && b.tid > a.tid) ? b : a)).tid;
   return {
     state: "active",
-    pending_close: bound.length - active.length,
+    pending_close: assessed.length - active.length,
     active_tid: chosen,
   };
 }
