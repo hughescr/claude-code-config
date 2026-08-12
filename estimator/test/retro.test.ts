@@ -565,4 +565,68 @@ describe("est retro — P1.8", () => {
     expect(body.scoring.n_scored).toBe(0);
     expect(body.buckets).toEqual([]);
   });
+
+  // CACHE-TTL-PRICING.md D8/D9: pins both the fire and the no-fire arm of the
+  // cw_ttl_repricing_boundary alert. healClosedOutcomes never restates an outcome
+  // finalized before `cw_ttl_price_fix_at` on a pure repricing event (no request
+  // row moves), so a retro that fits across that boundary with no signal at all
+  // would be pooling two different measurements of the same quantity — this alert
+  // is the signal.
+  describe("cw_ttl_repricing_boundary alert", () => {
+    // `at` (the request's own ts) stays fixed and far enough before `finalizedAt` to
+    // clear the quiescence gate's 48h staleness arm; `finalizedAt` is what varies
+    // relative to the fix stamp, since that — not the request ts — is what the alert
+    // (and healClosedOutcomes' candidate filter) actually keys on.
+    async function closedAt(n: number, finalizedAt: string): Promise<string> {
+      const session = `cttl${n}`;
+      const at = "2026-01-01T00:00:00Z";
+      turn(h.db, { session, prompt: "p1", at, durationMs: 60_000 });
+      const r = await h.cli(
+        ...openArgs({ subject: `cttl task ${n}`, "raw-p50": 1000, "raw-p90": 3000 }),
+        "--session",
+        session,
+        "--prompt",
+        "p1",
+        "--json",
+      );
+      expect(r.code).toBe(0);
+      const tid = r.json<{ tid: string }>().tid;
+      request(h.db, `cttl-req-${n}`, { session, out: 1000, ts: at });
+      attributeTasks(h.db);
+      closeTask(h.db, { tid, now: new Date(finalizedAt) });
+      return tid;
+    }
+
+    test("fires when at least one closed outcome predates the stamp", async () => {
+      // Finalized well before the fix stamp: stale, and the alert must name it.
+      await closedAt(1, "2026-01-05T00:00:00Z");
+      // Finalized after the fix stamp: not stale, must not be counted.
+      await closedAt(2, "2026-01-20T00:00:00Z");
+      h.db.query("INSERT OR REPLACE INTO config (k, v) VALUES ('cw_ttl_price_fix_at', ?)").run(
+        "2026-01-10T00:00:00Z",
+      );
+
+      const report = retro(h.db, { asOf: NOW, dryRun: true });
+      const alert = report.alerts.find((a) => a.startsWith("cw_ttl_repricing_boundary:"));
+      expect(alert).toBeDefined();
+      expect(alert).toContain("1 closed outcome");
+      expect(alert).toContain("2026-01-10T00:00:00Z");
+    });
+
+    test("does not fire when the stamp is unset", async () => {
+      await closedAt(1, "2026-01-05T00:00:00Z");
+      const report = retro(h.db, { asOf: NOW, dryRun: true });
+      expect(report.alerts.some((a) => a.startsWith("cw_ttl_repricing_boundary:"))).toBe(false);
+    });
+
+    test("does not fire when the stamp predates every closed outcome", async () => {
+      await closedAt(1, "2026-01-05T00:00:00Z");
+      await closedAt(2, "2026-01-20T00:00:00Z");
+      h.db.query("INSERT OR REPLACE INTO config (k, v) VALUES ('cw_ttl_price_fix_at', ?)").run(
+        "2026-01-01T00:00:00Z",
+      );
+      const report = retro(h.db, { asOf: NOW, dryRun: true });
+      expect(report.alerts.some((a) => a.startsWith("cw_ttl_repricing_boundary:"))).toBe(false);
+    });
+  });
 });

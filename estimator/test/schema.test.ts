@@ -1107,19 +1107,121 @@ describe("schema migration", () => {
     ).toBe(0);
   });
 
-  // NOTE on byte-identity coverage for the v19 -> v20 step specifically: this
-  // file's OTHER migration tests above ("a v7 database migrates...", "a v12
-  // database gains...", "a v13 database gains...", "the v14 step...") all walk a
-  // genuinely pre-v19-shaped database FORWARD through every pending step,
-  // including this one, and diff the result against a truly fresh file byte for
-  // byte — they already exercise and PROVE this step's ADD COLUMN placement.
-  // A dedicated v19->v20 byte-diff test here would need to fabricate a "v19
-  // shape" by DROP-COLUMNing a database this repo's OWN schema.sql already built
-  // to v20 (comments and all), which reintroduces those v20-only comments into a
-  // supposedly-v19 file and corrupts the very placement it would be testing —
-  // the DROP/CREATE VIEW and ADD COLUMN functional behaviour is covered by the
-  // two tests below and by the pricing-semantics suite; true sqlite_master
-  // byte-identity for this step rides on the chain tests above.
+  /**
+   * The obligation every ADD COLUMN step carries (see the v14 test above and its
+   * counterpart in test/story-points.test.ts): a migrated file must be byte-identical
+   * to a fresh one. For v19 -> v20 this needs a GENUINELY v19-shaped database, not
+   * one fabricated by dropping columns from THIS repo's own (already-v20) schema.sql
+   * — that would reintroduce v20-only comments into a "v19" file and corrupt the very
+   * placement being tested. So the three v19 view bodies are inlined verbatim below
+   * (from the pre-cutover schema, the same source `git show <pre-fix rev>:schema.sql`
+   * would give), the same way the v14 chain test inlines the pre-v15 v_task_actual_epoch.
+   *
+   * DROP VIEW / CREATE VIEW ordering matters: `ALTER TABLE ... DROP COLUMN`
+   * re-validates every remaining view in the schema and fails outright if one
+   * references the column being dropped or selects from a view that would no longer
+   * resolve. v_cw_ttl_exposure and v_cw_1h_price_gap name v20 columns directly, so
+   * they drop and stay dropped; v_task_actual (unchanged since v19) selects from
+   * v_wcet, which selects from v_priced, so those two must be put back in their v19
+   * shape rather than merely dropped, or every later DROP COLUMN below fails with an
+   * opaque "error in view ...: no such column" the instant it is reached.
+   * DROP COLUMN order within model_price also matters: usd_cw1h_src's CHECK
+   * references usd_cw1h, so the _src column has to go first.
+   */
+  test("a genuinely v19-shaped database migrates to exactly the shape schema.sql builds", () => {
+    db.exec(`
+      DROP VIEW v_cw_ttl_exposure;
+      DROP VIEW v_cw_1h_price_gap;
+      DROP VIEW v_task_actual_epoch;
+      DROP VIEW v_wcet;
+      DROP VIEW v_priced;
+      CREATE VIEW v_priced AS
+      SELECT r.*, p.usd_in, p.usd_out, p.usd_cw, p.usd_cr, p.provisional
+      FROM v_request_tiered r
+      JOIN model_price p ON p.family = r.price_family
+       AND p.effective_from = (SELECT MAX(effective_from) FROM model_price
+                               WHERE family = r.price_family AND effective_from <= r.ts);
+      CREATE VIEW v_wcet AS
+      SELECT v.*,
+        CAST((v.out_tok*v.usd_out + v.cw_tok*v.usd_cw) / v.ref_out AS INTEGER) AS wcet,
+        CAST((v.in_tok*v.usd_in + v.out_tok*v.usd_out
+              + v.cw_tok*v.usd_cw + v.cr_tok*v.usd_cr) / v.ref_out AS INTEGER) AS scet
+      FROM (SELECT p.*,
+              (SELECT usd_out FROM model_price
+                WHERE family = (SELECT v FROM config WHERE k='ref_model')
+                  AND effective_from <= p.ts
+                ORDER BY effective_from DESC LIMIT 1) AS ref_out
+            FROM v_priced p) v;
+      CREATE VIEW v_task_actual_epoch AS
+      SELECT r.tid,
+        SUM(CAST((CASE e.estimand
+                    WHEN 'out'         THEN r.out_tok*pe.usd_out
+                    WHEN 'work_cet'    THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw
+                    WHEN 'out_cw_in'   THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw + r.in_tok*pe.usd_in
+                    WHEN 'story_point' THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw
+                  END) / rf.usd_out AS INTEGER)) AS wcet_at_epoch,
+        e.price_epoch, e.eid AS eid_at_start
+      FROM v_request_live r
+      JOIN estimate e ON e.eid = (SELECT MIN(eid) FROM estimate WHERE tid = r.tid)
+      JOIN model_price pe
+        ON pe.family = CASE WHEN (r.in_tok + r.cw_tok + r.cr_tok) > 200000
+                             AND r.model_family NOT LIKE '%]'
+                             AND EXISTS (SELECT 1 FROM model_price hi
+                                          WHERE hi.family = r.model_family || '@above_200k'
+                                            AND hi.effective_from <= e.price_epoch)
+                            THEN r.model_family || '@above_200k'
+                            ELSE r.model_family END
+       AND pe.effective_from = (SELECT MAX(effective_from) FROM model_price
+                                WHERE family = pe.family AND effective_from <= e.price_epoch)
+      JOIN model_price rf ON rf.family = e.ref_model
+       AND rf.effective_from = (SELECT MAX(effective_from) FROM model_price
+                                WHERE family = rf.family AND effective_from <= e.price_epoch)
+      WHERE r.tid IS NOT NULL AND r.attr <> 'overhead'
+        AND r.origin IN ('main','subagent')
+      GROUP BY r.tid;
+      ALTER TABLE outcome DROP COLUMN cw_ttl_unknown_share;
+      ALTER TABLE model_price DROP COLUMN usd_cw1h_src;
+      ALTER TABLE model_price DROP COLUMN usd_cw1h;
+      ALTER TABLE request DROP COLUMN cw_ttl_src;
+      ALTER TABLE request DROP COLUMN cw1h_tok;
+      ALTER TABLE request DROP COLUMN cw5m_tok;
+      DELETE FROM config WHERE k IN ('price_cw_1h_min_multiple','price_cw_1h_max_multiple',
+                                     'price_cw_1h_default_multiple','cw_ttl_unknown_warn_share');
+      UPDATE config SET v = '19' WHERE k = 'schema_version';
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+
+    db = openDb({ path }); // migrates on open
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    // The four config seeds this step is responsible for come back at their defaults.
+    const seed = (k: string): string | undefined =>
+      db.query<{ v: string }, [string]>("SELECT v FROM config WHERE k = ?").get(k)?.v;
+    expect(seed("price_cw_1h_min_multiple")).toBe("1.5");
+    expect(seed("price_cw_1h_max_multiple")).toBe("2.5");
+    expect(seed("price_cw_1h_default_multiple")).toBe("2");
+    expect(seed("cw_ttl_unknown_warn_share")).toBe("0.02");
+
+    // This is the assertion that would have caught the D1 comment-placement bug:
+    // it fails on `table:request` against the pre-fix schema.sql and passes once
+    // schema.sql's ADD COLUMN splice matches where ALTER actually leaves it.
+    const freshDir = mkdtempSync(join(tmpdir(), "estimator-schema-v20-"));
+    const fresh = openDb({ path: join(freshDir, "estimator.db") });
+    try {
+      const objects = (d: Database): unknown =>
+        d
+          .query<unknown, []>(
+            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+          )
+          .all();
+      expect(objects(db)).toEqual(objects(fresh));
+    } finally {
+      fresh.close();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+  });
+
   test("migration rule 2: a tuned cache-write-1h knob survives the v19 -> v20 step", () => {
     db.exec(`
       UPDATE config SET v = '1.4' WHERE k = 'price_cw_1h_min_multiple';

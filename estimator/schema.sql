@@ -446,16 +446,26 @@ CREATE TABLE request (              -- the atomic fact: one row per deduped API 
                                     -- OTEL only (Phase 2); transcripts lack it
   tid TEXT REFERENCES task(tid),    -- NULL = unattributed: a counted state, never an error
   attr TEXT NOT NULL DEFAULT 'none' CHECK (attr IN
-    ('none','exclusive','sticky','ambiguous','overhead','pre_task','replay')), cw5m_tok INTEGER NOT NULL DEFAULT 0 CHECK (cw5m_tok >= 0), cw1h_tok INTEGER NOT NULL DEFAULT 0 CHECK (cw1h_tok >= 0), cw_ttl_src TEXT NOT NULL DEFAULT 'unrecorded' CHECK (cw_ttl_src IN ('transcript','unrecorded'))
+    ('none','exclusive','sticky','ambiguous','overhead','pre_task','replay'))
                                     -- 'replay' added in R2: a sidechain re-emission of an
                                     -- already-counted message under a NEW request_id. Kept as
                                     -- a row for auditability; excluded from EVERY sum.
-                                    -- CACHE-TTL-PRICING.md D1 (v20): cw5m_tok/cw1h_tok are a
-                                    -- DECOMPOSITION of cw_tok, not a replacement — cw_tok stays
-                                    -- the authoritative aggregate. cw_ttl_src='transcript' means
-                                    -- the split was observed; 'unrecorded' means it was not, and
-                                    -- is the honest default for OTEL-only rows and pre-fix history.
-) STRICT;
+, cw5m_tok INTEGER NOT NULL DEFAULT 0 CHECK (cw5m_tok >= 0), cw1h_tok INTEGER NOT NULL DEFAULT 0 CHECK (cw1h_tok >= 0), cw_ttl_src TEXT NOT NULL DEFAULT 'unrecorded' CHECK (cw_ttl_src IN ('transcript','unrecorded'))) STRICT;
+-- CACHE-TTL-PRICING.md D1 (v20): cw5m_tok/cw1h_tok are a
+-- DECOMPOSITION of cw_tok, not a replacement — cw_tok stays
+-- the authoritative aggregate. cw_ttl_src='transcript' means
+-- the split was observed; 'unrecorded' means it was not, and
+-- is the honest default for OTEL-only rows and pre-fix history.
+-- These three columns are spelled here, on the closing-paren line, rather than
+-- attached inline after `attr` above, because that is where ALTER TABLE ADD
+-- COLUMN actually splices them: `request` carries no table-level constraint, so
+-- SQLite's insertion point is the closing paren itself, and no comment can live
+-- inside the statement once ALTER is the real migration path (as opposed to the
+-- fresh-DDL path this file also serves). The next column added to `request`
+-- must follow the same shape — comment-then-splice, not splice-then-comment —
+-- or a v19->v20-style byte mismatch between "migrated" and "freshly built"
+-- databases reintroduces itself. See test/schema.test.ts's v19->v20 byte-identity
+-- pinning test.
 CREATE INDEX ix_req_tid   ON request(tid);
 CREATE INDEX ix_req_turn  ON request(session_id, prompt_id);
 CREATE INDEX ix_req_agent ON request(agent_id);
