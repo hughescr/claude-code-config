@@ -667,7 +667,10 @@ function collectAgents(
       if (parsed.anomaly !== undefined) anomalies.push(parsed.anomaly);
     }
     if (meta !== null && meta.spawnDepth > 1) {
-      // Unobserved to date — §5.1 says log it if it ever appears.
+      // Observed, not hypothetical: HOOK-BINDING-SPEC.md §7.1's read-only census of the
+      // live projects tree found spawnDepth 2 (48 agents) and spawnDepth 3 (1 agent) —
+      // a real, ~2%-of-agents population, all carrying a `parentAgentId` field. §5.1
+      // still says log it whenever it appears.
       anomalies.push({
         kind: "spawn_depth_gt1",
         detail: `agent ${agentId}: spawnDepth=${meta.spawnDepth}`,

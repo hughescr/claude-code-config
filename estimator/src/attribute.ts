@@ -523,9 +523,17 @@ export function attributeTasks(db: Database): AttributionResult {
       let chosen: { tid: string; attr: Attr } | null = null;
       if (open.length === 1) chosen = { tid: open[0]!, attr: "exclusive" };
       else if (open.length > 1) {
-        // Most-recently-touched wins, and the row SAYS it was ambiguous. `ambiguous`
-        // is excluded from the calibration corpus and reported as a share, so this
-        // is a counted cost rather than a silent guess (§5.4).
+        // Most-recently-touched wins, and the row SAYS it was ambiguous — but that
+        // label is NOT excluded from the calibration corpus (HOOK-BINDING-SPEC.md §1,
+        // §10 step 1b): `v_task_actual_epoch` and `v_velocity` (schema.sql) apply no
+        // `attr` filter beyond `overhead`/`auxiliary`, and `src/calibrate.ts` applies
+        // none at all, so an `ambiguous` request's spend reaches `actual_wcet_at_epoch`
+        // and thence velocity like any other. `outcome.ambiguous_share` records the
+        // rate honestly; it is not a gate. This is a counted, disclosed guess — not an
+        // excluded one — which is why the hook-binding design (see that spec) refuses
+        // to ever write a guess-grade alias: a wrong guess here is silently poisoned
+        // corpus, not a labelled and quarantined one. See HOOK-BINDING-SPEC.md §11 Q7
+        // for the open question of whether the corpus itself should gate on this.
         const best = open.reduce((a, b) =>
           (lastTouch.get(b) ?? -Infinity) > (lastTouch.get(a) ?? -Infinity) ? b : a,
         );

@@ -329,7 +329,13 @@ function claim(dir: string, name: string): { text: string; claimed: string | nul
     try {
       return { text: readFileSync(draining, "utf8"), claimed: draining };
     } catch {
-      return { text: "", claimed: draining };
+      // HOOK-BINDING-SPEC.md §4.2 / §10 step 1a: a read failure here must NOT report
+      // `claimed: draining`. The caller's `cleanup()` unconditionally `rmSync`s every
+      // path in `claimed`, so returning the path here would delete a `.draining` file
+      // this call never actually read — a genuine data-loss path, pre-existing and
+      // shared by `compliance.jsonl` and `task-events.jsonl`. Returning `claimed: null`
+      // leaves the file exactly where the recovery branch above finds it next sweep.
+      return { text: "", claimed: null };
     }
   }
   if (!existsSync(live)) return { text: "", claimed: null };
@@ -341,7 +347,11 @@ function claim(dir: string, name: string): { text: string; claimed: string | nul
   try {
     return { text: readFileSync(draining, "utf8"), claimed: draining };
   } catch {
-    return { text: "", claimed: draining };
+    // Same reasoning as the recovery-branch catch above: the rename succeeded (the
+    // live file is already gone) but the read did not, so the caller must not delete
+    // it. `claimed: null` means this drain's `cleanup()` will not touch it, and the
+    // next sweep's recovery branch (the `existsSync(draining)` arm above) picks it up.
+    return { text: "", claimed: null };
   }
 }
 
