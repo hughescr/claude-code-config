@@ -41,7 +41,7 @@ fi
 
 # Check for Hugo project
 has_hugo_config="false"
-if [[ -f "hugo.toml" ]] || [[ -f "hugo/hugo.toml" ]] || [[ -f "config/_default/hugo.toml" ]]; then
+if [[ -f "hugo.toml" ]] || [[ -f "hugo/hugo.toml" ]] || [[ -f "config/_default/hugo.toml" ]] || [[ -f "config/_default/config.toml" ]]; then
     has_hugo_config="true"
 fi
 
