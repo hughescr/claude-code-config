@@ -60,6 +60,8 @@ const EXPECTED_TABLES = [
 
 const EXPECTED_VIEWS = [
   "v_block_accuracy",
+  "v_cw_1h_price_gap", // CACHE-TTL-PRICING.md D5
+  "v_cw_ttl_exposure", // CACHE-TTL-PRICING.md D3/D10
   "v_estimate_identity",
   "v_eta_corpus",
   "v_missed_estimate",
@@ -109,6 +111,7 @@ const EXPECTED_CONFIG_KEYS = [
   "board_min_interval_s",
   "boot_resamples",
   "coverage_prior",
+  "cw_ttl_unknown_warn_share",
   "estimand",
   "eta_min_fit",
   "eta_min_pinball_gain",
@@ -117,6 +120,9 @@ const EXPECTED_CONFIG_KEYS = [
   "otel_max_body_mb",
   "otel_spool_retention_days",
   "otel_stale_min",
+  "price_cw_1h_default_multiple",
+  "price_cw_1h_max_multiple",
+  "price_cw_1h_min_multiple",
   "quiesce_main_min",
   "recon_alert_pct",
   "ref_model",
