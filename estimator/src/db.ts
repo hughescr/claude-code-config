@@ -53,6 +53,24 @@ export const DB_PATH: string = process.env.EST_DB ?? join(DATA_ROOT, "estimator.
 /**
  * Must match the config.schema_version seed in schema.sql.
  *
+ * 21 — hook-based spawn-time attribution binding (HOOK-BINDING-SPEC.md, Craig
+ *     2026-08-12). CONFIG ROWS ONLY — no CREATE, no ALTER, no new table, no new
+ *     index, no new view, no CHECK change (spec §8.1). Four seeds:
+ *     `hook_bind_enabled` (master switch; `0` makes the hook's spool-append job a
+ *     no-op, the rollback lever), `hook_focus_ttl_min` (how old an `est focus`
+ *     pointer may be and still be believed — deliberately equal to
+ *     `attr_stale_minutes`'s default, per spec rev 3: measured as IDLE time against
+ *     the focused task's own liveness window, not fixed time-since-set, so a task
+ *     that is still absorbing work never ages its own focus marker out from under
+ *     it), `hook_bind_marker` (whether the `[est:<tid8>]` description marker is
+ *     honoured; off by default — model-controlled text must not mint an
+ *     exclusive-grade alias on its own), `hook_bind_batch_max` (drain batch cap).
+ *     `task_alias.source = 'hook'` is a new documented VALUE of an existing
+ *     unchecked column (`schema.sql:86`, no CHECK) — not a schema object, so it is
+ *     not a migration step. New `anomaly.kind` values are documented in
+ *     `src/spool.ts`'s module doc rather than in `schema.sql`'s in-DDL catalogue
+ *     comment, because editing a comment inside a `CREATE` body IS a schema change
+ *     under `test/schema.test.ts`'s byte-identity assertion (spec §8.2, Q3).
  * 20 — the cache-write TTL pricing fix (CACHE-TTL-PRICING.md D1-D6, Craig 2026-08-12).
  *     Anthropic prices a cache write by the TTL requested (1.25x base input for 5m,
  *     2.00x for 1h); `model_price` had exactly one cache-write column and every 1h
@@ -328,7 +346,7 @@ export const DB_PATH: string = process.env.EST_DB ?? join(DATA_ROOT, "estimator.
  *     `v_phase_actual.phase_conf`, auxiliary origin excluded from calibration.
  * 1 — initial R3 §4.2 shape.
  */
-export const SCHEMA_VERSION = "20";
+export const SCHEMA_VERSION = "21";
 
 /**
  * Forward-only, additive migrations, applied by {@link openDb} on a WRITABLE
@@ -1610,6 +1628,20 @@ INSERT OR IGNORE INTO config (k, v) VALUES
         db.exec("ALTER TABLE outcome ADD COLUMN cw_ttl_unknown_share REAL");
       }
     },
+  },
+  {
+    from: "20",
+    to: "21",
+    // Hook-based spawn-time attribution binding (see the SCHEMA_VERSION doc comment
+    // above). Config rows only — no DDL at all, following the v4 -> v5 precedent that
+    // seeded attr_stale_turns/attr_stale_minutes the same way.
+    sql: `
+INSERT OR IGNORE INTO config (k, v) VALUES
+  ('hook_bind_enabled',    '1'),
+  ('hook_focus_ttl_min',   '120'),
+  ('hook_bind_marker',     '0'),
+  ('hook_bind_batch_max',  '5000');
+`,
   },
 ];
 

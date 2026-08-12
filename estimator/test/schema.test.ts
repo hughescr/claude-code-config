@@ -1248,6 +1248,74 @@ describe("schema migration", () => {
       db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM v_cw_ttl_exposure").get()?.n,
     ).toBe(0);
   });
+
+  // ---------------------------------------------------------------------------
+  // HOOK-BINDING-SPEC.md -- hook-based spawn-time attribution binding (v21)
+  // ---------------------------------------------------------------------------
+
+  test("a genuinely v20-shaped database migrates to exactly the shape schema.sql builds (v21, config rows only)", () => {
+    db.exec(`
+      DELETE FROM config WHERE k IN
+        ('hook_bind_enabled','hook_focus_ttl_min','hook_bind_marker','hook_bind_batch_max');
+      UPDATE config SET v = '20' WHERE k = 'schema_version';
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+
+    db = openDb({ path }); // migrates on open
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    const seed = (k: string): string | undefined =>
+      db.query<{ v: string }, [string]>("SELECT v FROM config WHERE k = ?").get(k)?.v;
+    expect(seed("hook_bind_enabled")).toBe("1");
+    expect(seed("hook_focus_ttl_min")).toBe("120");
+    expect(seed("hook_bind_marker")).toBe("0");
+    expect(seed("hook_bind_batch_max")).toBe("5000");
+
+    // v21 is config-only: no CREATE, no ALTER. `sqlite_master` must be byte-identical
+    // to a fresh database's (test/schema.test.ts's own byte-identity discipline, §8.2).
+    const freshDir = mkdtempSync(join(tmpdir(), "estimator-schema-v21-"));
+    const fresh = openDb({ path: join(freshDir, "estimator.db") });
+    try {
+      const objects = (d: Database): unknown =>
+        d
+          .query<unknown, []>(
+            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+          )
+          .all();
+      expect(objects(db)).toEqual(objects(fresh));
+    } finally {
+      fresh.close();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+  });
+
+  test("migration rule 2: a tuned hook_focus_ttl_min knob survives the v20 -> v21 step", () => {
+    db.exec(`
+      UPDATE config SET v = '45' WHERE k = 'hook_focus_ttl_min';
+      UPDATE config SET v = '20' WHERE k = 'schema_version';
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    // `INSERT OR IGNORE`: a value Craig has already tuned is never restated by a
+    // migration that lands on a file already carrying the v21 shape.
+    expect(
+      db.query<{ v: string }, []>("SELECT v FROM config WHERE k = 'hook_focus_ttl_min'").get()?.v,
+    ).toBe("45");
+  });
+
+  test("the v20 -> v21 step lands on a file that already has the shape and only lacks the marker", () => {
+    db.query("UPDATE config SET v='20' WHERE k='schema_version'").run();
+    const path = join(dir, "estimator.db");
+    db.close();
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(
+      db.query<{ v: string }, []>("SELECT v FROM config WHERE k = 'hook_bind_enabled'").get()?.v,
+    ).toBe("1");
+  });
 });
 
 // ---------------------------------------------------------------------------

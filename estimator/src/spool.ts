@@ -34,10 +34,21 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
-import { DATA_ROOT } from "./db.ts";
+import { DATA_ROOT, getConfig } from "./db.ts";
 import type { IngestAnomaly } from "./ingest.ts";
+import { UPSERT_ALIAS_SQL } from "./tasks.ts";
 
 /**
  * Where the hooks write and this reader reads. The directory lives under DATA_ROOT,
@@ -62,6 +73,36 @@ export const SPOOL_DIR: string = spoolDirFrom(process.env);
 
 export const COMPLIANCE_FILE = "compliance.jsonl";
 export const TASK_EVENTS_FILE = "task-events.jsonl";
+/**
+ * HOOK-BINDING-SPEC.md (v21): spawn-time attribution bindings, one JSONL line per
+ * `PostToolUse(Agent|Workflow)` fire in the PARENT session (`scripts/nudge.ts` job 0).
+ * Same crash-safety contract as the two files above — `O_APPEND` under `PIPE_BUF`,
+ * claimed by rename, drained inside the sweep's own transaction, never written to by
+ * a hook holding the writer lock.
+ *
+ * **`task_alias.source = 'hook'`, the only new value of an existing, unchecked column**
+ * (`schema.sql:86` — `source TEXT NOT NULL DEFAULT 'sweeper'`, no CHECK; the comment
+ * beside it is inside a `CREATE TABLE` body and is therefore NOT edited here — doing so
+ * would be a schema change under `test/schema.test.ts`'s byte-identity assertion, §8.2).
+ * `'hook'` means: *the parent session, at the instant of the spawn, had exactly one
+ * thing this delegation could belong to (evaluated against the set that was open and
+ * live at that instant), or was explicitly told which one by a human pointer, or
+ * inherited it from a parent agent that already carried an exact-grade alias.* Evidence
+ * of the same grade as a human `est bind`, gathered without a human — and the only grade
+ * this hook is permitted to write, because `ambiguous` attribution is NOT excluded from
+ * the calibration corpus (see the note beside `src/attribute.ts:527`), so a guess-grade
+ * alias would be silent, durable corpus poison rather than a labelled guess.
+ *
+ * **New `anomaly.kind` values** this drain and `src/attribute.ts` can write are
+ * documented in full in `src/ingest.ts`'s `IngestAnomaly` union (the writer's parameter
+ * type) rather than repeated here; the short version: every kind below `BENIGN` in
+ * `src/cli.ts`'s `BENIGN_ANOMALY_KINDS` describes a WITNESS or a STAND-DOWN (no alias
+ * written, or deferred to a more authoritative source), never a wrong write. Only
+ * `hook_bind_conflict` and `alias_split_identity` are ALERTING — either being nonzero
+ * means one identity is claimed by two different tids through two different
+ * mechanisms, which the design's whole safety story says should never happen.
+ */
+export const AGENT_BINDS_FILE = "agent-binds.jsonl";
 const DRAINING_SUFFIX = ".draining";
 
 /**
@@ -76,6 +117,18 @@ const DRAINING_SUFFIX = ".draining";
  */
 export const MICROSWEEP_MARKER = ".microsweep";
 export const OVERRUN_MARKER_PREFIX = ".overrun-notified.";
+/**
+ * HOOK-BINDING-SPEC.md §3.2a: `est focus`'s session-scoped pointer, one file per
+ * session — `.focus.<sanitizeForFilename(session_id)>`. Declared here for the same
+ * reason every marker above is: `pruneMarkers` has to recognise the name so a marker
+ * for a session that never comes back cannot leak forever. The REAPER's ceiling
+ * ({@link FOCUS_MARKER_TTL_MS}, 7 days) is deliberately much longer than the
+ * BELIEVABILITY window (`hook_focus_ttl_min`, default 120 — see the ladder in
+ * `scripts/nudge.ts`): a marker can sit on disk, unbelieved, for a week before this
+ * pruner ever touches it. The two are different questions — "may this file still be
+ * read" vs "may what it says still be trusted" — and conflating them was rev 1's bug.
+ */
+export const FOCUS_MARKER_PREFIX = ".focus.";
 /**
  * P2.7's board-regeneration throttle marker, declared here for the reason stated
  * above: `pruneMarkers` has to recognise every name written into this directory, and a
@@ -165,6 +218,73 @@ export interface TaskEventRecord {
   task_num: string;
   to_status: string;
   source: "pretooluse";
+}
+
+/**
+ * One `PostToolUse(Agent|Workflow)` spawn-time resolution (HOOK-BINDING-SPEC.md §4).
+ * `v: 2` names the line format so a future revision can tell old lines apart without
+ * guessing from field presence.
+ *
+ * `local_id` is nullable: rung 9's `no_identity` witness (`tool_response` absent or an
+ * unrecognised shape) has no spawned identity to name. `wf_launch_id` is populated only
+ * for `kind: "workflow_run"`, recorded for audit and the drain report but written
+ * nowhere in v1 (§6.1, §8.3 phase 2). `parent_agent` is populated only for
+ * `basis: "nested"` (§7.1) — the id of the sidechain agent THIS process is, whose own
+ * alias the drain resolves the child against.
+ */
+export type SpawnBindKind = "agent" | "workflow_run";
+
+/**
+ * The resolution ladder's rung (§3.3), recorded so the drain and `est sweep --json`
+ * can build the `binds_basis` histogram — the first measurement this project has ever
+ * had for "how often is the active set genuinely ambiguous at the instant of a spawn"
+ * (§7.3). `"parent_agent"` is not a ladder rung — it is the basis a nested record's
+ * alias is written under, AFTER the drain resolves rung 0 against the parent's own
+ * alias (§4.1 step 5, §3.3 rung 0's `basis` column).
+ */
+export type SpawnBindBasis =
+  | "marker"
+  | "focus"
+  | "focus_quiet"
+  | "focus_disagrees"
+  | "sole_active"
+  | "multi_active"
+  | "no_active"
+  | "no_bound"
+  | "db_unavailable"
+  | "no_identity"
+  | "nested"
+  | "parent_agent";
+
+export interface SpawnBindRecord {
+  ts: string;
+  v: 2;
+  src: "posttooluse";
+  /** `payload.session_id` — the canonical session for a hook-written alias (§6.1),
+   *  always, including for a workflow run whose OWN state lives under a different one. */
+  sid: string;
+  /** The harness's own per-call id — the dedup key (§7.2 layer 1). */
+  tuid: string;
+  tool: "Agent" | "Workflow";
+  /** `t_spawn`, ISO (§3.1) — `now - (duration_ms ?? totalDurationMs ?? 0)`. */
+  spawn_at: string;
+  kind: SpawnBindKind;
+  /** The SPAWNED identity's own id (`agentId` or `runId`) — null only for `no_identity`. */
+  local_id: string | null;
+  wf_launch_id: string | null;
+  /** `payload.agent_id` when non-null (§7.1) — null for every non-nested record. */
+  parent_agent: string | null;
+  /** Nested-resolution attempt counter (§4.1 step 5): 0 at first write, incremented
+   *  each time the drain re-appends an unresolved nested record; capped at 3 retries. */
+  att: number;
+  tid: string | null;
+  basis: SpawnBindBasis;
+  /** Active / bound candidate counts at resolution time — diagnostic only. */
+  na?: number;
+  nb?: number;
+  /** Top-level payload key NAMES only, never values (§4, §9.1 privacy rule). */
+  k?: string[];
+  agent_type?: string;
 }
 
 export interface SpoolRead<T> {
@@ -269,6 +389,101 @@ export function parseTaskEventLines(text: string): SpoolRead<TaskEventRecord> {
   return { rows, malformed: bad, truncatedTail };
 }
 
+const SPAWN_BIND_BASES: ReadonlySet<string> = new Set([
+  "marker",
+  "focus",
+  "focus_quiet",
+  "focus_disagrees",
+  "sole_active",
+  "multi_active",
+  "no_active",
+  "no_bound",
+  "db_unavailable",
+  "no_identity",
+  "nested",
+  "parent_agent",
+]);
+
+export function parseSpawnBindLines(text: string): SpoolRead<SpawnBindRecord> {
+  const { values, malformed, truncatedTail } = parseLines(text);
+  const rows: SpawnBindRecord[] = [];
+  let bad = malformed;
+  for (const v of values) {
+    if (v === null || typeof v !== "object") {
+      bad += 1;
+      continue;
+    }
+    const o = v as Record<string, unknown>;
+    const ts = str(o.ts);
+    const sid = str(o.sid);
+    const tuid = str(o.tuid);
+    const tool = o.tool === "Agent" || o.tool === "Workflow" ? o.tool : null;
+    const spawnAt = str(o.spawn_at);
+    const kind = o.kind === "agent" || o.kind === "workflow_run" ? o.kind : null;
+    const basis = typeof o.basis === "string" && SPAWN_BIND_BASES.has(o.basis) ? (o.basis as SpawnBindBasis) : null;
+    if (ts === null || sid === null || tuid === null || tool === null || spawnAt === null || kind === null || basis === null) {
+      bad += 1;
+      continue;
+    }
+    const att = typeof o.att === "number" && Number.isFinite(o.att) ? Math.max(0, Math.trunc(o.att)) : 0;
+    rows.push({
+      ts,
+      v: 2,
+      src: "posttooluse",
+      sid,
+      tuid,
+      tool,
+      spawn_at: spawnAt,
+      kind,
+      local_id: str(o.local_id),
+      wf_launch_id: str(o.wf_launch_id),
+      parent_agent: str(o.parent_agent),
+      att,
+      tid: str(o.tid),
+      basis,
+      na: typeof o.na === "number" ? o.na : undefined,
+      nb: typeof o.nb === "number" ? o.nb : undefined,
+      k: Array.isArray(o.k) && o.k.every((x) => typeof x === "string") ? (o.k as string[]) : undefined,
+      agent_type: str(o.agent_type) ?? undefined,
+    });
+  }
+  return { rows, malformed: bad, truncatedTail };
+}
+
+/**
+ * Serialize one {@link SpawnBindRecord}, honoring the hard 512-byte `PIPE_BUF` budget
+ * (§4): if the full line exceeds 511 bytes, drop `k`, then `basis`/`na`/`nb`,
+ * re-serializing after each drop; if it is STILL over, return null (write nothing —
+ * fail open, same discipline as every other hot-path failure in this file). In
+ * practice this only bites on an unusually long `local_id`/`tid`, since every other
+ * field is bounded by construction.
+ */
+export function serializeSpawnBindLine(rec: SpawnBindRecord): string | null {
+  // A plain mutable bag rather than the typed record past this point: the assembly
+  // rule (§4) drops fields the TYPE otherwise requires (`basis`), so the budget
+  // fallback is deliberately untyped — it only ever runs on the pathological case of
+  // an unusually long id, and the drain's parser (`parseSpawnBindLines`) tolerates a
+  // missing `basis` by falling back through `str()`/the `SPAWN_BIND_BASES` guard.
+  const full: Record<string, unknown> = { ...rec };
+  const attempts: Array<() => void> = [
+    () => {}, // attempt 0: the full record, as given
+    () => {
+      delete full.k;
+    },
+    () => {
+      delete full.basis;
+      delete full.na;
+      delete full.nb;
+    },
+  ];
+  for (const drop of attempts) {
+    drop();
+    const line = JSON.stringify(full);
+    if (Buffer.byteLength(line) <= 511) return line;
+  }
+  return null;
+}
+
 export interface DrainResult {
   task_events: { read: number; inserted: number; malformed: number; truncated: number };
   compliance: {
@@ -282,6 +497,8 @@ export interface DrainResult {
   };
   /** Stale hook marker files removed this drain (P1.10 jobs 3/4 leave them behind). */
   markers_pruned: number;
+  /** HOOK-BINDING-SPEC.md §4.1 step 6: the agent-binds drain's own report. */
+  binds: SpawnBindDrainResult;
   anomalies: IngestAnomaly[];
   /**
    * Delete the claimed `.draining` files. **Call this only AFTER the surrounding
@@ -292,11 +509,70 @@ export interface DrainResult {
   cleanup: () => void;
 }
 
+/**
+ * HOOK-BINDING-SPEC.md §4.1 step 6. Field names match the spec's `binds_*` naming
+ * exactly (minus the `binds_` prefix, which `report.spool` in `src/cli.ts` restores —
+ * the same relationship `task_events`/`compliance` above already have to their
+ * `report.spool.task_events_*` / `compliance_*` fields).
+ *
+ *   - `bound`           non-nested aliases newly written this drain (rungs 1/2/3/5).
+ *   - `nested_bound`    nested (`basis:"nested"`) records resolved against a parent's
+ *                       alias and written this drain (§4.1 step 5).
+ *   - `nested_deferred` nested records that found no parent alias yet and were
+ *                       re-appended to the LIVE spool with `att+1` for a later sweep.
+ *   - `conflict`        `hook_bind_conflict` (ALERTING) — a different mechanism
+ *                       already owns the identity under a different tid.
+ *   - `superseded`      `hook_bind_superseded` (BENIGN) — a different hook alias
+ *                       already owns the identity; first writer keeps it.
+ *   - `deferred_human`  `hook_bind_deferred_to_human` (BENIGN) — an `est_bind` row
+ *                       already owns the identity; the hook stood down.
+ *   - `unbound`         `hook_bind_orphan_tid` (BENIGN) — the named tid no longer
+ *                       has a `task` row by the time the drain ran.
+ *   - `dup`             the identity already carries this SAME (id_kind, tid) pair —
+ *                       `already_bound`, an idempotent no-op, no anomaly.
+ *   - `dropped`         `tuid` groups dropped for disagreeing on `tid` within one
+ *                       batch (`hook_bind_conflict`, counted once per group here, not
+ *                       once per record) plus unparseable lines.
+ *   - `basis`           `{basis: count}` over EVERY surviving record (witnesses and
+ *                       binds alike) — the §9 denominator for "how often is the
+ *                       active set genuinely ambiguous at the instant of a spawn".
+ */
+export interface SpawnBindDrainResult {
+  read: number;
+  bound: number;
+  nested_bound: number;
+  nested_deferred: number;
+  conflict: number;
+  superseded: number;
+  deferred_human: number;
+  unbound: number;
+  dup: number;
+  dropped: number;
+  basis: Record<string, number>;
+}
+
+function emptySpawnBindDrain(): SpawnBindDrainResult {
+  return {
+    read: 0,
+    bound: 0,
+    nested_bound: 0,
+    nested_deferred: 0,
+    conflict: 0,
+    superseded: 0,
+    deferred_human: 0,
+    unbound: 0,
+    dup: 0,
+    dropped: 0,
+    basis: {},
+  };
+}
+
 export function emptyDrain(): DrainResult {
   return {
     task_events: { read: 0, inserted: 0, malformed: 0, truncated: 0 },
     compliance: { read: 0, nudged: 0, unbound: 0, db_unavailable: 0, malformed: 0, truncated: 0 },
     markers_pruned: 0,
+    binds: emptySpawnBindDrain(),
     anomalies: [],
     cleanup: () => {},
   };
@@ -355,6 +631,272 @@ function claim(dir: string, name: string): { text: string; claimed: string | nul
   }
 }
 
+/** The 4 MiB per-sweep cap on the agent-binds batch (§4.2), independent of the
+ *  `hook_bind_batch_max` record-count cap — whichever bound is hit first wins. */
+const BIND_BATCH_MAX_BYTES = 4 * 1024 * 1024;
+
+/** One row's outcome against the identity-wide owner pre-check (§4.1 step 3). */
+type BindOutcome =
+  | "bound"
+  | "dup"
+  | "deferred_human"
+  | "superseded"
+  | "conflict"
+  | "split_identity";
+
+/**
+ * Apply {@link UPSERT_ALIAS_SQL} for one `source='hook'` alias, after the
+ * IDENTITY-WIDE owner pre-check (§4.1 step 3) — no `session_id` filter, unlike
+ * `bindTask`'s own session-scoped check, because `ux_alias_exclusive` is
+ * session-scoped (`schema.sql:104-105`) and a query that were not identity-wide would
+ * make `hook_bind_conflict` blind to exactly the case it exists to catch (§5.2).
+ *
+ * Never throws on a `ux_alias_exclusive` violation: every branch below either writes
+ * an INSERT the pre-check has already proven cannot conflict, or skips the INSERT
+ * entirely. A throw here would roll back the whole drain transaction (§4.1 step 3).
+ */
+function bindAliasWithOwnerCheck(
+  db: Database,
+  args: { tid: string; idKind: "agent" | "workflow_run"; sessionId: string; localId: string; ts: string },
+): BindOutcome {
+  const rows = db
+    .query<{ tid: string; session_id: string; source: string }, [string, string]>(
+      "SELECT tid, session_id, source FROM task_alias WHERE id_kind = ? AND local_id = ?",
+    )
+    .all(args.idKind, args.localId);
+
+  if (rows.length > 1) return "split_identity";
+
+  if (rows.length === 1) {
+    const existing = rows[0]!;
+    if (existing.tid === args.tid) return "dup"; // already_bound, idempotent no-op
+    if (existing.source === "est_bind") return "deferred_human";
+    if (existing.source === "hook") return "superseded";
+    return "conflict";
+  }
+
+  db.query(UPSERT_ALIAS_SQL).run({
+    $tid: args.tid,
+    $id_kind: args.idKind,
+    $session_id: args.sessionId,
+    $local_id: args.localId,
+    $first_seen: args.ts,
+    $source: "hook",
+  } as never);
+  return "bound";
+}
+
+/**
+ * The agent-binds drain (HOOK-BINDING-SPEC.md §4.1). Call INSIDE the sweep's write
+ * transaction, before `attributeTasks` — same discipline as `drainSpool`'s other two
+ * files, and required here too: a bind written after attribution has already run for
+ * this pass is picked up on the NEXT pass, not this one (§4).
+ *
+ * Returns the report plus TWO deferred side effects the caller must apply AFTER the
+ * transaction commits, exactly like `DrainResult.cleanup`: `claimed` (the `.draining`
+ * path to delete) and `reappend` (raw JSONL lines — the batch-bound overflow and any
+ * nested records still waiting on their parent's alias — to append back to the LIVE
+ * file). Both are deferred for the same reason `cleanup()` is: acting on either
+ * inside the transaction would lose records if the commit then failed.
+ */
+function drainAgentBinds(
+  db: Database,
+  dir: string,
+  now: Date,
+): { binds: SpawnBindDrainResult; anomalies: IngestAnomaly[]; claimed: string | null; reappend: string[] } {
+  const out = emptySpawnBindDrain();
+  const anomalies: IngestAnomaly[] = [];
+  const reappend: string[] = [];
+
+  const claimedFile = claim(dir, AGENT_BINDS_FILE);
+  if (claimedFile.text === "") {
+    return { binds: out, anomalies, claimed: claimedFile.claimed, reappend };
+  }
+
+  const batchMaxRaw = Number.parseInt(getConfig(db, "hook_bind_batch_max") ?? "5000", 10);
+  const batchMax = Number.isFinite(batchMaxRaw) && batchMaxRaw > 0 ? batchMaxRaw : 5000;
+
+  // Physical lines, oldest first (append order == file order), so the batch bound and
+  // the byte cap operate on the same units re-appended to the live file verbatim — a
+  // line this pass never even parsed must survive unchanged for the next one.
+  const rawLines = (claimedFile.text.endsWith("\n") ? claimedFile.text.slice(0, -1) : claimedFile.text)
+    .split("\n")
+    .filter((l) => l.trim() !== "");
+
+  let takenBytes = 0;
+  let takeCount = 0;
+  for (; takeCount < rawLines.length && takeCount < batchMax; takeCount += 1) {
+    const bytes = Buffer.byteLength(rawLines[takeCount]!) + 1;
+    if (takeCount > 0 && takenBytes + bytes > BIND_BATCH_MAX_BYTES) break;
+    takenBytes += bytes;
+  }
+  const thisBatchText = rawLines.slice(0, takeCount).join("\n") + (takeCount > 0 ? "\n" : "");
+  for (const line of rawLines.slice(takeCount)) reappend.push(line);
+
+  const parsed = parseSpawnBindLines(thisBatchText);
+  out.read = parsed.rows.length;
+  if (parsed.malformed > 0) {
+    out.dropped += parsed.malformed;
+    anomalies.push({
+      kind: "malformed_line",
+      detail: `${parsed.malformed} unparseable line(s) in ${AGENT_BINDS_FILE}`,
+    });
+  }
+
+  // --- §4.1 step 2 / §7.2 layer 1: group by tuid, resolve within-batch disagreement ---
+  const groups = new Map<string, SpawnBindRecord[]>();
+  for (const r of parsed.rows) {
+    const g = groups.get(r.tuid);
+    if (g !== undefined) g.push(r);
+    else groups.set(r.tuid, [r]);
+  }
+
+  const earliest = (a: SpawnBindRecord, b: SpawnBindRecord): SpawnBindRecord => (a.ts <= b.ts ? a : b);
+  const survivors: SpawnBindRecord[] = [];
+  for (const recs of groups.values()) {
+    const withTid = recs.filter((r) => r.tid !== null);
+    if (new Set(withTid.map((r) => r.tid)).size > 1) {
+      out.dropped += 1;
+      anomalies.push({
+        kind: "hook_bind_conflict",
+        detail: "hook drain: one tool_use_id resolved to more than one tid within a single batch",
+      });
+      continue;
+    }
+    survivors.push(withTid.length > 0 ? withTid.reduce(earliest) : recs.reduce(earliest));
+  }
+
+  const ts = now.toISOString();
+
+  for (const r of survivors) {
+    out.basis[r.basis] = (out.basis[r.basis] ?? 0) + 1;
+
+    // --- §4.1 step 5: nested resolution, against THIS BATCH's own aliases too ---
+    if (r.basis === "nested") {
+      if (r.parent_agent === null || r.local_id === null) {
+        out.dropped += 1; // malformed nested record — should not happen, guarded anyway
+        continue;
+      }
+      const parentRows = db
+        .query<{ tid: string }, [string]>(
+          "SELECT DISTINCT tid FROM task_alias WHERE id_kind = 'agent' AND local_id = ? ORDER BY tid",
+        )
+        .all(r.parent_agent);
+      if (parentRows.length >= 1) {
+        // A parent with more than one tid (split identity) is the PARENT's problem,
+        // already surfaced by `alias_split_identity` when ITS alias was written; the
+        // deterministic lowest-tid choice here mirrors `src/attribute.ts`'s own
+        // tie-break so the child never disagrees with how the parent itself resolves.
+        const outcome = bindAliasWithOwnerCheck(db, {
+          tid: parentRows[0]!.tid,
+          idKind: r.kind,
+          sessionId: r.sid,
+          localId: r.local_id,
+          ts,
+        });
+        applyBindOutcome(outcome, out, anomalies);
+        if (outcome === "bound") out.nested_bound += 1;
+      } else if (r.att < 3) {
+        out.nested_deferred += 1;
+        const line = serializeSpawnBindLine({ ...r, att: r.att + 1 });
+        if (line !== null) reappend.push(line); // fail open: budget overflow just drops it
+      } else {
+        anomalies.push({
+          kind: "hook_spawn_depth_unbound",
+          detail: "hook drain: a nested spawn's parent agent still has no bound alias after 3 deferrals",
+        });
+      }
+      continue;
+    }
+
+    // --- witnesses: tid === null, no alias, §3.3 rungs 4/6/7/8/9 ---
+    if (r.tid === null) {
+      if (r.basis === "multi_active") {
+        anomalies.push({
+          kind: "hook_bind_multi_active",
+          detail: "hook: more than one task was active in this session at the instant of a spawn; no alias written",
+        });
+      } else if (r.basis === "no_active") {
+        anomalies.push({
+          kind: "hook_bind_no_active",
+          detail: "hook: every task bound to this session had gone quiet at the instant of a spawn; no alias written",
+        });
+      } else if (r.basis === "focus_disagrees") {
+        anomalies.push({
+          kind: "hook_focus_disagrees",
+          detail: "hook: est focus named a quiet task while a different task was active; no alias written",
+        });
+      }
+      // `no_bound`: no anomaly — `missed_estimate` already reports it (§3.3 rung 8).
+      // `db_unavailable` / `no_identity`: never an anomaly (§3.3 rung 9, §7.4).
+      continue;
+    }
+
+    // --- §4.1 step 3: a direct bind ---
+    if (r.local_id === null) {
+      out.dropped += 1; // tid set but no identity — malformed, should not happen
+      continue;
+    }
+    const task = db.query<{ n: number }, [string]>("SELECT 1 AS n FROM task WHERE tid = ?").get(r.tid);
+    if (task === null || task === undefined) {
+      out.unbound += 1;
+      anomalies.push({
+        kind: "hook_bind_orphan_tid",
+        detail: "hook drain: a spawn's bound tid no longer has a task row",
+      });
+      continue;
+    }
+    const outcome = bindAliasWithOwnerCheck(db, {
+      tid: r.tid,
+      idKind: r.kind,
+      sessionId: r.sid,
+      localId: r.local_id,
+      ts,
+    });
+    applyBindOutcome(outcome, out, anomalies);
+    if (outcome === "bound") out.bound += 1;
+  }
+
+  return { binds: out, anomalies, claimed: claimedFile.claimed, reappend };
+}
+
+function applyBindOutcome(outcome: BindOutcome, out: SpawnBindDrainResult, anomalies: IngestAnomaly[]): void {
+  switch (outcome) {
+    case "bound":
+    case "dup":
+      if (outcome === "dup") out.dup += 1;
+      return;
+    case "deferred_human":
+      out.deferred_human += 1;
+      anomalies.push({
+        kind: "hook_bind_deferred_to_human",
+        detail: "hook drain: an est_bind row already owns this identity (identity-wide check); the hook stood down",
+      });
+      return;
+    case "superseded":
+      out.superseded += 1;
+      anomalies.push({
+        kind: "hook_bind_superseded",
+        detail: "hook drain: a different hook-written alias already owns this identity (cross-drain ladder drift); first writer keeps it",
+      });
+      return;
+    case "conflict":
+      out.conflict += 1;
+      anomalies.push({
+        kind: "hook_bind_conflict",
+        detail: "hook drain: this identity is already owned by a different tid through a non-hook, non-est_bind mechanism (identity-wide check)",
+      });
+      return;
+    case "split_identity":
+      out.dropped += 1;
+      anomalies.push({
+        kind: "alias_split_identity",
+        detail: "hook drain: one (id_kind, local_id) identity holds rows under more than one session_id (identity-wide check)",
+      });
+      return;
+  }
+}
+
 /**
  * Drain both spool files into the database. Call INSIDE the sweep's transaction.
  *
@@ -377,8 +919,23 @@ export function drainSpool(db: Database, dir: string = SPOOL_DIR): DrainResult {
   result.markers_pruned = pruneMarkers(dir);
 
   const claimed: string[] = [];
+  let bindsReappend: string[] = [];
   result.cleanup = (): void => {
     for (const p of claimed) rmSync(p, { force: true });
+    // HOOK-BINDING-SPEC.md §4.1 step 5 / §4.2: batch overflow and deferred nested
+    // records go back onto the LIVE file, and only AFTER the `.draining` copies are
+    // gone — otherwise a crash between the two could leave one copy in each and the
+    // next drain would process it twice (harmless, since binding is idempotent, but
+    // needless). A single append, same O_APPEND discipline the hook itself uses.
+    if (bindsReappend.length > 0) {
+      try {
+        mkdirSync(dir, { recursive: true });
+        appendFileSync(join(dir, AGENT_BINDS_FILE), `${bindsReappend.join("\n")}\n`, { flag: "a" });
+      } catch {
+        // A lost re-append degrades to turn inference for those spawns — the same
+        // fallback every other failure in this design has.
+      }
+    }
   };
 
   const events = claim(dir, TASK_EVENTS_FILE);
@@ -447,6 +1004,12 @@ export function drainSpool(db: Database, dir: string = SPOOL_DIR): DrainResult {
     }
   }
 
+  const binds = drainAgentBinds(db, dir, new Date());
+  if (binds.claimed !== null) claimed.push(binds.claimed);
+  bindsReappend = binds.reappend;
+  result.binds = binds.binds;
+  result.anomalies.push(...binds.anomalies);
+
   return result;
 }
 
@@ -489,6 +1052,13 @@ export const BOARD_MARKER_TTL_MS = 24 * 60 * 60 * 1000;
  * teaching the pruner to walk a second directory would give it two owners.
  */
 export const CLOSE_PASS_MARKER_TTL_MS = 24 * 60 * 60 * 1000;
+/**
+ * The REAPER's ceiling for a `.focus.<sid>` marker (§3.2a) — a filesystem-hygiene
+ * bound, not the believability window. A marker this old is almost certainly a
+ * finished or abandoned session's leftover; `est close` reclaims it far sooner in the
+ * ordinary case, so 7 days is a backstop for a session that never closed at all.
+ */
+export const FOCUS_MARKER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * Delete stale hook marker files. Called from `drainSpool`, so it runs on every sweep
@@ -523,6 +1093,11 @@ export function pruneMarkers(dir: string = SPOOL_DIR, now: Date = new Date()): n
       // form is a pre-suffix leftover. No `.tmp.` sibling — only the mtime is ever read,
       // so the writer is a plain `writeFileSync` and there is no staging file to reap.
       ttl = CLOSE_PASS_MARKER_TTL_MS;
+    } else if (name.startsWith(FOCUS_MARKER_PREFIX)) {
+      // Covers both `.focus.<sid>` itself and `.focus.<sid>.tmp.<pid>` — the atomic
+      // write's staging file, left behind only by a crash between the write and the
+      // rename, same reasoning as `.board`'s own `.tmp.` arm above.
+      ttl = FOCUS_MARKER_TTL_MS;
     } else {
       continue;
     }
@@ -546,6 +1121,89 @@ export function pruneMarkers(dir: string = SPOOL_DIR, now: Date = new Date()): n
 export function clearOverrunMarker(tid: string, dir: string = SPOOL_DIR): void {
   try {
     rmSync(join(dir, overrunMarkerFile(tid)), { force: true });
+  } catch {
+    // Never fail a close over a marker file.
+  }
+}
+
+/** Who wrote a focus marker — carried for audit, never branched on by a reader. */
+export type FocusMarkerWriter = "est_open" | "est_focus" | "est_bind";
+
+export interface FocusMarker {
+  tid: string;
+  ts: string;
+  by: FocusMarkerWriter;
+}
+
+/** Marker filename (not path) for `est focus`'s session-scoped pointer (§3.2a). */
+export function focusMarkerFile(sessionId: string): string {
+  return `${FOCUS_MARKER_PREFIX}${sanitizeForFilename(sessionId)}`;
+}
+
+/**
+ * Write (or overwrite) the focus marker for `sessionId`, atomically: `<name>.tmp.<pid>`
+ * then `renameSync` (§3.2a), so two processes writing one resumed session's marker
+ * cannot interleave a half-written file — last writer wins, which is the intent.
+ * Never throws: a lost focus write degrades to the ladder's later rungs, exactly like
+ * every other best-effort marker in this file.
+ */
+export function writeFocusMarker(
+  sessionId: string,
+  tid: string,
+  by: FocusMarkerWriter,
+  dir: string = SPOOL_DIR,
+  now: Date = new Date(),
+): void {
+  try {
+    mkdirSync(dir, { recursive: true });
+    const path = join(dir, focusMarkerFile(sessionId));
+    const tmp = `${path}.tmp.${process.pid}`;
+    const marker: FocusMarker = { tid, ts: now.toISOString(), by };
+    writeFileSync(tmp, JSON.stringify(marker));
+    renameSync(tmp, path);
+  } catch {
+    // Best-effort, like every other marker write in this file.
+  }
+}
+
+/**
+ * Read `sessionId`'s focus marker, or null when there is none / it is unreadable /
+ * malformed. Returns the marker AS WRITTEN — the ladder (`scripts/nudge.ts`) is the
+ * one place that decides whether it is still believable (§3.2a's idle-based TTL); this
+ * function makes no freshness judgement of its own.
+ */
+export function readFocusMarker(sessionId: string, dir: string = SPOOL_DIR): FocusMarker | null {
+  try {
+    const parsed = JSON.parse(readFileSync(join(dir, focusMarkerFile(sessionId)), "utf8")) as Record<
+      string,
+      unknown
+    >;
+    const tid = str(parsed.tid);
+    const ts = str(parsed.ts);
+    const by = parsed.by;
+    if (tid === null || ts === null || (by !== "est_open" && by !== "est_focus" && by !== "est_bind")) {
+      return null;
+    }
+    return { tid, ts, by };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Disarm the focus marker for `sessionId`. Called by `est close` for the tid it
+ * closed — exactly the `clearOverrunMarker` discipline above — so a marker naming a
+ * now-finalized task cannot go on granting `exclusive`-grade bindings, and a reopen
+ * does not inherit a stale pointer. Only clears when the marker actually names `tid`:
+ * a session can host several tasks (schema v6), and closing one must not blow away a
+ * DIFFERENT task's live focus.
+ */
+export function clearFocusMarker(sessionId: string, tid: string, dir: string = SPOOL_DIR): void {
+  try {
+    const current = readFocusMarker(sessionId, dir);
+    if (current !== null && current.tid === tid) {
+      rmSync(join(dir, focusMarkerFile(sessionId)), { force: true });
+    }
   } catch {
     // Never fail a close over a marker file.
   }

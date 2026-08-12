@@ -1649,7 +1649,7 @@ WHERE s.terminator = 'open'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '20'),
+  ('schema_version',          '21'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.
@@ -1836,7 +1836,15 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   -- Reporting threshold for `outcome.cw_ttl_unknown_share` / `v_cw_ttl_exposure`:
   -- `est report` warns above this share. NOT a pricing lever — D4's unknown-TTL
   -- fallback rate is deliberately not config (see the note on v_priced above).
-  ('cw_ttl_unknown_warn_share',    '0.02');
+  ('cw_ttl_unknown_warn_share',    '0.02'),
+  -- HOOK-BINDING-SPEC.md (v21): hook-based spawn-time attribution binding. Master
+  -- switch, believability TTL (idle-based per rev 3 -- see hook_focus_ttl_min's use
+  -- in src/spool.ts), the description-marker opt-in (off by default: model-controlled
+  -- text must not mint an exclusive-grade alias on its own), and the drain batch cap.
+  ('hook_bind_enabled',    '1'),
+  ('hook_focus_ttl_min',   '120'),
+  ('hook_bind_marker',     '0'),
+  ('hook_bind_batch_max',  '5000');
 
 INSERT OR IGNORE INTO bucket_def (bucket, created_at, dims_json, parent_bucket, split_pinball_gain, active)
 VALUES ('global', strftime('%Y-%m-%dT%H:%M:%SZ','now'), '{}', NULL, NULL, 1);

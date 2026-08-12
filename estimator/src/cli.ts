@@ -569,6 +569,24 @@ export const BENIGN_ANOMALY_KINDS: ReadonlySet<string> = new Set([
   // ledger row: it is the only visible difference between "nobody planted" and
   // "somebody planted something this database cannot resolve".
   "plant_unlinked",
+  // HOOK-BINDING-SPEC.md §8.4 (v21): hook-based spawn-time attribution binding. Every
+  // kind below is a WITNESS OR STAND-DOWN, never a wrong write — the design's whole
+  // safety story is that a hook alias is only ever exact-grade, so the failure modes
+  // it can produce are "recorded nothing" (a measurement) or "deferred to a more
+  // authoritative source" (the intended precedence), not corrupted spend. The two
+  // kinds that describe an actual identity DISAGREEING with itself —
+  // `hook_bind_conflict` and `alias_split_identity` — are deliberately NOT in this
+  // set; they are ALERTING (§9.4 A1) because either one being nonzero is a design
+  // defect, not ordinary traffic.
+  "hook_bind_multi_active", // genuinely ambiguous spawn instant; no alias written
+  "hook_bind_no_active", // every bound task had gone quiet; no alias written
+  "hook_focus_disagrees", // stale focus pointer vs a live active set; no alias written
+  "hook_marker_unresolved", // a mistyped/stale [est:...] prefix; ignored, not obeyed
+  "hook_spawn_depth_unbound", // nested spawn whose parent never got an alias after 3 deferrals
+  "hook_bind_orphan_tid", // the task named at spawn time was deleted before the drain ran
+  "hook_bind_deferred_to_human", // an est_bind row already owns the identity; the hook stood down
+  "hook_bind_superseded", // hook-vs-hook ladder drift across a drain boundary; first writer keeps it
+  "alias_unbound", // est unbind / est bind --replace audit trail
   // NOTE: `board_render_failed` (P2.7) is deliberately ABSENT from this set — it
   // does not go through `report.anomalies` at all (see the sweep's board-regen
   // step). The design's "never fails the sweep" is unconditional: `--strict`

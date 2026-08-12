@@ -284,6 +284,36 @@ export interface IngestAnomaly {
     // because a cleanup that leaves no trace is the same class of thing as the rows it
     // removes — the ledger has to be able to answer "what did the audit take?".
     | "audit_removed"
+    // HOOK-BINDING-SPEC.md (v21), raised by src/spool.ts's agent-binds drain and by
+    // src/attribute.ts. New kinds are documented HERE and in src/spool.ts's module
+    // doc rather than in schema.sql's in-DDL `anomaly.kind` catalogue comment,
+    // because editing a comment inside a CREATE body is a schema change under
+    // test/schema.test.ts's byte-identity assertion (spec §8.2, Q3). BENIGN
+    // (src/cli.ts BENIGN_ANOMALY_KINDS) unless noted:
+    //   hook_bind_multi_active   -- genuinely ambiguous spawn instant; no alias written
+    //   hook_bind_no_active      -- every bound task in the session had gone quiet
+    //   hook_focus_disagrees     -- stale focus pointer vs a live active set
+    //   hook_marker_unresolved   -- a mistyped/stale [est:...] prefix; ignored
+    //   hook_spawn_depth_unbound -- nested spawn whose parent never got an alias
+    //   hook_bind_orphan_tid     -- the task named at spawn time was deleted before drain
+    //   hook_bind_deferred_to_human -- an est_bind row already owns the identity
+    //   hook_bind_superseded     -- hook-vs-hook ladder drift across a drain boundary
+    //   alias_unbound            -- est unbind / est bind --replace audit trail
+    //   hook_bind_conflict       -- ALERTING: a hook alias disagrees with a DIFFERENT
+    //                               mechanism about one identity
+    //   alias_split_identity     -- ALERTING: one (id_kind, local_id) holds rows under
+    //                               two session ids with two different tids
+    | "hook_bind_multi_active"
+    | "hook_bind_no_active"
+    | "hook_focus_disagrees"
+    | "hook_marker_unresolved"
+    | "hook_spawn_depth_unbound"
+    | "hook_bind_orphan_tid"
+    | "hook_bind_deferred_to_human"
+    | "hook_bind_superseded"
+    | "alias_unbound"
+    | "hook_bind_conflict"
+    | "alias_split_identity"
     // Discovery-level, passed through unchanged by {@link toIngestAnomalies}.
     | AnomalyKind;
   detail: string;

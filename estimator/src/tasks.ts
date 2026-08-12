@@ -1202,8 +1202,14 @@ INSERT INTO estimate (
  * session dirs. It deliberately does NOT swallow a `ux_alias_exclusive` violation:
  * a second task claiming one agent, run or Task-tool number is a real conflict and
  * must surface, not vanish into a DO NOTHING.
+ *
+ * EXPORTED (HOOK-BINDING-SPEC.md §4.1 step 3): `src/spool.ts`'s agent-binds drain is
+ * a second writer of `source='hook'` rows, and it performs its OWN identity-wide
+ * owner pre-check first (unlike `bindTask`'s session-scoped one, see that function's
+ * doc comment) — so by the time it reaches this statement a conflict is structurally
+ * impossible and `DO NOTHING` only ever fires on a genuine idempotent re-drain.
  */
-const UPSERT_ALIAS_SQL = `
+export const UPSERT_ALIAS_SQL = `
 INSERT INTO task_alias (tid, id_kind, session_id, local_id, first_seen, source)
 VALUES ($tid, $id_kind, $session_id, $local_id, $first_seen, $source)
 ON CONFLICT(id_kind, session_id, local_id, tid) DO NOTHING
