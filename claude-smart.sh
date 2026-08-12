@@ -11,16 +11,15 @@
 # Auto-detected: javascript (via package.json), typescript (via tsconfig.json or package.json),
 #                hugo (via hugo.toml or config.toml with Hugo directories)
 #
-# Launches the natively installed claude binary, running "claude update" first
-# (best-effort: offline/slow update never blocks launch).
+# Launches the natively installed claude binary.
 
 set -euo pipefail
 
-# Native claude binary (npm global install via homebrew node)
-CLAUDE_BIN=/opt/homebrew/bin/claude
+# Native claude binary (native installer)
+CLAUDE_BIN="$HOME/.local/bin/claude"
 if [[ ! -x "$CLAUDE_BIN" ]]; then
     echo "claude-smart: claude binary not found at $CLAUDE_BIN" >&2
-    echo "claude-smart: install with: npm install -g @anthropic-ai/claude-code" >&2
+    echo "claude-smart: install with: curl -fsSL https://claude.ai/install.sh | bash" >&2
     exit 1
 fi
 
@@ -96,13 +95,6 @@ CLAUDE_FLAGS=()
 for dir in "${PLUGIN_DIRS[@]}"; do
     [[ -d "$dir" ]] && CLAUDE_FLAGS+=(--plugin-dir "$dir")
 done
-
-# Self-update before launch (best-effort: never block on failure or slowness)
-if command -v timeout &>/dev/null; then
-    timeout 60 "$CLAUDE_BIN" update || echo "claude-smart: update failed or timed out; launching installed version" >&2
-else
-    "$CLAUDE_BIN" update || echo "claude-smart: update failed; launching installed version" >&2
-fi
 
 # Launch the native binary
 exec "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" "$@"
