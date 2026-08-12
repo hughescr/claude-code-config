@@ -15,9 +15,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb, SCHEMA_VERSION, schemaVersion } from "../src/db.ts";
-import { BACKFILL_TASK_EVENT_TID_SQL, INSERT_TASK_EVENT_SQL } from "../src/ingest.ts";
+import { BACKFILL_TASK_EVENT_TID_SQL, INSERT_TASK_EVENT_SQL, UPSERT_REQUEST_SQL } from "../src/ingest.ts";
 import { CLOSE_PASS_CANDIDATE_SQL } from "../src/autoclose.ts";
 import { ABOVE_200K_SUFFIX, LONG_CONTEXT_THRESHOLD } from "../src/prices.ts";
+import { INSERT_AUXILIARY_SQL, SUPERSEDE_AUXILIARY_SQL } from "../src/otel.ts";
 
 let dir: string;
 let db: Database;
@@ -39,14 +40,23 @@ afterEach(() => {
 /** USD per Mtok, effective from `from` (default: covers all history). */
 function price(
   family: string,
-  rates: { in: number; out: number; cw: number; cr: number },
+  rates: { in: number; out: number; cw: number; cr: number; cw1h?: number },
   from = "1970-01-01T00:00:00Z",
 ): void {
   db.query(
     `INSERT INTO model_price (family, effective_from, usd_in, usd_out, usd_cw, usd_cr,
-                              provisional, source, synced_epoch, ingested_at)
-     VALUES (?,?,?,?,?,?,0,'manual',NULL,'1970-01-01T00:00:00Z')`,
-  ).run(family, from, rates.in, rates.out, rates.cw, rates.cr);
+                              usd_cw1h, usd_cw1h_src, provisional, source, synced_epoch, ingested_at)
+     VALUES (?,?,?,?,?,?,?,?,0,'manual',NULL,'1970-01-01T00:00:00Z')`,
+  ).run(
+    family,
+    from,
+    rates.in,
+    rates.out,
+    rates.cw,
+    rates.cr,
+    rates.cw1h ?? null,
+    rates.cw1h === undefined ? "unrecorded" : "manual",
+  );
 }
 
 interface ReqOpts {
@@ -56,6 +66,9 @@ interface ReqOpts {
   out_tok?: number;
   cw_tok?: number;
   cr_tok?: number;
+  cw5m_tok?: number;
+  cw1h_tok?: number;
+  cw_ttl_src?: string;
   ts?: string;
   tid?: string | null;
   attr?: string;
@@ -66,8 +79,9 @@ function request(id: string, o: ReqOpts = {}): void {
   const family = o.family ?? "claude-test-1";
   db.query(
     `INSERT INTO request (request_id, session_id, origin, model, model_family, ts,
-                          in_tok, out_tok, cw_tok, cr_tok, tid, attr, agent_id)
-     VALUES (?, 's1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                          in_tok, out_tok, cw_tok, cr_tok, cw5m_tok, cw1h_tok, cw_ttl_src,
+                          tid, attr, agent_id)
+     VALUES (?, 's1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     o.origin ?? "main",
@@ -78,6 +92,9 @@ function request(id: string, o: ReqOpts = {}): void {
     o.out_tok ?? 0,
     o.cw_tok ?? 0,
     o.cr_tok ?? 0,
+    o.cw5m_tok ?? 0,
+    o.cw1h_tok ?? 0,
+    o.cw_ttl_src ?? "unrecorded",
     o.tid ?? null,
     o.attr ?? "none",
     o.agent_id ?? null,
@@ -1088,5 +1105,330 @@ describe("schema migration", () => {
     expect(
       db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM otel_request").get()?.n,
     ).toBe(0);
+  });
+
+  // NOTE on byte-identity coverage for the v19 -> v20 step specifically: this
+  // file's OTHER migration tests above ("a v7 database migrates...", "a v12
+  // database gains...", "a v13 database gains...", "the v14 step...") all walk a
+  // genuinely pre-v19-shaped database FORWARD through every pending step,
+  // including this one, and diff the result against a truly fresh file byte for
+  // byte — they already exercise and PROVE this step's ADD COLUMN placement.
+  // A dedicated v19->v20 byte-diff test here would need to fabricate a "v19
+  // shape" by DROP-COLUMNing a database this repo's OWN schema.sql already built
+  // to v20 (comments and all), which reintroduces those v20-only comments into a
+  // supposedly-v19 file and corrupts the very placement it would be testing —
+  // the DROP/CREATE VIEW and ADD COLUMN functional behaviour is covered by the
+  // two tests below and by the pricing-semantics suite; true sqlite_master
+  // byte-identity for this step rides on the chain tests above.
+  test("migration rule 2: a tuned cache-write-1h knob survives the v19 -> v20 step", () => {
+    db.exec(`
+      UPDATE config SET v = '1.4' WHERE k = 'price_cw_1h_min_multiple';
+      UPDATE config SET v = '19' WHERE k = 'schema_version';
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    // `INSERT OR IGNORE`: a value Craig has already tuned is never restated by a
+    // migration that lands on a file already carrying the v20 shape.
+    expect(
+      db.query<{ v: string }, []>("SELECT v FROM config WHERE k = 'price_cw_1h_min_multiple'").get()?.v,
+    ).toBe("1.4");
+  });
+
+  test("the v19 -> v20 step lands on a file that already has the shape and only lacks the marker", () => {
+    db.query("UPDATE config SET v='19' WHERE k='schema_version'").run();
+    const path = join(dir, "estimator.db");
+    db.close();
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(
+      db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM v_cw_ttl_exposure").get()?.n,
+    ).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CACHE-TTL-PRICING.md — the cache-write TTL pricing fix (v20)
+// ---------------------------------------------------------------------------
+
+describe("cache-write TTL pricing (D1-D5)", () => {
+  const RATES = { in: 1, out: 1, cw: 1, cr: 1, cw1h: 2 };
+
+  beforeEach(() => {
+    price("claude-sonnet-4-5", RATES); // config.ref_model
+    price("claude-test-1", RATES);
+  });
+
+  const wcetOf = (id: string): number =>
+    db.query<{ wcet: number }, [string]>("SELECT wcet FROM v_wcet WHERE request_id = ?").get(id)!.wcet;
+
+  test("a 5m-only cache write prices at exactly cw_tok * usd_cw", () => {
+    request("r5m", { cw_tok: 100, cw5m_tok: 100, cw1h_tok: 0, cw_ttl_src: "transcript" });
+    expect(wcetOf("r5m")).toBe(100 * RATES.cw);
+  });
+
+  test("a 1h-only cache write prices at exactly cw_tok * usd_cw1h (2x usd_in here)", () => {
+    request("r1h", { cw_tok: 100, cw5m_tok: 0, cw1h_tok: 100, cw_ttl_src: "transcript" });
+    expect(wcetOf("r1h")).toBe(100 * RATES.cw1h);
+  });
+
+  test("a mixed request prices the weighted sum of both legs", () => {
+    request("rmix", { cw_tok: 100, cw5m_tok: 60, cw1h_tok: 40, cw_ttl_src: "transcript" });
+    expect(wcetOf("rmix")).toBe(60 * RATES.cw + 40 * RATES.cw1h);
+  });
+
+  test("D4: an unrecorded-TTL request is priced EXACTLY as it was pre-fix — cw_tok * usd_cw", () => {
+    request("runk", { cw_tok: 100, cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded" });
+    expect(wcetOf("runk")).toBe(100 * RATES.cw);
+  });
+
+  test("D3: an over-split row (cw5m+cw1h > cw_tok) is clamped to price exactly cw_tok tokens, at the LOWER (5m-filled-first) rate", () => {
+    // 80 + 80 = 160 > cw_tok(100). 5m fills first: 5m_priced=80, 1h_priced=min(80,20)=20.
+    request("rover", { cw_tok: 100, cw5m_tok: 80, cw1h_tok: 80, cw_ttl_src: "transcript" });
+    const naive1hFirst = 80 * RATES.cw1h + 20 * RATES.cw; // the rejected, higher-priced order
+    const fiveMFirst = 80 * RATES.cw + 20 * RATES.cw1h; // what the view actually computes
+    expect(wcetOf("rover")).toBe(fiveMFirst);
+    expect(wcetOf("rover")).toBeLessThan(naive1hFirst);
+
+    const row = db
+      .query<{ cw5m_priced_tok: number; cw1h_priced_tok: number; cw_ttl_unknown_tok: number }, [string]>(
+        "SELECT cw5m_priced_tok, cw1h_priced_tok, cw_ttl_unknown_tok FROM v_priced WHERE request_id = ?",
+      )
+      .get("rover")!;
+    // The three legs always sum to exactly cw_tok, in both directions.
+    expect(row.cw5m_priced_tok + row.cw1h_priced_tok + row.cw_ttl_unknown_tok).toBe(100);
+  });
+
+  // v_cw_ttl_exposure (D3/D10) is deliberately NOT keyed by request_id — it is
+  // the diagnostic/reporting surface, so rows are distinguished by `ts` here.
+  test("v_cw_ttl_exposure surfaces unknown-TTL and over-split rows, and only those", () => {
+    request("known", { cw_tok: 100, cw5m_tok: 60, cw1h_tok: 40, cw_ttl_src: "transcript", ts: "2026-01-01T00:00:01Z" });
+    request("unk", { cw_tok: 100, cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded", ts: "2026-01-01T00:00:02Z" });
+    request("over", { cw_tok: 100, cw5m_tok: 80, cw1h_tok: 80, cw_ttl_src: "transcript", ts: "2026-01-01T00:00:03Z" });
+    request("nocache", { cw_tok: 0, ts: "2026-01-01T00:00:04Z" });
+
+    const rows = db
+      .query<{ ts: string; cw_ttl_unknown_tok: number; cw_ttl_over_tok: number }, []>(
+        "SELECT ts, cw_ttl_unknown_tok, cw_ttl_over_tok FROM v_cw_ttl_exposure ORDER BY ts",
+      )
+      .all();
+    expect(rows.map((r) => r.ts)).toEqual(["2026-01-01T00:00:02Z", "2026-01-01T00:00:03Z"]);
+    expect(rows.find((r) => r.ts === "2026-01-01T00:00:02Z")).toMatchObject({
+      cw_ttl_unknown_tok: 100,
+      cw_ttl_over_tok: 0,
+    });
+    expect(rows.find((r) => r.ts === "2026-01-01T00:00:03Z")).toMatchObject({
+      cw_ttl_unknown_tok: 0,
+      cw_ttl_over_tok: 60,
+    });
+  });
+
+  test("v_cw_ttl_exposure is reachable for an UNPRICED family too", () => {
+    // "claude-unpriced-1" has NO model_price row at all — v_priced's INNER JOIN
+    // would drop it entirely, which is exactly the blind spot this view exists
+    // to avoid.
+    request("unpriced_unk", {
+      family: "claude-unpriced-1",
+      cw_tok: 50,
+      cw_ttl_src: "unrecorded",
+      ts: "2026-01-01T00:00:09Z",
+    });
+    const row = db
+      .query<{ n: number }, []>(
+        "SELECT COUNT(*) AS n FROM v_cw_ttl_exposure WHERE ts = '2026-01-01T00:00:09Z'",
+      )
+      .get()!;
+    expect(row.n).toBe(1);
+    expect(
+      db
+        .query<{ n: number }, []>(
+          "SELECT COUNT(*) AS n FROM v_priced WHERE request_id = 'unpriced_unk'",
+        )
+        .get()!.n,
+    ).toBe(0);
+  });
+
+  test("v_cw_1h_price_gap names a family with cache-write spend but no recorded 1h rate, and only that one", () => {
+    price("claude-test-2", { in: 1, out: 1, cw: 1, cr: 1 }); // no cw1h — 'unrecorded'
+    request("gapped", { family: "claude-test-2", cw_tok: 10 });
+    request("covered", { family: "claude-test-1", cw_tok: 10, cw5m_tok: 10, cw_ttl_src: "transcript" });
+
+    const gap = db.query<{ family: string }, []>("SELECT family FROM v_cw_1h_price_gap").all();
+    expect(gap.map((r) => r.family)).toEqual(["claude-test-2"]);
+
+    db.exec("UPDATE model_price SET usd_cw1h = 2, usd_cw1h_src = 'manual' WHERE family = 'claude-test-2'");
+    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM v_cw_1h_price_gap").get()!.n).toBe(0);
+  });
+
+  test("D3: v_wcet and v_task_actual_epoch agree on the same cw_cost expression", () => {
+    task("t1");
+    estimate("t1", {
+      price_epoch: "2026-01-01T00:00:00Z",
+      ref_model: "claude-sonnet-4-5",
+      estimand: "work_cet",
+    });
+    request("rtask", {
+      tid: "t1",
+      attr: "exclusive",
+      origin: "main",
+      cw_tok: 100,
+      cw5m_tok: 60,
+      cw1h_tok: 40,
+      cw_ttl_src: "transcript",
+      ts: "2026-01-01T00:00:00Z",
+    });
+
+    const fromWcet = db
+      .query<{ wcet_task_effort: number }, []>(
+        "SELECT wcet_task_effort FROM v_task_actual WHERE tid = 't1'",
+      )
+      .get()!.wcet_task_effort;
+    const fromEpoch = db
+      .query<{ wcet_at_epoch: number }, []>(
+        "SELECT wcet_at_epoch FROM v_task_actual_epoch WHERE tid = 't1'",
+      )
+      .get()!.wcet_at_epoch;
+    expect(fromEpoch).toBe(fromWcet);
+    expect(fromWcet).toBe(60 * RATES.cw + 40 * RATES.cw1h);
+  });
+
+  test("D1/D7: OTEL never names the three new request columns — it has no TTL information", () => {
+    expect(INSERT_AUXILIARY_SQL).not.toContain("cw5m_tok");
+    expect(INSERT_AUXILIARY_SQL).not.toContain("cw1h_tok");
+    expect(INSERT_AUXILIARY_SQL).not.toContain("cw_ttl_src");
+    expect(SUPERSEDE_AUXILIARY_SQL).not.toContain("cw5m_tok");
+    expect(SUPERSEDE_AUXILIARY_SQL).not.toContain("cw1h_tok");
+    expect(SUPERSEDE_AUXILIARY_SQL).not.toContain("cw_ttl_src");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CACHE-TTL-PRICING.md D1/D7 — ingest-side dedup ratchet (UPSERT_REQUEST_SQL)
+// ---------------------------------------------------------------------------
+
+describe("cache-write TTL dedup ratchet (D7)", () => {
+  const upsert = (row: {
+    request_id: string;
+    model: string;
+    cw_tok: number;
+    cw5m_tok: number;
+    cw1h_tok: number;
+    cw_ttl_src: string;
+  }): void => {
+    db.query(UPSERT_REQUEST_SQL).run({
+      $request_id: row.request_id,
+      $message_id: null,
+      $is_sidechain: 0,
+      $session_id: "s1",
+      $prompt_id: null,
+      $origin: "main",
+      $agent_id: null,
+      $run_id: null,
+      $wf_launch_id: null,
+      $model: row.model,
+      $model_family: row.model,
+      $attribution_agent: null,
+      $attribution_skill: null,
+      $ts: "2026-01-01T00:00:00Z",
+      $in_tok: 0,
+      $out_tok: 0,
+      $cw_tok: row.cw_tok,
+      $cr_tok: 0,
+      $cw5m_tok: row.cw5m_tok,
+      $cw1h_tok: row.cw1h_tok,
+      $cw_ttl_src: row.cw_ttl_src,
+    } as never);
+  };
+
+  const stored = () =>
+    db
+      .query<
+        { cw_tok: number; cw5m_tok: number; cw1h_tok: number; cw_ttl_src: string; model: string },
+        []
+      >("SELECT cw_tok, cw5m_tok, cw1h_tok, cw_ttl_src, model FROM request WHERE request_id = 'rid1'")
+      .get()!;
+
+  test("same model, unrecorded THEN transcript: knowledge ratchets up and counters MAX", () => {
+    upsert({ request_id: "rid1", model: "claude-test-1", cw_tok: 50, cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded" });
+    upsert({ request_id: "rid1", model: "claude-test-1", cw_tok: 100, cw5m_tok: 60, cw1h_tok: 40, cw_ttl_src: "transcript" });
+    expect(stored()).toMatchObject({ cw_tok: 100, cw5m_tok: 60, cw1h_tok: 40, cw_ttl_src: "transcript" });
+  });
+
+  test("same model, transcript THEN a later line with no split: the label does NOT ratchet down, and cw_tok can still rise ahead of the split (the honest residual D3 prices)", () => {
+    upsert({ request_id: "rid1", model: "claude-test-1", cw_tok: 100, cw5m_tok: 60, cw1h_tok: 40, cw_ttl_src: "transcript" });
+    upsert({ request_id: "rid1", model: "claude-test-1", cw_tok: 150, cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded" });
+    const row = stored();
+    expect(row.cw_ttl_src).toBe("transcript");
+    expect(row.cw_tok).toBe(150); // MAX ratchets the aggregate...
+    expect(row.cw5m_tok).toBe(60); // ...but the split counters do NOT follow it,
+    expect(row.cw1h_tok).toBe(40); // which is the visible residual D3's clamp prices.
+  });
+
+  test("a TAKEOVER by an unrecorded row over a stored transcript row yields unrecorded WITH the winner's counters — never 'transcript' over 0/0", () => {
+    // Model A wins first (bigger total), model B (smaller) is the loser.
+    upsert({ request_id: "rid1", model: "claude-test-1", cw_tok: 100, cw5m_tok: 60, cw1h_tok: 40, cw_ttl_src: "transcript" });
+    // A DIFFERENT, LARGER-total model with no split takes over the row.
+    db.query(UPSERT_REQUEST_SQL).run({
+      $request_id: "rid1",
+      $message_id: null,
+      $is_sidechain: 0,
+      $session_id: "s1",
+      $prompt_id: null,
+      $origin: "main",
+      $agent_id: null,
+      $run_id: null,
+      $wf_launch_id: null,
+      $model: "claude-test-9",
+      $model_family: "claude-test-9",
+      $attribution_agent: null,
+      $attribution_skill: null,
+      $ts: "2026-01-01T00:00:01Z",
+      $in_tok: 0,
+      $out_tok: 1000, // forces a bigger EXCLUDED_TOTAL, so this row TAKES OVER
+      $cw_tok: 0,
+      $cr_tok: 0,
+      $cw5m_tok: 0,
+      $cw1h_tok: 0,
+      $cw_ttl_src: "unrecorded",
+    } as never);
+    const row = stored();
+    expect(row.model).toBe("claude-test-9");
+    expect(row.cw_ttl_src).toBe("unrecorded"); // NEVER 'transcript' over a 0/0 split
+    expect(row.cw5m_tok).toBe(0);
+    expect(row.cw1h_tok).toBe(0);
+  });
+
+  test("a CONTESTED non-takeover by a transcript row over a stored unrecorded row leaves the stored row's label AND counters untouched", () => {
+    // The STORED row has the larger total, so the challenger below is contested
+    // but does NOT take over (RID_TAKEOVER needs a STRICTLY larger excluded total).
+    upsert({ request_id: "rid1", model: "claude-test-9", cw_tok: 1000, cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded" });
+    db.query(UPSERT_REQUEST_SQL).run({
+      $request_id: "rid1",
+      $message_id: null,
+      $is_sidechain: 0,
+      $session_id: "s1",
+      $prompt_id: null,
+      $origin: "main",
+      $agent_id: null,
+      $run_id: null,
+      $wf_launch_id: null,
+      $model: "claude-test-1", // a DIFFERENT, SMALLER-total model: contested, no takeover
+      $model_family: "claude-test-1",
+      $attribution_agent: null,
+      $attribution_skill: null,
+      $ts: "2026-01-01T00:00:01Z",
+      $in_tok: 0,
+      $out_tok: 0,
+      $cw_tok: 100,
+      $cr_tok: 0,
+      $cw5m_tok: 60,
+      $cw1h_tok: 40,
+      $cw_ttl_src: "transcript",
+    } as never);
+    const row = stored();
+    expect(row.model).toBe("claude-test-9"); // the stored winner is untouched
+    expect(row.cw_ttl_src).toBe("unrecorded");
+    expect(row.cw_tok).toBe(1000);
   });
 });

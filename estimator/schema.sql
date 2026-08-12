@@ -33,9 +33,15 @@ CREATE TABLE model_price (          -- pricing is DATA; dated aliases collapse t
                                     -- | 'claude-api-skill' | 'model-selection' (now occasional
                                     -- cross-checks only, §4.3)
   synced_epoch TEXT,                -- R3 -> price_sync(price_epoch): which sync wrote this row
-  ingested_at TEXT NOT NULL,
+  ingested_at TEXT NOT NULL, usd_cw1h REAL CHECK (usd_cw1h IS NULL OR usd_cw1h >= 0), usd_cw1h_src TEXT NOT NULL DEFAULT 'unrecorded' CHECK (usd_cw1h_src IN ('litellm','models_dev','manual','derived_from_input','unrecorded') AND ((usd_cw1h IS NULL) = (usd_cw1h_src = 'unrecorded'))),
   PRIMARY KEY (family, effective_from)
 ) STRICT, WITHOUT ROWID;
+-- CACHE-TTL-PRICING.md D2: `usd_cw1h` is the 1-hour cache-write premium (2x base
+-- input, vs 1.25x for the 5-minute write `usd_cw` already holds). Honestly
+-- nullable: an unsynced/unfilled vintage says so via `usd_cw1h_src='unrecorded'`
+-- rather than silently defaulting to a number nobody measured. The pairing check
+-- is COLUMN-level (attached to usd_cw1h_src, referencing the already-declared
+-- usd_cw1h) because ALTER TABLE ADD COLUMN cannot add a table-level CHECK.
 
 CREATE TABLE price_sync (           -- R3: the DB IS the local price snapshot/cache (§4.3).
                                     -- ccusage keeps no on-disk cache to read [R3]; we keep ours.
@@ -440,10 +446,15 @@ CREATE TABLE request (              -- the atomic fact: one row per deduped API 
                                     -- OTEL only (Phase 2); transcripts lack it
   tid TEXT REFERENCES task(tid),    -- NULL = unattributed: a counted state, never an error
   attr TEXT NOT NULL DEFAULT 'none' CHECK (attr IN
-    ('none','exclusive','sticky','ambiguous','overhead','pre_task','replay'))
+    ('none','exclusive','sticky','ambiguous','overhead','pre_task','replay')), cw5m_tok INTEGER NOT NULL DEFAULT 0 CHECK (cw5m_tok >= 0), cw1h_tok INTEGER NOT NULL DEFAULT 0 CHECK (cw1h_tok >= 0), cw_ttl_src TEXT NOT NULL DEFAULT 'unrecorded' CHECK (cw_ttl_src IN ('transcript','unrecorded'))
                                     -- 'replay' added in R2: a sidechain re-emission of an
                                     -- already-counted message under a NEW request_id. Kept as
                                     -- a row for auditability; excluded from EVERY sum.
+                                    -- CACHE-TTL-PRICING.md D1 (v20): cw5m_tok/cw1h_tok are a
+                                    -- DECOMPOSITION of cw_tok, not a replacement — cw_tok stays
+                                    -- the authoritative aggregate. cw_ttl_src='transcript' means
+                                    -- the split was observed; 'unrecorded' means it was not, and
+                                    -- is the honest default for OTEL-only rows and pre-fix history.
 ) STRICT;
 CREATE INDEX ix_req_tid   ON request(tid);
 CREATE INDEX ix_req_turn  ON request(session_id, prompt_id);
@@ -631,7 +642,7 @@ CREATE TABLE outcome (              -- APPEND-ONLY; current = MAX(revision). Reo
   scope_seq_final INTEGER,
   scope_declared INTEGER NOT NULL DEFAULT 0,     -- R2: 1 = Claude ran `est scope`;
                                                  -- 0 with a hash diff = undeclared drift
-  velocity_raw REAL, velocity_cal REAL, in_band INTEGER,
+  velocity_raw REAL, velocity_cal REAL, in_band INTEGER, cw_ttl_unknown_share REAL,
   PRIMARY KEY (tid, revision)
 ) STRICT, WITHOUT ROWID;
 CREATE TRIGGER out_ro_u BEFORE UPDATE ON outcome BEGIN SELECT RAISE(ABORT,'append-only'); END;
@@ -1212,8 +1223,22 @@ FROM v_request_live r;
 
 -- INNER JOIN: an unpriced model can never silently zero a task (the LEFT-JOIN flaw is dead).
 -- Unpriced requests fall out here and are COUNTED by v_unpriced; they no longer block anything.
+--
+-- CACHE-TTL-PRICING.md D3 (v20): the three cw*_priced_tok columns are a DECOMPOSITION
+-- of cw_tok, clamped so they always sum to exactly cw_tok in BOTH directions — the
+-- split can fall short of the aggregate (honestly-unknown TTL) or exceed it (two
+-- divergent replays of one request_id, each MAX-ed independently per §5.2). The 5m
+-- leg is filled FIRST: an over-split row is therefore priced at the LOWER rate,
+-- never the higher one — the same direction-of-failure rule D4 commits to (never
+-- manufacture Work-CET no log supports). Under-split rows are unaffected: when
+-- cw5m_tok + cw1h_tok <= cw_tok every MIN below is inert and the expression
+-- degrades to the obvious one.
 CREATE VIEW v_priced AS
-SELECT r.*, p.usd_in, p.usd_out, p.usd_cw, p.usd_cr, p.provisional
+SELECT r.*, p.usd_in, p.usd_out, p.usd_cw, p.usd_cr, p.usd_cw1h, p.provisional,
+  MIN(r.cw5m_tok, r.cw_tok) AS cw5m_priced_tok,
+  MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)) AS cw1h_priced_tok,
+  r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)
+           - MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)) AS cw_ttl_unknown_tok
 FROM v_request_tiered r
 JOIN model_price p ON p.family = r.price_family
  AND p.effective_from = (SELECT MAX(effective_from) FROM model_price
@@ -1223,6 +1248,15 @@ CREATE VIEW v_unpriced AS           -- sweep logs an anomaly and offers `est pri
 SELECT * FROM v_request_live        -- finalization PROCEEDS, recording outcome.unpriced_share.
 WHERE model_family NOT IN (SELECT DISTINCT family FROM model_price);
 
+-- CACHE-TTL-PRICING.md D4 (v20): the unknown-TTL residual (cw_ttl_unknown_tok) is
+-- priced at the recorded 5-minute rate, same as the over-split's 5m-filled-first
+-- clamp above — the direction that cannot poison calibration (under-report, never
+-- inflate). This is NOT a config knob: a `cw_ttl_unknown_policy` setting would let
+-- one `est config set` restate every historical actual through
+-- v_task_actual_epoch, exactly the hazard the unit comments above litigate for
+-- ref_model/estimand. `COALESCE(p.usd_cw1h, p.usd_cw)` on the 1h-priced leg falls
+-- back the same way when a vintage has no recorded 1h rate at all.
+--
 -- Self-consistent vintage: each request priced at ITS OWN ts (and its OWN context
 -- tier, via v_priced), ref-model normaliser at the SAME ts. The normaliser is
 -- deliberately the ref model's STANDARD-tier output price: it defines the unit
@@ -1230,15 +1264,45 @@ WHERE model_family NOT IN (SELECT DISTINCT family FROM model_price);
 -- request being measured would not be a unit at all.
 CREATE VIEW v_wcet AS
 SELECT v.*,
-  CAST((v.out_tok*v.usd_out + v.cw_tok*v.usd_cw) / v.ref_out AS INTEGER) AS wcet,
+  CAST((v.out_tok*v.usd_out + v.cw_cost) / v.ref_out AS INTEGER) AS wcet,
   CAST((v.in_tok*v.usd_in + v.out_tok*v.usd_out
-        + v.cw_tok*v.usd_cw + v.cr_tok*v.usd_cr) / v.ref_out AS INTEGER) AS scet
+        + v.cw_cost + v.cr_tok*v.usd_cr) / v.ref_out AS INTEGER) AS scet
 FROM (SELECT p.*,
+        p.cw1h_priced_tok * COALESCE(p.usd_cw1h, p.usd_cw)
+          + p.cw5m_priced_tok * p.usd_cw
+          + p.cw_ttl_unknown_tok * p.usd_cw AS cw_cost,
         (SELECT usd_out FROM model_price
           WHERE family = (SELECT v FROM config WHERE k='ref_model')
             AND effective_from <= p.ts
           ORDER BY effective_from DESC LIMIT 1) AS ref_out
       FROM v_priced p) v;
+
+-- CACHE-TTL-PRICING.md D3/D10 (v20): the queryable exposure surface. Based on
+-- v_request_live, NOT v_priced — v_priced INNER JOINs model_price, so an UNPRICED
+-- family's requests fall out of it entirely, and a request that is both unpriced
+-- AND of unknown TTL is exactly the case this view exists to show. The `<>`
+-- predicate covers both directions in one guard: under-split rows expose
+-- cw_ttl_unknown_tok > 0, over-split rows expose cw_ttl_over_tok > 0 (priced
+-- safely by v_priced's clamp above, but still visible here).
+CREATE VIEW v_cw_ttl_exposure AS
+SELECT ts, model_family, tid, cw_tok, cw5m_tok, cw1h_tok, cw_ttl_src,
+       MAX(cw_tok - cw5m_tok - cw1h_tok, 0) AS cw_ttl_unknown_tok,
+       MAX(cw5m_tok + cw1h_tok - cw_tok, 0) AS cw_ttl_over_tok
+FROM v_request_live
+WHERE cw_tok > 0
+  AND (cw_ttl_src = 'unrecorded'
+       OR cw5m_tok + cw1h_tok <> cw_tok);
+
+-- CACHE-TTL-PRICING.md D5 (v20): price-side coverage, made visible rather than
+-- merely guarded. A family with cache-write spend but no recorded 1h rate is
+-- still priced (D4's fallback), but silently — this is the surface `est report`
+-- reads so a `--set` that omitted `--cw-1h` cannot revert a family to the 5m
+-- fallback with no signal at all.
+CREATE VIEW v_cw_1h_price_gap AS
+SELECT p.family, p.effective_from, p.usd_cw1h_src
+FROM model_price p
+WHERE p.usd_cw1h IS NULL
+  AND EXISTS (SELECT 1 FROM v_priced r WHERE r.price_family = p.family AND r.cw_tok > 0);
 
 -- The Spend-CET-style total: 'auxiliary' IS included in `wcet`/`scet` here, because
 -- this view answers "what did this task cost" and auxiliary calls are real money.
@@ -1356,13 +1420,32 @@ LEFT JOIN v_phase_actual pa
 -- through to NULL, `actual_wcet_at_epoch IS NOT NULL` would drop every completed
 -- story-point task out of v_velocity, and the corpus would never learn a rate at all
 -- — silently, since a missing row looks exactly like work nobody has finished yet.
+-- CACHE-TTL-PRICING.md D3 (v20): this view prices at price_epoch, not at the
+-- request's own ts, so it cannot read v_priced's cw_cost column and repeats the
+-- SAME clamped expression inline against pe.* — a second copy of one rule, the
+-- exact failure the 200000 / @above_200k literals already taught this repo about
+-- (test/schema.test.ts asserts the two agree, same as it already does for those
+-- literals). 5m filled first, unknown residual priced at the 5m rate: identical
+-- to v_priced's cw5m_priced_tok / cw1h_priced_tok / cw_ttl_unknown_tok.
 CREATE VIEW v_task_actual_epoch AS
 SELECT r.tid,
   SUM(CAST((CASE e.estimand
               WHEN 'out'         THEN r.out_tok*pe.usd_out
-              WHEN 'work_cet'    THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw
-              WHEN 'out_cw_in'   THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw + r.in_tok*pe.usd_in
-              WHEN 'story_point' THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw
+              WHEN 'work_cet'    THEN r.out_tok*pe.usd_out
+                + MIN(r.cw5m_tok, r.cw_tok) * pe.usd_cw
+                + MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)) * COALESCE(pe.usd_cw1h, pe.usd_cw)
+                + (r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)
+                            - MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok))) * pe.usd_cw
+              WHEN 'out_cw_in'   THEN r.out_tok*pe.usd_out + r.in_tok*pe.usd_in
+                + MIN(r.cw5m_tok, r.cw_tok) * pe.usd_cw
+                + MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)) * COALESCE(pe.usd_cw1h, pe.usd_cw)
+                + (r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)
+                            - MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok))) * pe.usd_cw
+              WHEN 'story_point' THEN r.out_tok*pe.usd_out
+                + MIN(r.cw5m_tok, r.cw_tok) * pe.usd_cw
+                + MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)) * COALESCE(pe.usd_cw1h, pe.usd_cw)
+                + (r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)
+                            - MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok))) * pe.usd_cw
             END) / rf.usd_out AS INTEGER)) AS wcet_at_epoch,
   e.price_epoch, e.eid AS eid_at_start
 FROM v_request_live r
@@ -1556,7 +1639,7 @@ WHERE s.terminator = 'open'
 -- ---------------------------------------------------------------------------
 
 INSERT OR IGNORE INTO config (k, v) VALUES
-  ('schema_version',          '19'),
+  ('schema_version',          '20'),
   -- Work-CET = price-weighted (output + cache_creation), normalised by the
   -- ref_model's output price (§4.1). Retro A/B candidates once n >= 20:
   -- 'out' | 'work_cet' (== out+cw, the default) | 'out_cw_in'. Config flip, no migration.
@@ -1728,7 +1811,22 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   -- previous `sweep_census` row, that is a discovery OUTAGE, not a corpus that
   -- shrank — raise `census_collapse` and skip D2/D3 rather than durably recording
   -- hundreds of false losses.
-  ('census_collapse_pct',      '20');
+  ('census_collapse_pct',      '20'),
+  -- CACHE-TTL-PRICING.md D2/D5/D6/D10 (v20): the cache-write 1-hour premium.
+  -- Plausibility band for a published `usd_cw1h` candidate, as a multiple of the
+  -- VINTAGE'S OWN `usd_in` (never a different vintage's — see D5). Anthropic
+  -- publishes 1.25x (5m) / 2.00x (1h); the band is wide enough to admit upstream
+  -- rounding without admitting a copy-paste bug (claude-3-haiku's 24x in the
+  -- LiteLLM snapshot is the measured example that motivated the gate).
+  ('price_cw_1h_min_multiple',    '1.5'),
+  ('price_cw_1h_max_multiple',    '2.5'),
+  -- The fallback multiple when no published rate is present or the gate rejects
+  -- one: `usd_cw1h = price_cw_1h_default_multiple * usd_in`.
+  ('price_cw_1h_default_multiple', '2'),
+  -- Reporting threshold for `outcome.cw_ttl_unknown_share` / `v_cw_ttl_exposure`:
+  -- `est report` warns above this share. NOT a pricing lever — D4's unknown-TTL
+  -- fallback rate is deliberately not config (see the note on v_priced above).
+  ('cw_ttl_unknown_warn_share',    '0.02');
 
 INSERT OR IGNORE INTO bucket_def (bucket, created_at, dims_json, parent_bucket, split_pinball_gain, active)
 VALUES ('global', strftime('%Y-%m-%dT%H:%M:%SZ','now'), '{}', NULL, NULL, 1);

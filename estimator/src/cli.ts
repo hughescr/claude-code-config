@@ -103,7 +103,17 @@ import {
   type TranscriptIndexEntry,
 } from "./ingest.ts";
 import { LOCK_PATH, LockBusyError, withLock } from "./lock.ts";
-import { isoSeconds, setManualPrice, showPrices, sync, type SyncResult } from "./prices.ts";
+import {
+  currentPrice,
+  fillCw1h,
+  isoSeconds,
+  priceFamily,
+  setManualPrice,
+  showPrices,
+  sync,
+  type FillCw1hResult,
+  type SyncResult,
+} from "./prices.ts";
 import { attributeTasks } from "./attribute.ts";
 import {
   BURN_SCHEMA,
@@ -221,7 +231,10 @@ export const COMMAND_FLAGS: Record<Command, FlagSpec> = {
   init: { booleans: [], values: [] },
   sweep: { booleans: ["blocking", "strict"], values: ["budget", "root", "chunk"] },
   backfill: { booleans: ["strict"], values: ["budget", "root", "chunk", "top"] },
-  prices: { booleans: ["sync", "show"], values: ["source", "set", "in", "out", "cw", "cr", "at"] },
+  prices: {
+    booleans: ["sync", "show", "fill-cw-1h", "cw-1h-unrecorded"],
+    values: ["source", "set", "in", "out", "cw", "cr", "cw-1h", "at"],
+  },
   census: { booleans: [], values: ["limit", "root"] },
   config: { booleans: [], values: [] },
   anchor: { booleans: [], values: ["note"] },
@@ -1742,7 +1755,7 @@ SELECT %KEY% AS key,
   COALESCE(SUM(in_tok),0) AS in_tok, COALESCE(SUM(out_tok),0) AS out_tok,
   COALESCE(SUM(cw_tok),0) AS cw_tok, COALESCE(SUM(cr_tok),0) AS cr_tok,
   COALESCE(SUM(wcet),0) AS wcet, COALESCE(SUM(scet),0) AS scet,
-  COALESCE(SUM((in_tok*usd_in + out_tok*usd_out + cw_tok*usd_cw + cr_tok*usd_cr) / 1000000.0),0) AS usd
+  COALESCE(SUM((in_tok*usd_in + out_tok*usd_out + cw_cost + cr_tok*usd_cr) / 1000000.0),0) AS usd
 FROM v_wcet GROUP BY %KEY% ORDER BY wcet DESC, n_req DESC
 `;
 
@@ -2208,9 +2221,13 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
   const wantSync = flagBool(p, "sync");
   const wantShow = flagBool(p, "show");
   const setModel = flagString(p, "set");
+  // CACHE-TTL-PRICING.md D6: the one-shot historical fill.
+  const wantFillCw1h = flagBool(p, "fill-cw-1h");
 
-  if (!wantSync && !wantShow && setModel === null) {
-    ctx.err("est prices: nothing to do — pass --sync, --show or --set <model> --in .. --out .. --cw .. --cr ..");
+  if (!wantSync && !wantShow && setModel === null && !wantFillCw1h) {
+    ctx.err(
+      "est prices: nothing to do — pass --sync, --show, --fill-cw-1h or --set <model> --in .. --out .. --cw .. --cr ..",
+    );
     return 1;
   }
 
@@ -2258,7 +2275,7 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
     return 1;
   }
 
-  const writes = setModel !== null || wantSync;
+  const writes = setModel !== null || wantSync || wantFillCw1h;
   const body = async (db: Database): Promise<number> => {
     let result: SyncResult | null = null;
 
@@ -2281,7 +2298,30 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
         );
         return 1;
       }
-      const rates = { usd_in, usd_out, usd_cw, usd_cr };
+      // CACHE-TTL-PRICING.md D5: `--cw-1h` is REQUIRED when the family's most
+      // recent existing vintage already carries a recorded (non-'unrecorded')
+      // 1h rate — a bare `--set` that omitted it used to silently revert every
+      // future 1h cache write on that family to the 5m fallback, with NO signal
+      // anywhere (`cw_ttl_unrecorded` watches request-side capture,
+      // `v_cw_ttl_exposure` watches request-side unknowns; neither watches
+      // price-side coverage — that is what `v_cw_1h_price_gap` is for).
+      // `--cw-1h-unrecorded` is the explicit escape hatch for "I really do mean
+      // unknown". A family with no prior recorded rate stays optional.
+      const cw1hFlag = rate("cw-1h");
+      const cw1hUnrecorded = flagBool(p, "cw-1h-unrecorded");
+      const priorFamily = priceFamily(setModel);
+      const prior = currentPrice(db, priorFamily);
+      const priorRecorded = prior !== null && prior.usd_cw1h !== null;
+      if (priorRecorded && cw1hFlag === null && !cw1hUnrecorded) {
+        ctx.err(
+          `est prices --set ${setModel}: this family's most recent vintage carries a recorded ` +
+            `1h cache-write rate (src=${prior!.usd_cw1h_src}, usd_cw1h=${prior!.usd_cw1h}) — ` +
+            `pass --cw-1h <rate> to carry it forward, or --cw-1h-unrecorded to deliberately drop it`,
+        );
+        return 1;
+      }
+      const usd_cw1h = cw1hUnrecorded ? null : cw1hFlag;
+      const rates = { usd_in, usd_out, usd_cw, usd_cr, usd_cw1h };
       const set = setManualPrice(db, setModel, rates, { at: at ?? undefined });
       if (ctx.json) {
         ctx.out(JSON.stringify(set, null, 2));
@@ -2317,6 +2357,19 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
       }
     }
 
+    if (wantFillCw1h) {
+      const fillResult: FillCw1hResult = await fillCw1h(db, { source });
+      if (ctx.json) {
+        ctx.out(JSON.stringify(fillResult, null, 2));
+      } else if (!ctx.quiet) {
+        ctx.out(
+          `est prices --fill-cw-1h: epoch ${fillResult.price_epoch}, ` +
+            `${fillResult.n_filled} vintage row(s) filled (${fillResult.n_implausible} implausible, ` +
+            `fell back to derived_from_input)`,
+        );
+      }
+    }
+
     if (wantShow) {
       // The same parsed instant --set uses, normalised to the second so it
       // compares against `effective_from` the way SQLite actually compares it.
@@ -2326,13 +2379,16 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
       } else {
         ctx.out(
           renderTable(
-            ["family", "from", "in", "out", "cache_w", "cache_r", "src", "prov"],
+            ["family", "from", "in", "out", "cache_w", "cw_1h", "cache_r", "src", "prov"],
             rows.map((r) => [
               r.family,
               r.effective_from.slice(0, 10),
               String(r.usd_in),
               String(r.usd_out),
               String(r.usd_cw),
+              // CACHE-TTL-PRICING.md D5: 'unrecorded' is the honest label for a
+              // vintage nobody has priced the 1h premium for yet.
+              r.usd_cw1h === null ? "unrecorded" : String(r.usd_cw1h),
               String(r.usd_cr),
               r.source,
               r.provisional ? "yes" : "",

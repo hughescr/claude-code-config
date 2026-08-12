@@ -29,7 +29,7 @@
 import type { Database } from "bun:sqlite";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { ROOT } from "./db.ts";
+import { getConfig, ROOT, setConfig } from "./db.ts";
 
 /** Primary upstream — the table ccusage itself prices from. */
 export const LITELLM_URL =
@@ -106,12 +106,79 @@ const DATE_DIGITS = 6;
 /** `model_price.source` — the R3 vocabulary. */
 export type PriceSourceName = "litellm" | "models_dev" | "manual" | "otel";
 
-/** USD per MILLION tokens, matching `model_price`'s stated unit. */
+/** `model_price.usd_cw1h_src` — CACHE-TTL-PRICING.md D2. */
+export type Usd1hSrc = "litellm" | "models_dev" | "manual" | "derived_from_input" | "unrecorded";
+
+/**
+ * USD per MILLION tokens, matching `model_price`'s stated unit.
+ *
+ * `usd_cw1h` (CACHE-TTL-PRICING.md D2) is the 1-hour cache-write premium. Inside
+ * a freshly parsed {@link ResolvedFamily} (from `parseLiteLLM`/`parseModelsDev`)
+ * it is the RAW, UNGATED candidate straight off upstream — `null` when upstream
+ * publishes no such key. `sync()`'s `put()` is the ONE place that runs it through
+ * {@link resolveCw1h}'s plausibility gate and writes the gated result, EXCEPT
+ * when the `ResolvedFamily` carries `usd_cw1h_gated: true` (a tier-peer or
+ * bracket-suffix derivation that is copying an already-resolved rate wholesale,
+ * exactly as it already copies usd_in/out/cw/cr wholesale) — see D5.
+ */
 export interface Rates {
   usd_in: number;
   usd_out: number;
   usd_cw: number;
   usd_cr: number;
+  /** Optional so every EXISTING 4-field `Rates` literal in this codebase still
+   *  compiles unchanged; absent is read as `null` (no candidate) everywhere this
+   *  file consumes it. */
+  usd_cw1h?: number | null;
+}
+
+/** The plausibility band `est prices --sync` / `--fill-cw-1h` gate a candidate against. */
+export interface Cw1hBand {
+  min: number;
+  max: number;
+  dflt: number;
+}
+
+export interface Cw1hResolution {
+  rate: number | null;
+  src: Usd1hSrc;
+  /** True iff a candidate was PRESENT and REJECTED — the only case D5 anomalies. */
+  implausible: boolean;
+}
+
+/**
+ * CACHE-TTL-PRICING.md D5 — the one gate every candidate 1h rate passes through
+ * before it is stored, pure and independent of `db` so it can be unit-tested and
+ * shared between `sync()` and `est prices --fill-cw-1h` (D6).
+ *
+ * `usd_in`/`usd_cw` MUST be the rates of the row the candidate is being written
+ * ONTO (the candidate vintage's own, for a fresh sync; the STORED row's, for a
+ * historical fill) — a published absolute belongs to whatever pricing era
+ * upstream is currently in, and testing it against a different vintage would pin
+ * a modern number onto an old row or reject a correct one.
+ *
+ * `usd_cw = 0` (a pre-caching family, e.g. claude-instant) means "write nothing":
+ * deriving `2 * usd_in` there would fabricate a rate for a capability the model
+ * does not have. A candidate present but implausible (§2's claude-3-haiku 24x)
+ * is REJECTED and reported (`implausible: true`); a candidate simply ABSENT
+ * falls back the same way but is NOT reported — absence is the normal upstream
+ * state for several current families, and reporting it would be recurring
+ * ledger noise on every sync.
+ */
+export function resolveCw1h(
+  candidate: number | null,
+  usd_in: number,
+  usd_cw: number,
+  band: Cw1hBand,
+  publishedSrc: "litellm" | "models_dev",
+): Cw1hResolution {
+  if (usd_cw === 0) return { rate: null, src: "unrecorded", implausible: false };
+  if (candidate !== null) {
+    const plausible = candidate >= usd_cw && candidate >= band.min * usd_in && candidate <= band.max * usd_in;
+    if (plausible) return { rate: candidate, src: publishedSrc, implausible: false };
+    return { rate: band.dflt * usd_in, src: "derived_from_input", implausible: true };
+  }
+  return { rate: band.dflt * usd_in, src: "derived_from_input", implausible: false };
 }
 
 export interface NormalizedModel {
@@ -139,6 +206,16 @@ export interface ResolvedFamily {
   provisional: boolean;
   /** The sibling a provisional rate was copied from. */
   peer?: string;
+  /**
+   * CACHE-TTL-PRICING.md D5: true iff `rates.usd_cw1h` / `usd_cw1h_src` are
+   * ALREADY GATED and must be written verbatim — a tier-peer or bracket-suffix
+   * derivation copying an already-resolved rate wholesale, the same way it
+   * already copies usd_in/out/cw/cr wholesale. Unset (falsy) for a fresh
+   * `parseLiteLLM`/`parseModelsDev` entry, whose `rates.usd_cw1h` is a RAW,
+   * UNGATED candidate that `put()` must run through {@link resolveCw1h}.
+   */
+  usd_cw1h_gated?: boolean;
+  usd_cw1h_src?: Usd1hSrc;
 }
 
 /** One leg of the fallback chain, recorded so `est prices --sync` can explain itself. */
@@ -322,6 +399,22 @@ export function compareGeneration(a: number[], b: number[]): number {
 // Upstream parsers
 // ---------------------------------------------------------------------------
 
+/**
+ * A `config` row read as a number, with the seed as the floor of trust.
+ *
+ * A LOCAL copy of `src/liveness.ts`'s `configNum` rather than an import: that
+ * module re-exports through `src/eta.ts` and imports `src/tasks.ts` (for
+ * `isoNow`), which itself imports `priceFamily` from THIS file — importing
+ * `configNum` here would close an import cycle. Same one-line body, no
+ * behavioural drift risk.
+ */
+function configNumLocal(db: Database, key: string, dflt: number): number {
+  const raw = getConfig(db, key);
+  if (raw === null) return dflt;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : dflt;
+}
+
 function perMtok(perToken: number): number {
   // Kill binary-float dust: 3e-6 * 1e6 is not exactly 3 in IEEE 754.
   return Math.round(perToken * 1e6 * 1e9) / 1e9;
@@ -356,15 +449,24 @@ export function parseLiteLLM(table: RawTable): Map<string, ResolvedFamily> {
     if (inTok === null || outTok === null) continue;
 
     const norm = normalizeModelId(id);
+    // CACHE-TTL-PRICING.md D5: RAW candidate only — no gating here. `null` when
+    // upstream carries no such key at all (the normal state for several current
+    // families, e.g. claude-4-opus/claude-4-sonnet in the committed snapshot).
+    const cw1hRaw = finite(e.cache_creation_input_token_cost_above_1hr);
     const rates: Rates = {
       usd_in: perMtok(inTok),
       usd_out: perMtok(outTok),
       usd_cw: perMtok(finite(e.cache_creation_input_token_cost) ?? 0),
       usd_cr: perMtok(finite(e.cache_read_input_token_cost) ?? 0),
+      usd_cw1h: cw1hRaw === null ? null : perMtok(cw1hRaw),
     };
 
     const inHi = finite(e.input_cost_per_token_above_200k_tokens);
     const outHi = finite(e.output_cost_per_token_above_200k_tokens);
+    // No published `..._above_1hr_above_200k_tokens` key exists today (§2); read
+    // defensively in case upstream ever adds one, so the long-context tier is not
+    // silently stuck on `derived_from_input` the day it does.
+    const cw1hHiRaw = finite(e.cache_creation_input_token_cost_above_1hr_above_200k_tokens);
     const above200k: Rates | null =
       inHi !== null && outHi !== null
         ? {
@@ -376,6 +478,7 @@ export function parseLiteLLM(table: RawTable): Map<string, ResolvedFamily> {
             usd_cr: perMtok(
               finite(e.cache_read_input_token_cost_above_200k_tokens) ?? rates.usd_cr,
             ),
+            usd_cw1h: cw1hHiRaw === null ? null : perMtok(cw1hHiRaw),
           }
         : null;
 
@@ -417,6 +520,9 @@ export function parseModelsDev(doc: RawTable): Map<string, ResolvedFamily> {
     if (inM === null || outM === null) continue;
 
     const norm = normalizeModelId(id);
+    // CACHE-TTL-PRICING.md D5: a `cache_write_1h`-shaped key, if models.dev ever
+    // publishes one — it has none today, so this is `null` and falls through to
+    // the `derived_from_input` fallback, same as an absent LiteLLM key.
     out.set(norm.family, {
       family: norm.family,
       tier: norm.tier,
@@ -426,6 +532,7 @@ export function parseModelsDev(doc: RawTable): Map<string, ResolvedFamily> {
         usd_out: outM,
         usd_cw: finite(cost.cache_write) ?? 0,
         usd_cr: finite(cost.cache_read) ?? 0,
+        usd_cw1h: finite(cost.cache_write_1h),
       },
       above200k: null,
       source: "models_dev",
@@ -617,34 +724,54 @@ interface PriceRow {
   usd_out: number;
   usd_cw: number;
   usd_cr: number;
+  usd_cw1h: number | null;
+  usd_cw1h_src: string;
   provisional: number;
   source: string;
 }
 
+const PRICE_ROW_COLS =
+  "family, effective_from, usd_in, usd_out, usd_cw, usd_cr, usd_cw1h, usd_cw1h_src, provisional, source";
+
 /** The rate in force for `family` at `at` (default: latest). */
 export function currentPrice(db: Database, family: string, at?: string): PriceRow | null {
   const sql = at
-    ? `SELECT family, effective_from, usd_in, usd_out, usd_cw, usd_cr, provisional, source
+    ? `SELECT ${PRICE_ROW_COLS}
          FROM model_price WHERE family = ? AND effective_from <= ?
         ORDER BY effective_from DESC LIMIT 1`
-    : `SELECT family, effective_from, usd_in, usd_out, usd_cw, usd_cr, provisional, source
+    : `SELECT ${PRICE_ROW_COLS}
          FROM model_price WHERE family = ?
         ORDER BY effective_from DESC LIMIT 1`;
   const q = db.query<PriceRow, string[]>(sql);
   return (at ? q.get(family, at) : q.get(family)) ?? null;
 }
 
-function ratesEqual(a: Rates, b: PriceRow): boolean {
+/**
+ * CACHE-TTL-PRICING.md D5: `a.usd_cw1h_src` (a fields carried alongside `Rates`
+ * by the caller, since `Rates` itself has no src) must compare too, so the FIRST
+ * sync after the v20 migration writes a NEW `effective_from` row — a genuine
+ * move in what is priced at — rather than silently no-op'ing because the four
+ * original fields happen to match.
+ */
+function ratesEqual(a: Rates & { usd_cw1h_src: Usd1hSrc }, b: PriceRow): boolean {
   return (
     a.usd_in === b.usd_in &&
     a.usd_out === b.usd_out &&
     a.usd_cw === b.usd_cw &&
-    a.usd_cr === b.usd_cr
+    a.usd_cr === b.usd_cr &&
+    a.usd_cw1h === b.usd_cw1h &&
+    a.usd_cw1h_src === b.usd_cw1h_src
   );
 }
 
 /** The two `anomaly.kind`s this file writes — the dedup scope, and nothing else's. */
-const PRICE_ANOMALY_KINDS = ["provisional_price", "unpriced_model"] as const;
+const PRICE_ANOMALY_KINDS = [
+  "provisional_price",
+  "unpriced_model",
+  // CACHE-TTL-PRICING.md D5/D10: a published usd_cw1h candidate FAILED the
+  // plausibility gate (present but implausible — never for a merely absent key).
+  "price_cw_1h_implausible",
+] as const;
 
 interface AnomalyRow {
   kind: (typeof PRICE_ANOMALY_KINDS)[number];
@@ -690,8 +817,19 @@ function recordAnomalies(db: Database, ts: string, rows: readonly AnomalyRow[]):
 /** Existing authoritative families, so a provisional can be derived offline. */
 function poolFromDb(db: Database): ResolvedFamily[] {
   const rows = db
-    .query<{ family: string; usd_in: number; usd_out: number; usd_cw: number; usd_cr: number }, []>(
-      `SELECT family, usd_in, usd_out, usd_cw, usd_cr FROM model_price p
+    .query<
+      {
+        family: string;
+        usd_in: number;
+        usd_out: number;
+        usd_cw: number;
+        usd_cr: number;
+        usd_cw1h: number | null;
+        usd_cw1h_src: Usd1hSrc;
+      },
+      []
+    >(
+      `SELECT family, usd_in, usd_out, usd_cw, usd_cr, usd_cw1h, usd_cw1h_src FROM model_price p
         WHERE provisional = 0
           AND effective_from = (SELECT MAX(effective_from) FROM model_price
                                  WHERE family = p.family)`,
@@ -703,10 +841,17 @@ function poolFromDb(db: Database): ResolvedFamily[] {
       family: r.family,
       tier: norm.tier,
       generation: norm.generation,
-      rates: { usd_in: r.usd_in, usd_out: r.usd_out, usd_cw: r.usd_cw, usd_cr: r.usd_cr },
+      rates: { usd_in: r.usd_in, usd_out: r.usd_out, usd_cw: r.usd_cw, usd_cr: r.usd_cr, usd_cw1h: r.usd_cw1h },
       above200k: null,
       source: "litellm" as PriceSourceName,
       provisional: false,
+      // CACHE-TTL-PRICING.md D5: an EXISTING row's usd_cw1h is already gated —
+      // copy it verbatim rather than re-running the gate on what would then be a
+      // resolved value masquerading as a raw candidate (a `derived_from_input`
+      // rate happens to sit inside the plausibility band by construction, so
+      // re-gating it would silently relabel it as an upstream-published one).
+      usd_cw1h_gated: true,
+      usd_cw1h_src: r.usd_cw1h_src,
     };
   });
 }
@@ -792,13 +937,30 @@ export async function sync(db: Database, opts: SyncOptions = {}): Promise<SyncRe
       family: base,
       tier: norm.tier,
       generation: norm.generation,
-      rates: { usd_in: cur.usd_in, usd_out: cur.usd_out, usd_cw: cur.usd_cw, usd_cr: cur.usd_cr },
+      rates: {
+        usd_in: cur.usd_in,
+        usd_out: cur.usd_out,
+        usd_cw: cur.usd_cw,
+        usd_cr: cur.usd_cr,
+        usd_cw1h: cur.usd_cw1h,
+      },
       above200k:
         hi === null
           ? null
-          : { usd_in: hi.usd_in, usd_out: hi.usd_out, usd_cw: hi.usd_cw, usd_cr: hi.usd_cr },
+          : {
+              usd_in: hi.usd_in,
+              usd_out: hi.usd_out,
+              usd_cw: hi.usd_cw,
+              usd_cr: hi.usd_cr,
+              // No published 1h rate for the long-context tier (D5): always
+              // `derived_from_input` against ITS OWN usd_in, never copied from hi.
+              usd_cw1h: null,
+            },
       source: cur.source as PriceSourceName,
       provisional: cur.provisional === 1,
+      // See poolFromDb: an existing row's usd_cw1h is already gated.
+      usd_cw1h_gated: true,
+      usd_cw1h_src: cur.usd_cw1h_src as Usd1hSrc,
     };
   };
 
@@ -832,7 +994,11 @@ export async function sync(db: Database, opts: SyncOptions = {}): Promise<SyncRe
     if (norm.contextSuffix !== null) {
       const base = baseRates(norm.family);
       if (base !== null) {
-        const rates = long && base.above200k !== null ? base.above200k : base.rates;
+        // The long-context leg's usd_cw1h is always null (no published rate for
+        // it, D5) — ungated, falls through to `derived_from_input` in `put()`.
+        // The standard leg carries whatever gate state `base` itself carries.
+        const usingBase200k = long && base.above200k !== null;
+        const rates = usingBase200k ? base.above200k! : base.rates;
         // Honest about what we know: an exact rate (the long-context tier, or a
         // suffix that is not about context at all) is authoritative; guessing a
         // long-context invocation at the standard rate is not.
@@ -846,6 +1012,8 @@ export async function sync(db: Database, opts: SyncOptions = {}): Promise<SyncRe
           source: base.source,
           provisional: guessed,
           peer: base.family,
+          usd_cw1h_gated: usingBase200k ? undefined : base.usd_cw1h_gated,
+          usd_cw1h_src: usingBase200k ? undefined : base.usd_cw1h_src,
         });
         if (guessed) {
           provisionalNotes.push({
@@ -865,38 +1033,80 @@ export async function sync(db: Database, opts: SyncOptions = {}): Promise<SyncRe
       unmatched.push(family);
       continue;
     }
+    const usingPeer200k = long && peer.above200k !== null;
     resolved.push({
       family,
       tier: norm.tier,
       generation: norm.generation,
-      rates: long && peer.above200k !== null ? peer.above200k : peer.rates,
+      rates: usingPeer200k ? peer.above200k! : peer.rates,
       above200k: norm.contextSuffix === null ? peer.above200k : null,
       source: peer.source,
       provisional: true,
       peer: peer.family,
+      usd_cw1h_gated: usingPeer200k ? undefined : peer.usd_cw1h_gated,
+      usd_cw1h_src: usingPeer200k ? undefined : peer.usd_cw1h_src,
     });
     provisionalNotes.push({ family, peer: peer.family });
   }
 
   const insert = db.query(
     `INSERT INTO model_price
-       (family, effective_from, usd_in, usd_out, usd_cw, usd_cr, provisional, source, synced_epoch, ingested_at)
-     VALUES (?,?,?,?,?,?,?,?,?,?)
+       (family, effective_from, usd_in, usd_out, usd_cw, usd_cr, usd_cw1h, usd_cw1h_src,
+        provisional, source, synced_epoch, ingested_at)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
      ON CONFLICT(family, effective_from) DO UPDATE SET
        usd_in = excluded.usd_in, usd_out = excluded.usd_out,
        usd_cw = excluded.usd_cw, usd_cr = excluded.usd_cr,
+       usd_cw1h = excluded.usd_cw1h, usd_cw1h_src = excluded.usd_cw1h_src,
        provisional = excluded.provisional, source = excluded.source,
        synced_epoch = excluded.synced_epoch, ingested_at = excluded.ingested_at
      WHERE excluded.provisional <= model_price.provisional`,
   );
 
   let written = 0;
+  const cw1hImplausible: Array<{ family: string; ratio: number | null }> = [];
 
-  /** Write one family/tier row iff its rate is new or has moved. */
-  const put = (family: string, rates: Rates, provisional: boolean, src: PriceSourceName): void => {
+  const cw1hBand: Cw1hBand = {
+    min: configNumLocal(db, "price_cw_1h_min_multiple", 1.5),
+    max: configNumLocal(db, "price_cw_1h_max_multiple", 2.5),
+    dflt: configNumLocal(db, "price_cw_1h_default_multiple", 2),
+  };
+
+  /**
+   * Write one family/tier row iff its rate is new or has moved.
+   *
+   * CACHE-TTL-PRICING.md D5: `gated` is set ONLY by a tier-peer/bracket-suffix
+   * derivation that is copying an already-resolved rate wholesale (see
+   * `ResolvedFamily.usd_cw1h_gated`) — in that case `rates.usd_cw1h` is written
+   * verbatim with the carried `src`. Otherwise `rates.usd_cw1h` is treated as a
+   * RAW candidate and run through {@link resolveCw1h} against THIS family's own
+   * `usd_in`/`usd_cw`, per D5's "the target row's own rates" rule.
+   */
+  const put = (
+    family: string,
+    rates: Rates,
+    provisional: boolean,
+    src: PriceSourceName,
+    gated?: { src: Usd1hSrc },
+  ): void => {
     const existing = currentPrice(db, family);
 
-    if (existing && ratesEqual(rates, existing) && existing.provisional === (provisional ? 1 : 0)) {
+    const cw1h: Cw1hResolution =
+      gated !== undefined
+        ? { rate: rates.usd_cw1h ?? null, src: gated.src, implausible: false }
+        : resolveCw1h(
+            rates.usd_cw1h ?? null,
+            rates.usd_in,
+            rates.usd_cw,
+            cw1hBand,
+            src === "models_dev" ? "models_dev" : "litellm",
+          );
+
+    if (
+      existing &&
+      ratesEqual({ ...rates, usd_cw1h: cw1h.rate, usd_cw1h_src: cw1h.src }, existing) &&
+      existing.provisional === (provisional ? 1 : 0)
+    ) {
       return; // unchanged — do not manufacture price history
     }
     // A family's first rate covers all prior history; only real changes get the
@@ -926,19 +1136,29 @@ export async function sync(db: Database, opts: SyncOptions = {}): Promise<SyncRe
       rates.usd_out,
       rates.usd_cw,
       rates.usd_cr,
+      cw1h.rate,
+      cw1h.src,
       provisional ? 1 : 0,
       src,
       epoch,
       epoch,
     );
     written++;
+    if (cw1h.implausible) {
+      const candidate = rates.usd_cw1h ?? null;
+      cw1hImplausible.push({
+        family,
+        ratio: candidate !== null && rates.usd_in > 0 ? candidate / rates.usd_in : null,
+      });
+    }
   };
 
   // BEGIN IMMEDIATE (§2): take the write lock up front rather than discovering
   // mid-transaction that the sweeper holds it and having to roll back.
   db.transaction(() => {
     for (const r of resolved) {
-      put(r.family, r.rates, r.provisional, r.source);
+      const gated = r.usd_cw1h_gated === true ? { src: r.usd_cw1h_src ?? "unrecorded" } : undefined;
+      put(r.family, r.rates, r.provisional, r.source, gated);
       if (r.above200k) put(r.family + ABOVE_200K_SUFFIX, r.above200k, r.provisional, r.source);
     }
 
@@ -961,6 +1181,13 @@ export async function sync(db: Database, opts: SyncOptions = {}): Promise<SyncRe
       ...unmatched.map((family) => ({
         kind: "unpriced_model" as const,
         detail: `${family} matched no upstream entry and has no same-tier peer; NO price row written`,
+      })),
+      ...cw1hImplausible.map((p) => ({
+        kind: "price_cw_1h_implausible" as const,
+        detail:
+          `${p.family}: published cache-write 1h rate is ${p.ratio === null ? "unreadable" : `${p.ratio.toFixed(2)}x`} ` +
+          `its own usd_in, outside the [${cw1hBand.min}x, ${cw1hBand.max}x] plausibility band; ` +
+          `fell back to derived_from_input (${cw1hBand.dflt}x)`,
       })),
     ]);
 
@@ -1047,6 +1274,15 @@ export function setManualPrice(
   const effectiveFrom =
     opts.at !== undefined ? isoSeconds(opts.at) : hasHistory ? epoch : EPOCH_ZERO;
 
+  // CACHE-TTL-PRICING.md D5: a manual override's 1h rate is 'manual' when the
+  // caller supplied one, 'unrecorded' when they did not — never derived, because
+  // a human at the keyboard either knows the rate or is explicitly saying they
+  // don't (`--cw-1h-unrecorded`). The "don't silently revert a family that HAD a
+  // recorded rate" refusal is enforced by the CLI layer (`cmdPrices`), which has
+  // to read the prior vintage's src to name it in the error before this ever runs.
+  const usd_cw1h = rates.usd_cw1h ?? null;
+  const usd_cw1h_src: Usd1hSrc = usd_cw1h !== null ? "manual" : "unrecorded";
+
   db.transaction(() => {
     db.query(
       `INSERT INTO price_sync (price_epoch, synced_at, source, url, etag, n_families, n_provisional, ok)
@@ -1054,11 +1290,13 @@ export function setManualPrice(
     ).run(epoch, epoch);
     db.query(
       `INSERT INTO model_price
-         (family, effective_from, usd_in, usd_out, usd_cw, usd_cr, provisional, source, synced_epoch, ingested_at)
-       VALUES (?,?,?,?,?,?,0,'manual',?,?)
+         (family, effective_from, usd_in, usd_out, usd_cw, usd_cr, usd_cw1h, usd_cw1h_src,
+          provisional, source, synced_epoch, ingested_at)
+       VALUES (?,?,?,?,?,?,?,?,0,'manual',?,?)
        ON CONFLICT(family, effective_from) DO UPDATE SET
          usd_in = excluded.usd_in, usd_out = excluded.usd_out,
          usd_cw = excluded.usd_cw, usd_cr = excluded.usd_cr,
+         usd_cw1h = excluded.usd_cw1h, usd_cw1h_src = excluded.usd_cw1h_src,
          provisional = 0, source = 'manual',
          synced_epoch = excluded.synced_epoch, ingested_at = excluded.ingested_at`,
     ).run(
@@ -1068,12 +1306,124 @@ export function setManualPrice(
       rates.usd_out,
       rates.usd_cw,
       rates.usd_cr,
+      usd_cw1h,
+      usd_cw1h_src,
       epoch,
       epoch,
     );
   }).immediate();
 
   return { family, effective_from: effectiveFrom, price_epoch: epoch, backdated: effectiveFrom < epoch };
+}
+
+export interface FillCw1hOptions {
+  /** Injected clock. */
+  now?: Date;
+  /** Injected fetch, for testing the live leg without a network. */
+  fetchImpl?: typeof fetch;
+  fixtureDir?: string;
+  timeoutMs?: number;
+  source?: "auto" | "live" | "fixture";
+}
+
+export interface FillCw1hResult {
+  price_epoch: string;
+  n_filled: number;
+  /** Of the filled rows, how many hit an implausible published rate (D5 gate rejection). */
+  n_implausible: number;
+  filled: Array<{ family: string; effective_from: string; usd_cw1h: number | null; src: Usd1hSrc }>;
+}
+
+/**
+ * `est prices --fill-cw-1h` (CACHE-TTL-PRICING.md D6) — human-run, one-shot,
+ * IDEMPOTENT in the sense that matters: `model_price` itself never moves twice.
+ * The 1-hour premium was 2x for the ENTIRE corpus (§1) — this is a capture gap,
+ * not a price move, so it fills every `usd_cw1h IS NULL` vintage from the same
+ * source chain and gate as `sync()` (D5), rather than writing the fill only at
+ * the sync epoch (which would leave 48 days of history priced at a rate nobody
+ * ever intended).
+ *
+ * The UPDATE is guarded `WHERE usd_cw1h IS NULL` in both the SELECT and the
+ * UPDATE itself: it can never restate a recorded rate, touches no other column
+ * (`usd_in`/`out`/`cw`/`cr`, `provisional`, `source`, `synced_epoch` are all left
+ * exactly as they were — in particular `ingested_at` is deliberately untouched,
+ * see the `cw_ttl_price_fix_at` stamp below), and a re-run over an
+ * already-filled corpus selects nothing.
+ *
+ * `price_sync` (source='manual') and `config.cw_ttl_price_fix_at` are written on
+ * EVERY call, including a no-op one — this is the audit trail of "the operation
+ * ran", and the stamp is load-bearing for anything downstream that needs to know
+ * a repricing event happened even when the corpus already had nothing left to
+ * fill. `anomaly(kind='cw_1h_price_backfilled')` is a direct, ts-keyed INSERT
+ * rather than the deduping `recordAnomalies` helper, on purpose: `recordAnomalies`
+ * dedups on `(kind, detail)`, and every OTHER run of this command is meant to
+ * leave its own row rather than collapse into the first one — this is a one-shot
+ * human command's audit ledger, not the automatic per-sweep anomaly vocabulary
+ * D10 pins to a count-free detail.
+ */
+export async function fillCw1h(db: Database, opts: FillCw1hOptions = {}): Promise<FillCw1hResult> {
+  const now = opts.now ?? new Date();
+  const epoch = uniqueEpoch(db, isoSeconds(now));
+  const { primary, secondary } = await walkChain(opts);
+
+  const band: Cw1hBand = {
+    min: configNumLocal(db, "price_cw_1h_min_multiple", 1.5),
+    max: configNumLocal(db, "price_cw_1h_max_multiple", 2.5),
+    dflt: configNumLocal(db, "price_cw_1h_default_multiple", 2),
+  };
+
+  const rows = db
+    .query<{ family: string; effective_from: string; usd_in: number; usd_cw: number }, []>(
+      "SELECT family, effective_from, usd_in, usd_cw FROM model_price WHERE usd_cw1h IS NULL",
+    )
+    .all();
+
+  const update = db.query(
+    `UPDATE model_price SET usd_cw1h = ?, usd_cw1h_src = ?
+      WHERE family = ? AND effective_from = ? AND usd_cw1h IS NULL`,
+  );
+
+  const filled: FillCw1hResult["filled"] = [];
+  let nImplausible = 0;
+
+  db.transaction(() => {
+    for (const row of rows) {
+      const upstream = primary.get(row.family) ?? secondary.get(row.family);
+      const candidate = upstream?.rates.usd_cw1h ?? null;
+      const publishedSrc: "litellm" | "models_dev" = primary.has(row.family) ? "litellm" : "models_dev";
+      const resolved = resolveCw1h(candidate, row.usd_in, row.usd_cw, band, publishedSrc);
+      update.run(resolved.rate, resolved.src, row.family, row.effective_from);
+      filled.push({
+        family: row.family,
+        effective_from: row.effective_from,
+        usd_cw1h: resolved.rate,
+        src: resolved.src,
+      });
+      if (resolved.implausible) nImplausible++;
+    }
+
+    db.query(
+      `INSERT INTO price_sync (price_epoch, synced_at, source, url, etag, n_families, n_provisional, ok)
+       VALUES (?,?, 'manual', NULL, NULL, ?, 0, 1)`,
+    ).run(epoch, epoch, filled.length);
+
+    db.query("INSERT INTO anomaly (ts, kind, detail) VALUES (?,?,?)").run(
+      epoch,
+      "cw_1h_price_backfilled",
+      `est prices --fill-cw-1h at ${epoch}: filled ${filled.length} family/vintage row(s) ` +
+        `(${nImplausible} implausible, fell back to derived_from_input)`,
+    );
+
+    // NOT YET CONSUMED in this branch (D8's closed-outcome re-heal on a pure
+    // repricing event is out of scope here — see the worktree report). Written
+    // anyway because it costs nothing and is the one fact a future D8
+    // implementation needs and cannot reconstruct after this call returns: this
+    // fill deliberately leaves `ingested_at` alone, so nothing else records that
+    // a repricing event happened here.
+    setConfig(db, "cw_ttl_price_fix_at", epoch);
+  }).immediate();
+
+  return { price_epoch: epoch, n_filled: filled.length, n_implausible: nImplausible, filled };
 }
 
 /** `est prices --show`: the rate in force per family, newest first. */

@@ -16,6 +16,7 @@ import {
   compactionAnomalies,
   detectForkReplays,
   detectRidCollisions,
+  extractRequest,
   ingestAgentTranscript,
   ingestMainTranscript,
   ingestSession,
@@ -496,6 +497,9 @@ function req(parts: Partial<RequestRow>): RequestRow {
     out_tok: 1,
     cw_tok: 0,
     cr_tok: 0,
+    cw5m_tok: 0,
+    cw1h_tok: 0,
+    cw_ttl_src: "unrecorded",
     ...parts,
   };
 }
@@ -1120,3 +1124,140 @@ function blank(parts: Partial<Parameters<typeof writeBatch>[1]>): Parameters<typ
     ...parts,
   };
 }
+
+// ---------------------------------------------------------------------------
+// CACHE-TTL-PRICING.md D1 — extractRequest reads the cache-write TTL split
+// ---------------------------------------------------------------------------
+
+describe("extractRequest — the cache-write TTL split (D1)", () => {
+  const CTX = { origin: "main" as const, sessionId: SESSION, promptId: "p1" };
+
+  function usageLine(usage: Record<string, unknown>): Record<string, unknown> {
+    return {
+      requestId: "req_ttl_1",
+      timestamp: "2026-07-28T10:00:00.000Z",
+      message: { id: "msg_1", model: "claude-sonnet-5", usage },
+    };
+  }
+
+  test("a line WITH the cache_creation sub-object reads both keys by name, regardless of order", () => {
+    const line = usageLine({
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_creation_input_tokens: 100,
+      cache_read_input_tokens: 0,
+      // key order deliberately reversed from the "usual" ephemeral_5m-first shape —
+      // §2 measured this varying line to line in the same file.
+      cache_creation: { ephemeral_1h_input_tokens: 40, ephemeral_5m_input_tokens: 60 },
+    });
+    const result = extractRequest(line as never, CTX);
+    expect(result.row).not.toBeNull();
+    expect(result.row).toMatchObject({ cw5m_tok: 60, cw1h_tok: 40, cw_ttl_src: "transcript" });
+  });
+
+  test("a line with the AGGREGATE but NO sub-object is 'unrecorded' — never inferred as 'all 5m'", () => {
+    const line = usageLine({
+      input_tokens: 1,
+      output_tokens: 1,
+      cache_creation_input_tokens: 100,
+      cache_read_input_tokens: 0,
+      // no `cache_creation` key at all
+    });
+    const result = extractRequest(line as never, CTX);
+    expect(result.row).not.toBeNull();
+    // NOT {cw5m_tok: 100, cw1h_tok: 0} — that would be a fabricated inference.
+    expect(result.row).toMatchObject({ cw_tok: 100, cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded" });
+  });
+
+  test("a line with NO cache writes at all is 'unrecorded' with zero split, same as any other usage line", () => {
+    const line = usageLine({ input_tokens: 1, output_tokens: 1 });
+    const result = extractRequest(line as never, CTX);
+    expect(result.row).toMatchObject({ cw_tok: 0, cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CACHE-TTL-PRICING.md D7 — resolveRidCollisions merges the split too
+// ---------------------------------------------------------------------------
+
+describe("resolveRidCollisions — the split merges like every other counter (D7)", () => {
+  function row(parts: Partial<RequestRow>): RequestRow {
+    return {
+      request_id: "rid_x",
+      message_id: null,
+      is_sidechain: 0,
+      session_id: SESSION,
+      prompt_id: null,
+      origin: "main",
+      agent_id: null,
+      run_id: null,
+      wf_launch_id: null,
+      model: "claude-sonnet-5",
+      model_family: "claude-sonnet-5",
+      attribution_agent: null,
+      attribution_skill: null,
+      ts: "2026-07-28T10:00:00.000Z",
+      in_tok: 0,
+      out_tok: 0,
+      cw_tok: 0,
+      cr_tok: 0,
+      cw5m_tok: 0,
+      cw1h_tok: 0,
+      cw_ttl_src: "unrecorded",
+      ...parts,
+    };
+  }
+
+  test("a genuine multi-model contest: the WINNING model's own two rows still merge the split (MAX within the model, label ratchets up)", () => {
+    // Two cumulative snapshots of the WINNING model (claude-opus-5) — merged
+    // within-model before the cross-model comparison, per resolveRidCollisions'
+    // own doc comment. A same-model-only batch is NOT contested and passes
+    // through this function untouched (the SQL-side upsert merges that case —
+    // see the D7 dedup-ratchet tests in schema.test.ts), so a genuine second
+    // model is required to exercise the in-code merge path at all.
+    const winner1 = row({
+      model: "claude-opus-5",
+      model_family: "claude-opus-5",
+      out_tok: 1000,
+      cw_tok: 100,
+      cw5m_tok: 60,
+      cw1h_tok: 0,
+      cw_ttl_src: "transcript",
+    });
+    const winner2 = row({
+      model: "claude-opus-5",
+      model_family: "claude-opus-5",
+      out_tok: 1000,
+      cw_tok: 100,
+      cw5m_tok: 60,
+      cw1h_tok: 40,
+      cw_ttl_src: "transcript",
+    });
+    const loser = row({
+      model: "claude-sonnet-5",
+      model_family: "claude-sonnet-5",
+      out_tok: 1,
+      cw_tok: 0,
+      cw5m_tok: 0,
+      cw1h_tok: 0,
+      cw_ttl_src: "unrecorded",
+    });
+    const { requests } = resolveRidCollisions([winner1, winner2, loser]);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      model: "claude-opus-5",
+      cw5m_tok: 60,
+      cw1h_tok: 40,
+      cw_ttl_src: "transcript",
+    });
+  });
+
+  test("two rows, TWO models: the winner is taken WHOLE — the split is never blended across models", () => {
+    const winner = row({ model: "claude-opus-5", model_family: "claude-opus-5", out_tok: 1000, cw_tok: 0, cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded" });
+    const loser = row({ model: "claude-sonnet-5", model_family: "claude-sonnet-5", cw_tok: 500, cw5m_tok: 500, cw1h_tok: 0, cw_ttl_src: "transcript" });
+    const { requests, anomalies } = resolveRidCollisions([loser, winner]);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({ model: "claude-opus-5", cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded" });
+    expect(anomalies.map((a) => a.kind)).toEqual(["rid_collision"]);
+  });
+});

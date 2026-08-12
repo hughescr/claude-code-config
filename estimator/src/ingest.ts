@@ -79,6 +79,11 @@ export interface RequestRow {
   out_tok: number;
   cw_tok: number;
   cr_tok: number;
+  /** CACHE-TTL-PRICING.md D1: a DECOMPOSITION of cw_tok, not a replacement. */
+  cw5m_tok: number;
+  cw1h_tok: number;
+  /** 'transcript' iff the source line carried `usage.cache_creation.{ephemeral_5m,1h}`. */
+  cw_ttl_src: "transcript" | "unrecorded";
 }
 
 export interface AgentRunRow {
@@ -514,6 +519,35 @@ interface Usage {
   out_tok: number;
   cw_tok: number;
   cr_tok: number;
+  cw5m_tok: number;
+  cw1h_tok: number;
+  cw_ttl_src: "transcript" | "unrecorded";
+}
+
+/**
+ * CACHE-TTL-PRICING.md §2/D1/§5: `usage.cache_creation` is an OBJECT on most lines,
+ * carrying `ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`. Its key order
+ * varies between lines in the SAME file, so both keys are read BY NAME and never
+ * positionally. When the sub-object is absent, the split is NOT inferred from the
+ * aggregate (`cache_creation_input_tokens > 0` with no sub-object is `unrecorded`,
+ * never "all 5m") — measured at 0.8% of usage lines in the live corpus, and a later
+ * cumulative-snapshot line can raise `cw_tok` via the §5.2 MAX-dedup upsert while
+ * carrying no split at all, which is exactly the case `cw_ttl_src` exists to flag
+ * rather than silently misattribute.
+ */
+function extractCacheCreationSplit(
+  raw: Record<string, unknown>,
+): { cw5m_tok: number; cw1h_tok: number; cw_ttl_src: "transcript" | "unrecorded" } {
+  const sub = raw.cache_creation;
+  if (sub === null || typeof sub !== "object") {
+    return { cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded" };
+  }
+  const s = sub as Record<string, unknown>;
+  return {
+    cw5m_tok: int(s.ephemeral_5m_input_tokens),
+    cw1h_tok: int(s.ephemeral_1h_input_tokens),
+    cw_ttl_src: "transcript",
+  };
 }
 
 function extractUsage(line: TranscriptLine): Usage | null {
@@ -525,6 +559,7 @@ function extractUsage(line: TranscriptLine): Usage | null {
     out_tok: int(raw.output_tokens),
     cw_tok: int(raw.cache_creation_input_tokens),
     cr_tok: int(raw.cache_read_input_tokens),
+    ...extractCacheCreationSplit(raw),
   };
 }
 
@@ -1406,6 +1441,12 @@ export function resolveRidCollisions(
         merged.out_tok = Math.max(merged.out_tok, r.out_tok);
         merged.cw_tok = Math.max(merged.cw_tok, r.cw_tok);
         merged.cr_tok = Math.max(merged.cr_tok, r.cr_tok);
+        // CACHE-TTL-PRICING.md D7: this block merges rows WITHIN one model, which is
+        // exactly where the label ratchet is valid (across models the whole row is
+        // taken, never blended — see below).
+        merged.cw5m_tok = Math.max(merged.cw5m_tok, r.cw5m_tok);
+        merged.cw1h_tok = Math.max(merged.cw1h_tok, r.cw1h_tok);
+        if (r.cw_ttl_src === "transcript") merged.cw_ttl_src = "transcript";
       }
       return { model, row: merged };
     });
@@ -1869,6 +1910,23 @@ const counter = (col: string): string =>
                  ELSE MAX(request.${col}, excluded.${col}) END`;
 
 /**
+ * CACHE-TTL-PRICING.md D7: `counter()`'s twin for a label whose vocabulary does
+ * NOT sort the way MAX wants (`'unrecorded' > 'transcript'` lexically). Knowledge
+ * only ever ratchets up to `knownValue`, and STRICTLY within one model — the
+ * non-contested branch, exactly where `counter()`'s per-counter MAX is also valid.
+ * Across models (RID_CONTESTED) the label moves WHOLE with the winning row, like
+ * every other column: an independent ratchet there would let a takeover by a row
+ * WITHOUT the split move the counters to the winner's 0/0 (via `counter()`) while
+ * keeping the loser's `knownValue` label — fabricating a row that claims "observed"
+ * over a split nobody ever recorded.
+ */
+const label = (col: string, knownValue: string): string =>
+  `${col} = CASE WHEN ${RID_CONTESTED}
+                 THEN (CASE WHEN ${RID_TAKEOVER} THEN excluded.${col} ELSE request.${col} END)
+                 ELSE (CASE WHEN excluded.${col} = '${knownValue}' THEN '${knownValue}' ELSE request.${col} END)
+            END`;
+
+/**
  * THE statement (§5.2). MAX per counter per requestId; `session_id` is never
  * re-attributed (first-seen owns a fork replay); `tid`/`attr` are COALESCE'd so
  * an attribution pass that already ran is not undone by a re-sweep.
@@ -1890,18 +1948,21 @@ INSERT INTO request (
   request_id, message_id, is_sidechain, session_id, prompt_id, origin,
   agent_id, run_id, wf_launch_id, model, model_family,
   attribution_agent, attribution_skill, ts,
-  in_tok, out_tok, cw_tok, cr_tok
+  in_tok, out_tok, cw_tok, cr_tok, cw5m_tok, cw1h_tok, cw_ttl_src
 ) VALUES (
   $request_id, $message_id, $is_sidechain, $session_id, $prompt_id, $origin,
   $agent_id, $run_id, $wf_launch_id, $model, $model_family,
   $attribution_agent, $attribution_skill, $ts,
-  $in_tok, $out_tok, $cw_tok, $cr_tok
+  $in_tok, $out_tok, $cw_tok, $cr_tok, $cw5m_tok, $cw1h_tok, $cw_ttl_src
 )
 ON CONFLICT(request_id) DO UPDATE SET
   ${counter("out_tok")},
   ${counter("in_tok")},
   ${counter("cw_tok")},
   ${counter("cr_tok")},
+  ${counter("cw5m_tok")},
+  ${counter("cw1h_tok")},
+  ${label("cw_ttl_src", "transcript")},
   model        = CASE WHEN ${RID_TAKEOVER} THEN excluded.model        ELSE request.model        END,
   model_family = CASE WHEN ${RID_TAKEOVER} THEN excluded.model_family ELSE request.model_family END,
   ts           = CASE WHEN ${RID_TAKEOVER} THEN excluded.ts           ELSE request.ts           END,

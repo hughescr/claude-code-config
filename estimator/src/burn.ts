@@ -91,7 +91,7 @@ SELECT
   COALESCE(SUM(CASE WHEN origin='subagent'  AND attr<>'overhead' THEN wcet ELSE 0 END), 0) AS wcet_sub,
   COALESCE(SUM(CASE WHEN origin='auxiliary' AND attr<>'overhead' THEN wcet ELSE 0 END), 0) AS wcet_aux,
   COALESCE(SUM(CASE WHEN attr <> 'overhead'
-                    THEN (in_tok*usd_in + out_tok*usd_out + cw_tok*usd_cw + cr_tok*usd_cr) / 1000000.0
+                    THEN (in_tok*usd_in + out_tok*usd_out + cw_cost + cr_tok*usd_cr) / 1000000.0
                     ELSE 0 END), 0) AS usd,
   COUNT(*) AS n_req,
   MIN(ts) AS first_ts, MAX(ts) AS last_ts
