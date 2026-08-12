@@ -31,12 +31,12 @@
 
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { ROOT } from "../src/db.ts";
+import { DATA_ROOT } from "../src/db.ts";
 
 // Mirrors db.ts's EST_DB override for the same reason: tests should never
-// have to touch the real spool/ under estimator/. Unset in production, so
+// have to touch the real spool/ under estimator-data/. Unset in production, so
 // behaviour there is unchanged.
-const SPOOL_DIR = process.env.EST_SPOOL_DIR ?? join(ROOT, "spool");
+const SPOOL_DIR = process.env.EST_SPOOL_DIR ?? join(DATA_ROOT, "spool");
 const TASK_EVENTS_LOG = join(SPOOL_DIR, "task-events.jsonl");
 
 interface ToolUpdateInput {

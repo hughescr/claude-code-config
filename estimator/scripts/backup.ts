@@ -21,7 +21,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { DB_PATH, ROOT } from "../src/db.ts";
+import { DATA_ROOT, DB_PATH } from "../src/db.ts";
 
 interface Opts {
   db: string;
@@ -31,7 +31,7 @@ interface Opts {
 }
 
 function parse(argv: readonly string[]): Opts {
-  const opts: Opts = { db: DB_PATH, dir: join(ROOT, "backups"), keep: 8, quiet: false };
+  const opts: Opts = { db: DB_PATH, dir: join(DATA_ROOT, "backups"), keep: 8, quiet: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i]!;
     const eq = a.indexOf("=");

@@ -51,7 +51,7 @@ import {
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
-import { ROOT } from "../src/db.ts";
+import { DATA_ROOT } from "../src/db.ts";
 import {
   decodeLogs,
   decodeMetrics,
@@ -263,7 +263,7 @@ export function spoolBytes(dir: string): number {
  * nothing but the socket.
  */
 export function createReceiver(options: ReceiverOptions = {}): Receiver {
-  const dir = options.spoolDir ?? spoolDirFrom(process.env, ROOT);
+  const dir = options.spoolDir ?? spoolDirFrom(process.env, DATA_ROOT);
   const maxBody = options.maxBodyBytes ?? envInt("EST_OTEL_MAX_BODY_MB", DEFAULT_MAX_BODY_MB) * 1024 * 1024;
   const spoolMax = options.spoolMaxBytes ?? envInt("EST_OTEL_SPOOL_MAX_BYTES", DEFAULT_SPOOL_MAX_BYTES);
   const now = options.now ?? ((): Date => new Date());

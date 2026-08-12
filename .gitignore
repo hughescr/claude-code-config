@@ -45,14 +45,24 @@ __pycache__/
 /plugins/.last_inuse_sweep
 gh-pr-status-cache.json
 
-# estimator — the CLI's source is committed, its data never is (design R3 §4, §10 Q11)
+# estimator — the CLI's source is committed; all its runtime data lives in the
+# sibling estimator-data/ directory (DATA_ROOT in estimator/src/db.ts, default
+# resolve(ROOT, "..", "estimator-data"), overridable via EST_DATA_ROOT) and is
+# never committed (design R3 §4, §10 Q11): estimator.db (+ -wal/-shm sidecars),
+# sweep.lock, spool/, backups/, board.html and board.md all land there — one
+# directory to ignore instead of one entry per artifact, and `git clean` in the
+# checkout can never touch the corpus.
+estimator-data/
+# Pre-split entries, kept until the live corpus is actually moved to the sibling
+# estimator-data/ dir above (cutover, not part of this change). Until that move
+# lands, ~/.claude/estimator/estimator.db and friends still exist at these old
+# in-checkout paths — dropping these lines here would make the live DB, spool
+# and backups untracked-AND-unignored in a public repo. Remove only once the
+# cutover confirms nothing writes to these old paths any more.
 estimator/estimator.db*
 estimator/spool/
 estimator/backups/
 estimator/sweep.lock
-# P2.7: the rendered board carries real subjects, real ids and real figures — local
-# only, same rule as the DB itself. `--out <dir>` can point elsewhere, but the
-# default location (alongside estimator.db) must never be committable.
 estimator/board.html
 estimator/board.md
 # gate probes: the .ts scanners are code and committed; everything they PRODUCE is

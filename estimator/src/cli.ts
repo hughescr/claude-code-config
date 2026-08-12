@@ -57,8 +57,8 @@ import { dirname, join } from "node:path";
 import {
   ANCHOR_ID_KEY,
   ANCHOR_TEXT_KEY,
+  DATA_ROOT,
   DB_PATH,
-  ROOT,
   SCHEMA_VERSION,
   anchorDefinition,
   getConfig,
@@ -2028,10 +2028,11 @@ function lockNote(verb: string): string {
 }
 
 /**
- * Runtime scratch directories `est` writes into. Both are gitignored, so a fresh
- * clone lacks them and they are created here. `gates/` is deliberately absent:
- * it is committed source, and conjuring an empty one would paper over a broken
- * checkout instead of failing loudly (§2).
+ * Runtime scratch directories `est` writes into. Both live under {@link DATA_ROOT},
+ * the sibling data tree, not under the public checkout (`ROOT`) — so a fresh clone
+ * lacks them and they are created here. `gates/` is deliberately absent: it is
+ * committed source under `ROOT`, and conjuring an empty one would paper over a
+ * broken checkout instead of failing loudly (§2).
  */
 function ensureDirs(): void {
   // `spool/` in particular is not optional: the PostToolUse and PreToolUse hooks
@@ -2039,7 +2040,10 @@ function ensureDirs(): void {
   // (P1.10's "missing spool directory -> print nothing, exit 0" fail-open would
   // silently discard every delete capture).
   ensureSpool();
-  mkdirSync(join(ROOT, "backups"), { recursive: true });
+  // Under DATA_ROOT, not ROOT: backups are runtime output (copies of estimator.db),
+  // and the public checkout must never gain a path a careless `.gitignore` edit
+  // could leave uncovered (§4, §10 Q11) — see the DATA_ROOT doc comment in db.ts.
+  mkdirSync(join(DATA_ROOT, "backups"), { recursive: true });
 }
 
 async function cmdInit(ctx: Ctx): Promise<number> {
@@ -4326,8 +4330,8 @@ commands:
   help, version
 
 global flags:
-  --db <path>             database file (default: $EST_DB or <estimator>/estimator.db)
-  --lock <path>           writer lock file (default: $EST_LOCK or <estimator>/sweep.lock).
+  --db <path>             database file (default: $EST_DB or <estimator-data>/estimator.db)
+  --lock <path>           writer lock file (default: $EST_LOCK or <estimator-data>/sweep.lock).
                           One lock per database; a second corpus needs a second lock.
   -q, --quiet             suppress the human summary (hooks)
   --json                  machine-readable output

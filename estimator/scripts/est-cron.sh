@@ -28,7 +28,7 @@ set -u
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 . "$SCRIPT_DIR/est-lib.sh"
 
-WEEKLY_STAMP="$EST_HOME/backups/.last-weekly"   # under backups/, which is gitignored
+WEEKLY_STAMP="$EST_DATA_ROOT/backups/.last-weekly"   # under DATA_ROOT/backups/, outside the checkout
 WEEKLY_INTERVAL_S=604800                        # 7 days
 SWEEP_BUDGET="${EST_CRON_SWEEP_BUDGET:-300s}"
 BACKUP_KEEP="${EST_CRON_BACKUP_KEEP:-8}"

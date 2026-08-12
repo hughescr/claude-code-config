@@ -8,9 +8,17 @@
 # After sourcing, use:
 #   est_run <verb> [args...]   -> runs the est CLI whichever way it is available
 #   $EST_HOME                  -> /Users/craig/.claude/estimator (override with EST_HOME)
+#   $EST_DATA_ROOT              -> /Users/craig/.claude/estimator-data (override with EST_DATA_ROOT)
+#                                  mirrors src/db.ts's DATA_ROOT default (a sibling of
+#                                  EST_HOME, not a subdirectory of it) for shell scripts
+#                                  that need to locate runtime data without going through
+#                                  a TS entry point.
 
 EST_HOME="${EST_HOME:-$HOME/.claude/estimator}"
 export EST_HOME
+
+EST_DATA_ROOT="${EST_DATA_ROOT:-$(dirname -- "$EST_HOME")/estimator-data}"
+export EST_DATA_ROOT
 
 # --- locate bun -------------------------------------------------------------
 # Order: an explicit EST_BUN, then PATH, then the two locations bun actually

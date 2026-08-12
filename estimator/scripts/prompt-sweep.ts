@@ -40,13 +40,13 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { ROOT } from "../src/db.ts";
+import { DATA_ROOT } from "../src/db.ts";
 import { maybeSpawnMicrosweep } from "../src/microsweep.ts";
 
 // Same resolution as scripts/nudge.ts, for the same reason: tests must be able to point
 // the marker somewhere other than the deployed spool/, and the two hooks have to agree
 // about where that is or the shared throttle is not shared.
-const SPOOL_DIR = process.env.EST_SPOOL_DIR ?? join(ROOT, "spool");
+const SPOOL_DIR = process.env.EST_SPOOL_DIR ?? join(DATA_ROOT, "spool");
 
 /**
  * How often a prompt may trigger a sweep, in seconds.

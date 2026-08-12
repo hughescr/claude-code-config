@@ -38,12 +38,12 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { ROOT } from "../src/db.ts";
+import { DATA_ROOT } from "../src/db.ts";
 import { maybeSpawnMicrosweep } from "../src/microsweep.ts";
 
 // Same resolution as scripts/prompt-sweep.ts and scripts/nudge.ts, for the same reason:
 // the throttle marker is only shared if every caller agrees where it lives.
-const SPOOL_DIR = process.env.EST_SPOOL_DIR ?? join(ROOT, "spool");
+const SPOOL_DIR = process.env.EST_SPOOL_DIR ?? join(DATA_ROOT, "spool");
 
 /**
  * How recently another hook must have swept for a session start to decline, in seconds.

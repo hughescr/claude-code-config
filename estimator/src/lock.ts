@@ -2,7 +2,7 @@
  * Single-writer lock — token-estimation-design-r3.md §2, §4.
  *
  * "Single writer. Sweeper holds `flock`" — the sweeper takes an exclusive lock on
- * `~/.claude/estimator/sweep.lock` so two sweeps can never interleave their
+ * `~/.claude/estimator-data/sweep.lock` so two sweeps can never interleave their
  * upserts. Everything the lock protects is idempotent anyway (§5.2 upsert-with-MAX),
  * so the lock buys serialisation and a clean single transaction per sweep, not
  * correctness of last resort.
@@ -46,10 +46,10 @@ import {
 } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
-import { ROOT } from "./db.ts";
+import { DATA_ROOT } from "./db.ts";
 
 /** Canonical sweep lock. `EST_LOCK` overrides it (tests, parallel corpora). */
-export const LOCK_PATH: string = process.env.EST_LOCK ?? join(ROOT, "sweep.lock");
+export const LOCK_PATH: string = process.env.EST_LOCK ?? join(DATA_ROOT, "sweep.lock");
 
 /**
  * A lock whose holder we cannot check for liveness (foreign host, unparseable

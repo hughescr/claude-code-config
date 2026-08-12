@@ -44,15 +44,15 @@ import type { Database } from "bun:sqlite";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
-import { ROOT, openDb } from "../src/db.ts";
+import { DATA_ROOT, openDb } from "../src/db.ts";
 import { bandUnscorable } from "../src/tasks.ts";
 import { overrunMarkerFile, type NudgeKind } from "../src/spool.ts";
 import { maybeSpawnMicrosweep } from "../src/microsweep.ts";
 
 // `EST_DB` already overrides the database path (db.ts); this mirrors that
 // convention for the spool directory so tests never have to touch the real
-// spool/ under estimator/ — production is unaffected since the var is unset.
-const SPOOL_DIR = process.env.EST_SPOOL_DIR ?? join(ROOT, "spool");
+// spool/ under estimator-data/ — production is unaffected since the var is unset.
+const SPOOL_DIR = process.env.EST_SPOOL_DIR ?? join(DATA_ROOT, "spool");
 const COMPLIANCE_LOG = join(SPOOL_DIR, "compliance.jsonl");
 const NUDGE_BUDGET = 500; // P1.10 job 1: "budgeted to <=500 characters"
 const OVERRUN_BUDGET = 300; // P1.10 job 4: "a <=300-character additionalContext"

@@ -52,7 +52,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { DB_PATH, ROOT, openDb } from "../src/db.ts";
+import { DATA_ROOT, DB_PATH, openDb } from "../src/db.ts";
 import { withLock } from "../src/lock.ts";
 import { attributeTasks } from "../src/attribute.ts";
 import { promoteStartedTasks } from "../src/promote.ts";
@@ -265,7 +265,7 @@ export function repairAttribution(db: Database, options: RepairOptions = {}): Re
   const apply = options.apply ?? false;
   const now = options.now ?? new Date();
   const out = options.out ?? ((s: string) => process.stdout.write(`${s}\n`));
-  const backupDir = options.backupDir ?? join(ROOT, "backups");
+  const backupDir = options.backupDir ?? join(DATA_ROOT, "backups");
   const stamp = isoStamp(now);
 
   const before = snapshotCounts(db);

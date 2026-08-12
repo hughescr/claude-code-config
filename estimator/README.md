@@ -74,7 +74,8 @@ set. Details:
   retyping — rather than storing it. Exit 2 stays reserved for operations the system will not perform.
 
 Stack: TypeScript on bun, zero npm dependencies (`bun:sqlite`, `bun:test`). Everything is local —
-the database, its WAL sidecars, the OTLP spool and the weekly backups are gitignored and never
+the database, its WAL sidecars, the OTLP spool and the weekly backups live in a sibling
+`estimator-data/` directory outside the checkout (see [Layout](#layout)), gitignored and never
 leave this machine; only source code is committed.
 
 ## Layout
@@ -89,14 +90,37 @@ leave this machine; only source code is committed.
 | `gates/` | Phase 0 pre-build gate probes (`*.ts`, committed) and their reports (`*.md`, local), plus `g-smoke.ts` — the Phase 2 end-to-end smoke gate, which writes no report at all. |
 | `test/` | `bun test` suite. `support.ts` is the shared synthetic fixture builder, not a test file. |
 | `tsconfig.json` | Typecheck-only config (`bun run typecheck`); nothing here ever emits. |
-| `estimator.db` | The database (gitignored, WAL mode). Override the path with `EST_DB`. |
-| `spool/`, `backups/`, `sweep.lock` | Hook spool + OTLP spool, weekly `VACUUM INTO` backups, writer lock — all gitignored. |
+| `../estimator-data/` | **Outside this repo** (a sibling of the checkout, not a subdirectory of it): every file the estimator writes at runtime — see below. |
 | `~/.claude/skills/estimating/` | **Outside this repo**: the agent-facing procedure layer over this CLI — `SKILL.md` plus `references/`, saying when to estimate, how to derive a band (the story-point ladder, the anchor, mandatory decomposition above ~40 points) and which verb to reach for. It is the CLI's one documented consumer, so a change to a verb, a flag, a unit or its `--help` text is not done until this is changed with it; the help text wins when the two disagree, which is exactly why they must not. |
 
 Only the gate **probes** are committed. Everything they produce — the `*.json` dumps and the
 curated `*.md` reports alike — is corpus-derived data and stays local, alongside `DESIGN.md`,
 `DECISIONS.md` and the database itself: a curated report is still written *about* a real corpus,
 and this repository is public (`DECISIONS.md` §2, as superseded).
+
+### `../estimator-data/` — where the runtime data actually lives
+
+Every file the estimator writes at runtime lives under `DATA_ROOT` (`src/db.ts`), a **sibling**
+of this checkout — `resolve(ROOT, "..", "estimator-data")` by default, overridable wholesale with
+`EST_DATA_ROOT` (tests point it at a fresh `mkdtemp`). Code and data are separate trees on purpose:
+this repo is public and none of its data may ever be committed (§4, §10 Q11), and keeping the data
+inside the checkout meant the `.gitignore` had to enumerate every artifact by name — one forgotten
+entry away from publishing real subjects and real spend. With the split, the repo's ignore rule is
+one line (`estimator-data/`, at the tree root above this directory) and `git clean` in the checkout
+can never eat the corpus. Nothing under it is pre-created; each writer `mkdirSync`s its own
+subdirectory the first time it needs it, so a read-only open against a missing database still fails
+loudly instead of manufacturing an empty tree.
+
+| Path (under `estimator-data/`) | What it is | Override |
+|---|---|---|
+| `estimator.db` (+ `-wal`/`-shm`) | The database, WAL mode. | `EST_DB` |
+| `sweep.lock` | The single-writer sweep lock. | `EST_LOCK` |
+| `spool/` | Hook spool (compliance lines, task-delete capture) and OTLP spool, drained by the sweeper. | `EST_SPOOL_DIR` (`EST_SPOOL` also honoured — see `src/spool.ts`) |
+| `backups/` | Weekly `VACUUM INTO` snapshots. | `--dir`/`backupDir` (default `DATA_ROOT/backups`, independent of `EST_DB`) |
+| `board.html`, `board.md` | The rendered board (P2.7) — see below. | `--out <dir>` on `est board --html`/`--md` |
+
+`schema.sql`, the test fixtures (`FIXTURE_DIR` in `src/prices.ts`), `gates/`, `node_modules` and the
+docs all stay in the code dir — only what the estimator *writes* moved.
 
 ## Commands
 
@@ -155,7 +179,7 @@ around `scripts/nudge.ts`, `scripts/capture-delete.ts`, `scripts/prompt-sweep.ts
 them through `src/cli.ts`, and nothing should: registering them as verbs would add a second, unused
 invocation path.
 Phase 2 adds the OTLP receiver, `est recon` and the rendered board (`board.html`/`board.md`,
-gitignored data next to `estimator.db`, never committed).
+written into `estimator-data/` alongside `estimator.db`, never committed).
 
 **Exit codes** are a contract: `0` success *including a well-formed empty result* · `1` usage or
 fatal · `2` **rejected by an invariant** · `3` completed with alerting anomalies · `4` the sweep

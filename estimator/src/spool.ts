@@ -36,24 +36,24 @@
 import type { Database } from "bun:sqlite";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { ROOT } from "./db.ts";
+import { DATA_ROOT } from "./db.ts";
 import type { IngestAnomaly } from "./ingest.ts";
 
 /**
- * Where the hooks write and this reader reads. The directory is gitignored like the
- * database itself.
+ * Where the hooks write and this reader reads. The directory lives under DATA_ROOT,
+ * outside the public checkout, like the database itself.
  *
  * **`EST_SPOOL_DIR` is the name the hooks use and therefore the name that wins.**
  * `scripts/nudge.ts` and `scripts/capture-delete.ts` both resolve their spool as
- * `process.env.EST_SPOOL_DIR ?? join(ROOT, "spool")`; if this reader honoured only its
- * own `EST_SPOOL`, setting either variable alone would give the writers and the reader
- * two different directories — hooks appending to a spool no sweep ever drains, which
- * loses exactly the delete-capture records P1.11 exists to preserve, silently and with
- * a passing test suite on both sides. Both names are accepted so neither half can be
- * configured out from under the other; `spoolDirFrom` is exported so the agreement is
- * testable rather than assumed.
+ * `process.env.EST_SPOOL_DIR ?? join(DATA_ROOT, "spool")`; if this reader honoured only
+ * its own `EST_SPOOL`, setting either variable alone would give the writers and the
+ * reader two different directories — hooks appending to a spool no sweep ever drains,
+ * which loses exactly the delete-capture records P1.11 exists to preserve, silently and
+ * with a passing test suite on both sides. Both names are accepted so neither half can
+ * be configured out from under the other; `spoolDirFrom` is exported so the agreement
+ * is testable rather than assumed.
  */
-export function spoolDirFrom(env: Record<string, string | undefined>, root: string = ROOT): string {
+export function spoolDirFrom(env: Record<string, string | undefined>, root: string = DATA_ROOT): string {
   const explicit = env.EST_SPOOL_DIR ?? env.EST_SPOOL;
   return explicit !== undefined && explicit !== "" ? explicit : join(root, "spool");
 }

@@ -21,14 +21,34 @@ import { InvariantError } from "./errors.ts";
 /** Project root — the directory holding schema.sql, src/, scripts/, gates/. */
 export const ROOT: string = resolve(import.meta.dir, "..");
 
+/**
+ * Data root — the SIBLING directory holding everything the estimator writes at
+ * runtime: `estimator.db` (+ WAL sidecars), `sweep.lock`, `spool/`, `backups/`,
+ * `board.html`/`board.md`. `EST_DATA_ROOT` overrides it (tests, parallel corpora).
+ *
+ * A sibling of ROOT rather than a subdirectory of it, deliberately: this repo is
+ * PUBLIC and none of its data may ever be committed (§4, §10 Q11), and keeping the
+ * data inside the checkout meant the gitignore had to enumerate every artifact by
+ * name — one forgotten entry away from publishing real subjects and real spend.
+ * With code and data in separate trees the ignore rule is one line, `git clean`
+ * in the checkout can never eat the corpus, and "what do I back up" has a
+ * one-directory answer. Created lazily by whichever writer needs it first
+ * (`openDb`, `tryAcquireLock`, `ensureSpool`, `backup.ts` — each already
+ * `mkdirSync`s its parent), so a read-only open of a missing database still
+ * fails loudly instead of manufacturing an empty tree.
+ */
+export const DATA_ROOT: string =
+  process.env.EST_DATA_ROOT ?? resolve(ROOT, "..", "estimator-data");
+
 /** Canonical schema location. */
 export const SCHEMA_PATH: string = join(ROOT, "schema.sql");
 
 /**
  * Canonical database location. `EST_DB` overrides it (tests, one-off checks,
- * `est --db`); the DB and its sidecars are gitignored (§4, §10 Q11).
+ * `est --db`); the DB and its sidecars live under {@link DATA_ROOT}, outside the
+ * public checkout, so nothing estimation-related can ever be committed (§4, §10 Q11).
  */
-export const DB_PATH: string = process.env.EST_DB ?? join(ROOT, "estimator.db");
+export const DB_PATH: string = process.env.EST_DB ?? join(DATA_ROOT, "estimator.db");
 
 /**
  * Must match the config.schema_version seed in schema.sql.
