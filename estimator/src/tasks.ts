@@ -1980,6 +1980,15 @@ export interface BindInput {
   run?: string | null;
   agent?: string | null;
   now?: Date;
+  /**
+   * HOOK-BINDING-SPEC.md §5.3: unbind-then-bind, ONE transaction, so an identity is
+   * never momentarily unowned. Scoped to `bindTask`'s own existing (session_id,
+   * local_id) conflict check — NOT identity-wide across every session, which §11 Q8
+   * leaves as an open question this verb does not resolve. The human typing
+   * `--replace` is the authorization; no `--force` is required on top of it, unlike
+   * `unbindTask`'s guard against removing a human-written alias by accident.
+   */
+  replace?: boolean;
 }
 
 export interface BindResult {
@@ -2065,13 +2074,31 @@ export function bindTask(db: Database, input: BindInput): BindResult {
               .get(t.id_kind, t.session_id, t.local_id);
       if (existing !== null && existing !== undefined) {
         if (existing.tid !== input.tid) {
-          throw new InvariantError(
-            `${t.id_kind} ${t.local_id} (session ${t.session_id}) is already bound to tid ${existing.tid}`,
-            "aliases are never silently re-pointed — close or correct the other task first; re-pointing would move spend between actuals after the fact",
+          if (!input.replace) {
+            throw new InvariantError(
+              `${t.id_kind} ${t.local_id} (session ${t.session_id}) is already bound to tid ${existing.tid}`,
+              "aliases are never silently re-pointed — close or correct the other task first; re-pointing would move spend between actuals after the fact, or pass --replace to do so explicitly",
+            );
+          }
+          // §5.3 `--replace`: delete the old row and fall through to the insert
+          // below, inside this SAME transaction — the identity is never unowned.
+          db.query("DELETE FROM task_alias WHERE id_kind = ? AND session_id = ? AND local_id = ? AND tid = ?").run(
+            t.id_kind,
+            t.session_id,
+            t.local_id,
+            existing.tid,
           );
+          writeAnomaly(
+            db,
+            ts,
+            "alias_unbound",
+            `${t.id_kind} alias re-pointed by est bind --replace (identity-wide check)`,
+            existing.tid,
+          );
+        } else {
+          written.push({ ...t, existed: true });
+          continue;
         }
-        written.push({ ...t, existed: true });
-        continue;
       }
       db.query(UPSERT_ALIAS_SQL).run({
         $tid: input.tid,
@@ -2086,6 +2113,123 @@ export function bindTask(db: Database, input: BindInput): BindResult {
   }).immediate();
 
   return { tid: input.tid, written };
+}
+
+export interface UnbindInput {
+  agent?: string | null;
+  run?: string | null;
+  task?: string | null;
+  /** Required with `--task` (a Task-tool number is session-scoped); ignored otherwise
+   *  — `--agent`/`--run` are unbound IDENTITY-WIDE, across every session that holds a
+   *  row for them (§5.3, §5.2's identity-wide reading). */
+  session?: string | null;
+  force?: boolean;
+  now?: Date;
+}
+
+export interface UnboundAlias {
+  id_kind: AliasKind;
+  session_id: string;
+  local_id: string;
+  tid: string;
+  source: string;
+}
+
+export interface UnbindResult {
+  removed: UnboundAlias[];
+  /** What each removed identity's task loses, printed BEFORE the delete runs (§5.3:
+   *  "a correction is a decision, not a surprise") — one entry per DISTINCT tid that
+   *  lost at least one alias. */
+  before: Array<{ tid: string; actual_wcet: number | null }>;
+}
+
+/**
+ * The correction path for a hook-written (or any non-`session`) alias (§5.3). There
+ * was no unbind or repoint verb anywhere in `src/` before this — `bindTask`'s
+ * `InvariantError` refuses a competing owner, which is correct for a HUMAN typing
+ * `est bind` by mistake, but leaves a wrong `source='hook'` alias — minted at spawn
+ * scale, with no human in the loop — uncorrectable through the CLI.
+ *
+ * Deletes only NON-`session` aliases (a session binding is shared/additive, §5.4, and
+ * has no "wrong owner" to correct). Refuses, without `--force`, to remove a row whose
+ * `source = 'est_bind'` — a human wrote it, so unbinding it silently would be exactly
+ * the kind of surprising re-pointing this whole design refuses to do elsewhere.
+ */
+export function unbindTask(db: Database, input: UnbindInput): UnbindResult {
+  const ts = isoNow(input.now ?? new Date());
+
+  let idKind: AliasKind;
+  let localId: string;
+  let sessionFilter: string | null = null;
+  const given = [input.agent, input.run, input.task].filter((v) => v !== null && v !== undefined).length;
+  if (given !== 1) {
+    throw new UsageError("est unbind: give exactly one of --agent, --run or --task");
+  }
+  if (input.agent !== null && input.agent !== undefined) {
+    idKind = "agent";
+    localId = input.agent;
+  } else if (input.run !== null && input.run !== undefined) {
+    idKind = "workflow_run";
+    localId = input.run;
+  } else {
+    if (input.session === null || input.session === undefined) {
+      throw new UsageError("est unbind --task <n>: needs --session <sid> (a Task-tool number is session-scoped)");
+    }
+    idKind = "session_task";
+    localId = input.task!;
+    sessionFilter = input.session;
+  }
+
+  const rows =
+    sessionFilter === null
+      ? db
+          .query<{ session_id: string; tid: string; source: string }, [string, string]>(
+            "SELECT session_id, tid, source FROM task_alias WHERE id_kind = ? AND local_id = ?",
+          )
+          .all(idKind, localId)
+      : db
+          .query<{ session_id: string; tid: string; source: string }, [string, string, string]>(
+            "SELECT session_id, tid, source FROM task_alias WHERE id_kind = ? AND local_id = ? AND session_id = ?",
+          )
+          .all(idKind, localId, sessionFilter);
+
+  if (rows.length === 0) return { removed: [], before: [] };
+
+  const humanOwned = rows.filter((r) => r.source === "est_bind");
+  if (humanOwned.length > 0 && !input.force) {
+    throw new InvariantError(
+      `${idKind} ${localId} is bound by a human \`est bind\` (source='est_bind') to tid ${humanOwned[0]!.tid}`,
+      "pass --force to remove a human-written alias — make Craig say so",
+    );
+  }
+
+  const distinctTids = [...new Set(rows.map((r) => r.tid))];
+  const actualOf = db.prepare<{ actual: number | null }, [string]>(
+    "SELECT SUM(wcet) AS actual FROM v_task_actual WHERE tid = ?",
+  );
+  const before = distinctTids.map((tid) => ({ tid, actual_wcet: actualOf.get(tid)?.actual ?? null }));
+
+  const removed: UnboundAlias[] = [];
+  db.transaction(() => {
+    const del = db.prepare(
+      "DELETE FROM task_alias WHERE id_kind = ? AND session_id = ? AND local_id = ? AND tid = ?",
+    );
+    for (const r of rows) {
+      del.run(idKind, r.session_id, localId, r.tid);
+      removed.push({ id_kind: idKind, session_id: r.session_id, local_id: localId, tid: r.tid, source: r.source });
+    }
+    // Class only, never the ids (privacy rule; `insertAnomalies` dedups on
+    // (kind, detail), so a varying detail would defeat the ledger's purpose anyway).
+    writeAnomaly(
+      db,
+      ts,
+      "alias_unbound",
+      `${idKind} alias removed by est unbind`,
+      distinctTids.length === 1 ? distinctTids[0]! : null,
+    );
+  }).immediate();
+
+  return { removed, before };
 }
 
 function runSession(db: Database, runId: string): string | null {

@@ -122,6 +122,7 @@ import {
   classifyOpenError,
   refreshBurnCache,
   renderBurn,
+  resolveSession,
   type BurnJson,
 } from "./burn.ts";
 import { closeTask, healClosedOutcomes, type FinalStatus } from "./close.ts";
@@ -131,7 +132,16 @@ import { DEFAULT_BOARD_LIMIT, regenerateBoardIfDue, renderBoardFiles } from "./b
 import { promoteStartedTasks } from "./promote.ts";
 import { emptyJobsResult, JOBS_ROOT, reconcileJobs } from "./jobs.ts";
 import { otelDump, otelPort, otelStatus, renderOtelDump, renderOtelStatus } from "./otel-status.ts";
-import { drainSpool, emptyDrain, ensureSpool, spoolDirFrom, SPOOL_DIR } from "./spool.ts";
+import {
+  clearFocusMarker,
+  drainSpool,
+  emptyDrain,
+  ensureSpool,
+  readFocusMarker,
+  spoolDirFrom,
+  writeFocusMarker,
+  SPOOL_DIR,
+} from "./spool.ts";
 import {
   DEFAULT_OTEL_SPOOL_RETENTION_DAYS,
   drainOtel,
@@ -171,6 +181,7 @@ import {
   refclass,
   REFCLASS_BUDGET_CHARS,
   TASK_KINDS,
+  unbindTask,
   UsageError,
   type EstimateReason,
   type TaskKind,
@@ -197,6 +208,13 @@ export const COMMANDS = [
   "open",
   "block",
   "bind",
+  // HOOK-BINDING-SPEC.md §5.3: the correction path for a hook-written alias. `unbind`
+  // is a distinct verb rather than only `bind --replace` (§11 Q6 left this open) —
+  // `--replace` covers "I know what it should be instead"; `unbind` alone covers "I
+  // just want this identity un-owned", which has no natural spelling as a bind.
+  "unbind",
+  // HOOK-BINDING-SPEC.md §3.2a: the human pointer the hook's ladder rungs 2-4 read.
+  "focus",
   "scope",
   "burn",
   "close",
@@ -269,7 +287,13 @@ export const COMMAND_FLAGS: Record<Command, FlagSpec> = {
     ],
   },
   block: { booleans: [], values: ["phase", "title", "p50", "p90", "exp-agents", "model"] },
-  bind: { booleans: [], values: ["session", "task", "run", "agent"] },
+  // `--replace` (HOOK-BINDING-SPEC.md §5.3): unbind-then-bind, one transaction, so an
+  // identity is never momentarily unowned. Kept on `est bind <tid> ...`'s existing
+  // positional-tid shape rather than the spec's illustrative `--tid` flag form — one
+  // calling convention for one verb, and §11 Q6 left the exact surface open.
+  bind: { booleans: ["replace"], values: ["session", "task", "run", "agent"] },
+  unbind: { booleans: ["force"], values: ["session", "task", "run", "agent"] },
+  focus: { booleans: ["clear"], values: ["session"] },
   scope: { booleans: [], values: ["reason", "subject", "description", "dod"] },
   burn: { booleans: ["refresh"], values: ["session"] },
   // `accept` takes a VALUE — the human's verbatim acceptance — because a boolean
@@ -3110,6 +3134,12 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
           });
         }
 
+        // HOOK-BINDING-SPEC.md §3.2a, resolved YES (Q1): `est open` writes the session
+        // focus marker. Best-effort and OUTSIDE the transaction `openTask` already
+        // committed — a lost focus write degrades to the hook's later ladder rungs,
+        // exactly like every other marker in this design; it must never fail the open.
+        writeFocusMarker(result.anchor.sessionId, result.tid, "est_open", SPOOL_DIR, now);
+
         if (ctx.json) {
           ctx.out(
             JSON.stringify({
@@ -3371,18 +3401,24 @@ async function cmdBind(ctx: Ctx): Promise<number> {
   const tid = positional(ctx, 0);
   if (tid === null) throw new UsageError("est bind: missing <tid>");
   const p = ctx.parsed;
+  const session = flagString(p, "session");
   return await withLock(
     (): number => {
       const db = openDb({ path: ctx.dbPath });
       try {
+        const now = new Date();
         const r = bindTask(db, {
           tid,
-          session: flagString(p, "session"),
+          session,
           task: flagString(p, "task"),
           run: flagString(p, "run"),
           agent: flagString(p, "agent"),
-          now: new Date(),
+          replace: flagBool(p, "replace"),
+          now,
         });
+        // HOOK-BINDING-SPEC.md §3.2a: `est bind --session` is the other explicit
+        // human act that writes the focus marker (`est open` is the first, §3.2a).
+        if (session !== null) writeFocusMarker(session, tid, "est_bind", SPOOL_DIR, now);
         if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...r }));
         else if (!ctx.quiet) {
           for (const w of r.written) {
@@ -3395,6 +3431,80 @@ async function cmdBind(ctx: Ctx): Promise<number> {
       }
     },
     { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("bind") },
+  );
+}
+
+async function cmdUnbind(ctx: Ctx): Promise<number> {
+  const p = ctx.parsed;
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
+        const r = unbindTask(db, {
+          agent: flagString(p, "agent"),
+          run: flagString(p, "run"),
+          task: flagString(p, "task"),
+          session: flagString(p, "session"),
+          force: flagBool(p, "force"),
+          now: new Date(),
+        });
+        if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...r }));
+        else if (!ctx.quiet) {
+          if (r.removed.length === 0) {
+            ctx.out("est unbind: nothing bound to that identity");
+          } else {
+            // Printed BEFORE the caller sees the removal confirmed below — §5.3:
+            // "a correction is a decision, not a surprise".
+            for (const b of r.before) {
+              ctx.out(
+                `tid ${b.tid} currently carries ${b.actual_wcet === null ? "no priced actual yet" : `${num(b.actual_wcet)} Work-CET`}`,
+              );
+            }
+            for (const w of r.removed) {
+              ctx.out(`unbound ${w.id_kind}=${w.local_id} (session ${w.session_id}) from tid ${w.tid}`);
+            }
+          }
+        }
+        return 0;
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("unbind") },
+  );
+}
+
+async function cmdFocus(ctx: Ctx): Promise<number> {
+  const tid = positional(ctx, 0);
+  if (tid === null) throw new UsageError("est focus: missing <tid>");
+  const p = ctx.parsed;
+  const clear = flagBool(p, "clear");
+  const session = resolveSession(flagString(p, "session"));
+  if (session === null) {
+    throw new UsageError("est focus: --session <sid> is required (or set CLAUDE_SESSION_ID)");
+  }
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
+        const task = db.query<{ tid: string }, [string]>("SELECT tid FROM task WHERE tid = ?").get(tid);
+        if (task === null || task === undefined) {
+          throw new InvariantError(`unknown tid: ${tid}`, "run `est open` to mint a task first");
+        }
+        if (clear) {
+          clearFocusMarker(session, tid, SPOOL_DIR);
+          if (!ctx.quiet) ctx.out(`focus cleared: session ${session} (was ${tid})`);
+        } else {
+          writeFocusMarker(session, tid, "est_focus", SPOOL_DIR, new Date());
+          if (!ctx.quiet) ctx.out(`focus set: session ${session} → ${tid}`);
+        }
+        if (ctx.json) ctx.out(JSON.stringify({ schema: 1, session, tid, cleared: clear }));
+        return 0;
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("focus") },
   );
 }
 
@@ -4393,6 +4503,8 @@ commands:
   open                    mint or re-estimate a task; prints the calibrated band
   block                   one estimate per declared workflow phase, before the launch
   bind                    attach a session / task number / run / agent to a tid
+  unbind                  the correction path: remove a non-session alias (§5.3)
+  focus                   set/clear this session's pointer for the hook's ladder
   scope                   append a scope revision (the scope_change precondition)
   burn                    consumption against the band (--json is the statusline contract)
   close                   finalize by arithmetic
@@ -4504,6 +4616,20 @@ block <tid>:
                           so far, which should converge on the band already issued.
 
 bind <tid>:               [--session <sid>] [--task <n>] [--run <runId>] [--agent <agentId>]
+                          [--replace]   unbind-then-bind, one transaction, when the
+                            identity already belongs to a different tid (spec §5.3)
+unbind:                   (--agent <id> | --run <id> | --task <n> --session <sid>) [--force]
+                          the correction path for a hook-written (source='hook') alias.
+                          Refuses to remove a human-written (source='est_bind') alias
+                          without --force. Prints the owning tid and its current
+                          actual before acting.
+focus <tid>:              [--session <sid>] [--clear]
+                          a session-scoped pointer the hook's PostToolUse ladder
+                          reads (HOOK-BINDING-SPEC.md §3.2a); believed only for
+                          hook_focus_ttl_min of IDLE time on the focused task, not
+                          fixed time-since-set. Written automatically by est open
+                          and est bind --session; this verb is for the two-tasks-
+                          open-at-once case, or --clear to disarm it early.
 scope <tid>:              --reason <text> [--subject <t>] [--description <t>] [--dod <json|@file>]
 burn [<tid>]:             [--session <sid>] [--refresh]      read-only; never writes; always exits 0
 close <tid>:              [--status completed|abandoned|deleted|reopened]
@@ -4607,6 +4733,10 @@ export async function run(argv: readonly string[], io: RunOptions = {}): Promise
         return await verb(ctx, () => cmdBlock(ctx));
       case "bind":
         return await verb(ctx, () => cmdBind(ctx));
+      case "unbind":
+        return await verb(ctx, () => cmdUnbind(ctx));
+      case "focus":
+        return await verb(ctx, () => cmdFocus(ctx));
       case "scope":
         return await verb(ctx, () => cmdScope(ctx));
       case "burn":

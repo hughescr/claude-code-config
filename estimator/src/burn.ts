@@ -791,7 +791,7 @@ function isOpenTask(db: Database, tid: string): boolean {
  * and a tracked-task state computed from another would be two answers about two
  * different screens.
  */
-function resolveSession(session?: string | null): string | null {
+export function resolveSession(session?: string | null): string | null {
   const s = session ?? process.env.EST_SESSION_ID ?? process.env.CLAUDE_SESSION_ID ?? null;
   return s === null || s === "" ? null : s;
 }

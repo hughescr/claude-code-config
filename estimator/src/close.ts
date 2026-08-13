@@ -28,7 +28,7 @@ import { intervalUnion, taskIntervals } from "./burn.ts";
 import { getConfig } from "./db.ts";
 import { PROJECTS_ROOT } from "./discover.ts";
 import { countLiveAgents, liveAgentMaxMin } from "./liveness.ts";
-import { clearOverrunMarker, SPOOL_DIR } from "./spool.ts";
+import { clearFocusMarker, clearOverrunMarker, SPOOL_DIR } from "./spool.ts";
 import { bandUnscorable, InvariantError, isoNow, TERMINAL_TASK_STATUS } from "./tasks.ts";
 
 /** Where the harness records live sessions (`<pid>.json`); `EST_SESSIONS` overrides. */
@@ -1198,6 +1198,20 @@ export function closeTask(db: Database, input: CloseInput): CloseResult {
   // leak a file the sweep can only reap on a 30-day timer and, after a reopen, swallow
   // the first legitimate nudge of the new run.
   clearOverrunMarker(input.tid, input.spoolDir ?? SPOOL_DIR);
+
+  // HOOK-BINDING-SPEC.md §3.2a: the focus marker gets the same reclaim, for the same
+  // reason — a marker naming a now-finalized task must not go on granting
+  // exclusive-grade bindings, and a reopen must not inherit a stale pointer. A task
+  // may be aliased to several sessions (schema v6), so every one of them is checked;
+  // `clearFocusMarker` only removes a session's marker when it actually names THIS
+  // tid, so a different task's live focus in the same session is left untouched.
+  for (const s of db
+    .query<{ session_id: string }, [string]>(
+      "SELECT DISTINCT session_id FROM task_alias WHERE tid = ? AND id_kind = 'session'",
+    )
+    .all(input.tid)) {
+    clearFocusMarker(s.session_id, input.tid, input.spoolDir ?? SPOOL_DIR);
+  }
 
   const alerts: string[] = [];
   if (unpricedShare > 0) alerts.push(`unpriced_share=${(unpricedShare * 100).toFixed(1)}%`);
