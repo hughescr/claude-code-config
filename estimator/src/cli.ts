@@ -4668,11 +4668,12 @@ unbind:                   (--agent <id> | --run <id> | --task <n> --session <sid
                           actual before acting.
 focus <tid>:              [--session <sid>] [--clear]
                           a session-scoped pointer the hook's PostToolUse ladder
-                          reads (HOOK-BINDING-SPEC.md §3.2a); believed only for
-                          hook_focus_ttl_min of IDLE time on the focused task, not
-                          fixed time-since-set. Written automatically by est open
-                          and est bind --session; this verb is for the two-tasks-
-                          open-at-once case, or --clear to disarm it early.
+                          reads (HOOK-BINDING-SPEC.md §3.2a); believed only within
+                          hook_focus_ttl_min of when it was SET — a still-running
+                          task does not renew it, so re-run est focus to renew.
+                          Written automatically by est open and est bind --session;
+                          this verb is for the two-tasks-open-at-once case, or
+                          --clear to disarm it early.
 scope <tid>:              --reason <text> [--subject <t>] [--description <t>] [--dod <json|@file>]
 burn [<tid>]:             [--session <sid>] [--refresh]      read-only; never writes; always exits 0
 close <tid>:              [--status completed|abandoned|deleted|reopened]

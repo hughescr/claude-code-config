@@ -15,7 +15,7 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { COMMANDS } from "../src/cli.ts";
+import { COMMANDS, HELP } from "../src/cli.ts";
 
 const ROOT = join(import.meta.dir, "..");
 const README = readFileSync(join(ROOT, "README.md"), "utf8");
@@ -68,5 +68,22 @@ describe("README operational coverage", () => {
     expect(README).toContain("scripts/statusline-burn.ts");
     // The launchd job is installed; the table must not claim otherwise.
     expect(README).not.toContain("**NOT INSTALLED**");
+  });
+});
+
+describe("est help — focus TTL basis", () => {
+  test("the focus entry describes the TTL on its implemented fixed-from-set basis", () => {
+    const start = HELP.indexOf("focus <tid>:");
+    const end = HELP.indexOf("scope <tid>:");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const entry = HELP.slice(start, end);
+    expect(entry).toContain("hook_focus_ttl_min");
+    // resolveLadder ages the marker from marker.ts alone (scripts/nudge.ts:363-388);
+    // the behaviour is pinned by nudge.test.ts "a focus marker older than
+    // hook_focus_ttl_min is ignored EVEN WHILE its task is still absorbing work".
+    // This test pins the USER-FACING half, which rev-3 stated as its inverse.
+    expect(entry.toLowerCase()).not.toContain("idle");
+    expect(entry).toMatch(/when it was SET|time it was set/);
   });
 });
