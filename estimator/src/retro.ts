@@ -71,6 +71,13 @@ export const ATTR_COVERAGE_GATE = 0.7;
  *  is carried here only so a future writer does not have to touch this predicate too. */
 export const ATTR_COVERAGE_CLASSES = ["exclusive", "sticky"] as const;
 
+/** The live "which sessions are tracked" predicate — `attrBaseFilter`'s default, and
+ *  `gates/g-attr.ts`'s L1 tracked-session cut. Exported so a caller that must pin this
+ *  set to a snapshot taken BEFORE a mutating recompute (see `attrBaseFilter`'s `opts`
+ *  below) can quote the same subquery shape rather than hand-copying it. */
+export const LIVE_TRACKED_SESSIONS_SQL =
+  "SELECT DISTINCT session_id FROM task_alias WHERE session_id <> ''";
+
 /**
  * D3 (design/GATE-LIVE-SEMANTICS.md) — the base population the live G-ATTR headline
  * and this file's coverage numbers must share, so the number that licenses
@@ -83,22 +90,30 @@ export const ATTR_COVERAGE_CLASSES = ["exclusive", "sticky"] as const;
  * shadow, the staleness sensitivity grid) this file never opens. `until` is exclusive,
  * matching half-open epoch windows (`[cutover, hook-merge)`, `[hook-merge, now]`).
  *
- * Deliberately NOT plugged into `qualityPanel`'s own `coverage_tracked` below: that
- * query's denominator additionally admits `replay`/`overhead`/`auxiliary` origin, which
- * is wrong in the same way this predicate corrects, but re-basing it is a follow-up
- * (design/GATE-LIVE-SEMANTICS.md §7.2), not this export's job — changing what `retro.ts`
- * itself reports is a behaviour change the live G-ATTR re-gate does not require.
+ * `opts.trackedSessionsSql` overrides the tracked-session subquery (default
+ * `LIVE_TRACKED_SESSIONS_SQL`, read fresh off `task_alias` in whatever DB this SQL runs
+ * against). GLS D9's ex-hook counterfactual needs this: it deletes `source='hook'`
+ * rows and re-attributes on a throwaway copy, and a session whose ONLY alias was that
+ * hook binding must stay IN the denominator as now-uncovered spend, not fall out of it
+ * along with the row that used to name it — the population may only be fixed BEFORE the
+ * delete, or the shadow run answers a smaller question than the live one and the
+ * subtraction between them is meaningless. Callers computing a live-only number should
+ * omit `opts` and get the default.
  */
-export function attrBaseFilter(w: { since: string; until?: string }): {
+export function attrBaseFilter(
+  w: { since: string; until?: string },
+  opts: { trackedSessionsSql?: string } = {},
+): {
   sql: string;
   params: string[];
 } {
+  const trackedSessionsSql = opts.trackedSessionsSql ?? LIVE_TRACKED_SESSIONS_SQL;
   const params: string[] = [w.since];
   let sql = `ts >= ?
     AND origin IN ('main','subagent')
     AND attr <> 'replay'
     AND attr <> 'overhead'
-    AND session_id IN (SELECT DISTINCT session_id FROM task_alias WHERE session_id <> '')`;
+    AND session_id IN (${trackedSessionsSql})`;
   if (w.until !== undefined) {
     sql += ` AND ts < ?`;
     params.push(w.until);

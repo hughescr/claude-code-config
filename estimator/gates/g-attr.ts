@@ -67,7 +67,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb, getConfig, setConfig, DB_PATH } from "../src/db.ts";
 import { attributeTasks, attrWindow } from "../src/attribute.ts";
-import { attrBaseFilter, ATTR_COVERAGE_CLASSES, ATTR_COVERAGE_GATE } from "../src/retro.ts";
+import {
+  attrBaseFilter,
+  ATTR_COVERAGE_CLASSES,
+  ATTR_COVERAGE_GATE,
+  LIVE_TRACKED_SESSIONS_SQL,
+} from "../src/retro.ts";
 import { discoverCorpus, type SessionCorpus } from "../src/discover.ts";
 import { ingestSession, readJsonl, type RequestRow } from "../src/ingest.ts";
 import { TurnSegmenter, type TranscriptLine } from "../src/segment.ts";
@@ -163,23 +168,41 @@ export interface Headline {
   /** L4 — L3 + `ambiguous` over L2 — what `v_task_actual` actually sums today (GLS §5 cl.4). */
   ambiguous_incl_pct: number;
   /** E′ — the one rung comparable to 2026-07's 18.7% (GLS D12): `exclusive ∪ sticky`
-   *  over L0's whole-window denominator, live attribution rule. */
+   *  over L0's whole-window denominator, live attribution rule, in the SAME currency
+   *  as the frozen July number (`out_tok + cw_tok`, unweighted — July had no price
+   *  table, D4). D12 promises this rung changes ONLY the attribution rule; moving the
+   *  currency too would make it a two-variable comparison wearing a one-variable
+   *  label. `e_prime_priced_pct` is the priced-wcet variant of the SAME L0 population,
+   *  reported alongside as the sensitivity row that separates a currency shift from a
+   *  rule shift on this rung — it is NOT what "E′" means elsewhere in this file. */
   e_prime_pct: number;
+  /** L0, `exclusive ∪ sticky`, priced Work-CET — E′'s currency-sensitivity companion. */
+  e_prime_priced_pct: number;
 }
 
-export function computeHeadline(db: Database, w: AttrWindowArg): Headline {
+export function computeHeadline(
+  db: Database,
+  w: AttrWindowArg,
+  opts: { trackedSessionsSql?: string } = {},
+): Headline {
   const untilClause = w.until !== undefined ? " AND ts < ?" : "";
   const winParams: (string | number)[] = w.until !== undefined ? [w.since, w.until] : [w.since];
+  const trackedSessionsSql = opts.trackedSessionsSql ?? LIVE_TRACKED_SESSIONS_SQL;
+  const l0Where = `ts >= ?${untilClause} AND attr <> 'replay'`;
 
-  const L0 = classTotals(db, `ts >= ?${untilClause} AND attr <> 'replay'`, winParams);
+  const L0 = classTotals(db, l0Where, winParams);
   const L1 = classTotals(
     db,
     `ts >= ?${untilClause} AND attr <> 'replay'
-       AND session_id IN (SELECT DISTINCT session_id FROM task_alias WHERE session_id <> '')`,
+       AND session_id IN (${trackedSessionsSql})`,
     winParams,
   );
-  const base = attrBaseFilter(w);
+  const base = attrBaseFilter(w, opts);
   const L2 = classTotals(db, base.sql, base.params);
+  // The legacy-currency twin of L0 — same population, `out_tok + cw_tok` instead of
+  // `wcet` — so E′ can hold currency fixed while L0 above stays priced for every
+  // OTHER reader of `Headline.L0` (the ladder printout's total_wcet, byDimension, …).
+  const L0legacy = classTotalsExpr(db, "out_tok + cw_tok", l0Where, winParams);
 
   return {
     window: w,
@@ -188,7 +211,8 @@ export function computeHeadline(db: Database, w: AttrWindowArg): Headline {
     L2,
     coverage_pct: 100 * ratio(coverageNumerator(L2), L2.total),
     ambiguous_incl_pct: 100 * ratio(coverageNumerator(L2) + L2.ambiguous, L2.total),
-    e_prime_pct: 100 * ratio(coverageNumerator(L0), L0.total),
+    e_prime_pct: 100 * ratio(coverageNumerator(L0legacy), L0legacy.total),
+    e_prime_priced_pct: 100 * ratio(coverageNumerator(L0), L0.total),
   };
 }
 
@@ -240,6 +264,49 @@ export function currencySensitivity(db: Database, w: AttrWindowArg): Record<stri
   }
   out.request_count = { coverage_pct: 100 * ratio(covReq, totReq), total: totReq };
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// unpriced spend — every quantity above is `v_wcet`/`v_priced`, which INNER JOINs
+// `model_price`. A model family missing a price row (or predating its first
+// `effective_from`) falls out of numerator AND denominator with no trace unless this
+// is reported separately, off `v_unpriced` (schema.sql), which every other query in
+// this file skips.
+// ---------------------------------------------------------------------------
+
+export interface UnpricedShare {
+  /** request rows in-window that `v_wcet` silently drops (schema.sql's `v_unpriced`). */
+  count: number;
+  /** their out_tok+cw_tok mass — the same currency `currencySensitivity`'s
+   *  `out_plus_cw` row uses, so this is directly comparable to it. */
+  out_plus_cw: number;
+  /** window total out_tok+cw_tok over ALL non-replay requests (priced or not) —
+   *  the denominator `share_pct` is against. */
+  window_total_out_plus_cw: number;
+  share_pct: number;
+}
+
+export function unpricedShare(db: Database, w: AttrWindowArg): UnpricedShare {
+  const untilClause = w.until !== undefined ? " AND ts < ?" : "";
+  const winParams: (string | number)[] = w.until !== undefined ? [w.since, w.until] : [w.since];
+  const u = db
+    .query<{ n: number; mass: number | null }, (string | number)[]>(
+      `SELECT COUNT(*) AS n, SUM(out_tok + cw_tok) AS mass FROM v_unpriced WHERE ts >= ?${untilClause}`,
+    )
+    .get(...winParams) ?? { n: 0, mass: 0 };
+  const totalRow = db
+    .query<{ mass: number | null }, (string | number)[]>(
+      `SELECT SUM(out_tok + cw_tok) AS mass FROM v_request_live WHERE ts >= ?${untilClause}`,
+    )
+    .get(...winParams);
+  const mass = u.mass ?? 0;
+  const total = totalRow?.mass ?? 0;
+  return {
+    count: u.n,
+    out_plus_cw: mass,
+    window_total_out_plus_cw: total,
+    share_pct: 100 * ratio(mass, total),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -412,12 +479,30 @@ function withTempCopy<T>(masterPath: string, fn: (db: Database) => T): T {
  * only clean comparison is a turn walk that never saw a hook alias at all: delete
  * every `source='hook'` row on a throwaway copy and let `attributeTasks` recompute
  * every claim from scratch.
+ *
+ * The DELETE must not also move the DENOMINATOR. A session whose only `task_alias`
+ * row was the hook binding (the ~79%-subagent-mass topology HOOK-BINDING-SPEC
+ * targets: the agent runs in a session distinct from the one that opened the task)
+ * has no OTHER alias to keep it "tracked" once that row is gone — left to
+ * `attrBaseFilter`'s live subquery, such a session would silently leave L1/L2's
+ * population in the ex-hook run instead of staying in it as now-uncovered spend,
+ * shrinking the base and masking `hook_lift` for exactly the pass D9 exists to catch.
+ * So the tracked-session set is frozen from `task_alias` BEFORE the delete, into a
+ * temp table, and threaded into `computeHeadline` as the denominator's session
+ * predicate — only the attribution ANSWER (`attr` per row) is allowed to differ
+ * between live and ex-hook; the population it is measured over may not.
  */
 export function coverageExHook(masterPath: string, w: AttrWindowArg): number {
   return withTempCopy(masterPath, (db) => {
+    db.exec(
+      `CREATE TEMP TABLE frozen_tracked_session AS
+         SELECT DISTINCT session_id FROM task_alias WHERE session_id <> ''`,
+    );
     db.exec("DELETE FROM task_alias WHERE source = 'hook'");
     attributeTasks(db);
-    return computeHeadline(db, w).coverage_pct;
+    return computeHeadline(db, w, {
+      trackedSessionsSql: "SELECT session_id FROM frozen_tracked_session",
+    }).coverage_pct;
   });
 }
 
@@ -607,9 +692,22 @@ export async function ingestCompleteness(db: Database, limit: number = Infinity)
 
 export type Verdict = "PASS" | "ESCALATE";
 
-export function verdictOf(headlinePct: number, preconds: AnomalyPreconditions): Verdict {
+/**
+ * `unpricedCount` defaults to 0 so existing callers (and the D9/D10 shadow recomputes,
+ * which never touch `model_price`) are unaffected. A nonzero count means the headline
+ * above was computed over a base population that silently dropped some in-window
+ * spend class entirely (`v_priced`'s INNER JOIN on `model_price` — see
+ * `unpricedShare`); that is not a corpus-quality condition D14 can license through,
+ * so it gates PASS the same way the two anomaly counts already do.
+ */
+export function verdictOf(
+  headlinePct: number,
+  preconds: AnomalyPreconditions,
+  unpricedCount: number = 0,
+): Verdict {
   if (headlinePct < ATTR_COVERAGE_GATE * 100) return "ESCALATE";
   if (preconds.hook_bind_conflict !== 0 || preconds.alias_split_identity !== 0) return "ESCALATE";
+  if (unpricedCount !== 0) return "ESCALATE";
   return "PASS";
 }
 
@@ -656,7 +754,12 @@ interface LiveReport {
     L2_calibration_eligible_base: Record<string, number>;
     L3_headline_coverage_pct: number;
     L4_plus_ambiguous_pct: number;
+    /** SAME currency as the frozen July number (out_tok+cw_tok, unweighted) — the
+     *  true bridge rung; only the attribution rule differs from 2026-07 here. */
     E_prime_bridge_to_2026_07_pct: number;
+    /** L0 restated in priced wcet — E′'s currency-sensitivity companion, NOT itself
+     *  comparable to July's 18.7% (see `Headline.e_prime_priced_pct`). */
+    E_prime_priced_wcet_pct: number;
   };
   epochs: { pre_hook_merge: Headline; post_hook_merge: Headline } | null;
   coverage_ex_hook_pct: number | null;
@@ -668,6 +771,7 @@ interface LiveReport {
   by_origin: DimensionPoint[];
   by_model_family: DimensionPoint[];
   currency_sensitivity: Record<string, CurrencyPoint>;
+  unpriced_window: UnpricedShare;
   anomaly_preconditions: AnomalyPreconditions;
   join_quality_x1: JoinQualityX1 | null;
   verdict: Verdict;
@@ -708,6 +812,7 @@ export async function runLive(
   const origins = byDimension(db, "origin", { since });
   const families = byDimension(db, "model_family", { since });
   const currencies = currencySensitivity(db, { since });
+  const unpriced = unpricedShare(db, { since });
   const hadHookAliases = num(db, "SELECT COUNT(*) AS v FROM task_alias WHERE source='hook'") > 0;
 
   // The master temp copy: one VACUUM INTO of the live DB, reused as the pristine base
@@ -736,7 +841,7 @@ export async function runLive(
 
   const x1 = opts.skipX1 === true ? null : await ingestCompleteness(db, opts.ingestLimit ?? Infinity);
 
-  const verdict = verdictOf(headline.coverage_pct, preconds);
+  const verdict = verdictOf(headline.coverage_pct, preconds, unpriced.count);
 
   return {
     generated_at: now,
@@ -757,6 +862,7 @@ export async function runLive(
       L3_headline_coverage_pct: headline.coverage_pct,
       L4_plus_ambiguous_pct: headline.ambiguous_incl_pct,
       E_prime_bridge_to_2026_07_pct: headline.e_prime_pct,
+      E_prime_priced_wcet_pct: headline.e_prime_priced_pct,
     },
     epochs,
     coverage_ex_hook_pct: exHookPct,
@@ -768,6 +874,7 @@ export async function runLive(
     by_origin: origins,
     by_model_family: families,
     currency_sensitivity: currencies,
+    unpriced_window: unpriced,
     anomaly_preconditions: preconds,
     join_quality_x1: x1,
     verdict,
@@ -799,7 +906,12 @@ function printLiveReport(r: LiveReport): void {
   L(`  L2 + non-overhead, main/subagent ..... total ${r.ladder.L2_calibration_eligible_base.total_wcet}`);
   L(`  L3 exclusive∪sticky / L2 == HEADLINE . ${pct(r.ladder.L3_headline_coverage_pct)}`);
   L(`  L4 + ambiguous / L2 ................... ${pct(r.ladder.L4_plus_ambiguous_pct)}`);
-  L(`  E′ bridge to 2026-07 (exclusive∪sticky / L0) ${pct(r.ladder.E_prime_bridge_to_2026_07_pct)}`);
+  L(
+    `  E′ bridge to 2026-07 (exclusive∪sticky / L0, out+cw unweighted -- July's currency) ${pct(r.ladder.E_prime_bridge_to_2026_07_pct)}`,
+  );
+  L(
+    `  E′ priced-wcet variant (same L0 population, live currency -- NOT the July bridge) ${pct(r.ladder.E_prime_priced_wcet_pct)}`,
+  );
   L("");
   L("hook lift (D9) — coverage with vs without source='hook' aliases, uncontaminated shadow run:");
   L(
@@ -829,6 +941,13 @@ function printLiveReport(r: LiveReport): void {
   for (const [name, p] of Object.entries(r.currency_sensitivity)) {
     L(`  ${name.padEnd(14)} coverage ${pct(p.coverage_pct)}  total ${p.total}`);
   }
+  L("");
+  L("unpriced window spend (v_priced INNER JOINs model_price; this mass is in NEITHER numerator NOR denominator above):");
+  L(
+    `  count=${r.unpriced_window.count}  out+cw=${r.unpriced_window.out_plus_cw}  ` +
+      `share ${pct(r.unpriced_window.share_pct)} of window out+cw` +
+      (r.unpriced_window.count !== 0 ? "   -- BLOCKS PASS (est prices --sync?)" : ""),
+  );
   L("");
   L("by origin:");
   for (const o of r.by_origin) L(`  ${o.key.padEnd(10)} ${pct(o.share_pct)} of base   coverage ${pct(o.coverage_pct)}`);

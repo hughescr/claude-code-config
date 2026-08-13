@@ -26,6 +26,7 @@ import {
   staleClosedShare,
   stalenessGrid,
   taskCensus,
+  unpricedShare,
   verdictOf,
 } from "../gates/g-attr.ts";
 
@@ -311,6 +312,45 @@ describe("coverageExHook", () => {
         .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_alias WHERE source = 'hook'")
         .get()!.n;
       expect(stillHook).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a session tracked ONLY via a hook alias stays in the ex-hook DENOMINATOR as uncovered, not dropped from it", () => {
+    // s1 anchors the task (a real, non-hook alias) with a small main-turn spend.
+    // s2 hosts the delegated agent and has NO OTHER alias — the hook binding is its
+    // only route into `task_alias`. Live: s2's spend is exclusive via the hook, so
+    // s2 reads as fully "tracked". The uncontaminated counterfactual must still
+    // charge s2's spend to the SAME denominator once the hook alias is gone, not
+    // let s2 quietly leave the tracked-session population altogether.
+    turn(h.db, { session: "s1", prompt: "p1", at: "2026-08-02T10:00:00Z" });
+    seedTask(h.db, TID, { session: "s1", prompt: "p1", createdAt: "2026-08-02T10:00:00Z", bindSession: false });
+    alias(h.db, TID, "session", "s1", "s1", "manual");
+    request(h.db, "rq-main", { session: "s1", origin: "main", prompt: "p1", out: 10, ts: "2026-08-02T10:00:10Z" });
+
+    alias(h.db, TID, "agent", "s2", "ag1", "hook");
+    agentRun(h.db, "ag1", { session: "s2", launchPrompt: null, startedAt: "2026-08-02T10:00:20Z", endedAt: "2026-08-02T11:00:00Z" });
+    request(h.db, "rq-agent", { session: "s2", origin: "subagent", agent: "ag1", out: 90, ts: "2026-08-02T10:05:00Z" });
+
+    attributeTasks(h.db);
+    const live = computeHeadline(h.db, { since: "2026-08-01T00:00:00Z" });
+    expect(live.L2.total).toBe(100);
+    expect(live.coverage_pct).toBeCloseTo(100, 6);
+
+    const { mkdtempSync, rmSync, copyFileSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const { join } = require("node:path") as typeof import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "g-attr-live-test-"));
+    const masterPath = join(dir, "master.db");
+    h.db.exec(`VACUUM INTO '${masterPath.replace(/'/g, "''")}'`);
+    try {
+      const exHook = coverageExHook(masterPath, { since: "2026-08-01T00:00:00Z" });
+      // The TRUE same-denominator counterfactual: only s1's 10 stays covered out of
+      // a 100-total base. If the denominator had silently shrunk to just s1 (the
+      // bug), this would read 100 instead — hook_lift would be masked at ~0.
+      expect(exHook).toBeCloseTo(10, 6);
+      expect(live.coverage_pct - exHook).toBeCloseTo(90, 6);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
