@@ -825,6 +825,62 @@ describe("agent-binds drain — HOOK-BINDING-SPEC.md §4.1", () => {
     expect(existsSync(join(spool, AGENT_BINDS_FILE))).toBe(false); // nothing re-appended
   });
 
+  test("SweepReport.spool carries binds_* counters, binds_basis, and a binds_keysets histogram (§4.1 step 6 / §9.1)", async () => {
+    // Every assertion here is `undefined` before src/cli.ts's SweepReport.spool wires
+    // spool.binds.* through — src/spool.ts's DrainResult already carries it.
+    const { runSweep } = await import("../src/cli.ts");
+    seedTask("t-r1");
+    appendBind(
+      bindRecord({ tuid: "toolu_r1", tid: "t-r1", basis: "sole_active", k: ["session_id", "tool_name"] }),
+    );
+    appendBind(
+      bindRecord({
+        tuid: "toolu_r2",
+        tid: null,
+        basis: "multi_active",
+        k: ["session_id", "tool_name", "agent_id"], // deliberately a DIFFERENT key set
+      }),
+    );
+    const emptyRoot = join(h.dir, "empty-projects-binds");
+    mkdirSync(emptyRoot, { recursive: true });
+    const report = await runSweep(h.db, { root: emptyRoot, spoolDir: spool });
+    expect(report.spool.binds_read).toBe(2);
+    expect(report.spool.binds_bound).toBe(1);
+    expect(report.spool.binds_basis.multi_active).toBe(1);
+    expect(Object.keys(report.spool.binds_keysets)).toHaveLength(2);
+  });
+
+  test("hook_bind_enabled=0: the drain discards the whole batch unread — no alias, nothing re-appended, no anomaly, no .draining residue (§8.1)", () => {
+    seedTask("t1");
+    h.db.run("UPDATE config SET v = ? WHERE k = ?", ["0", "hook_bind_enabled"]);
+    // One record that WOULD bind, and one nested record whose parent has no alias yet
+    // (which, with the switch on, would be deferred and re-appended with att+1).
+    appendBind(bindRecord({ tuid: "toolu_gate1", tid: "t1", basis: "sole_active" }));
+    appendBind(
+      bindRecord({
+        tuid: "toolu_gate2",
+        kind: "agent",
+        local_id: "child-agent-gate",
+        tid: null,
+        basis: "nested",
+        parent_agent: "parent-not-bound-gate",
+      }),
+    );
+    const result = drain();
+    expect(
+      h.db
+        .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_alias WHERE source = 'hook'")
+        .get()?.n,
+    ).toBe(0);
+    expect(result.binds.disabled_dropped).toBe(2);
+    expect(result.binds.bound).toBe(0);
+    expect(result.binds.nested_deferred).toBe(0);
+    expect(result.anomalies.map((a) => a.kind)).not.toContain("hook_spawn_depth_unbound");
+    expect(result.anomalies.filter((a) => a.kind.startsWith("hook_"))).toHaveLength(0);
+    expect(existsSync(join(spool, AGENT_BINDS_FILE))).toBe(false); // nothing re-appended
+    expect(readdirSync(spool).some((f) => f.includes(".draining"))).toBe(false);
+  });
+
   test("attributeTasks: a 'hook' alias resolves exclusive, same as 'est_bind'", () => {
     seedTask("t1");
     appendBind(bindRecord({ tid: "t1", basis: "sole_active" }));

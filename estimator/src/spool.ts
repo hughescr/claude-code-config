@@ -536,6 +536,15 @@ export interface DrainResult {
  *   - `basis`           `{basis: count}` over EVERY surviving record (witnesses and
  *                       binds alike) — the §9 denominator for "how often is the
  *                       active set genuinely ambiguous at the instant of a spawn".
+ *   - `disabled_dropped` physical lines discarded whole because `hook_bind_enabled`
+ *                       was `"0"` at drain time (§8.1 master switch) — a distinct
+ *                       counter, not folded into `dropped`, so an operator's rollback
+ *                       shows up in `est sweep --json` as a deliberate no-op rather
+ *                       than looking like malformed input.
+ *   - `keysets`         `{sorted-top-level-key-names: count}` over every survivor's
+ *                       payload key set (`r.k`, or the literal string `"(absent)"`
+ *                       when `k` was not sent) — §9.1's key-set regression detector.
+ *                       Key NAMES only, never values: no privacy surface.
  */
 export interface SpawnBindDrainResult {
   read: number;
@@ -548,7 +557,9 @@ export interface SpawnBindDrainResult {
   unbound: number;
   dup: number;
   dropped: number;
+  disabled_dropped: number;
   basis: Record<string, number>;
+  keysets: Record<string, number>;
 }
 
 function emptySpawnBindDrain(): SpawnBindDrainResult {
@@ -563,7 +574,9 @@ function emptySpawnBindDrain(): SpawnBindDrainResult {
     unbound: 0,
     dup: 0,
     dropped: 0,
+    disabled_dropped: 0,
     basis: {},
+    keysets: {},
   };
 }
 
@@ -713,6 +726,22 @@ function drainAgentBinds(
     return { binds: out, anomalies, claimed: claimedFile.claimed, reappend };
   }
 
+  // HOOK-BINDING-SPEC.md §8.1 master switch. Enforced HERE, not hook-side: the nested
+  // and no-identity append paths in scripts/nudge.ts run no database query at all
+  // (§7.1 property 2, "zero hot-path DB work inside a worker"), so `hook_bind_enabled`
+  // — which lives in the DB config table — cannot be consulted before the append
+  // without breaking that property. The drain is the only place that can make the
+  // switch a real no-op: when it is off, the whole claimed batch is discarded (never
+  // parsed, never re-appended), so nothing is bound, nothing grows the live file back,
+  // and an operator's rollback cannot race a hook that is still writing.
+  if ((getConfig(db, "hook_bind_enabled") ?? "1") === "0") {
+    const lineCount = (claimedFile.text.endsWith("\n") ? claimedFile.text.slice(0, -1) : claimedFile.text)
+      .split("\n")
+      .filter((l) => l.trim() !== "").length;
+    out.disabled_dropped += lineCount;
+    return { binds: out, anomalies, claimed: claimedFile.claimed, reappend };
+  }
+
   const batchMaxRaw = Number.parseInt(getConfig(db, "hook_bind_batch_max") ?? "5000", 10);
   const batchMax = Number.isFinite(batchMaxRaw) && batchMaxRaw > 0 ? batchMaxRaw : 5000;
 
@@ -770,6 +799,11 @@ function drainAgentBinds(
 
   for (const r of survivors) {
     out.basis[r.basis] = (out.basis[r.basis] ?? 0) + 1;
+
+    // §9.1 key-set regression detector: top-level payload key NAMES only, sorted so
+    // order never fragments the histogram, never the values themselves.
+    const ks = r.k === undefined ? "(absent)" : [...r.k].sort().join(",");
+    out.keysets[ks] = (out.keysets[ks] ?? 0) + 1;
 
     // --- §4.1 step 5: nested resolution, against THIS BATCH's own aliases too ---
     if (r.basis === "nested") {
@@ -1169,8 +1203,8 @@ export function writeFocusMarker(
 /**
  * Read `sessionId`'s focus marker, or null when there is none / it is unreadable /
  * malformed. Returns the marker AS WRITTEN — the ladder (`scripts/nudge.ts`) is the
- * one place that decides whether it is still believable (§3.2a's idle-based TTL); this
- * function makes no freshness judgement of its own.
+ * one place that decides whether it is still believable (§3.2a/§8.1's fixed-from-set
+ * TTL); this function makes no freshness judgement of its own.
  */
 export function readFocusMarker(sessionId: string, dir: string = SPOOL_DIR): FocusMarker | null {
   try {

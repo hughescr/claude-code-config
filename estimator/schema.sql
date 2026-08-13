@@ -1838,9 +1838,10 @@ INSERT OR IGNORE INTO config (k, v) VALUES
   -- fallback rate is deliberately not config (see the note on v_priced above).
   ('cw_ttl_unknown_warn_share',    '0.02'),
   -- HOOK-BINDING-SPEC.md (v21): hook-based spawn-time attribution binding. Master
-  -- switch, believability TTL (idle-based per rev 3 -- see hook_focus_ttl_min's use
-  -- in src/spool.ts), the description-marker opt-in (off by default: model-controlled
-  -- text must not mint an exclusive-grade alias on its own), and the drain batch cap.
+  -- switch, fixed-from-set believability TTL (§3.2a/§8.1 -- see hook_focus_ttl_min's
+  -- use in scripts/nudge.ts), the description-marker opt-in (off by default:
+  -- model-controlled text must not mint an exclusive-grade alias on its own), and the
+  -- drain batch cap.
   ('hook_bind_enabled',    '1'),
   ('hook_focus_ttl_min',   '120'),
   ('hook_bind_marker',     '0'),

@@ -360,14 +360,12 @@ function resolveLadder(
     }
   }
 
-  // Rungs 2-4: the focus marker, believed only within an IDLE-based TTL (Craig's rev-3
-  // correction — see the doc comment on FOCUS_MARKER_PREFIX in src/spool.ts). Effective
-  // age is computed AT READ TIME (the mechanically simpler of the two options the spec
-  // allows) as `now - MAX(marker.ts, T's own last-attributed-touch)`: `activeTasks`
-  // already computes that touch through attribution's own staleness machinery, so a
-  // task that is still absorbing work keeps its focus marker believable no matter how
-  // long ago it was set, and a marker naming an already-quiet task ages out exactly
-  // when attribution itself would have stopped trusting the task.
+  // Rungs 2-4: the focus marker, believed only within a fixed-from-set TTL (§3.2a/§8.1:
+  // "a focus file older than the TTL is ignored"). Age is measured from the marker's
+  // OWN timestamp, not from any per-task touch — a marker does not get to renew its
+  // own believability just because the task it names is still absorbing work, because
+  // the task being touched is exactly the ambiguous case (an unrelated spawn keeps
+  // `touched` fresh too) that the TTL exists to bound.
   const marker = readFocusMarker(opts.session);
   if (marker !== null) {
     const target = bound.find((t) => t.tid === marker.tid);
@@ -375,14 +373,18 @@ function resolveLadder(
       const focusTtlMinRaw = Number.parseInt(getConfig(db, "hook_focus_ttl_min") ?? "120", 10);
       const focusTtlMs = (Number.isFinite(focusTtlMinRaw) ? focusTtlMinRaw : 120) * 60_000;
       const markerTs = Date.parse(marker.ts);
-      const effectiveSetAt = Number.isFinite(markerTs) ? Math.max(markerTs, target.touched) : target.touched;
-      const ageMs = opts.now.getTime() - effectiveSetAt;
-      if (ageMs <= focusTtlMs) {
-        if (target.active) return { tid: target.tid, basis: "focus", na, nb };
-        if (na === 0) return { tid: target.tid, basis: "focus_quiet", na, nb };
-        return { tid: null, basis: "focus_disagrees", na, nb }; // stale pointer vs live evidence
+      // An unparseable timestamp is treated as already EXPIRED, not as absent — falling
+      // back to `target.touched` (the prior behaviour) made a corrupt marker maximally
+      // believable instead of maximally suspect.
+      if (Number.isFinite(markerTs)) {
+        const ageMs = opts.now.getTime() - markerTs;
+        if (ageMs <= focusTtlMs) {
+          if (target.active) return { tid: target.tid, basis: "focus", na, nb };
+          if (na === 0) return { tid: target.tid, basis: "focus_quiet", na, nb };
+          return { tid: null, basis: "focus_disagrees", na, nb }; // stale pointer vs live evidence
+        }
       }
-      // expired: falls through, exactly as if there were no marker at all
+      // expired, or unparseable: falls through, exactly as if there were no marker at all
     }
   }
 

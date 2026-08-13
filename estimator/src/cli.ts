@@ -773,6 +773,23 @@ export interface SweepReport {
     malformed: number;
     /** Stale `.microsweep` / `.overrun-notified.*` marker files reaped this sweep. */
     markers_pruned: number;
+    /** HOOK-BINDING-SPEC.md §4.1 step 6: the agent-binds drain's own counters. */
+    binds_read: number;
+    binds_bound: number;
+    binds_nested_bound: number;
+    binds_nested_deferred: number;
+    binds_conflict: number;
+    binds_superseded: number;
+    binds_deferred_human: number;
+    binds_unbound: number;
+    binds_dup: number;
+    binds_dropped: number;
+    /** §8.1 master switch: lines discarded whole because `hook_bind_enabled` was off. */
+    binds_disabled_dropped: number;
+    /** `{basis: count}` over every surviving agent-binds record (§9 denominator). */
+    binds_basis: Record<string, number>;
+    /** `{sorted-key-names: count}` — §9.1's payload key-set regression detector. */
+    binds_keysets: Record<string, number>;
   };
   /**
    * P2.3/P2.4: what the OTEL spool contributed. Every field is 0 when no receiver is
@@ -1142,6 +1159,19 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
       compliance_db_unavailable: 0,
       malformed: 0,
       markers_pruned: 0,
+      binds_read: 0,
+      binds_bound: 0,
+      binds_nested_bound: 0,
+      binds_nested_deferred: 0,
+      binds_conflict: 0,
+      binds_superseded: 0,
+      binds_deferred_human: 0,
+      binds_unbound: 0,
+      binds_dup: 0,
+      binds_dropped: 0,
+      binds_disabled_dropped: 0,
+      binds_basis: {},
+      binds_keysets: {},
     },
     otel: {
       logs_read: 0,
@@ -1460,6 +1490,19 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     compliance_db_unavailable: spool.compliance.db_unavailable,
     malformed: spool.task_events.malformed + spool.compliance.malformed,
     markers_pruned: spool.markers_pruned,
+    binds_read: spool.binds.read,
+    binds_bound: spool.binds.bound,
+    binds_nested_bound: spool.binds.nested_bound,
+    binds_nested_deferred: spool.binds.nested_deferred,
+    binds_conflict: spool.binds.conflict,
+    binds_superseded: spool.binds.superseded,
+    binds_deferred_human: spool.binds.deferred_human,
+    binds_unbound: spool.binds.unbound,
+    binds_dup: spool.binds.dup,
+    binds_dropped: spool.binds.dropped,
+    binds_disabled_dropped: spool.binds.disabled_dropped,
+    binds_basis: spool.binds.basis,
+    binds_keysets: spool.binds.keysets,
   };
 
   // 1a2. **Link the lifecycle stream to its tasks.** Both `task_event` writers have

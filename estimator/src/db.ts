@@ -56,13 +56,14 @@ export const DB_PATH: string = process.env.EST_DB ?? join(DATA_ROOT, "estimator.
  * 21 — hook-based spawn-time attribution binding (HOOK-BINDING-SPEC.md, Craig
  *     2026-08-12). CONFIG ROWS ONLY — no CREATE, no ALTER, no new table, no new
  *     index, no new view, no CHECK change (spec §8.1). Four seeds:
- *     `hook_bind_enabled` (master switch; `0` makes the hook's spool-append job a
- *     no-op, the rollback lever), `hook_focus_ttl_min` (how old an `est focus`
- *     pointer may be and still be believed — deliberately equal to
- *     `attr_stale_minutes`'s default, per spec rev 3: measured as IDLE time against
- *     the focused task's own liveness window, not fixed time-since-set, so a task
- *     that is still absorbing work never ages its own focus marker out from under
- *     it), `hook_bind_marker` (whether the `[est:<tid8>]` description marker is
+ *     `hook_bind_enabled` (master switch; `0` makes the drain discard the whole
+ *     agent-binds batch unread — the rollback lever, enforced at drain time per
+ *     §7.1's "zero hot-path DB work inside a worker" rather than hook-side),
+ *     `hook_focus_ttl_min` (how old an `est focus` pointer may be and still be
+ *     believed — deliberately equal to `attr_stale_minutes`'s default, measured
+ *     FIXED from the marker's own timestamp per §3.2a/§8.1: "a focus file older
+ *     than the TTL is ignored", not renewed by the focused task's own liveness
+ *     window), `hook_bind_marker` (whether the `[est:<tid8>]` description marker is
  *     honoured; off by default — model-controlled text must not mint an
  *     exclusive-grade alias on its own), `hook_bind_batch_max` (drain batch cap).
  *     `task_alias.source = 'hook'` is a new documented VALUE of an existing

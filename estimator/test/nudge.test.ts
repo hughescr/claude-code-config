@@ -774,7 +774,7 @@ describe("nudge.ts — job 0: spawn-time attribution binding", () => {
     expect(lines[0]!.basis).not.toBe("no_identity");
   });
 
-  test("hook_bind_enabled=0 makes job 0 a true no-op: nothing written, not even a witness", () => {
+  test("hook_bind_enabled=0: the ROOT ladder writes nothing, not even a witness", () => {
     initDb();
     seedBoundTask("t-off", "sess-off");
     setConfigValue("hook_bind_enabled", "0");
@@ -789,6 +789,27 @@ describe("nudge.ts — job 0: spawn-time attribution binding", () => {
     );
     expect(r.exitCode).toBe(0);
     expect(agentBindsLines()).toHaveLength(0);
+  });
+
+  test("hook_bind_enabled=0: the NESTED path still appends a witness (§7.1 exemption — no DB read on this path at all, so the switch cannot gate it hook-side; enforced at drain time instead)", () => {
+    // No initDb(): same claim as the rung-0 test above — a nested spawn's hook fire
+    // performs ZERO database queries, so `hook_bind_enabled` (a DB config row) cannot
+    // be consulted here even in principle. This is deliberate, not a gap: the master
+    // switch is enforced by `drainAgentBinds` discarding the whole batch unread.
+    const r = runNudge(
+      JSON.stringify({
+        session_id: "sess-nested-off",
+        agent_id: "parent-agent-off",
+        tool_name: "Agent",
+        tool_use_id: "toolu_9b",
+        tool_input: {},
+        tool_response: asyncAgentResponse("child-agent-off"),
+      }),
+    );
+    expect(r.exitCode).toBe(0);
+    const lines = agentBindsLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ tid: null, basis: "nested", parent_agent: "parent-agent-off" });
   });
 
   test("a non-spawn tool name (e.g. Task/TaskUpdate) never reaches job 0 at all", () => {
@@ -902,11 +923,10 @@ describe("nudge.ts — job 0: spawn-time attribution binding", () => {
     });
 
     test("a focus marker OLDER than hook_focus_ttl_min, on an already-quiet task, is ignored", () => {
-      // Craig's rev-3 correction: effective age is IDLE-based —
-      // now - MAX(marker.ts, the task's own last-attributed touch) — so a marker on a
-      // task that is STILL absorbing work never ages out, however old the file is.
-      // This test has to backdate the task's OWN touch too, or the marker reads as
-      // fresh purely because the task was just minted (its `created_at` IS "now").
+      // §3.2a/§8.1's fixed-from-set TTL: age is measured from the marker's OWN
+      // timestamp, never renewed by the named task's own activity. This test backdates
+      // the task's touch too so it is unambiguous that the TASK's quietness, not just
+      // the marker's age, puts it past the ladder's focus rungs.
       initDb();
       seedBoundTask("t-fstale", "sess-focus-stale");
       const staleTs = new Date(Date.now() - 3 * 60 * 60 * 1000); // 3h old, > default 120 min
@@ -931,6 +951,53 @@ describe("nudge.ts — job 0: spawn-time attribution binding", () => {
       // exactly one bound task, quiet or not, resolves via rung 5/7 rather than focus.
       expect(agentBindsLines()[0]!.basis).not.toBe("focus");
       expect(agentBindsLines()[0]!.basis).not.toBe("focus_quiet");
+    });
+
+    test("a focus marker older than hook_focus_ttl_min is ignored EVEN WHILE its task is still absorbing work", () => {
+      // §3.2a/§8.1: the TTL is fixed from the marker's OWN timestamp. Both tasks here
+      // are freshly minted (created_at == "now", no backdating), so `touched` is fresh
+      // and both are `active` — the case the rev-3 idle-based reading would have kept
+      // believing the marker forever. A second active task forces real ambiguity: if
+      // the marker were wrongly still believed, this would resolve `focus`/`t-hot`
+      // instead of falling through to the session-wide ladder.
+      initDb();
+      seedBoundTask("t-hot", "sess-focus-hot");
+      seedBoundTask("t-hot2", "sess-focus-hot");
+      const staleTs = new Date(Date.now() - 3 * 60 * 60 * 1000); // 3h old, > default 120 min
+      writeFocusMarker("sess-focus-hot", "t-hot", "est_focus", spoolDir, staleTs);
+      const r = runNudge(
+        JSON.stringify({
+          session_id: "sess-focus-hot",
+          tool_name: "Agent",
+          tool_use_id: "toolu_16",
+          tool_input: {},
+          tool_response: asyncAgentResponse("agent-hot"),
+        }),
+      );
+      expect(r.exitCode).toBe(0);
+      const basis = agentBindsLines()[0]!.basis;
+      expect(basis).not.toBe("focus");
+      expect(basis).not.toBe("focus_quiet");
+      expect(basis).toBe("multi_active");
+    });
+
+    test("companion: a focus marker set 10 minutes ago on the same still-fresh-touch fixture still yields 'focus'", () => {
+      initDb();
+      seedBoundTask("t-hot3", "sess-focus-hot2");
+      seedBoundTask("t-hot4", "sess-focus-hot2");
+      const freshTs = new Date(Date.now() - 10 * 60 * 1000); // 10 min old, well within TTL
+      writeFocusMarker("sess-focus-hot2", "t-hot3", "est_focus", spoolDir, freshTs);
+      const r = runNudge(
+        JSON.stringify({
+          session_id: "sess-focus-hot2",
+          tool_name: "Agent",
+          tool_use_id: "toolu_17",
+          tool_input: {},
+          tool_response: asyncAgentResponse("agent-hot2"),
+        }),
+      );
+      expect(r.exitCode).toBe(0);
+      expect(agentBindsLines()[0]).toMatchObject({ tid: "t-hot3", basis: "focus" });
     });
   });
 });
