@@ -311,12 +311,29 @@ export function currencySensitivity(db: Database, w: AttrWindowArg): Record<stri
 // while staying invisible to `v_unpriced`, which only checks family membership. This
 // is exactly the "(or predating its first effective_from)" class named below, so the
 // guard is computed directly off `v_wcet` absence — a request is unpriced here iff no
-// `v_wcet` row exists for it, regardless of WHY the join failed.
+// `v_wcet` row exists for it (`w.request_id` unmatched), OR a `v_wcet` row exists but
+// its `wcet` is NULL — regardless of WHY the join or the arithmetic failed.
+//
+// The second half of that OR is not hypothetical: `v_wcet`'s ref-model normaliser
+// (schema.sql, `ref_out`) is a SCALAR SUBSELECT keyed on `config.ref_model` and
+// `effective_from <= p.ts`, uncorrelated with whether the REQUEST's own family
+// priced successfully. When the ref model's earliest vintage postdates a request,
+// that subselect returns NULL (not zero rows) — `v_priced p` already produced a row
+// for the request (its own family joined fine), so `v_wcet` STILL EMITS A ROW for
+// `request_id`, just with `wcet = CAST(x / NULL) = NULL`. A `NOT EXISTS` guard sees
+// that row and calls the request priced, while every `SUM(wcet)` numerator and
+// denominator elsewhere in this file silently drops it (SQL's `SUM` ignores NULL) —
+// PASS becomes reachable with that request's spend invisible on both sides at once.
+// Requiring `w.wcet IS NOT NULL` for "priced" closes both drop classes with one
+// predicate: absent row and present-but-NULL row are the same failure to a caller
+// that just wants to know whether this request's mass landed anywhere.
 // ---------------------------------------------------------------------------
 
 export interface UnpricedShare {
-  /** in-window request rows with no corresponding `v_wcet` row — family missing from
-   *  `model_price` entirely, OR priced only from a vintage that postdates the request. */
+  /** in-window request rows with no corresponding priced `v_wcet` row — family
+   *  missing from `model_price` entirely, priced only from a vintage that postdates
+   *  the request, OR (ref-model class) the `v_wcet` row exists but `wcet` is NULL
+   *  because the REF model's earliest vintage postdates the request. */
   count: number;
   /** their out_tok+cw_tok mass — the same currency `currencySensitivity`'s
    *  `out_plus_cw` row uses, so this is directly comparable to it. */
@@ -335,7 +352,9 @@ export function unpricedShare(db: Database, w: AttrWindowArg): UnpricedShare {
       `SELECT COUNT(*) AS n, SUM(r.out_tok + r.cw_tok) AS mass
          FROM v_request_live r
         WHERE r.ts >= ?${untilClause}
-          AND NOT EXISTS (SELECT 1 FROM v_wcet w WHERE w.request_id = r.request_id)`,
+          AND NOT EXISTS (
+            SELECT 1 FROM v_wcet w WHERE w.request_id = r.request_id AND w.wcet IS NOT NULL
+          )`,
     )
     .get(...winParams) ?? { n: 0, mass: 0 };
   const totalRow = db

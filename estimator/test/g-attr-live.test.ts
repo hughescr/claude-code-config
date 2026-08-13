@@ -14,7 +14,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { Database } from "bun:sqlite";
-import { agentRun, makeHarness, price, request, seedPrices, turn, TEST_FAMILY, type Harness } from "./support.ts";
+import { agentRun, makeHarness, price, request, seedPrices, turn, TEST_FAMILY, REF_MODEL, type Harness } from "./support.ts";
 import { attributeTasks } from "../src/attribute.ts";
 import {
   anomalyPreconditions,
@@ -215,10 +215,14 @@ describe("currencySensitivity", () => {
 });
 
 // ---------------------------------------------------------------------------
-// unpricedShare — the PASS guard's metric. Two drop classes: family absent from
-// `model_price` entirely, and a family priced only from a vintage that postdates the
-// request (`v_wcet` join fails on `MAX(effective_from) <= ts` returning NULL) — the
-// class `v_unpriced` (family-membership only) cannot see.
+// unpricedShare — the PASS guard's metric. Three drop classes: family absent from
+// `model_price` entirely; the REQUEST's family priced only from a vintage that
+// postdates the request (`v_priced`'s join fails on `MAX(effective_from) <= ts`
+// returning NULL, so `v_wcet` never emits a row at all); and the REF model priced
+// only from a vintage that postdates the request (`v_wcet`'s `ref_out` scalar
+// subselect returns NULL, so `v_wcet` DOES emit a row, just with `wcet` NULL) — the
+// first two `v_unpriced` (family-membership only) cannot see, and the third a
+// `NOT EXISTS`-only guard cannot see either, since the row is present.
 // ---------------------------------------------------------------------------
 
 describe("unpricedShare", () => {
@@ -262,6 +266,55 @@ describe("unpricedShare", () => {
     expect(u.out_plus_cw).toBe(20);
     expect(u.window_total_out_plus_cw).toBe(30); // 10 + 20
     expect(u.share_pct).toBeCloseTo((20 / 30) * 100, 6);
+  });
+
+  test("also counts a request predating the REF model's first effective_from — v_wcet emits a row with wcet NULL, not zero rows", () => {
+    // The REQUEST's own family (TEST_FAMILY) is priced from the epoch by seedPrices,
+    // so `v_priced` joins fine and `v_wcet` emits a row for every request below. The
+    // hole is on the OTHER side of `v_wcet`'s arithmetic: `ref_out` is a scalar
+    // subselect keyed on `config.ref_model` (seeded to REF_MODEL, schema.sql), and
+    // seedPrices' epoch row for REF_MODEL is replaced here with a vintage that only
+    // starts Aug 5 — so a request timestamped before that has `ref_out IS NULL`,
+    // hence `wcet IS NULL`, on a `v_wcet` row that still EXISTS. A `NOT EXISTS`-only
+    // guard would call this request priced; `SUM(wcet)` elsewhere silently drops it.
+    h.db.query("DELETE FROM model_price WHERE family = ?").run(REF_MODEL);
+    price(h.db, REF_MODEL, { in: 1, out: 1, cw: 1, cr: 1 }, "2026-08-05T00:00:00Z");
+
+    seedTask(h.db, TID, { session: "s1" });
+    request(h.db, "rq-post-ref", {
+      session: "s1",
+      origin: "main",
+      out: 10,
+      ts: "2026-08-06T00:00:00Z",
+      attr: "exclusive",
+      tid: TID,
+    });
+    request(h.db, "rq-pre-ref", {
+      session: "s1",
+      origin: "main",
+      out: 100,
+      ts: "2026-08-02T00:00:00Z",
+      attr: "none",
+    });
+
+    // Sanity: v_wcet has a row for BOTH requests (family priced fine); only the
+    // pre-ref one's wcet is NULL. If this fails, the fixture stopped exercising the
+    // scalar-subselect hole and the assertions below would pass for the wrong reason.
+    const wcetRows = h.db
+      .query<{ request_id: string; wcet: number | null }, []>(
+        "SELECT request_id, wcet FROM v_wcet ORDER BY request_id",
+      )
+      .all();
+    expect(wcetRows).toEqual([
+      { request_id: "rq-post-ref", wcet: 10 },
+      { request_id: "rq-pre-ref", wcet: null },
+    ]);
+
+    const u = unpricedShare(h.db, { since: "2026-01-01T00:00:00Z" });
+    expect(u.count).toBe(1);
+    expect(u.out_plus_cw).toBe(100);
+    expect(u.window_total_out_plus_cw).toBe(110); // 10 + 100
+    expect(u.share_pct).toBeCloseTo((100 / 110) * 100, 6);
   });
 
   test("zero when every in-window request has a v_wcet row", () => {
