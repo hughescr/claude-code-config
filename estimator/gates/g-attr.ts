@@ -59,12 +59,15 @@
  *   bun run gates/g-attr.ts [--db path] [--since ISO] [--hook-merge ISO]
  *                           [--json out.json] [--skip-x1] [--limit-sessions N]
  *   bun run gates/g-attr.ts --legacy-r3 [--json out.json] [--limit N]   # frozen 2026-07 ladder
+ *
+ * `--json` refuses to target the frozen `gates/g-attr.json` baseline (this file's own
+ * directory) unless `--force` is also given — see `guardJsonOut`/`FROZEN_BASELINE_PATH`.
  */
 
 import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync, copyFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { openDb, getConfig, setConfig, DB_PATH } from "../src/db.ts";
 import { attributeTasks, attrWindow } from "../src/attribute.ts";
 import {
@@ -95,6 +98,37 @@ function ratio(part: number, whole: number): number {
 function flag(argv: string[], name: string): string | undefined {
   const i = argv.indexOf(name);
   return i >= 0 ? argv[i + 1] : undefined;
+}
+
+// ---------------------------------------------------------------------------
+// frozen-baseline write guard — see file header: "never gates/g-attr.json, the
+// 2026-07-28 baseline". Nothing upstream of `--json` enforced that promise; a
+// habitual `--json gates/g-attr.json` from the `estimator/` cwd (the most natural
+// name for THIS gate's own output) silently destroys the one artifact the whole
+// D11/D12 comparability story depends on, and it is gitignored — unrecoverable
+// from git. Resolved from `import.meta.dir` (this file's own directory), not the
+// process cwd, so the guard holds regardless of where the gate is invoked from.
+// ---------------------------------------------------------------------------
+
+export const FROZEN_BASELINE_PATH = resolve(import.meta.dir, "g-attr.json");
+
+export class FrozenBaselineWriteError extends Error {
+  constructor(target: string) {
+    super(
+      `refusing to write ${target} -- this resolves to the frozen 2026-07-28 G-ATTR ` +
+        `baseline (${FROZEN_BASELINE_PATH}). Overwriting it destroys the D11/D12 ` +
+        `comparability story this gate depends on, and it is gitignored (unrecoverable ` +
+        `from git). Pass --force to overwrite it anyway, or choose a different --json path.`,
+    );
+    this.name = "FrozenBaselineWriteError";
+  }
+}
+
+/** Throws unless `force` is set and `jsonOut` does not resolve to the frozen baseline. */
+export function guardJsonOut(jsonOut: string, force: boolean): void {
+  if (resolve(jsonOut) === FROZEN_BASELINE_PATH && !force) {
+    throw new FrozenBaselineWriteError(jsonOut);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -268,14 +302,21 @@ export function currencySensitivity(db: Database, w: AttrWindowArg): Record<stri
 
 // ---------------------------------------------------------------------------
 // unpriced spend — every quantity above is `v_wcet`/`v_priced`, which INNER JOINs
-// `model_price`. A model family missing a price row (or predating its first
-// `effective_from`) falls out of numerator AND denominator with no trace unless this
-// is reported separately, off `v_unpriced` (schema.sql), which every other query in
-// this file skips.
+// `model_price` twice over: once on `family` membership, once on `effective_from <=
+// r.ts` (schema.sql's `v_priced`). A model family missing a price row OUTRIGHT is
+// what `v_unpriced` (schema.sql) reports — but a family that IS priced, just not as
+// of a request predating its earliest `effective_from` (e.g. `est prices --set --at
+// <iso>` stamping a vintage that starts after some already-ingested spend), joins to
+// nothing (`MAX(effective_from) <= r.ts` is NULL) and falls out of `v_priced`/`v_wcet`
+// while staying invisible to `v_unpriced`, which only checks family membership. This
+// is exactly the "(or predating its first effective_from)" class named below, so the
+// guard is computed directly off `v_wcet` absence — a request is unpriced here iff no
+// `v_wcet` row exists for it, regardless of WHY the join failed.
 // ---------------------------------------------------------------------------
 
 export interface UnpricedShare {
-  /** request rows in-window that `v_wcet` silently drops (schema.sql's `v_unpriced`). */
+  /** in-window request rows with no corresponding `v_wcet` row — family missing from
+   *  `model_price` entirely, OR priced only from a vintage that postdates the request. */
   count: number;
   /** their out_tok+cw_tok mass — the same currency `currencySensitivity`'s
    *  `out_plus_cw` row uses, so this is directly comparable to it. */
@@ -287,16 +328,19 @@ export interface UnpricedShare {
 }
 
 export function unpricedShare(db: Database, w: AttrWindowArg): UnpricedShare {
-  const untilClause = w.until !== undefined ? " AND ts < ?" : "";
+  const untilClause = w.until !== undefined ? " AND r.ts < ?" : "";
   const winParams: (string | number)[] = w.until !== undefined ? [w.since, w.until] : [w.since];
   const u = db
     .query<{ n: number; mass: number | null }, (string | number)[]>(
-      `SELECT COUNT(*) AS n, SUM(out_tok + cw_tok) AS mass FROM v_unpriced WHERE ts >= ?${untilClause}`,
+      `SELECT COUNT(*) AS n, SUM(r.out_tok + r.cw_tok) AS mass
+         FROM v_request_live r
+        WHERE r.ts >= ?${untilClause}
+          AND NOT EXISTS (SELECT 1 FROM v_wcet w WHERE w.request_id = r.request_id)`,
     )
     .get(...winParams) ?? { n: 0, mass: 0 };
   const totalRow = db
     .query<{ mass: number | null }, (string | number)[]>(
-      `SELECT SUM(out_tok + cw_tok) AS mass FROM v_request_live WHERE ts >= ?${untilClause}`,
+      `SELECT SUM(r.out_tok + r.cw_tok) AS mass FROM v_request_live r WHERE r.ts >= ?${untilClause}`,
     )
     .get(...winParams);
   const mass = u.mass ?? 0;
@@ -693,21 +737,55 @@ export async function ingestCompleteness(db: Database, limit: number = Infinity)
 export type Verdict = "PASS" | "ESCALATE";
 
 /**
+ * GLS §3's self-validation: `coverage_ex_hook` is always a FULL `attributeTasks`
+ * re-sweep on a copy with `source='hook'` rows deleted, never a query gated on
+ * whether that delete did anything. When there are no hook aliases to delete, the
+ * delete is a no-op — but the re-sweep is not: it still re-derives every row's `attr`
+ * from scratch, and can diverge from the stored `request.attr` on sweeper/config skew
+ * (a stale attr column, a config value that has moved since the last live sweep, or a
+ * fixture that set `attr` directly rather than through `attributeTasks`). In that
+ * regime `hook_lift` is NOT "0 by construction" — it is unconstrained, and a large
+ * value would currently be captioned as if it were zero. `HOOK_LIFT_SELF_CHECK_TOLERANCE_PP`
+ * is the "should reproduce the §1 baseline" tolerance: with no hook aliases present,
+ * |hook_lift| above it means the shadow harness (or the live attr column) is wrong
+ * before any PASS conclusion is drawn from it.
+ */
+export const HOOK_LIFT_SELF_CHECK_TOLERANCE_PP = 0.1;
+
+export interface HookSelfCheck {
+  hookAliasesPresent: boolean;
+  hookLiftPct: number;
+}
+
+/**
  * `unpricedCount` defaults to 0 so existing callers (and the D9/D10 shadow recomputes,
  * which never touch `model_price`) are unaffected. A nonzero count means the headline
  * above was computed over a base population that silently dropped some in-window
  * spend class entirely (`v_priced`'s INNER JOIN on `model_price` — see
  * `unpricedShare`); that is not a corpus-quality condition D14 can license through,
  * so it gates PASS the same way the two anomaly counts already do.
+ *
+ * `hookSelfCheck` defaults to a trivially-passing shape (`hookAliasesPresent: true`) so
+ * existing 2-/3-arg callers are unaffected. When hook aliases are ABSENT, GLS §3
+ * requires `coverage_ex_hook` to reproduce the live baseline (the delete was a no-op);
+ * a divergence beyond `HOOK_LIFT_SELF_CHECK_TOLERANCE_PP` means the D9 shadow harness
+ * cannot be trusted, so it gates PASS the same way the two anomaly counts already do.
  */
 export function verdictOf(
   headlinePct: number,
   preconds: AnomalyPreconditions,
   unpricedCount: number = 0,
+  hookSelfCheck: HookSelfCheck = { hookAliasesPresent: true, hookLiftPct: 0 },
 ): Verdict {
   if (headlinePct < ATTR_COVERAGE_GATE * 100) return "ESCALATE";
   if (preconds.hook_bind_conflict !== 0 || preconds.alias_split_identity !== 0) return "ESCALATE";
   if (unpricedCount !== 0) return "ESCALATE";
+  if (
+    !hookSelfCheck.hookAliasesPresent &&
+    Math.abs(hookSelfCheck.hookLiftPct) > HOOK_LIFT_SELF_CHECK_TOLERANCE_PP
+  ) {
+    return "ESCALATE";
+  }
   return "PASS";
 }
 
@@ -765,6 +843,9 @@ interface LiveReport {
   coverage_ex_hook_pct: number | null;
   hook_lift_pct: number | null;
   hook_aliases_present: boolean;
+  /** GLS §3 self-validation: true unless `hook_aliases_present` is false AND
+   *  `hook_lift_pct` exceeds `HOOK_LIFT_SELF_CHECK_TOLERANCE_PP` — see `verdictOf`. */
+  hook_self_check_ok: boolean;
   staleness_grid: StaleGridPoint[];
   stale_closed_share_pct: number;
   task_census: TaskCensus;
@@ -841,7 +922,13 @@ export async function runLive(
 
   const x1 = opts.skipX1 === true ? null : await ingestCompleteness(db, opts.ingestLimit ?? Infinity);
 
-  const verdict = verdictOf(headline.coverage_pct, preconds, unpriced.count);
+  const hookLiftPct = headline.coverage_pct - exHookPct;
+  const hookSelfCheckOk =
+    hadHookAliases || Math.abs(hookLiftPct) <= HOOK_LIFT_SELF_CHECK_TOLERANCE_PP;
+  const verdict = verdictOf(headline.coverage_pct, preconds, unpriced.count, {
+    hookAliasesPresent: hadHookAliases,
+    hookLiftPct,
+  });
 
   return {
     generated_at: now,
@@ -866,8 +953,9 @@ export async function runLive(
     },
     epochs,
     coverage_ex_hook_pct: exHookPct,
-    hook_lift_pct: headline.coverage_pct - exHookPct,
+    hook_lift_pct: hookLiftPct,
     hook_aliases_present: hadHookAliases,
+    hook_self_check_ok: hookSelfCheckOk,
     staleness_grid: grid,
     stale_closed_share_pct: staleShare,
     task_census: census,
@@ -916,7 +1004,11 @@ function printLiveReport(r: LiveReport): void {
   L("hook lift (D9) — coverage with vs without source='hook' aliases, uncontaminated shadow run:");
   L(
     `  coverage_ex_hook ${pct(r.coverage_ex_hook_pct ?? 0)}   hook_lift ${((r.hook_lift_pct ?? 0) >= 0 ? "+" : "") + (r.hook_lift_pct ?? 0).toFixed(1)}pp` +
-      (r.hook_aliases_present ? "" : "   (no source='hook' aliases yet — lift is 0 by construction)"),
+      (r.hook_aliases_present
+        ? ""
+        : r.hook_self_check_ok
+          ? "   (no source='hook' aliases yet — GLS §3 self-check: lift ~0 as expected)"
+          : "   (no source='hook' aliases yet — GLS §3 self-check FAILED: nonzero lift with no hook rows to delete — shadow harness/attr column is suspect -- BLOCKS PASS)"),
   );
   L(
     `  anomaly preconditions: hook_bind_conflict=${r.anomaly_preconditions.hook_bind_conflict}  alias_split_identity=${r.anomaly_preconditions.alias_split_identity}`,
@@ -985,6 +1077,9 @@ async function runLiveMain(argv: string[]): Promise<void> {
   const limitFlag = flag(argv, "--limit-sessions");
   const ingestLimit = limitFlag !== undefined ? Number(limitFlag) : Infinity;
   const skipX1 = argv.includes("--skip-x1");
+  const force = argv.includes("--force");
+
+  if (jsonOut !== undefined) guardJsonOut(jsonOut, force);
 
   const live = openDb({ path: dbPath, readonly: true });
   let report: LiveReport;
@@ -1244,6 +1339,9 @@ async function runLegacyR3(argv: string[]): Promise<void> {
   const jsonOut = flag(argv, "--json");
   const limitFlag = flag(argv, "--limit");
   const limit = limitFlag !== undefined ? Number(limitFlag) : Infinity;
+  const force = argv.includes("--force");
+
+  if (jsonOut !== undefined) guardJsonOut(jsonOut, force);
 
   const t0 = Date.now();
   const corpus = discoverCorpus();

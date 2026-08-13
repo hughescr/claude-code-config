@@ -14,7 +14,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { Database } from "bun:sqlite";
-import { agentRun, makeHarness, request, seedPrices, turn, type Harness } from "./support.ts";
+import { agentRun, makeHarness, price, request, seedPrices, turn, TEST_FAMILY, type Harness } from "./support.ts";
 import { attributeTasks } from "../src/attribute.ts";
 import {
   anomalyPreconditions,
@@ -22,6 +22,10 @@ import {
   computeHeadline,
   coverageExHook,
   currencySensitivity,
+  FROZEN_BASELINE_PATH,
+  FrozenBaselineWriteError,
+  guardJsonOut,
+  HOOK_LIFT_SELF_CHECK_TOLERANCE_PP,
   runLive,
   staleClosedShare,
   stalenessGrid,
@@ -165,6 +169,28 @@ describe("computeHeadline", () => {
     expect(headline.coverage_pct).toBe(0);
     expect(headline.L2.total).toBe(0);
   });
+
+  test("D12: e_prime_pct (July's unweighted currency) and e_prime_priced_pct (live priced wcet) diverge under asymmetric pricing", () => {
+    // Every OTHER fixture in this file relies on seedPrices' usd_out=usd_cw=1, which
+    // makes priced wcet numerically identical to out_tok+cw_tok — so a regression that
+    // silently swapped E' to priced wcet would be invisible to those tests. Re-price
+    // TEST_FAMILY asymmetrically (usd_out != usd_cw) so the two rungs can only agree
+    // by coincidence; the ref model (seedPrices' REF_MODEL row) stays at usd_out=1,
+    // so wcet = out_tok*2 + cw_cost(usd_cw=3), NOT out_tok+cw_tok.
+    price(h.db, TEST_FAMILY, { in: 1, out: 2, cw: 3, cr: 1 });
+    seedTask(h.db, TID, { session: "s1" });
+    request(h.db, "rq1", { session: "s1", origin: "main", out: 10, cw: 0, attr: "exclusive", tid: TID });
+    request(h.db, "rq2", { session: "s1", origin: "main", out: 4, cw: 2, attr: "none" });
+
+    const headline = computeHeadline(h.db, { since: "2026-01-01T00:00:00Z" });
+
+    // L0legacy (out_tok + cw_tok, unweighted, July's currency): rq1=10, rq2=6, total=16.
+    expect(headline.e_prime_pct).toBeCloseTo((10 / 16) * 100, 6);
+    // L0 priced wcet: rq1 = 10*2 + 0*3 = 20; rq2 = 4*2 + 2*3 = 14; total=34.
+    expect(headline.e_prime_priced_pct).toBeCloseTo((20 / 34) * 100, 6);
+    // The regression this guards against: swapping E' to priced wcet must be visible.
+    expect(Math.abs(headline.e_prime_pct - headline.e_prime_priced_pct)).toBeGreaterThan(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -185,6 +211,94 @@ describe("currencySensitivity", () => {
     expect(cs.in_out_cw!.total).toBe(20);
     expect(cs.request_count!.total).toBe(2);
     expect(cs.request_count!.coverage_pct).toBeCloseTo(50, 6); // 1 of 2 requests exclusive
+  });
+});
+
+// ---------------------------------------------------------------------------
+// unpricedShare — the PASS guard's metric. Two drop classes: family absent from
+// `model_price` entirely, and a family priced only from a vintage that postdates the
+// request (`v_wcet` join fails on `MAX(effective_from) <= ts` returning NULL) — the
+// class `v_unpriced` (family-membership only) cannot see.
+// ---------------------------------------------------------------------------
+
+describe("unpricedShare", () => {
+  test("counts requests with no v_wcet row: family absent from model_price entirely", () => {
+    seedTask(h.db, TID, { session: "s1" });
+    request(h.db, "rq-priced", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID });
+    request(h.db, "rq-nofamily", {
+      session: "s1",
+      origin: "main",
+      family: "totally-unpriced-family",
+      out: 15,
+      attr: "none",
+    });
+
+    const u = unpricedShare(h.db, { since: "2026-01-01T00:00:00Z" });
+    expect(u.count).toBe(1);
+    expect(u.out_plus_cw).toBe(15);
+    expect(u.window_total_out_plus_cw).toBe(25); // 10 + 15
+    expect(u.share_pct).toBeCloseTo((15 / 25) * 100, 6);
+  });
+
+  test("also counts a request predating its family's first effective_from — the class v_unpriced (family membership only) misses", () => {
+    seedTask(h.db, TID, { session: "s1" });
+    request(h.db, "rq-priced", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID });
+    // "vintage-family" IS present in model_price — just not effective until Aug 5 — so
+    // the OLD `v_unpriced` (family-membership-only) guard would have missed this row
+    // entirely: it counts as priced by family lookup, but `v_priced`'s join on
+    // `effective_from <= ts` fails and it never reaches `v_wcet`.
+    price(h.db, "vintage-family", { in: 1, out: 1, cw: 1, cr: 1 }, "2026-08-05T00:00:00Z");
+    request(h.db, "rq-prevint", {
+      session: "s1",
+      origin: "main",
+      family: "vintage-family",
+      out: 20,
+      ts: "2026-08-01T00:00:00Z",
+      attr: "none",
+    });
+
+    const u = unpricedShare(h.db, { since: "2026-01-01T00:00:00Z" });
+    expect(u.count).toBe(1);
+    expect(u.out_plus_cw).toBe(20);
+    expect(u.window_total_out_plus_cw).toBe(30); // 10 + 20
+    expect(u.share_pct).toBeCloseTo((20 / 30) * 100, 6);
+  });
+
+  test("zero when every in-window request has a v_wcet row", () => {
+    seedTask(h.db, TID, { session: "s1" });
+    request(h.db, "rq1", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID });
+    const u = unpricedShare(h.db, { since: "2026-01-01T00:00:00Z" });
+    expect(u).toEqual({ count: 0, out_plus_cw: 0, window_total_out_plus_cw: 10, share_pct: 0 });
+  });
+});
+
+describe("runLive — unpriced-spend PASS guard, wired end to end", () => {
+  test("a request predating its family's first effective_from blocks PASS even at 100% coverage with a clean ledger", async () => {
+    turn(h.db, { session: "s1", prompt: "p1", at: "2026-08-02T00:00:00Z" });
+    seedTask(h.db, TID, { session: "s1", prompt: "p1", createdAt: "2026-08-02T00:00:00Z" });
+    request(h.db, "rq1", { session: "s1", origin: "main", prompt: "p1", out: 10, ts: "2026-08-02T00:00:10Z" });
+    attributeTasks(h.db);
+
+    // Sanity: without the pre-vintage row, this fixture is a clean PASS (mirrors the
+    // "PASS carries the D14 licence text" runLive test above).
+    const clean = await runLive(h.db, { since: "2026-08-01T00:00:00Z", skipX1: true });
+    expect(clean.verdict).toBe("PASS");
+
+    price(h.db, "vintage-family", { in: 1, out: 1, cw: 1, cr: 1 }, "2026-08-05T00:00:00Z");
+    request(h.db, "rq-prevint", {
+      session: "s1",
+      origin: "main",
+      family: "vintage-family",
+      out: 5,
+      ts: "2026-08-02T00:00:10Z",
+      attr: "none",
+    });
+
+    const dirty = await runLive(h.db, { since: "2026-08-01T00:00:00Z", skipX1: true });
+    expect(dirty.unpriced_window.count).toBe(1);
+    expect(dirty.anomaly_preconditions).toEqual({ hook_bind_conflict: 0, alias_split_identity: 0 });
+    expect(dirty.verdict).toBe("ESCALATE");
+    expect(dirty.licenses).toBeNull();
   });
 });
 
@@ -403,6 +517,64 @@ describe("verdictOf", () => {
     expect(verdictOf(95, { hook_bind_conflict: 1, alias_split_identity: 0 })).toBe("ESCALATE");
     expect(verdictOf(95, { hook_bind_conflict: 0, alias_split_identity: 1 })).toBe("ESCALATE");
   });
+  const CLEAN = { hook_bind_conflict: 0, alias_split_identity: 0 };
+  test("nonzero unpriced-spend count escalates even with a clean ledger and full coverage", () => {
+    expect(verdictOf(95, CLEAN, 3)).toBe("ESCALATE");
+    expect(verdictOf(95, CLEAN, 1)).toBe("ESCALATE");
+  });
+  test("zero unpriced-spend count does not itself escalate", () => {
+    expect(verdictOf(95, CLEAN, 0)).toBe("PASS");
+  });
+  test("GLS §3: no hook aliases present, but a large hook_lift, escalates (broken shadow harness)", () => {
+    expect(
+      verdictOf(95, CLEAN, 0, { hookAliasesPresent: false, hookLiftPct: 5 }),
+    ).toBe("ESCALATE");
+    expect(
+      verdictOf(95, CLEAN, 0, { hookAliasesPresent: false, hookLiftPct: -5 }),
+    ).toBe("ESCALATE"); // the check is on |lift|, not just positive lift
+  });
+  test("GLS §3: no hook aliases present, lift within tolerance, passes", () => {
+    expect(
+      verdictOf(95, CLEAN, 0, { hookAliasesPresent: false, hookLiftPct: 0 }),
+    ).toBe("PASS");
+    expect(
+      verdictOf(95, CLEAN, 0, {
+        hookAliasesPresent: false,
+        hookLiftPct: HOOK_LIFT_SELF_CHECK_TOLERANCE_PP / 2,
+      }),
+    ).toBe("PASS");
+  });
+  test("GLS §3: a large hook_lift is fine when hook aliases ARE present — that's the point of D9", () => {
+    expect(
+      verdictOf(95, CLEAN, 0, { hookAliasesPresent: true, hookLiftPct: 40 }),
+    ).toBe("PASS");
+  });
+  test("4-arg default (no hookSelfCheck passed) behaves exactly like the 3-arg form", () => {
+    expect(verdictOf(95, CLEAN, 0)).toBe("PASS");
+    expect(verdictOf(69.9, CLEAN, 0)).toBe("ESCALATE");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// guardJsonOut — the frozen-baseline write guard
+// ---------------------------------------------------------------------------
+
+describe("guardJsonOut", () => {
+  test("refuses to write the frozen baseline path without --force", () => {
+    expect(() => guardJsonOut(FROZEN_BASELINE_PATH, false)).toThrow(FrozenBaselineWriteError);
+  });
+  test("a relative path resolving to the same file is caught too", () => {
+    // gates/g-attr.json, resolved from the process cwd (this test file runs from the
+    // package root under `bun test`) — the exact habitual invocation the finding names.
+    expect(() => guardJsonOut("gates/g-attr.json", false)).toThrow(FrozenBaselineWriteError);
+  });
+  test("--force overrides the refusal", () => {
+    expect(() => guardJsonOut(FROZEN_BASELINE_PATH, true)).not.toThrow();
+  });
+  test("a different --json path is never blocked", () => {
+    expect(() => guardJsonOut("/tmp/some-other-report.json", false)).not.toThrow();
+    expect(() => guardJsonOut("gates/g-attr-2026-08.json", false)).not.toThrow();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -436,6 +608,11 @@ describe("runLive", () => {
     expect(report.coverage_ex_hook_pct).toBeGreaterThanOrEqual(0);
     expect(report.coverage_ex_hook_pct).toBeLessThanOrEqual(100);
     expect(report.staleness_grid.length).toBeGreaterThan(0);
+    // GLS §3 self-check: this fixture's `request.attr` was set directly rather than
+    // derived by `attributeTasks`, so the ex-hook re-sweep is EXPECTED to diverge from
+    // it even though no hook aliases exist to delete — exactly the "sweeper/config
+    // skew" class the self-check exists to catch. It must therefore read false here.
+    expect(report.hook_self_check_ok).toBe(false);
 
     // The live handle passed in must read back EXACTLY as it did before the run —
     // every mutating step in `runLive` operates on a `VACUUM INTO` temp copy.
@@ -446,11 +623,18 @@ describe("runLive", () => {
   });
 
   test("PASS carries the D14 licence text; a clean anomaly ledger is required, not just the threshold", async () => {
-    seedTask(h.db, TID, { session: "s1", createdAt: "2026-08-02T00:00:00Z" });
-    request(h.db, "rq1", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID, ts: "2026-08-02T00:00:00Z" });
+    // Driven through the REAL attribution pass (`turn` + `attributeTasks`), unlike the
+    // fixture above — a fixture where the shadow harness genuinely reproduces the
+    // baseline is required to observe a legitimate, self-check-clean PASS (GLS §3).
+    turn(h.db, { session: "s1", prompt: "p1", at: "2026-08-02T00:00:00Z" });
+    seedTask(h.db, TID, { session: "s1", prompt: "p1", createdAt: "2026-08-02T00:00:00Z" });
+    request(h.db, "rq1", { session: "s1", origin: "main", prompt: "p1", out: 10, ts: "2026-08-02T00:00:10Z" });
+    attributeTasks(h.db);
 
     const clean = await runLive(h.db, { since: "2026-08-01T00:00:00Z", skipX1: true });
     expect(clean.headline.coverage_pct).toBeCloseTo(100, 6);
+    expect(clean.hook_aliases_present).toBe(false);
+    expect(clean.hook_self_check_ok).toBe(true); // no hook rows, and the re-sweep agrees
     expect(clean.verdict).toBe("PASS");
     expect(clean.licenses).toContain("P2.11");
     expect(clean.licenses).toContain("Not a validation of the binder");
@@ -460,5 +644,24 @@ describe("runLive", () => {
     expect(dirty.headline.coverage_pct).toBeCloseTo(100, 6); // unchanged — same requests
     expect(dirty.verdict).toBe("ESCALATE"); // but the ledger is unclean now
     expect(dirty.licenses).toBeNull();
+  });
+
+  test("GLS §3 self-check: a large hook_lift with no hook aliases present blocks PASS", () => {
+    // The exact hazard the finding names: `request.attr` set directly (never routed
+    // through `attributeTasks`), no `source='hook'` rows to delete, so the ex-hook
+    // shadow's full re-sweep has nothing anchoring it to the stored attr and diverges
+    // sharply. Coverage alone (100%) and the anomaly ledger (clean) would both permit
+    // a PASS; the self-check must be the thing that blocks it.
+    seedTask(h.db, TID, { session: "s1", createdAt: "2026-08-02T00:00:00Z" });
+    request(h.db, "rq1", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID, ts: "2026-08-02T00:00:00Z" });
+
+    return runLive(h.db, { since: "2026-08-01T00:00:00Z", skipX1: true }).then((report) => {
+      expect(report.headline.coverage_pct).toBeCloseTo(100, 6);
+      expect(report.anomaly_preconditions).toEqual({ hook_bind_conflict: 0, alias_split_identity: 0 });
+      expect(report.hook_aliases_present).toBe(false);
+      expect(report.hook_self_check_ok).toBe(false);
+      expect(report.verdict).toBe("ESCALATE");
+      expect(report.licenses).toBeNull();
+    });
   });
 });
