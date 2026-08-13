@@ -641,6 +641,62 @@ describe("parseSpawnBindLines / serializeSpawnBindLine", () => {
     expect(parsed.malformed).toBe(1);
     expect(parsed.rows).toHaveLength(0);
   });
+
+  // HOOK-BINDING-SPEC.md §14.9#10 (REV3): the focus_drop pipeline — parse, serialize
+  // under the PIPE_BUF budget, and the drain/report wiring below — had zero coverage.
+  test("focus_drop round-trips through serialize -> parse, within the byte budget", () => {
+    const rec = bindRecord({
+      tid: null,
+      basis: "multi_active",
+      na: 2,
+      nb: 2,
+      k: ["session_id", "tool_name"],
+      focus_drop: "idle",
+    });
+    const line = serializeSpawnBindLine(rec);
+    expect(line).not.toBeNull();
+    expect(Buffer.byteLength(line!)).toBeLessThanOrEqual(511);
+    const parsed = parseSpawnBindLines(`${line}\n`);
+    expect(parsed.malformed).toBe(0);
+    expect(parsed.rows[0]?.focus_drop).toBe("idle");
+  });
+
+  test("an unknown focus_drop reason is ignored, not malformed — SPAWN_BIND_FOCUS_DROPS filters, it does not reject", () => {
+    const raw = JSON.stringify({ ...bindRecord({ tid: "t1", basis: "sole_active" }), focus_drop: "nope" });
+    const parsed = parseSpawnBindLines(`${raw}\n`);
+    expect(parsed.malformed).toBe(0);
+    expect(parsed.rows).toHaveLength(1);
+    expect(parsed.rows[0]?.focus_drop).toBeUndefined();
+  });
+
+  test("budget fallback: `k` is sacrificed FIRST, `focus_drop` survives", () => {
+    const rec = bindRecord({
+      focus_drop: "contested",
+      k: Array.from({ length: 40 }, (_, i) => `key_name_number_${i}`),
+    });
+    const line = serializeSpawnBindLine(rec);
+    expect(line).not.toBeNull();
+    expect(line).not.toContain('"k"');
+    expect(line).toContain('"focus_drop":"contested"');
+    expect(Buffer.byteLength(line!)).toBeLessThanOrEqual(511);
+  });
+
+  test("budget fallback: `focus_drop` is sacrificed SECOND and the survivor still parses (§14.9#10)", () => {
+    let n = 200;
+    while (
+      Buffer.byteLength(JSON.stringify(bindRecord({ local_id: "a".repeat(n), focus_drop: "idle" }))) <= 511
+    ) {
+      n += 1;
+    }
+    const rec = bindRecord({ local_id: "a".repeat(n), focus_drop: "idle", basis: "sole_active", tid: "t1" });
+    const line = serializeSpawnBindLine(rec);
+    expect(line).not.toBeNull();
+    expect(Buffer.byteLength(line!)).toBeLessThanOrEqual(511);
+    expect(line!.includes("focus_drop")).toBe(false);
+    const parsed = parseSpawnBindLines(`${line}\n`);
+    expect(parsed.malformed).toBe(0);
+    expect(parsed.rows[0]?.basis).toBe("sole_active");
+  });
 });
 
 describe("agent-binds drain — HOOK-BINDING-SPEC.md §4.1", () => {
@@ -664,6 +720,16 @@ describe("agent-binds drain — HOOK-BINDING-SPEC.md §4.1", () => {
     expect(result.binds.basis.multi_active).toBe(1);
     expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_alias").get()?.n).toBe(0);
     expect(result.anomalies.map((a) => a.kind)).toContain("hook_bind_multi_active");
+  });
+
+  test("focus_drop is counted per-reason on the drain, additive to basis, not a replacement (§14.8)", () => {
+    seedTask("t1");
+    appendBind(bindRecord({ tuid: "toolu_fd1", tid: "t1", basis: "sole_active", focus_drop: "contested" }));
+    appendBind(bindRecord({ tuid: "toolu_fd2", tid: null, basis: "multi_active", na: 2, nb: 2, focus_drop: "idle" }));
+    appendBind(bindRecord({ tuid: "toolu_fd3", tid: "t1", basis: "sole_active" }));
+    const result = drain();
+    expect(result.binds.focus_drop).toEqual({ contested: 1, idle: 1 });
+    expect(result.binds.basis.sole_active).toBe(2);
   });
 
   test("no_bound and db_unavailable witnesses never raise an anomaly", () => {
@@ -825,7 +891,7 @@ describe("agent-binds drain — HOOK-BINDING-SPEC.md §4.1", () => {
     expect(existsSync(join(spool, AGENT_BINDS_FILE))).toBe(false); // nothing re-appended
   });
 
-  test("SweepReport.spool carries binds_* counters, binds_basis, and a binds_keysets histogram (§4.1 step 6 / §9.1)", async () => {
+  test("SweepReport.spool carries binds_* counters, binds_basis, binds_focus_drop, and a binds_keysets histogram (§4.1 step 6 / §9.1 / §14.9#10)", async () => {
     // Every assertion here is `undefined` before src/cli.ts's SweepReport.spool wires
     // spool.binds.* through — src/spool.ts's DrainResult already carries it.
     const { runSweep } = await import("../src/cli.ts");
@@ -841,13 +907,15 @@ describe("agent-binds drain — HOOK-BINDING-SPEC.md §4.1", () => {
         k: ["session_id", "tool_name", "agent_id"], // deliberately a DIFFERENT key set
       }),
     );
+    appendBind(bindRecord({ tuid: "toolu_r3", tid: null, basis: "multi_active", focus_drop: "idle" }));
     const emptyRoot = join(h.dir, "empty-projects-binds");
     mkdirSync(emptyRoot, { recursive: true });
     const report = await runSweep(h.db, { root: emptyRoot, spoolDir: spool });
-    expect(report.spool.binds_read).toBe(2);
+    expect(report.spool.binds_read).toBe(3);
+    expect(report.spool.binds_focus_drop.idle).toBe(1);
     expect(report.spool.binds_bound).toBe(1);
-    expect(report.spool.binds_basis.multi_active).toBe(1);
-    expect(Object.keys(report.spool.binds_keysets)).toHaveLength(2);
+    expect(report.spool.binds_basis.multi_active).toBe(2); // toolu_r2 and the new toolu_r3
+    expect(Object.keys(report.spool.binds_keysets)).toHaveLength(3); // r1's, r2's, and toolu_r3's "(absent)"
   });
 
   test("hook_bind_enabled=0: the drain discards the whole batch unread — no alias, nothing re-appended, no anomaly, no .draining residue (§8.1)", () => {

@@ -1092,58 +1092,92 @@ describe("nudge.ts — job 0: spawn-time attribution binding", () => {
       });
     });
 
-    // §14.9 case 4: the anti-circularity regression for §14.1's finding. Manufactures
-    // exactly the evidence a NAIVE `MAX(marker.ts, T.last_attributed_activity)` basis
-    // would have read as "T is still busy" — a hook-written alias for T and an
-    // attributed turn, planted INSIDE the idle gap — and asserts the verdict is
-    // unchanged. This is INV-TTL (§14.2) made concrete: the bridge reads only
-    // turn(session_id, started_at, duration_ms) and task_scope, never `tid` or
-    // `task_alias`, so none of this manufactured evidence can move it.
-    test("§14.9#4 anti-circularity: more hook-bound activity for T does not renew a marker across an idle gap", () => {
+    // §14.9 case 4: the anti-circularity regression for §14.1's finding. A naive basis
+    // of MAX(marker.ts, T.last_attributed_activity) — or one reading `burn_cache`'s
+    // live-agent count for T — is CIRCULAR: activity this marker's OWN hook binds
+    // caused would renew the very marker that caused it, so a marker pointing at the
+    // WRONG task would never age out. The fixture below manufactures both of those
+    // contaminated signals (a hook-written `task_alias` for T, `turn.tid` rows
+    // attributed to T, and a `burn_cache` row showing T live) and deliberately plants
+    // them on the FAR side of an idle hole — i.e. exactly where a circular basis would
+    // read them as fresh — while the RAW turn stream still has an unbridged >TTL gap.
+    // Any basis that reads T's attributed activity (`turn.tid`) or `burn_cache` would
+    // therefore believe the marker; only the label-free session-turn bridge (§14.4,
+    // reading solely `turn(session_id, started_at, duration_ms)` and `task_scope`,
+    // INV-TTL §14.2) drops it. Fired twice — once before, once after the contaminated
+    // rows exist — to pin the literal INV-TTL statement: seeding more hook-bound
+    // activity for T changes nothing about the verdict.
+    test("§14.9#4 anti-circularity: hook-bound activity for T, planted past an idle gap, does not renew the marker", () => {
       initDb();
       seedBoundTask("t-anti-t", "sess-anti");
       seedBoundTask("t-anti-u", "sess-anti");
       const markerTs = new Date(Date.now() - 4 * 60 * 60_000);
-      // One turn right at the marker, then NOTHING until t_spawn ~4h later — an
-      // unbroken idle gap on the RAW turn stream.
+      // One turn right at the marker...
       seedTurn("sess-anti", "p0", markerTs, 0);
       writeFocusMarker("sess-anti", "t-anti-t", "est_focus", spoolDir, markerTs);
+      // ...then a >TTL hole (2h, past the 120-min default TTL)...
+      const resumeAt = new Date(markerTs.getTime() + 3 * 60 * 60_000);
+      // ...then turns resume on the FAR side of the hole and bridge on to t_spawn.
+      seedTurnsEvery("sess-anti", resumeAt, new Date(Date.now() - 60_000), 10 * 60_000, 0, "q");
+
+      // Line A: fired BEFORE any contaminated evidence exists.
+      const a = runNudge(
+        JSON.stringify({
+          session_id: "sess-anti",
+          tool_name: "Agent",
+          tool_use_id: "toolu_anti_a",
+          tool_input: {},
+          tool_response: asyncAgentResponse("agent-anti-a"),
+        }),
+      );
+      expect(a.exitCode).toBe(0);
 
       const db = openDb({ path: dbPath });
       try {
-        const midTs = new Date(markerTs.getTime() + 2 * 60 * 60_000).toISOString(); // 2h into the gap
-        // A pre-existing hook-written alias for T, planted well inside the gap.
+        // A hook-written alias for T, dated on the far side of the hole — exactly what
+        // §5.2's boundSpan/addTouch would have produced from a marker that (wrongly)
+        // survived the gap.
         db.run(
           "INSERT INTO task_alias (tid,id_kind,session_id,local_id,first_seen,source) VALUES (?,?,?,?,?,?)",
-          ["t-anti-t", "agent", "sess-anti", "agent-manufactured", midTs, "hook"],
+          ["t-anti-t", "agent", "sess-anti", "agent-manufactured", resumeAt.toISOString(), "hook"],
         );
-        // What attribution would have done with that alias: the one turn covering it
-        // gets tid = T. Set directly so the scenario is the WORST case, not merely a
-        // plausible one — the naive circular basis would read this as T being touched
-        // at p0's instant, i.e. exactly the marker's own timestamp.
-        db.run("UPDATE turn SET tid = ? WHERE session_id = ? AND prompt_id = ?", [
+        // What attribution would have done with that alias: every far-side turn
+        // (including the one nearest t_spawn) gets tid = T, making a naive
+        // MAX(marker.ts, T.last_attributed_activity) basis read T as fresh.
+        db.run("UPDATE turn SET tid = ? WHERE session_id = ?", ["t-anti-t", "sess-anti"]);
+        // The second contaminated input the finding names: `burn_cache` showing T
+        // live right now.
+        db.run("INSERT INTO burn_cache (tid, as_of, n_agents_live) VALUES (?, ?, ?)", [
           "t-anti-t",
-          "sess-anti",
-          "p0",
+          new Date().toISOString(),
+          1,
         ]);
       } finally {
         db.close();
       }
 
-      const r = runNudge(
+      // Line B: fired AFTER the contaminated evidence exists.
+      const b = runNudge(
         JSON.stringify({
           session_id: "sess-anti",
           tool_name: "Agent",
-          tool_use_id: "toolu_anti",
+          tool_use_id: "toolu_anti_b",
           tool_input: {},
-          tool_response: asyncAgentResponse("agent-anti"),
+          tool_response: asyncAgentResponse("agent-anti-b"),
         }),
       );
-      expect(r.exitCode).toBe(0);
-      const line = agentBindsLines()[0]!;
-      expect(line.focus_drop).toBe("idle");
-      expect(line.basis).not.toBe("focus");
-      expect(line.basis).not.toBe("focus_quiet");
+      expect(b.exitCode).toBe(0);
+
+      const [lineA, lineB] = agentBindsLines();
+      expect(lineA!.focus_drop).toBe("idle");
+      expect(lineB!.focus_drop).toBe("idle");
+      // INV-TTL, made explicit: seeding more hook-bound activity for T changed nothing.
+      expect(lineB!.basis).toBe(lineA!.basis);
+      expect(lineB!.focus_drop).toBe(lineA!.focus_drop);
+      expect(lineB!.basis).toBe("multi_active");
+      expect(lineB!.tid).toBeNull();
+      expect(lineB!.basis).not.toBe("focus");
+      expect(lineB!.basis).not.toBe("focus_quiet");
     });
 
     // §14.9 case 5: competing-evidence invalidation (§14.5), scoped narrowly to
