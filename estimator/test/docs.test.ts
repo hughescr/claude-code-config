@@ -72,18 +72,20 @@ describe("README operational coverage", () => {
 });
 
 describe("est help — focus TTL basis", () => {
-  test("the focus entry describes the TTL on its implemented fixed-from-set basis", () => {
+  test("the focus entry describes the TTL on its implemented idle-gap basis (REV3, §14.4)", () => {
     const start = HELP.indexOf("focus <tid>:");
     const end = HELP.indexOf("scope <tid>:");
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
     const entry = HELP.slice(start, end);
     expect(entry).toContain("hook_focus_ttl_min");
-    // resolveLadder ages the marker from marker.ts alone (scripts/nudge.ts:363-388);
-    // the behaviour is pinned by nudge.test.ts "a focus marker older than
-    // hook_focus_ttl_min is ignored EVEN WHILE its task is still absorbing work".
-    // This test pins the USER-FACING half, which rev-3 stated as its inverse.
-    expect(entry.toLowerCase()).not.toContain("idle");
-    expect(entry).toMatch(/when it was SET|time it was set/);
+    // resolveLadder's `focusVerdict` bridges the SESSION's own turn stream
+    // (scripts/nudge.ts) — the behaviour is pinned by nudge.test.ts's §14.9 cases,
+    // headlined by "a focus marker survives well past hook_focus_ttl_min while its
+    // session keeps producing turns". This test pins the USER-FACING half: the entry
+    // must describe an idle gap, and must NOT claim a fixed age from when it was set
+    // (the rev-2 reading this test used to pin, now its inverse).
+    expect(entry.toLowerCase()).toContain("idle");
+    expect(entry).not.toMatch(/when it was SET|time it was set/);
   });
 });

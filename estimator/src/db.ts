@@ -59,11 +59,13 @@ export const DB_PATH: string = process.env.EST_DB ?? join(DATA_ROOT, "estimator.
  *     `hook_bind_enabled` (master switch; `0` makes the drain discard the whole
  *     agent-binds batch unread — the rollback lever, enforced at drain time per
  *     §7.1's "zero hot-path DB work inside a worker" rather than hook-side),
- *     `hook_focus_ttl_min` (how old an `est focus` pointer may be and still be
- *     believed — deliberately equal to `attr_stale_minutes`'s default, measured
- *     FIXED from the marker's own timestamp per §3.2a/§8.1: "a focus file older
- *     than the TTL is ignored", not renewed by the focused task's own liveness
- *     window), `hook_bind_marker` (whether the `[est:<tid8>]` description marker is
+ *     `hook_focus_ttl_min` (the longest IDLE GAP an `est focus` pointer's session may
+ *     sit across and still be believed — REV3, §14.4 — deliberately equal to
+ *     `attr_stale_minutes`'s default; NOT an age from the marker's own timestamp, and
+ *     NOT renewed by the focused task's own attributed liveness window either (INV-TTL,
+ *     §14.2 — a bound task's spans must not feed back into its own marker's
+ *     believability), only by the session's raw turn stream continuing to transact),
+ *     `hook_bind_marker` (whether the `[est:<tid8>]` description marker is
  *     honoured; off by default — model-controlled text must not mint an
  *     exclusive-grade alias on its own), `hook_bind_batch_max` (drain batch cap).
  *     `task_alias.source = 'hook'` is a new documented VALUE of an existing

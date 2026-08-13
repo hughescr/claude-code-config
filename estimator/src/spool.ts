@@ -123,10 +123,12 @@ export const OVERRUN_MARKER_PREFIX = ".overrun-notified.";
  * reason every marker above is: `pruneMarkers` has to recognise the name so a marker
  * for a session that never comes back cannot leak forever. The REAPER's ceiling
  * ({@link FOCUS_MARKER_TTL_MS}, 7 days) is deliberately much longer than the
- * BELIEVABILITY window (`hook_focus_ttl_min`, default 120 — see the ladder in
- * `scripts/nudge.ts`): a marker can sit on disk, unbelieved, for a week before this
- * pruner ever touches it. The two are different questions — "may this file still be
- * read" vs "may what it says still be trusted" — and conflating them was rev 1's bug.
+ * BELIEVABILITY window (`hook_focus_ttl_min`, default 120 — REV3: an IDLE-GAP bound
+ * on the session's own turn stream, not an age; see the idle bridge in
+ * `scripts/nudge.ts`, HOOK-BINDING-SPEC.md §14.4): a marker can sit on disk,
+ * unbelieved, for a week before this pruner ever touches it. The two are different
+ * questions — "may this file still be read" vs "may what it says still be trusted" —
+ * and conflating them was rev 1's bug.
  */
 export const FOCUS_MARKER_PREFIX = ".focus.";
 /**
@@ -256,6 +258,21 @@ export type SpawnBindBasis =
   | "nested"
   | "parent_agent";
 
+/**
+ * HOOK-BINDING-SPEC.md §14.4/§14.8 (REV3): why a focus marker was DROPPED by the
+ * idle-bridge predicate rather than believed, recorded on the spool line so the
+ * drain's `binds_focus_drop` histogram (§14.8) can show how often markers die and
+ * why. `not_candidate` = named tid is not in the session's bound set at t_spawn;
+ * `bad_ts` = the marker's own timestamp did not parse; `post_spawn` = the marker was
+ * written AFTER t_spawn (§14.4.3); `contested` = competing evidence on a different
+ * bound task (§14.5); `idle` = a bridge gap >= `hook_focus_ttl_min` (§14.4.1);
+ * `scan_cap` = the turn-stream scan hit `FOCUS_BRIDGE_SCAN_MAX` and failed closed.
+ * Never set when no marker was read, nor when the marker WAS believed (`basis`
+ * `focus`/`focus_quiet`, or rung 4's `focus_disagrees` — a live-evidence override of
+ * a BELIEVED marker, not a drop).
+ */
+export type SpawnBindFocusDrop = "not_candidate" | "bad_ts" | "post_spawn" | "contested" | "idle" | "scan_cap";
+
 export interface SpawnBindRecord {
   ts: string;
   v: 2;
@@ -285,6 +302,9 @@ export interface SpawnBindRecord {
   /** Top-level payload key NAMES only, never values (§4, §9.1 privacy rule). */
   k?: string[];
   agent_type?: string;
+  /** §14.4/§14.8 (REV3): set only when a focus marker was read and DROPPED by the
+   *  idle bridge — see {@link SpawnBindFocusDrop}. */
+  focus_drop?: SpawnBindFocusDrop;
 }
 
 export interface SpoolRead<T> {
@@ -404,6 +424,15 @@ const SPAWN_BIND_BASES: ReadonlySet<string> = new Set([
   "parent_agent",
 ]);
 
+const SPAWN_BIND_FOCUS_DROPS: ReadonlySet<string> = new Set([
+  "not_candidate",
+  "bad_ts",
+  "post_spawn",
+  "contested",
+  "idle",
+  "scan_cap",
+]);
+
 export function parseSpawnBindLines(text: string): SpoolRead<SpawnBindRecord> {
   const { values, malformed, truncatedTail } = parseLines(text);
   const rows: SpawnBindRecord[] = [];
@@ -445,6 +474,10 @@ export function parseSpawnBindLines(text: string): SpoolRead<SpawnBindRecord> {
       nb: typeof o.nb === "number" ? o.nb : undefined,
       k: Array.isArray(o.k) && o.k.every((x) => typeof x === "string") ? (o.k as string[]) : undefined,
       agent_type: str(o.agent_type) ?? undefined,
+      focus_drop:
+        typeof o.focus_drop === "string" && SPAWN_BIND_FOCUS_DROPS.has(o.focus_drop)
+          ? (o.focus_drop as SpawnBindFocusDrop)
+          : undefined,
     });
   }
   return { rows, malformed: bad, truncatedTail };
@@ -452,11 +485,11 @@ export function parseSpawnBindLines(text: string): SpoolRead<SpawnBindRecord> {
 
 /**
  * Serialize one {@link SpawnBindRecord}, honoring the hard 512-byte `PIPE_BUF` budget
- * (§4): if the full line exceeds 511 bytes, drop `k`, then `basis`/`na`/`nb`,
- * re-serializing after each drop; if it is STILL over, return null (write nothing —
- * fail open, same discipline as every other hot-path failure in this file). In
- * practice this only bites on an unusually long `local_id`/`tid`, since every other
- * field is bounded by construction.
+ * (§4): if the full line exceeds 511 bytes, drop `k`, then `focus_drop` (§14.8: "the
+ * second thing sacrificed"), then `basis`/`na`/`nb`, re-serializing after each drop;
+ * if it is STILL over, return null (write nothing — fail open, same discipline as
+ * every other hot-path failure in this file). In practice this only bites on an
+ * unusually long `local_id`/`tid`, since every other field is bounded by construction.
  */
 export function serializeSpawnBindLine(rec: SpawnBindRecord): string | null {
   // A plain mutable bag rather than the typed record past this point: the assembly
@@ -469,6 +502,9 @@ export function serializeSpawnBindLine(rec: SpawnBindRecord): string | null {
     () => {}, // attempt 0: the full record, as given
     () => {
       delete full.k;
+    },
+    () => {
+      delete full.focus_drop;
     },
     () => {
       delete full.basis;
@@ -545,6 +581,11 @@ export interface DrainResult {
  *                       payload key set (`r.k`, or the literal string `"(absent)"`
  *                       when `k` was not sent) — §9.1's key-set regression detector.
  *                       Key NAMES only, never values: no privacy surface.
+ *   - `focus_drop`      `{reason: count}` (§14.8, REV3) over every survivor's
+ *                       {@link SpawnBindFocusDrop}, when present — how often the
+ *                       idle-bridge predicate dropped a marker, and why. Additive to
+ *                       `basis`, not a replacement: a dropped marker still resolves
+ *                       through rungs 5-8 and is counted there too.
  */
 export interface SpawnBindDrainResult {
   read: number;
@@ -560,6 +601,7 @@ export interface SpawnBindDrainResult {
   disabled_dropped: number;
   basis: Record<string, number>;
   keysets: Record<string, number>;
+  focus_drop: Record<string, number>;
 }
 
 function emptySpawnBindDrain(): SpawnBindDrainResult {
@@ -577,6 +619,7 @@ function emptySpawnBindDrain(): SpawnBindDrainResult {
     disabled_dropped: 0,
     basis: {},
     keysets: {},
+    focus_drop: {},
   };
 }
 
@@ -804,6 +847,11 @@ function drainAgentBinds(
     // order never fragments the histogram, never the values themselves.
     const ks = r.k === undefined ? "(absent)" : [...r.k].sort().join(",");
     out.keysets[ks] = (out.keysets[ks] ?? 0) + 1;
+
+    // §14.8 (REV3): the idle-bridge drop histogram, additive to `basis` above.
+    if (r.focus_drop !== undefined) {
+      out.focus_drop[r.focus_drop] = (out.focus_drop[r.focus_drop] ?? 0) + 1;
+    }
 
     // --- §4.1 step 5: nested resolution, against THIS BATCH's own aliases too ---
     if (r.basis === "nested") {
@@ -1091,6 +1139,12 @@ export const CLOSE_PASS_MARKER_TTL_MS = 24 * 60 * 60 * 1000;
  * bound, not the believability window. A marker this old is almost certainly a
  * finished or abandoned session's leftover; `est close` reclaims it far sooner in the
  * ordinary case, so 7 days is a backstop for a session that never closed at all.
+ *
+ * Still deliberately separate from believability under REV3 (§14): the believability
+ * window is an IDLE gap on the session's own turn stream (`hook_focus_ttl_min`,
+ * `scripts/nudge.ts`'s idle bridge, §14.4), not an age — "may this file still be
+ * read" and "may what it says still be trusted" remain two different questions with
+ * two different answers, and conflating them was rev 1's bug either way.
  */
 export const FOCUS_MARKER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -1203,8 +1257,12 @@ export function writeFocusMarker(
 /**
  * Read `sessionId`'s focus marker, or null when there is none / it is unreadable /
  * malformed. Returns the marker AS WRITTEN — the ladder (`scripts/nudge.ts`) is the
- * one place that decides whether it is still believable (§3.2a/§8.1's fixed-from-set
- * TTL); this function makes no freshness judgement of its own.
+ * one place that decides whether it is still believable (§14.4's idle-gap TTL, REV3);
+ * this function makes no freshness judgement of its own. That split is MORE load
+ * bearing under REV3, not less (§14.4.4): the believability predicate is computed
+ * read-time, inside the ladder's own transaction, precisely so this stays the only
+ * place freshness is judged — a drain-time re-stamp was rejected partly to avoid
+ * smearing that one question across two components.
  */
 export function readFocusMarker(sessionId: string, dir: string = SPOOL_DIR): FocusMarker | null {
   try {

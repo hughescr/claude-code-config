@@ -790,6 +790,10 @@ export interface SweepReport {
     binds_basis: Record<string, number>;
     /** `{sorted-key-names: count}` — §9.1's payload key-set regression detector. */
     binds_keysets: Record<string, number>;
+    /** `{reason: count}` (§14.8, REV3) over every survivor that read a focus marker
+     *  and had it DROPPED by the idle-bridge predicate rather than believed —
+     *  additive to `binds_basis`, not a replacement. */
+    binds_focus_drop: Record<string, number>;
   };
   /**
    * P2.3/P2.4: what the OTEL spool contributed. Every field is 0 when no receiver is
@@ -1172,6 +1176,7 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
       binds_disabled_dropped: 0,
       binds_basis: {},
       binds_keysets: {},
+      binds_focus_drop: {},
     },
     otel: {
       logs_read: 0,
@@ -1503,6 +1508,7 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     binds_disabled_dropped: spool.binds.disabled_dropped,
     binds_basis: spool.binds.basis,
     binds_keysets: spool.binds.keysets,
+    binds_focus_drop: spool.binds.focus_drop,
   };
 
   // 1a2. **Link the lifecycle stream to its tasks.** Both `task_event` writers have
@@ -4668,9 +4674,12 @@ unbind:                   (--agent <id> | --run <id> | --task <n> --session <sid
                           actual before acting.
 focus <tid>:              [--session <sid>] [--clear]
                           a session-scoped pointer the hook's PostToolUse ladder
-                          reads (HOOK-BINDING-SPEC.md §3.2a); believed only within
-                          hook_focus_ttl_min of when it was SET — a still-running
-                          task does not renew it, so re-run est focus to renew.
+                          reads (HOOK-BINDING-SPEC.md §14.4); believed until the
+                          SESSION goes hook_focus_ttl_min minutes without a turn —
+                          an idle gap, not an age from when it was set, so a
+                          still-running task keeps it alive on its own. Re-running
+                          est focus RE-POINTS it to a different task; it is not a
+                          chore you owe the system to keep this one alive.
                           Written automatically by est open and est bind --session;
                           this verb is for the two-tasks-open-at-once case, or
                           --clear to disarm it early.

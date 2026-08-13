@@ -51,12 +51,14 @@ import {
   overrunMarkerFile,
   readFocusMarker,
   serializeSpawnBindLine,
+  type FocusMarker,
   type NudgeKind,
   type SpawnBindBasis,
+  type SpawnBindFocusDrop,
   type SpawnBindKind,
   type SpawnBindRecord,
 } from "../src/spool.ts";
-import { activeTasks } from "../src/burn.ts";
+import { activeTasks, type ActiveTask } from "../src/burn.ts";
 import { maybeSpawnMicrosweep } from "../src/microsweep.ts";
 
 // `EST_DB` already overrides the database path (db.ts); this mirrors that
@@ -324,6 +326,119 @@ interface LadderResult {
   basis: SpawnBindBasis;
   na: number;
   nb: number;
+  /** HOOK-BINDING-SPEC.md §14.4/§14.8 (REV3): set only when a focus marker was read
+   *  and DROPPED by the idle bridge — see {@link focusVerdict}. */
+  focusDrop?: SpawnBindFocusDrop;
+}
+
+/**
+ * HOOK-BINDING-SPEC.md §14.4/§14.8 (REV3): the idle-bridge scan's PK-slice read is
+ * bounded so an unbounded backlog cannot be walked in full on the hot path. A code
+ * constant, not config (§14.4.2): 2000 turns inside one marker's lifetime is a shape
+ * this corpus has never produced, and `binds_focus_drop.scan_cap` (§14.8) is the
+ * observed counter that checks the assumption rather than assuming it. Hitting the
+ * cap fails CLOSED (marker dropped) — every ambiguity in this design resolves toward
+ * "write no alias".
+ */
+const FOCUS_BRIDGE_SCAN_MAX = 2000;
+
+type FocusVerdict = { believed: true } | { believed: false; reason: SpawnBindFocusDrop };
+
+/**
+ * HOOK-BINDING-SPEC.md §14.5 (REV3), constraint (c): competing-evidence invalidation.
+ * A believed marker naming `T` is killed when a DIFFERENT bound task `U` has a
+ * label-free `est scope` row newer than the marker — the one CLI act that can move a
+ * session's real focus onto `U` without also rewriting the marker file itself (every
+ * other such act — `est open`, `est bind --session`, `est focus`, `est close` —
+ * already rewrites or clears the pointer atomically; see §14.5's completeness table).
+ * Label-free per INV-TTL (§14.2): `task_scope.source = 'est_scope'` is written only by
+ * a human running `est scope`, never by this hook or by attribution, so this probe
+ * cannot be moved by the marker's own writes either.
+ */
+function competingEvidence(db: Database, bound: ActiveTask[], marker: FocusMarker): boolean {
+  for (const t of bound) {
+    if (t.tid === marker.tid) continue;
+    const row = db
+      .query<{ n: number }, [string, string]>(
+        "SELECT 1 AS n FROM task_scope WHERE tid = ? AND ts > ? AND source = 'est_scope' LIMIT 1",
+      )
+      .get(t.tid, marker.ts);
+    if (row !== null && row !== undefined) return true;
+  }
+  return false;
+}
+
+/**
+ * HOOK-BINDING-SPEC.md §14.4 (REV3): the idle bridge. A focus marker naming `T` is
+ * BELIEVED at `spawnAt` (`t_spawn`) iff `bound` still carries `T` as a candidate, the
+ * marker was not written after `t_spawn`, no competing evidence (§14.5) applies to a
+ * different bound task, and the SESSION's own turn stream bridges
+ * `[marker.ts, t_spawn]` with no gap of `ttlMs` or more.
+ *
+ * Marker-immune by construction (INV-TTL, §14.2): every input this function reads is
+ * `turn(session_id, started_at, duration_ms)` or `task_scope` — rows no hook write and
+ * no attribution pass ever touches — so the verdict is invariant under deleting every
+ * `task_alias` row this marker has ever caused. It is the anti-circularity property
+ * §14.1 names: `T`'s own ATTRIBUTED activity (which this marker's binds manufacture)
+ * plays no part in the predicate, only the session's raw turn timeline does. Monotone
+ * by construction too: once a gap exists inside `[marker.ts, t_spawn]` it exists for
+ * every LATER `t_spawn` as well, so a dead marker can never be revived by resuming the
+ * session — the bridge, not `now - last_turn <= TTL`, is what makes expiry a one-way
+ * latch (§14.4.1 property 2).
+ */
+function focusVerdict(
+  db: Database,
+  marker: FocusMarker,
+  bound: ActiveTask[],
+  session: string,
+  spawnAt: Date,
+  ttlMs: number,
+): FocusVerdict {
+  const target = bound.find((t) => t.tid === marker.tid);
+  if (target === undefined) return { believed: false, reason: "not_candidate" };
+
+  const markerMs = Date.parse(marker.ts);
+  // An unparseable timestamp is EXPIRED, not absent (kept verbatim from the prior
+  // fixed-from-set reading, §14.7): a corrupt marker is maximally suspect, not
+  // maximally believable.
+  if (!Number.isFinite(markerMs)) return { believed: false, reason: "bad_ts" };
+
+  const spawnMs = spawnAt.getTime();
+  // §14.4.3: judged at t_spawn, not at fire time — the same anachronism §3.1 already
+  // forecloses on the window filter. A synchronous Agent's PostToolUse can fire hours
+  // after t_spawn, and `est focus` may well have run in between; a marker written
+  // AFTER the spawn it would be judged against cannot have been what the human was
+  // pointing at when the spawn happened.
+  if (markerMs > spawnMs) return { believed: false, reason: "post_spawn" };
+
+  if (competingEvidence(db, bound, marker)) return { believed: false, reason: "contested" };
+
+  // The bridge itself: walk the session's turns forward from marker.ts, extending a
+  // cursor by each turn's own span; a step that exceeds ttlMs — including the final
+  // step to t_spawn — is an idle gap and the marker is dead. `LIMIT` at exactly the
+  // scan cap (not cap+1): hitting it fails closed on the conservative assumption that
+  // more rows exist beyond it, per §14.4.2's specification.
+  const rows = db
+    .query<{ started_at: string; duration_ms: number | null }, [string, string, string]>(
+      `SELECT started_at, duration_ms FROM turn
+        WHERE session_id = ? AND started_at >= ? AND started_at <= ?
+        ORDER BY started_at ASC
+        LIMIT ${FOCUS_BRIDGE_SCAN_MAX}`,
+    )
+    .all(session, marker.ts, spawnAt.toISOString());
+  if (rows.length === FOCUS_BRIDGE_SCAN_MAX) return { believed: false, reason: "scan_cap" };
+
+  let cursor = markerMs;
+  for (const row of rows) {
+    const s = Date.parse(row.started_at);
+    if (!Number.isFinite(s)) continue; // a corrupt turn row: skip it, do not let it break the bridge
+    if (s - cursor > ttlMs) return { believed: false, reason: "idle" };
+    // A turn with duration_ms IS NULL contributes started_at alone (§14.4.2): treating
+    // NULL as zero is the same conservative direction as skipping a corrupt row above.
+    cursor = Math.max(cursor, s + (row.duration_ms ?? 0));
+  }
+  if (spawnMs - cursor > ttlMs) return { believed: false, reason: "idle" };
+  return { believed: true };
 }
 
 /**
@@ -346,13 +461,18 @@ function resolveLadder(
   const active = bound.filter((t) => t.active);
   const na = active.length;
   const nb = bound.length;
+  // Set at most once, by the focus block below, and carried onto every LATER return
+  // (rungs 5-8) so a dropped marker's reason survives onto the spool line even when
+  // the walk falls all the way through (§14.8: additive to `basis`, not exclusive).
+  let focusDrop: SpawnBindFocusDrop | undefined;
+  const R = (tid: string | null, basis: SpawnBindBasis): LadderResult => ({ tid, basis, na, nb, focusDrop });
 
   // Rung 1: the description marker, only when explicitly enabled (default off, §3.2b).
   if ((getConfig(db, "hook_bind_marker") ?? "0") === "1") {
     const prefix = extractMarkerTidPrefix(opts.toolName, opts.toolInput);
     if (prefix !== null) {
       const matches = bound.filter((t) => t.tid.toLowerCase().startsWith(prefix));
-      if (matches.length === 1) return { tid: matches[0]!.tid, basis: "marker", na, nb };
+      if (matches.length === 1) return R(matches[0]!.tid, "marker");
       // Zero or many matches: the marker is IGNORED, not obeyed — falls through to the
       // rest of the ladder exactly as if it had never been present. (`hook_marker_unresolved`
       // is not raised from here: hooks never write to the database, §1 P1.10; see this
@@ -360,39 +480,39 @@ function resolveLadder(
     }
   }
 
-  // Rungs 2-4: the focus marker, believed only within a fixed-from-set TTL (§3.2a/§8.1:
-  // "a focus file older than the TTL is ignored"). Age is measured from the marker's
-  // OWN timestamp, not from any per-task touch — a marker does not get to renew its
-  // own believability just because the task it names is still absorbing work, because
-  // the task being touched is exactly the ambiguous case (an unrelated spawn keeps
-  // `touched` fresh too) that the TTL exists to bound.
+  // Rungs 2-4: the focus marker. REV3 (§14.4, HOOK-BINDING-SPEC.md — AUTHORITATIVE
+  // over the prior fixed-from-set reading): believed while the SESSION's own turn
+  // stream bridges [marker.ts, t_spawn] with no idle gap >= hook_focus_ttl_min and no
+  // competing evidence (§14.5) — NOT a fixed age measured from the marker's own
+  // timestamp. It is `T`'s own ATTRIBUTED activity that may never renew the marker's
+  // believability (§14.1's circularity: a bound task's spans reset its own
+  // `quietTurns`, so the marker would otherwise manufacture the very evidence that
+  // keeps it alive) — the bridge reads only the session's raw turn timeline and
+  // `task_scope`, which are label-free and immune to this marker's own writes by
+  // construction (INV-TTL, §14.2), so it cannot renew its own believability by one
+  // second no matter how much of `T`'s activity it caused.
   const marker = readFocusMarker(opts.session);
   if (marker !== null) {
-    const target = bound.find((t) => t.tid === marker.tid);
-    if (target !== undefined) {
-      const focusTtlMinRaw = Number.parseInt(getConfig(db, "hook_focus_ttl_min") ?? "120", 10);
-      const focusTtlMs = (Number.isFinite(focusTtlMinRaw) ? focusTtlMinRaw : 120) * 60_000;
-      const markerTs = Date.parse(marker.ts);
-      // An unparseable timestamp is treated as already EXPIRED, not as absent — falling
-      // back to `target.touched` (the prior behaviour) made a corrupt marker maximally
-      // believable instead of maximally suspect.
-      if (Number.isFinite(markerTs)) {
-        const ageMs = opts.now.getTime() - markerTs;
-        if (ageMs <= focusTtlMs) {
-          if (target.active) return { tid: target.tid, basis: "focus", na, nb };
-          if (na === 0) return { tid: target.tid, basis: "focus_quiet", na, nb };
-          return { tid: null, basis: "focus_disagrees", na, nb }; // stale pointer vs live evidence
-        }
-      }
-      // expired, or unparseable: falls through, exactly as if there were no marker at all
+    const focusTtlMinRaw = Number.parseInt(getConfig(db, "hook_focus_ttl_min") ?? "120", 10);
+    const focusTtlMs = (Number.isFinite(focusTtlMinRaw) ? focusTtlMinRaw : 120) * 60_000;
+    const verdict = focusVerdict(db, marker, bound, opts.session, opts.spawnAt, focusTtlMs);
+    if (verdict.believed) {
+      const target = bound.find((t) => t.tid === marker.tid)!;
+      if (target.active) return R(target.tid, "focus");
+      if (na === 0) return R(target.tid, "focus_quiet");
+      return R(null, "focus_disagrees"); // stale pointer vs live evidence — not a drop, see §14.8
     }
+    // Dropped: treated as ABSENT, never a witness on its own — falls through to the
+    // rest of the ladder exactly as if there were no marker at all, carrying the
+    // reason onto whichever rung ultimately answers (§3.3, §14.8's `focus_drop`).
+    focusDrop = verdict.reason;
   }
 
   // Rungs 5-8: the session-wide active set.
-  if (nb === 0) return { tid: null, basis: "no_bound", na, nb };
-  if (na === 0) return { tid: null, basis: "no_active", na, nb };
-  if (na === 1) return { tid: active[0]!.tid, basis: "sole_active", na, nb };
-  return { tid: null, basis: "multi_active", na, nb };
+  if (nb === 0) return R(null, "no_bound");
+  if (na === 0) return R(null, "no_active");
+  if (na === 1) return R(active[0]!.tid, "sole_active");
+  return R(null, "multi_active");
 }
 
 /**
@@ -470,7 +590,15 @@ function resolveAndAppendBind(
     if (ladder === undefined) {
       rec = { ...base, parent_agent: null, tid: null, basis: "db_unavailable" };
     } else {
-      rec = { ...base, parent_agent: null, tid: ladder.tid, basis: ladder.basis, na: ladder.na, nb: ladder.nb };
+      rec = {
+        ...base,
+        parent_agent: null,
+        tid: ladder.tid,
+        basis: ladder.basis,
+        na: ladder.na,
+        nb: ladder.nb,
+        focus_drop: ladder.focusDrop,
+      };
     }
   }
 

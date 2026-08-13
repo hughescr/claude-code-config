@@ -129,6 +129,67 @@ function seedBoundTask(tid: string, sessionId: string): void {
   }
 }
 
+/**
+ * §14.4/§14.9 (REV3): one `turn` row — the ONLY input the idle bridge reads besides
+ * `task_scope` (INV-TTL, §14.2). `promptId` must be unique within the session (turn's
+ * PK is `(session_id, prompt_id)`).
+ */
+function seedTurn(sessionId: string, promptId: string, startedAt: Date, durationMs: number | null = 0): void {
+  const db = openDb({ path: dbPath });
+  try {
+    db.run("INSERT INTO turn (session_id,prompt_id,started_at,duration_ms) VALUES (?,?,?,?)", [
+      sessionId,
+      promptId,
+      startedAt.toISOString(),
+      durationMs,
+    ]);
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * §14.9's "the session has a turn every ~N minutes" fixtures: seed one `durationMs`-
+ * long turn every `stepMs` from `start` up to and including `end`. `prefix` keeps
+ * `prompt_id`s unique across more than one call for the same session (turn's PK is
+ * `(session_id, prompt_id)`) — e.g. an "idle hole" fixture calling this twice.
+ */
+function seedTurnsEvery(
+  sessionId: string,
+  start: Date,
+  end: Date,
+  stepMs: number,
+  durationMs = 0,
+  prefix = "p",
+): void {
+  let t = start.getTime();
+  let i = 0;
+  while (t <= end.getTime()) {
+    seedTurn(sessionId, `${prefix}${i}`, new Date(t), durationMs);
+    t += stepMs;
+    i += 1;
+  }
+}
+
+/**
+ * §14.5's competing-evidence probe: a `task_scope` row for `tid` at `ts`, under
+ * `source`. Only `'est_scope'` is what the probe matches — `seedBoundTask` already
+ * writes a `seq=1` row with `source='est_open'`, which is why `seq` defaults to 2 here
+ * (append-only PK is `(tid, seq)`).
+ */
+function seedTaskScope(tid: string, ts: Date, source: string, seq = 2): void {
+  const db = openDb({ path: dbPath });
+  try {
+    db.run(
+      `INSERT INTO task_scope (tid,seq,ts,subject,description,dod_json,scope_hash,source)
+       VALUES (?,?,?,?,?,?,?,?)`,
+      [tid, seq, ts.toISOString(), "later scope", null, "[]", `deadbeef${seq}`, source],
+    );
+  } finally {
+    db.close();
+  }
+}
+
 function seedTask(opts: {
   tid: string;
   sessionId: string;
@@ -903,7 +964,7 @@ describe("nudge.ts — job 0: spawn-time attribution binding", () => {
     });
   });
 
-  describe("the est focus pointer (§3.2a) — rungs 2-4", () => {
+  describe("the est focus pointer (§3.2a) — rungs 2-4, REV3 idle bridge (§14.4)", () => {
     test("rung 2: focus names an ACTIVE task -> bind, basis='focus'", () => {
       initDb();
       seedBoundTask("t-f1", "sess-focus2");
@@ -922,11 +983,355 @@ describe("nudge.ts — job 0: spawn-time attribution binding", () => {
       expect(agentBindsLines()[0]).toMatchObject({ tid: "t-f1", basis: "focus" });
     });
 
-    test("a focus marker OLDER than hook_focus_ttl_min, on an already-quiet task, is ignored", () => {
-      // §3.2a/§8.1's fixed-from-set TTL: age is measured from the marker's OWN
-      // timestamp, never renewed by the named task's own activity. This test backdates
-      // the task's touch too so it is unambiguous that the TASK's quietness, not just
-      // the marker's age, puts it past the ladder's focus rungs.
+    // §14.9 case 1 (the ruling's headline case): a 6-hour-old marker survives because
+    // the SESSION kept transacting, not because the task's own age is short. This is
+    // the test that FAILS under the superseded fixed-from-set reading (F1 variant A),
+    // and is the whole reason REV3 exists (HOOK-BINDING-SPEC.md §14.0, §14.9#1).
+    test("§14.9#1 headline: a focus marker survives 6 hours of steady session turns", () => {
+      initDb();
+      seedBoundTask("t-headline", "sess-headline");
+      const markerTs = new Date(Date.now() - 6 * 60 * 60_000);
+      writeFocusMarker("sess-headline", "t-headline", "est_focus", spoolDir, markerTs);
+      // A turn every 20 minutes across the whole 6 hours — no gap anywhere near the
+      // 120-minute default TTL.
+      seedTurnsEvery("sess-headline", markerTs, new Date(Date.now() - 60_000), 20 * 60_000);
+      const r = runNudge(
+        JSON.stringify({
+          session_id: "sess-headline",
+          tool_name: "Agent",
+          tool_use_id: "toolu_headline",
+          tool_input: {},
+          tool_response: asyncAgentResponse("agent-headline"),
+        }),
+      );
+      expect(r.exitCode).toBe(0);
+      expect(agentBindsLines()[0]).toMatchObject({ tid: "t-headline", basis: "focus" });
+    });
+
+    // §14.9 case 2: idle expiry, and the monotonicity it pins. A gap inside the bridge
+    // kills the marker even though activity resumes later and continues right up to
+    // t_spawn — expiry is a one-way latch (§14.4.1 property 2), not a "how long ago was
+    // the last turn" check, which would wrongly revive a dead marker on resume.
+    test("§14.9#2 idle expiry: a >TTL hole in the turn stream drops the marker and later activity does not resurrect it", () => {
+      initDb();
+      seedBoundTask("t-idle", "sess-idle");
+      const markerTs = new Date(Date.now() - 6 * 60 * 60_000);
+      writeFocusMarker("sess-idle", "t-idle", "est_focus", spoolDir, markerTs);
+      // Turns for the first hour...
+      seedTurnsEvery("sess-idle", markerTs, new Date(markerTs.getTime() + 60 * 60_000), 10 * 60_000);
+      // ...then a 3-hour hole (> the 120-minute default TTL)...
+      const resumeAt = new Date(markerTs.getTime() + 4 * 60 * 60_000);
+      // ...then turns resume and continue right up to (near) t_spawn.
+      seedTurnsEvery("sess-idle", resumeAt, new Date(Date.now() - 60_000), 10 * 60_000, 0, "q");
+      const r = runNudge(
+        JSON.stringify({
+          session_id: "sess-idle",
+          tool_name: "Agent",
+          tool_use_id: "toolu_idle",
+          tool_input: {},
+          tool_response: asyncAgentResponse("agent-idle"),
+        }),
+      );
+      expect(r.exitCode).toBe(0);
+      const line = agentBindsLines()[0]!;
+      expect(line.focus_drop).toBe("idle");
+      expect(line.basis).not.toBe("focus");
+      expect(line.basis).not.toBe("focus_quiet");
+    });
+
+    // §14.9 case 3: the boundary is `>`, not `>=` (scripts/nudge.ts's `focusVerdict`).
+    // Both gaps below are between two SEEDED turns, never against t_spawn itself, so
+    // the comparison is exact and immune to subprocess spawn-time jitter; only the
+    // final "bridge the rest of the way to t_spawn" step is left to real wall-clock
+    // time, and it is given a comfortable margin in both cases.
+    describe("§14.9#3 the idle-gap boundary", () => {
+      test("a gap of EXACTLY hook_focus_ttl_min is still believed", () => {
+        initDb();
+        seedBoundTask("t-bound1", "sess-bound1");
+        const ttlMs = 120 * 60_000; // the default hook_focus_ttl_min
+        const base = new Date(Date.now() - 2 * ttlMs);
+        writeFocusMarker("sess-bound1", "t-bound1", "est_focus", spoolDir, base);
+        seedTurn("sess-bound1", "p0", base, 0);
+        seedTurn("sess-bound1", "p1", new Date(base.getTime() + ttlMs), 0); // gap == ttlMs exactly
+        seedTurn("sess-bound1", "p2", new Date(base.getTime() + ttlMs + 60_000), 0); // bridge to t_spawn
+        const r = runNudge(
+          JSON.stringify({
+            session_id: "sess-bound1",
+            tool_name: "Agent",
+            tool_use_id: "toolu_bound1",
+            tool_input: {},
+            tool_response: asyncAgentResponse("agent-bound1"),
+          }),
+        );
+        expect(r.exitCode).toBe(0);
+        expect(agentBindsLines()[0]).toMatchObject({ tid: "t-bound1", basis: "focus" });
+      });
+
+      test("a gap one second past hook_focus_ttl_min is dropped 'idle'", () => {
+        initDb();
+        seedBoundTask("t-bound2", "sess-bound2");
+        const ttlMs = 120 * 60_000;
+        const base = new Date(Date.now() - 2 * ttlMs);
+        writeFocusMarker("sess-bound2", "t-bound2", "est_focus", spoolDir, base);
+        seedTurn("sess-bound2", "p0", base, 0);
+        seedTurn("sess-bound2", "p1", new Date(base.getTime() + ttlMs + 1000), 0); // one second OVER
+        seedTurn("sess-bound2", "p2", new Date(base.getTime() + ttlMs + 60_000), 0); // resumes after
+        const r = runNudge(
+          JSON.stringify({
+            session_id: "sess-bound2",
+            tool_name: "Agent",
+            tool_use_id: "toolu_bound2",
+            tool_input: {},
+            tool_response: asyncAgentResponse("agent-bound2"),
+          }),
+        );
+        expect(r.exitCode).toBe(0);
+        const line = agentBindsLines()[0]!;
+        expect(line.focus_drop).toBe("idle");
+        expect(line.basis).not.toBe("focus");
+      });
+    });
+
+    // §14.9 case 4: the anti-circularity regression for §14.1's finding. Manufactures
+    // exactly the evidence a NAIVE `MAX(marker.ts, T.last_attributed_activity)` basis
+    // would have read as "T is still busy" — a hook-written alias for T and an
+    // attributed turn, planted INSIDE the idle gap — and asserts the verdict is
+    // unchanged. This is INV-TTL (§14.2) made concrete: the bridge reads only
+    // turn(session_id, started_at, duration_ms) and task_scope, never `tid` or
+    // `task_alias`, so none of this manufactured evidence can move it.
+    test("§14.9#4 anti-circularity: more hook-bound activity for T does not renew a marker across an idle gap", () => {
+      initDb();
+      seedBoundTask("t-anti-t", "sess-anti");
+      seedBoundTask("t-anti-u", "sess-anti");
+      const markerTs = new Date(Date.now() - 4 * 60 * 60_000);
+      // One turn right at the marker, then NOTHING until t_spawn ~4h later — an
+      // unbroken idle gap on the RAW turn stream.
+      seedTurn("sess-anti", "p0", markerTs, 0);
+      writeFocusMarker("sess-anti", "t-anti-t", "est_focus", spoolDir, markerTs);
+
+      const db = openDb({ path: dbPath });
+      try {
+        const midTs = new Date(markerTs.getTime() + 2 * 60 * 60_000).toISOString(); // 2h into the gap
+        // A pre-existing hook-written alias for T, planted well inside the gap.
+        db.run(
+          "INSERT INTO task_alias (tid,id_kind,session_id,local_id,first_seen,source) VALUES (?,?,?,?,?,?)",
+          ["t-anti-t", "agent", "sess-anti", "agent-manufactured", midTs, "hook"],
+        );
+        // What attribution would have done with that alias: the one turn covering it
+        // gets tid = T. Set directly so the scenario is the WORST case, not merely a
+        // plausible one — the naive circular basis would read this as T being touched
+        // at p0's instant, i.e. exactly the marker's own timestamp.
+        db.run("UPDATE turn SET tid = ? WHERE session_id = ? AND prompt_id = ?", [
+          "t-anti-t",
+          "sess-anti",
+          "p0",
+        ]);
+      } finally {
+        db.close();
+      }
+
+      const r = runNudge(
+        JSON.stringify({
+          session_id: "sess-anti",
+          tool_name: "Agent",
+          tool_use_id: "toolu_anti",
+          tool_input: {},
+          tool_response: asyncAgentResponse("agent-anti"),
+        }),
+      );
+      expect(r.exitCode).toBe(0);
+      const line = agentBindsLines()[0]!;
+      expect(line.focus_drop).toBe("idle");
+      expect(line.basis).not.toBe("focus");
+      expect(line.basis).not.toBe("focus_quiet");
+    });
+
+    // §14.9 case 5: competing-evidence invalidation (§14.5), scoped narrowly to
+    // `source='est_scope'`. The companion proves the scoping is deliberate, not an
+    // oversight: `seedBoundTask` itself writes a `task_scope` row with
+    // `source='est_open'` for every task it seeds, and that source is NOT covered,
+    // because a real `est open` would already have rewritten the marker file itself
+    // (§14.5's completeness table) — this rule exists only for `est scope`, the one
+    // CLI act that moves a session's focus without touching the marker.
+    describe("§14.9#5 competing evidence (§14.5)", () => {
+      test("an est_scope row on a DIFFERENT bound task, newer than the marker, contests it", () => {
+        initDb();
+        seedBoundTask("t-cont-t", "sess-cont");
+        seedBoundTask("t-cont-u", "sess-cont");
+        const markerTs = new Date(Date.now() - 30 * 60_000);
+        writeFocusMarker("sess-cont", "t-cont-t", "est_focus", spoolDir, markerTs);
+        seedTurnsEvery("sess-cont", markerTs, new Date(Date.now() - 60_000), 5 * 60_000); // bridge intact
+        seedTaskScope("t-cont-u", new Date(Date.now() - 10 * 60_000), "est_scope");
+        const r = runNudge(
+          JSON.stringify({
+            session_id: "sess-cont",
+            tool_name: "Agent",
+            tool_use_id: "toolu_cont",
+            tool_input: {},
+            tool_response: asyncAgentResponse("agent-cont"),
+          }),
+        );
+        expect(r.exitCode).toBe(0);
+        const line = agentBindsLines()[0]!;
+        expect(line.focus_drop).toBe("contested");
+        expect(line.basis).not.toBe("focus");
+      });
+
+      test("companion: the same row under source='est_open' does NOT contest it (the deliberate scoping)", () => {
+        initDb();
+        seedBoundTask("t-openc-t", "sess-openc");
+        seedBoundTask("t-openc-u", "sess-openc");
+        const markerTs = new Date(Date.now() - 30 * 60_000);
+        writeFocusMarker("sess-openc", "t-openc-t", "est_focus", spoolDir, markerTs);
+        seedTurnsEvery("sess-openc", markerTs, new Date(Date.now() - 60_000), 5 * 60_000);
+        seedTaskScope("t-openc-u", new Date(Date.now() - 10 * 60_000), "est_open");
+        const r = runNudge(
+          JSON.stringify({
+            session_id: "sess-openc",
+            tool_name: "Agent",
+            tool_use_id: "toolu_openc",
+            tool_input: {},
+            tool_response: asyncAgentResponse("agent-openc"),
+          }),
+        );
+        expect(r.exitCode).toBe(0);
+        expect(agentBindsLines()[0]).toMatchObject({ tid: "t-openc-t", basis: "focus" });
+      });
+    });
+
+    // §14.9 case 6: judged at t_spawn, not at hook-fire time (§14.4.3) — a synchronous
+    // Agent's PostToolUse can fire hours after t_spawn, and `est focus` may well have
+    // run in between. The task's `created_at` is backdated so it is still a candidate
+    // AT t_spawn (§3.1's window filter); only the marker's own timestamp is what
+    // decides post_spawn vs believed here.
+    describe("§14.9#6 post_spawn (§14.4.3)", () => {
+      test("a marker written AFTER t_spawn (a 1h synchronous Agent, marker set 10 min ago) is dropped 'post_spawn'", () => {
+        initDb();
+        seedBoundTask("t-post1", "sess-post1");
+        const oneHourMs = 60 * 60_000;
+        const db = openDb({ path: dbPath });
+        try {
+          db.run("UPDATE task SET created_at = ? WHERE tid = ?", [
+            new Date(Date.now() - 2 * oneHourMs).toISOString(),
+            "t-post1",
+          ]);
+        } finally {
+          db.close();
+        }
+        const markerTs = new Date(Date.now() - 10 * 60_000); // AFTER t_spawn (now - 1h)
+        writeFocusMarker("sess-post1", "t-post1", "est_focus", spoolDir, markerTs);
+        const r = runNudge(
+          JSON.stringify({
+            session_id: "sess-post1",
+            tool_name: "Agent",
+            tool_use_id: "toolu_post1",
+            tool_input: {},
+            tool_response: syncAgentResponse("agent-post1", oneHourMs),
+          }),
+        );
+        expect(r.exitCode).toBe(0);
+        const line = agentBindsLines()[0]!;
+        expect(line.focus_drop).toBe("post_spawn");
+        expect(line.basis).not.toBe("focus");
+        expect(line.basis).not.toBe("focus_quiet");
+      });
+
+      test("companion: a marker written well before t_spawn, with an intact bridge, is believed", () => {
+        initDb();
+        seedBoundTask("t-post2", "sess-post2");
+        const markerTs = new Date(Date.now() - 4 * 60 * 60_000);
+        writeFocusMarker("sess-post2", "t-post2", "est_focus", spoolDir, markerTs);
+        seedTurnsEvery("sess-post2", markerTs, new Date(Date.now() - 60_000), 20 * 60_000);
+        const r = runNudge(
+          JSON.stringify({
+            session_id: "sess-post2",
+            tool_name: "Agent",
+            tool_use_id: "toolu_post2",
+            tool_input: {},
+            tool_response: asyncAgentResponse("agent-post2"),
+          }),
+        );
+        expect(r.exitCode).toBe(0);
+        expect(agentBindsLines()[0]).toMatchObject({ tid: "t-post2", basis: "focus" });
+      });
+    });
+
+    // §14.9 case 7: an unparseable marker timestamp is EXPIRED, not absent — kept
+    // verbatim from the prior fixed-from-set reading (a corrupt marker is maximally
+    // suspect, not maximally believable). `readFocusMarker` does not itself validate
+    // that `ts` parses, so this constructs the corrupt shape by hand.
+    test("§14.9#7 bad_ts: an unparseable marker timestamp is dropped, never believed", () => {
+      initDb();
+      seedBoundTask("t-badts", "sess-badts");
+      mkdirSync(spoolDir, { recursive: true });
+      writeFileSync(
+        join(spoolDir, ".focus.sess-badts"),
+        JSON.stringify({ tid: "t-badts", ts: "not-a-timestamp", by: "est_focus" }),
+      );
+      const r = runNudge(
+        JSON.stringify({
+          session_id: "sess-badts",
+          tool_name: "Agent",
+          tool_use_id: "toolu_badts",
+          tool_input: {},
+          tool_response: asyncAgentResponse("agent-badts"),
+        }),
+      );
+      expect(r.exitCode).toBe(0);
+      const line = agentBindsLines()[0]!;
+      expect(line.focus_drop).toBe("bad_ts");
+      expect(line.basis).not.toBe("focus");
+      expect(line.basis).not.toBe("focus_quiet");
+    });
+
+    // §14.9 case 8: hitting FOCUS_BRIDGE_SCAN_MAX fails CLOSED. 2000 turns one second
+    // apart span barely half an hour — comfortably inside the TTL on their own — so the
+    // ONLY way this can fail is the scan cap (scripts/nudge.ts), never an idle gap.
+    test("§14.9#8 scan_cap: hitting the bridge scan cap drops the marker", () => {
+      initDb();
+      seedBoundTask("t-scancap", "sess-scancap");
+      const markerTs = new Date(Date.now() - 40 * 60_000);
+      writeFocusMarker("sess-scancap", "t-scancap", "est_focus", spoolDir, markerTs);
+      const db = openDb({ path: dbPath });
+      try {
+        const start = markerTs.getTime();
+        db.transaction(() => {
+          for (let i = 0; i < 2000; i += 1) {
+            db.run("INSERT INTO turn (session_id,prompt_id,started_at,duration_ms) VALUES (?,?,?,?)", [
+              "sess-scancap",
+              `p${i}`,
+              new Date(start + i * 1000).toISOString(),
+              0,
+            ]);
+          }
+        })();
+      } finally {
+        db.close();
+      }
+      const r = runNudge(
+        JSON.stringify({
+          session_id: "sess-scancap",
+          tool_name: "Agent",
+          tool_use_id: "toolu_scancap",
+          tool_input: {},
+          tool_response: asyncAgentResponse("agent-scancap"),
+        }),
+      );
+      expect(r.exitCode).toBe(0);
+      const line = agentBindsLines()[0]!;
+      expect(line.focus_drop).toBe("scan_cap");
+      expect(line.basis).not.toBe("focus");
+      expect(line.basis).not.toBe("focus_quiet");
+    });
+
+    // §14.9 case 9: the three pre-REV3 fixtures, kept and re-commented rather than
+    // deleted (§14.7 rows 9-11) — none of their ASSERTIONS change, only why they pass.
+    test("§14.9#9a a focus marker across an idle session (no turn rows at all) on an already-quiet task is ignored", () => {
+      // Under REV3 this is an idle-gap drop, not a fixed-age one: `seedBoundTask` seeds
+      // NO `turn` rows, so the bridge finds nothing between marker.ts and t_spawn and
+      // the whole 3-hour span is one unbroken idle gap (§14.7 row 9). Backdating the
+      // task's own `created_at` too keeps this test unambiguous about WHY it falls
+      // through — the marker is dropped before "active" is ever consulted.
       initDb();
       seedBoundTask("t-fstale", "sess-focus-stale");
       const staleTs = new Date(Date.now() - 3 * 60 * 60 * 1000); // 3h old, > default 120 min
@@ -947,19 +1352,22 @@ describe("nudge.ts — job 0: spawn-time attribution binding", () => {
         }),
       );
       expect(r.exitCode).toBe(0);
-      // Falls through past the (ignored) stale marker to the session-wide ladder:
-      // exactly one bound task, quiet or not, resolves via rung 5/7 rather than focus.
-      expect(agentBindsLines()[0]!.basis).not.toBe("focus");
-      expect(agentBindsLines()[0]!.basis).not.toBe("focus_quiet");
+      const line = agentBindsLines()[0]!;
+      expect(line.focus_drop).toBe("idle");
+      expect(line.basis).not.toBe("focus");
+      expect(line.basis).not.toBe("focus_quiet");
     });
 
-    test("a focus marker older than hook_focus_ttl_min is ignored EVEN WHILE its task is still absorbing work", () => {
-      // §3.2a/§8.1: the TTL is fixed from the marker's OWN timestamp. Both tasks here
-      // are freshly minted (created_at == "now", no backdating), so `touched` is fresh
-      // and both are `active` — the case the rev-3 idle-based reading would have kept
-      // believing the marker forever. A second active task forces real ambiguity: if
-      // the marker were wrongly still believed, this would resolve `focus`/`t-hot`
-      // instead of falling through to the session-wide ladder.
+    test("§14.9#9b a focus marker over an idle gap is dropped even while its named task's own window looks fresh", () => {
+      // The F1/variant-A pin, retitled: this is no longer "the TTL is fixed from the
+      // marker's own timestamp" (superseded, §14.7 row 10) — it is the SAME idle-gap
+      // drop as 9a, for the SAME reason (`seedBoundTask` seeds no `turn` rows, so the
+      // 3-hour span is one unbroken gap), now on a session with a SECOND open task so
+      // the fall-through lands on `multi_active` rather than `no_active`. Note, and do
+      // not "fix": `t-hot2`'s own `task_scope` row (written by `seedBoundTask`, source
+      // `'est_open'`) does NOT additionally trigger `contested` — §14.5's rule is
+      // scoped to `source='est_scope'` only (see the companion test above), so `idle`
+      // is this fixture's ONLY reason, not two independent ones.
       initDb();
       seedBoundTask("t-hot", "sess-focus-hot");
       seedBoundTask("t-hot2", "sess-focus-hot");
@@ -975,13 +1383,21 @@ describe("nudge.ts — job 0: spawn-time attribution binding", () => {
         }),
       );
       expect(r.exitCode).toBe(0);
-      const basis = agentBindsLines()[0]!.basis;
-      expect(basis).not.toBe("focus");
-      expect(basis).not.toBe("focus_quiet");
-      expect(basis).toBe("multi_active");
+      const line = agentBindsLines()[0]!;
+      expect(line.focus_drop).toBe("idle");
+      expect(line.basis).not.toBe("focus");
+      expect(line.basis).not.toBe("focus_quiet");
+      expect(line.basis).toBe("multi_active");
     });
 
-    test("companion: a focus marker set 10 minutes ago on the same still-fresh-touch fixture still yields 'focus'", () => {
+    test("§14.9#9c companion: a focus marker set 10 minutes ago on a two-open-task session still yields 'focus' (est_scope scoping guard)", () => {
+      // Kept unchanged (§14.7 row 11): passes for the same reason it always did — a
+      // 10-minute-old marker is well inside the idle-gap TTL even with zero turn rows
+      // seeded — and is now ALSO the regression guard on §14.5's scoping: `t-hot4`'s
+      // `task_scope` row is newer than the marker but carries `source='est_open'`
+      // (written by `seedBoundTask`), which the competing-evidence rule deliberately
+      // ignores because a REAL `est open` would already have rewritten the marker file
+      // itself. If this ever starts asserting `contested`, the scoping regressed.
       initDb();
       seedBoundTask("t-hot3", "sess-focus-hot2");
       seedBoundTask("t-hot4", "sess-focus-hot2");
