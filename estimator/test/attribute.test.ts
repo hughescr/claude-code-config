@@ -766,3 +766,70 @@ describe("the full sweep path: bind -> sweep -> agent_run/workflow_run tids -> b
     expect(report.anomalies.by_kind.agent_never_returned).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// HOOK-BINDING-SPEC.md §5.2 — deterministic agent/run binding, alias_split_identity
+// ---------------------------------------------------------------------------
+
+describe("HOOK-BINDING-SPEC.md §5.2: identity-wide alias resolution", () => {
+  test("a 'hook' source alias resolves exactly like 'est_bind' — exclusive", () => {
+    seedTask(h.db, TID, { bindSession: false });
+    alias(h.db, TID, "agent", "s1", "a1");
+    h.db.query("UPDATE task_alias SET source = 'hook' WHERE local_id = 'a1'").run();
+    turn(h.db, { session: "s1", prompt: "p1", at: "2026-01-01T00:00:00Z", durationMs: 1000 });
+    agentRun(h.db, "a1", { session: "s1", launchPrompt: "p1", startedAt: "2026-01-01T00:00:00Z", endedAt: null });
+    request(h.db, "r1", { session: "s1", prompt: null, origin: "subagent", agent: "a1", out: 100 });
+    attributeTasks(h.db);
+    expect(agentTid("a1")).toBe(TID);
+    expect(req("r1")).toEqual({ tid: TID, attr: "exclusive" });
+  });
+
+  test("two sessions binding one agent id to the SAME tid is not a split — no anomaly", () => {
+    seedTask(h.db, TID, { bindSession: false });
+    alias(h.db, TID, "agent", "s1", "a1");
+    alias(h.db, TID, "agent", "s2", "a1"); // legal under ux_alias_exclusive: different session_id
+    agentRun(h.db, "a1", { session: "s1", launchPrompt: null });
+    const result = attributeTasks(h.db);
+    expect(result.anomalies).toEqual([]);
+    expect(agentTid("a1")).toBe(TID);
+  });
+
+  test("two sessions binding one agent id to DIFFERENT tids: deterministic winner + alias_split_identity", () => {
+    // ux_alias_exclusive is (id_kind, session_id, local_id) — SESSION-SCOPED — so this
+    // is a physically legal pair of rows today, before any hook writes a single line.
+    seedTask(h.db, TID, { bindSession: false });
+    seedTask(h.db, TID2, { session: "s2", bindSession: false });
+    alias(h.db, TID2, "agent", "s2", "a1"); // insert the "later" session's row FIRST —
+    alias(h.db, TID, "agent", "s1", "a1"); //  the winner must not depend on insert/read order
+    agentRun(h.db, "a1", { session: "s1", launchPrompt: null });
+    const result = attributeTasks(h.db);
+    expect(result.anomalies.map((a) => a.kind)).toEqual(["alias_split_identity"]);
+    // Deterministic: lowest session_id wins ("s1" < "s2").
+    expect(agentTid("a1")).toBe(TID);
+  });
+
+  test("the winner is order-independent: re-running attributeTasks never flips it", () => {
+    seedTask(h.db, TID, { bindSession: false });
+    seedTask(h.db, TID2, { session: "s2", bindSession: false });
+    alias(h.db, TID, "agent", "s1", "a1");
+    alias(h.db, TID2, "agent", "s2", "a1");
+    agentRun(h.db, "a1", { session: "s1", launchPrompt: null });
+    attributeTasks(h.db);
+    const first = agentTid("a1");
+    attributeTasks(h.db);
+    const second = agentTid("a1");
+    expect(first).toBe(second);
+    expect(first).toBe(TID);
+  });
+
+  test("a split on a workflow_run identity is detected the same way", () => {
+    seedTask(h.db, TID, { bindSession: false });
+    seedTask(h.db, TID2, { session: "s2", bindSession: false });
+    alias(h.db, TID2, "workflow_run", "s2", "run-1");
+    alias(h.db, TID, "workflow_run", "s1", "run-1");
+    workflowRun(h.db, "run-1", { session: "s1", launchPrompt: "p1" });
+    const result = attributeTasks(h.db);
+    expect(result.anomalies.map((a) => a.kind)).toEqual(["alias_split_identity"]);
+    expect(runTid("run-1")).toBe(TID);
+  });
+});

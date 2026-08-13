@@ -30,6 +30,7 @@ import {
   type Harness,
 } from "./support.ts";
 import {
+  activeTasks,
   aggregateBurn,
   burnJson,
   burnRead,
@@ -801,6 +802,76 @@ describe("task_attrib — the tracked-task state", () => {
     delete legacy.task_attrib;
     delete legacy.pending_close;
     expect(formatSegment(legacy as BurnActive)).toContain("WCET");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// activeTasks — HOOK-BINDING-SPEC.md §3.0's extracted predicate, and its openAt
+// window filter (§3.1)
+// ---------------------------------------------------------------------------
+
+describe("activeTasks — HOOK-BINDING-SPEC.md §3.0/§3.1", () => {
+  /** Same shape as the `task_attrib` describe block's own helper, above — a task
+   *  bound to `s1` with attributed spend and no live delegation. */
+  async function boundTask(now: Date): Promise<string> {
+    const tid = await openTask();
+    request(h.db, "r-main", { origin: "main", out: 150, cw: 50, ts: "2026-01-01T00:01:00Z" });
+    attributeTasks(h.db);
+    refreshBurnCache(h.db, now);
+    return tid;
+  }
+
+  test("without openAt, behaves exactly like taskAttribState's own candidate set", async () => {
+    const now = new Date("2026-01-01T00:30:00Z");
+    const tid = await boundTask(now);
+    const result = activeTasks(h.db, { session: "s1", now });
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ tid, active: true });
+  });
+
+  test("openAt drops a task MINTED AFTER the spawn instant", async () => {
+    // §3.1: a task created after `t_spawn` must not win an exact binding for a spawn
+    // that predates its own existence.
+    const tid = await boundTask(new Date("2026-01-01T00:30:00Z"));
+    const createdAt = h.db.query<{ created_at: string }, [string]>(
+      "SELECT created_at FROM task WHERE tid = ?",
+    ).get(tid)!.created_at;
+    const beforeCreation = new Date(Date.parse(createdAt) - 60_000);
+    const result = activeTasks(h.db, { session: "s1", now: beforeCreation, openAt: beforeCreation });
+    expect(result).toHaveLength(0);
+  });
+
+  test("openAt drops a task FINALIZED before the spawn instant", async () => {
+    const tid = await boundTask(new Date("2026-01-01T00:30:00Z"));
+    const closeAt = new Date("2026-01-01T01:00:00Z");
+    const closed = await h.cli("close", tid, "--force", "--json");
+    expect(closed.code).toBe(0);
+    void closeAt;
+    const spawnAfterClose = new Date("2026-01-01T02:00:00Z");
+    const result = activeTasks(h.db, { session: "s1", now: spawnAfterClose, openAt: spawnAfterClose });
+    expect(result).toHaveLength(0);
+  });
+
+  test("openAt KEEPS a task whose window contains the spawn instant, even if it has since retired", async () => {
+    // §3.1's residual: the LIVENESS verdict stays the cached one (never a query at
+    // `openAt`), so a task that went quiet between `openAt` and `now` is dropped by
+    // the liveness test, not by the window filter — the window filter's job is only
+    // existence-in-time, and it must not itself remove a candidate that is merely old.
+    const tid = await boundTask(new Date("2026-01-01T00:01:30Z"));
+    // `est open` stamps `created_at` at the REAL wall clock; backdate it to just
+    // before the fixture's turn so the window-membership check below is meaningful
+    // (this is a fixture correction, not part of the mechanism under test).
+    h.db.query("UPDATE task SET created_at = ? WHERE tid = ?").run("2026-01-01T00:00:00Z", tid);
+
+    const spawnAt = new Date("2026-01-01T00:01:30Z"); // right at the last touch
+    const stillActive = activeTasks(h.db, { session: "s1", now: spawnAt, openAt: spawnAt });
+    expect(stillActive).toHaveLength(1);
+    expect(stillActive[0]).toMatchObject({ tid, active: true });
+
+    const now = new Date("2026-01-01T06:01:30Z"); // 6 h later: retired by attr_stale_minutes (120)
+    const result = activeTasks(h.db, { session: "s1", now, openAt: spawnAt });
+    expect(result).toHaveLength(1);
+    expect(result[0]).toMatchObject({ tid, active: false });
   });
 });
 

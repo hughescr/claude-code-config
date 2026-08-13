@@ -27,6 +27,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db.ts";
+import { writeFocusMarker } from "../src/spool.ts";
 
 const NUDGE_SCRIPT = join(import.meta.dir, "..", "scripts", "nudge.ts");
 
@@ -85,6 +86,47 @@ function complianceLines(): Array<Record<string, unknown>> {
  */
 function initDb(): void {
   openDb({ path: dbPath }).close();
+}
+
+function agentBindsLines(): Array<Record<string, unknown>> {
+  const path = join(spoolDir, "agent-binds.jsonl");
+  if (!existsSync(path)) return [];
+  return readFileSync(path, "utf8")
+    .split("\n")
+    .filter((l) => l.trim().length > 0)
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+function setConfigValue(key: string, value: string): void {
+  const db = openDb({ path: dbPath });
+  try {
+    db.run("UPDATE config SET v = ? WHERE k = ?", [value, key]);
+  } finally {
+    db.close();
+  }
+}
+
+/** A minimal open task, aliased to `sessionId` (source='est_bind') — no estimate. */
+function seedBoundTask(tid: string, sessionId: string): void {
+  const db = openDb({ path: dbPath });
+  const now = new Date().toISOString();
+  try {
+    db.run(
+      "INSERT INTO task (tid,kind,status,created_at,anchor_session,anchor_prompt) VALUES (?,?,?,?,?,?)",
+      [tid, "implement", "in_progress", now, sessionId, "p1"],
+    );
+    db.run(
+      `INSERT INTO task_scope (tid,seq,ts,subject,description,dod_json,scope_hash,source)
+       VALUES (?,1,?,?,?,?,?,?)`,
+      [tid, now, "test task", null, "[]", "deadbeef", "est_open"],
+    );
+    db.run(
+      "INSERT INTO task_alias (tid,id_kind,session_id,local_id,first_seen,source) VALUES (?,?,?,?,?,?)",
+      [tid, "session", sessionId, sessionId, now, "est_bind"],
+    );
+  } finally {
+    db.close();
+  }
 }
 
 function seedTask(opts: {
@@ -530,5 +572,365 @@ describe("nudge.ts — P1.10 job 3: EST_DISABLE_MICROSWEEP escape hatch", () => 
     expect(readdirSync(spoolDir).filter((f) => f.startsWith(".microsweep"))).toEqual([
       ".microsweep",
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HOOK-BINDING-SPEC.md — job 0: spawn-time attribution binding
+// ---------------------------------------------------------------------------
+
+describe("nudge.ts — job 0: spawn-time attribution binding", () => {
+  /** VERIFIED shapes (spec §2.2): async Agent, sync Agent, Workflow. */
+  const asyncAgentResponse = (agentId: string): Record<string, unknown> => ({
+    isAsync: true,
+    status: "async_launched",
+    agentId,
+    description: "do a thing",
+    resolvedModel: "claude-test-1",
+    prompt: "...",
+  });
+  const syncAgentResponse = (agentId: string, totalDurationMs: number): Record<string, unknown> => ({
+    status: "completed",
+    agentId,
+    agentType: "general-purpose",
+    resolvedModel: "claude-test-1",
+    totalDurationMs,
+    totalTokens: 100,
+  });
+  const workflowResponse = (runId: string, taskId: string): Record<string, unknown> => ({
+    status: "async_launched",
+    taskId,
+    taskType: "workflow",
+    workflowName: "demo",
+    runId,
+    transcriptDir: "/tmp/x",
+    scriptPath: "/tmp/x.sh",
+  });
+
+  test("rung 5 (sole_active): the only bound task in the session wins, source will be 'hook'", () => {
+    initDb();
+    seedBoundTask("t-sole", "sess-sole");
+    const r = runNudge(
+      JSON.stringify({
+        session_id: "sess-sole",
+        tool_name: "Agent",
+        tool_use_id: "toolu_1",
+        tool_input: { description: "spawn one" },
+        tool_response: asyncAgentResponse("agent-sole"),
+      }),
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe(""); // job 0 is silent — never a hookSpecificOutput contributor
+    const lines = agentBindsLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ tid: "t-sole", basis: "sole_active", kind: "agent", local_id: "agent-sole" });
+  });
+
+  test("rung 6 (multi_active): two active tasks in the session -> witness, no tid", () => {
+    initDb();
+    seedBoundTask("t-a", "sess-multi");
+    seedBoundTask("t-b", "sess-multi");
+    const r = runNudge(
+      JSON.stringify({
+        session_id: "sess-multi",
+        tool_name: "Agent",
+        tool_use_id: "toolu_2",
+        tool_input: {},
+        tool_response: asyncAgentResponse("agent-multi"),
+      }),
+    );
+    expect(r.exitCode).toBe(0);
+    const lines = agentBindsLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ tid: null, basis: "multi_active" });
+  });
+
+  test("rung 8 (no_bound): nothing aliased to this session at all -> witness, no anomaly path", () => {
+    initDb();
+    const r = runNudge(
+      JSON.stringify({
+        session_id: "sess-nobound",
+        tool_name: "Agent",
+        tool_use_id: "toolu_3",
+        tool_input: {},
+        tool_response: asyncAgentResponse("agent-nobound"),
+      }),
+    );
+    expect(r.exitCode).toBe(0);
+    const lines = agentBindsLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ tid: null, basis: "no_bound" });
+  });
+
+  test("rung 9 (db_unavailable): no database on disk at all -> witness, exit 0, no stdout", () => {
+    // Deliberately no initDb() call.
+    const r = runNudge(
+      JSON.stringify({
+        session_id: "sess-nodb",
+        tool_name: "Agent",
+        tool_use_id: "toolu_4",
+        tool_input: {},
+        tool_response: asyncAgentResponse("agent-nodb"),
+      }),
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe("");
+    const lines = agentBindsLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ tid: null, basis: "db_unavailable" });
+  });
+
+  test("rung 9 (no_identity): tool_response absent entirely -> witness, no database ever opened", () => {
+    // No initDb() either — if this rung opened the database it would ALSO report
+    // db_unavailable, not no_identity, so a no_identity result is itself evidence the
+    // identity check ran (and short-circuited) before any DB access was attempted.
+    const r = runNudge(
+      JSON.stringify({
+        session_id: "sess-noident",
+        tool_name: "Agent",
+        tool_use_id: "toolu_5",
+        tool_input: {},
+      }),
+    );
+    expect(r.exitCode).toBe(0);
+    const lines = agentBindsLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ tid: null, basis: "no_identity" });
+  });
+
+  test("rung 0 (nested): payload.agent_id present -> witness with parent_agent, no database required", () => {
+    // No initDb(): the design's own claim is that a nested spawn's hook fire performs
+    // ZERO database queries, so it must resolve identically whether or not one exists.
+    const r = runNudge(
+      JSON.stringify({
+        session_id: "sess-nested",
+        agent_id: "parent-agent-1",
+        agent_type: "general-purpose",
+        tool_name: "Agent",
+        tool_use_id: "toolu_6",
+        tool_input: {},
+        tool_response: asyncAgentResponse("child-agent-1"),
+      }),
+    );
+    expect(r.exitCode).toBe(0);
+    const lines = agentBindsLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      tid: null,
+      basis: "nested",
+      parent_agent: "parent-agent-1",
+      kind: "agent",
+      local_id: "child-agent-1",
+      agent_type: "general-purpose",
+    });
+  });
+
+  test("a Workflow launch resolves kind='workflow_run', local_id=runId, wf_launch_id carried for audit", () => {
+    initDb();
+    seedBoundTask("t-wf", "sess-wf");
+    const r = runNudge(
+      JSON.stringify({
+        session_id: "sess-wf",
+        tool_name: "Workflow",
+        tool_use_id: "toolu_7",
+        tool_input: { script: "..." },
+        tool_response: workflowResponse("run-1", "launch-1"),
+      }),
+    );
+    expect(r.exitCode).toBe(0);
+    const lines = agentBindsLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      tid: "t-wf",
+      basis: "sole_active",
+      kind: "workflow_run",
+      local_id: "run-1",
+      wf_launch_id: "launch-1",
+    });
+  });
+
+  test("t_spawn correction: a SYNCHRONOUS Agent call still binds a task that has since retired", () => {
+    // PostToolUse fires at COMPLETION for a sync call. Backdating the clock by
+    // totalDurationMs is what lets a task that was active AT THE SPAWN still bind,
+    // even though the session has gone quiet by the time this hook fires.
+    initDb();
+    seedBoundTask("t-sync", "sess-sync");
+    const twoHoursMs = 2 * 60 * 60 * 1000;
+    const r = runNudge(
+      JSON.stringify({
+        session_id: "sess-sync",
+        tool_name: "Agent",
+        tool_use_id: "toolu_8",
+        tool_input: {},
+        tool_response: syncAgentResponse("agent-sync", twoHoursMs),
+      }),
+    );
+    expect(r.exitCode).toBe(0);
+    const lines = agentBindsLines();
+    expect(lines).toHaveLength(1);
+    // Whether this lands on sole_active or a later rung, it must not be db_unavailable
+    // / no_identity — the point under test is that IDENTITY resolution ran at all.
+    expect(lines[0]!.basis).not.toBe("db_unavailable");
+    expect(lines[0]!.basis).not.toBe("no_identity");
+  });
+
+  test("hook_bind_enabled=0 makes job 0 a true no-op: nothing written, not even a witness", () => {
+    initDb();
+    seedBoundTask("t-off", "sess-off");
+    setConfigValue("hook_bind_enabled", "0");
+    const r = runNudge(
+      JSON.stringify({
+        session_id: "sess-off",
+        tool_name: "Agent",
+        tool_use_id: "toolu_9",
+        tool_input: {},
+        tool_response: asyncAgentResponse("agent-off"),
+      }),
+    );
+    expect(r.exitCode).toBe(0);
+    expect(agentBindsLines()).toHaveLength(0);
+  });
+
+  test("a non-spawn tool name (e.g. Task/TaskUpdate) never reaches job 0 at all", () => {
+    initDb();
+    const r = runNudge(
+      JSON.stringify({
+        session_id: "sess-notaspawn",
+        tool_name: "TaskUpdate",
+        tool_use_id: "toolu_10",
+        tool_input: {},
+      }),
+    );
+    expect(r.exitCode).toBe(0);
+    expect(agentBindsLines()).toHaveLength(0);
+  });
+
+  test("a payload with no tool_use_id writes nothing — no safe dedup key to group on", () => {
+    initDb();
+    seedBoundTask("t-notuid", "sess-notuid");
+    const r = runNudge(
+      JSON.stringify({
+        session_id: "sess-notuid",
+        tool_name: "Agent",
+        tool_input: {},
+        tool_response: asyncAgentResponse("agent-notuid"),
+      }),
+    );
+    expect(r.exitCode).toBe(0);
+    expect(agentBindsLines()).toHaveLength(0);
+  });
+
+  test("job 0 never contributes to stdout — job 1's nudge payload (if any) is unaffected", () => {
+    initDb();
+    // Unbound session: job 1 should still nudge, and job 0 should still spool a
+    // witness line — the two jobs are independent and neither suppresses the other.
+    const r = runNudge(
+      JSON.stringify({
+        session_id: "sess-both",
+        tool_name: "Agent",
+        tool_use_id: "toolu_11",
+        tool_input: {},
+        tool_response: asyncAgentResponse("agent-both"),
+      }),
+    );
+    expect(r.exitCode).toBe(0);
+    const payload = JSON.parse(r.stdout) as { hookSpecificOutput: { additionalContext: string } };
+    expect(payload.hookSpecificOutput.additionalContext).toContain("est:");
+    expect(agentBindsLines()).toHaveLength(1);
+    expect(complianceLines()).toHaveLength(1);
+  });
+
+  describe("the [est:<tid8>] description marker (hook_bind_marker=1)", () => {
+    // The marker regex is `[0-9a-f]{8,36}` — hex only, no hyphens — matching a
+    // uuidv7 tid's own alphabet, so the fixture tids below are pure hex.
+    test("resolves to exactly one candidate -> rung 1 bind, basis='marker'", () => {
+      initDb();
+      seedBoundTask("0123abcd", "sess-marker");
+      seedBoundTask("9876fedc", "sess-marker");
+      setConfigValue("hook_bind_marker", "1");
+      const r = runNudge(
+        JSON.stringify({
+          session_id: "sess-marker",
+          tool_name: "Agent",
+          tool_use_id: "toolu_12",
+          tool_input: { description: "do the thing [est:0123abcd] please" },
+          tool_response: asyncAgentResponse("agent-marker"),
+        }),
+      );
+      expect(r.exitCode).toBe(0);
+      const lines = agentBindsLines();
+      expect(lines[0]).toMatchObject({ tid: "0123abcd", basis: "marker" });
+    });
+
+    test("default OFF: the same description does NOT bind via the marker", () => {
+      initDb();
+      seedBoundTask("0123abcd", "sess-marker-off");
+      seedBoundTask("9876fedc", "sess-marker-off");
+      const r = runNudge(
+        JSON.stringify({
+          session_id: "sess-marker-off",
+          tool_name: "Agent",
+          tool_use_id: "toolu_13",
+          tool_input: { description: "do the thing [est:0123abcd] please" },
+          tool_response: asyncAgentResponse("agent-marker-off"),
+        }),
+      );
+      expect(r.exitCode).toBe(0);
+      const lines = agentBindsLines();
+      // Falls through to the session-wide ladder instead — two active candidates.
+      expect(lines[0]).toMatchObject({ tid: null, basis: "multi_active" });
+    });
+  });
+
+  describe("the est focus pointer (§3.2a) — rungs 2-4", () => {
+    test("rung 2: focus names an ACTIVE task -> bind, basis='focus'", () => {
+      initDb();
+      seedBoundTask("t-f1", "sess-focus2");
+      seedBoundTask("t-f2", "sess-focus2");
+      writeFocusMarker("sess-focus2", "t-f1", "est_focus", spoolDir);
+      const r = runNudge(
+        JSON.stringify({
+          session_id: "sess-focus2",
+          tool_name: "Agent",
+          tool_use_id: "toolu_14",
+          tool_input: {},
+          tool_response: asyncAgentResponse("agent-f1"),
+        }),
+      );
+      expect(r.exitCode).toBe(0);
+      expect(agentBindsLines()[0]).toMatchObject({ tid: "t-f1", basis: "focus" });
+    });
+
+    test("a focus marker OLDER than hook_focus_ttl_min, on an already-quiet task, is ignored", () => {
+      // Craig's rev-3 correction: effective age is IDLE-based —
+      // now - MAX(marker.ts, the task's own last-attributed touch) — so a marker on a
+      // task that is STILL absorbing work never ages out, however old the file is.
+      // This test has to backdate the task's OWN touch too, or the marker reads as
+      // fresh purely because the task was just minted (its `created_at` IS "now").
+      initDb();
+      seedBoundTask("t-fstale", "sess-focus-stale");
+      const staleTs = new Date(Date.now() - 3 * 60 * 60 * 1000); // 3h old, > default 120 min
+      const db = openDb({ path: dbPath });
+      try {
+        db.run("UPDATE task SET created_at = ? WHERE tid = ?", [staleTs.toISOString(), "t-fstale"]);
+      } finally {
+        db.close();
+      }
+      writeFocusMarker("sess-focus-stale", "t-fstale", "est_focus", spoolDir, staleTs);
+      const r = runNudge(
+        JSON.stringify({
+          session_id: "sess-focus-stale",
+          tool_name: "Agent",
+          tool_use_id: "toolu_15",
+          tool_input: {},
+          tool_response: asyncAgentResponse("agent-fstale"),
+        }),
+      );
+      expect(r.exitCode).toBe(0);
+      // Falls through past the (ignored) stale marker to the session-wide ladder:
+      // exactly one bound task, quiet or not, resolves via rung 5/7 rather than focus.
+      expect(agentBindsLines()[0]!.basis).not.toBe("focus");
+      expect(agentBindsLines()[0]!.basis).not.toBe("focus_quiet");
+    });
   });
 });
