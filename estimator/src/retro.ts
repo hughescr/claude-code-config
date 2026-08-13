@@ -66,6 +66,61 @@ import { JOBS_ROOT, jobsRetroPanel, type JobsPanelRow } from "./jobs.ts";
 /** The G-ATTR bar. Below this, the historical corpus is not calibration-grade. */
 export const ATTR_COVERAGE_GATE = 0.7;
 
+/** Classes counted as attributed for calibration purposes (design/GATE-LIVE-SEMANTICS.md
+ *  D3). `sticky` has no writer in `src/attribute.ts` today (D1's rewrite rationale) and
+ *  is carried here only so a future writer does not have to touch this predicate too. */
+export const ATTR_COVERAGE_CLASSES = ["exclusive", "sticky"] as const;
+
+/** The live "which sessions are tracked" predicate — `attrBaseFilter`'s default, and
+ *  `gates/g-attr.ts`'s L1 tracked-session cut. Exported so a caller that must pin this
+ *  set to a snapshot taken BEFORE a mutating recompute (see `attrBaseFilter`'s `opts`
+ *  below) can quote the same subquery shape rather than hand-copying it. */
+export const LIVE_TRACKED_SESSIONS_SQL =
+  "SELECT DISTINCT session_id FROM task_alias WHERE session_id <> ''";
+
+/**
+ * D3 (design/GATE-LIVE-SEMANTICS.md) — the base population the live G-ATTR headline
+ * and this file's coverage numbers must share, so the number that licenses
+ * calibration is defined once. Two definitions of it is the July failure (a
+ * `sticky`-inclusive number nobody's code ever computed) repeating itself in a new
+ * column.
+ *
+ * Returned as `{sql, params}` — a WHERE-clause fragment over `v_wcet` — rather than
+ * executed here, because the gate runs it against database copies (the `source='hook'`
+ * shadow, the staleness sensitivity grid) this file never opens. `until` is exclusive,
+ * matching half-open epoch windows (`[cutover, hook-merge)`, `[hook-merge, now]`).
+ *
+ * `opts.trackedSessionsSql` overrides the tracked-session subquery (default
+ * `LIVE_TRACKED_SESSIONS_SQL`, read fresh off `task_alias` in whatever DB this SQL runs
+ * against). GLS D9's ex-hook counterfactual needs this: it deletes `source='hook'`
+ * rows and re-attributes on a throwaway copy, and a session whose ONLY alias was that
+ * hook binding must stay IN the denominator as now-uncovered spend, not fall out of it
+ * along with the row that used to name it — the population may only be fixed BEFORE the
+ * delete, or the shadow run answers a smaller question than the live one and the
+ * subtraction between them is meaningless. Callers computing a live-only number should
+ * omit `opts` and get the default.
+ */
+export function attrBaseFilter(
+  w: { since: string; until?: string },
+  opts: { trackedSessionsSql?: string } = {},
+): {
+  sql: string;
+  params: string[];
+} {
+  const trackedSessionsSql = opts.trackedSessionsSql ?? LIVE_TRACKED_SESSIONS_SQL;
+  const params: string[] = [w.since];
+  let sql = `ts >= ?
+    AND origin IN ('main','subagent')
+    AND attr <> 'replay'
+    AND attr <> 'overhead'
+    AND session_id IN (${trackedSessionsSql})`;
+  if (w.until !== undefined) {
+    sql += ` AND ts < ?`;
+    params.push(w.until);
+  }
+  return { sql, params };
+}
+
 /**
  * The decomposition mandate's threshold, in STORY POINTS — the "~40" that
  * `skills/estimating/SKILL.md` and `CLAUDE.md` state as a rule.

@@ -1,0 +1,720 @@
+/**
+ * test/g-attr-live.test.ts — the live G-ATTR re-gate's metric computation
+ * (design/GATE-LIVE-SEMANTICS.md), against a synthetic fixture DB.
+ *
+ * Everything here is invented (§4: no real id, path or token figure in a tracked
+ * file). These tests seed `request`/`task`/`task_alias`/`turn`/`agent_run` directly —
+ * `gates/g-attr.ts` reads `request.attr`, so what is under test is the AGGREGATION,
+ * not the attribution pass itself (that is `test/attribute.test.ts`'s job).
+ *
+ * All DB access here goes through `makeHarness` (a `mkdtempSync` temp dir; `EST_DB`-
+ * equivalent by construction, never the live database) — including inside
+ * `coverageExHook`/`stalenessGrid`, which additionally `VACUUM INTO` their own
+ * throwaway copies under `node:os`'s `tmpdir()`.
+ */
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { Database } from "bun:sqlite";
+import { agentRun, makeHarness, price, request, seedPrices, turn, TEST_FAMILY, REF_MODEL, type Harness } from "./support.ts";
+import { attributeTasks } from "../src/attribute.ts";
+import {
+  anomalyPreconditions,
+  byDimension,
+  computeHeadline,
+  coverageExHook,
+  currencySensitivity,
+  FROZEN_BASELINE_PATH,
+  FrozenBaselineWriteError,
+  guardJsonOut,
+  HOOK_LIFT_SELF_CHECK_TOLERANCE_PP,
+  runLive,
+  staleClosedShare,
+  stalenessGrid,
+  taskCensus,
+  unpricedShare,
+  verdictOf,
+} from "../gates/g-attr.ts";
+
+let h: Harness;
+
+beforeEach(() => {
+  h = makeHarness("est-gattr-live-");
+  seedPrices(h.db);
+});
+
+afterEach(() => {
+  h.close();
+});
+
+// ---------------------------------------------------------------------------
+// seeding helpers — `task`/`task_alias` directly, no ceremony (mirrors attribute.test.ts)
+// ---------------------------------------------------------------------------
+
+interface TaskSpec {
+  session?: string;
+  prompt?: string;
+  createdAt?: string;
+  status?: string;
+  bindSession?: boolean;
+}
+
+function seedTask(db: Database, tid: string, spec: TaskSpec = {}): string {
+  const session = spec.session ?? "s1";
+  const prompt = spec.prompt ?? "p1";
+  db.query(
+    `INSERT INTO task (tid, kind, status, created_at, started_at, ended_at, anchor_session, anchor_prompt)
+     VALUES (?, 'implement', ?, ?, NULL, NULL, ?, ?)`,
+  ).run(tid, spec.status ?? "in_progress", spec.createdAt ?? "2026-08-01T00:00:00Z", session, prompt);
+  if (spec.bindSession !== false) alias(db, tid, "session", session, session);
+  return tid;
+}
+
+function alias(db: Database, tid: string, kind: string, session: string, localId: string, source = "manual"): void {
+  db.query(
+    `INSERT OR REPLACE INTO task_alias (tid, id_kind, session_id, local_id, first_seen, source)
+     VALUES (?, ?, ?, ?, '2026-08-01T00:00:00Z', ?)`,
+  ).run(tid, kind, session, localId, source);
+}
+
+/**
+ * The full FK chain `outcome` needs — `bucket_def`, `task_scope` (the `(tid, scope_seq)`
+ * composite FK on `estimate`), then `estimate` itself — trimmed to whatever every
+ * NOT NULL column and CHECK requires, with no bearing on what `taskCensus` measures.
+ */
+function finalize(db: Database, tid: string, finalizedAt: string, status = "completed"): void {
+  const ts = "2026-08-01T00:00:00Z";
+  db.query("INSERT OR IGNORE INTO bucket_def (bucket, created_at, dims_json) VALUES ('default', ?, '{}')").run(ts);
+  db.query(
+    "INSERT INTO task_scope (tid, seq, ts, subject, scope_hash, source) VALUES (?, 1, ?, 'test', 'deadbeef', 'est_open')",
+  ).run(tid, ts);
+  db.query(
+    `INSERT INTO estimate (tid, version, created_at, reason, scope_seq, raw_p50_wcet, raw_p90_wcet,
+       exp_agents, exp_wf_phases, exp_files_write, exp_turns, exp_requests, bucket, bucket_n,
+       shrink_w, cal_p50_wcet, cal_p90_wcet, price_epoch, ref_model, estimand, estimator_model)
+     VALUES (?, 1, ?, 'initial', 1, 0, 0, 1, 0, 1, 1, 1, 'default', 0, 0, 0, 0, ?, 'test-ref', 'work_cet', 'test-model')`,
+  ).run(tid, ts, ts);
+  const eid = (db.query<{ eid: number }, []>("SELECT last_insert_rowid() AS eid").get()!).eid;
+  db.query(
+    `INSERT INTO outcome (tid, revision, finalized_at, final_status, censored, eid_at_start, eid_final,
+       actual_wcet, actual_scet, actual_in, actual_out, actual_cw, actual_cr, n_requests, n_agents)
+     VALUES (?, 1, ?, ?, 0, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0)`,
+  ).run(tid, finalizedAt, status, eid, eid);
+}
+
+function anomaly(db: Database, kind: string, detail = "test", tid: string | null = null): void {
+  db.query("INSERT INTO anomaly (ts, kind, detail, tid) VALUES (?, ?, ?, ?)").run(
+    "2026-08-01T00:00:00Z",
+    kind,
+    detail,
+    tid,
+  );
+}
+
+const TID = "019f0000-0000-7000-8000-000000000001";
+const TID2 = "019f0000-0000-7000-8000-000000000002";
+
+// ---------------------------------------------------------------------------
+// computeHeadline — D1-D5
+// ---------------------------------------------------------------------------
+
+describe("computeHeadline", () => {
+  test("L2 excludes overhead, replay and auxiliary; coverage is exclusive+sticky over L2", () => {
+    seedTask(h.db, TID, { session: "s1" });
+
+    // In L2 (main/subagent, non-replay, non-overhead, tracked session): 10 exclusive.
+    request(h.db, "rq1", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID });
+    // In L2: 5 ambiguous — counted in the denominator, not the numerator.
+    request(h.db, "rq2", { session: "s1", origin: "subagent", out: 5, attr: "ambiguous", tid: TID });
+    // Excluded from L2 by origin (auxiliary).
+    request(h.db, "rq3", { session: "s1", origin: "auxiliary", out: 1000, attr: "exclusive", tid: TID });
+    // Excluded from L2 by attr (overhead, replay).
+    request(h.db, "rq4", { session: "s1", origin: "main", out: 1000, attr: "overhead", tid: TID });
+    request(h.db, "rq5", { session: "s1", origin: "main", out: 1000, attr: "replay", tid: TID });
+    // Untracked session: in L0, excluded from L1/L2.
+    request(h.db, "rq6", { session: "s-untracked", origin: "main", out: 50, attr: "none" });
+
+    const headline = computeHeadline(h.db, { since: "2026-01-01T00:00:00Z" });
+
+    expect(headline.L2.exclusive).toBe(10);
+    expect(headline.L2.ambiguous).toBe(5);
+    expect(headline.L2.total).toBe(15);
+    expect(headline.coverage_pct).toBeCloseTo((10 / 15) * 100, 6);
+    expect(headline.ambiguous_incl_pct).toBeCloseTo(100, 6);
+
+    // L1 keeps the auxiliary row (tracked session, no origin filter) but not the
+    // untracked one; L0 keeps everything except replay.
+    expect(headline.L1.total).toBe(10 + 5 + 1000 + 1000); // rq1+rq2+rq3+rq4, rq5 is replay
+    expect(headline.L0.total).toBe(10 + 5 + 1000 + 1000 + 50);
+
+    // E' = exclusive+sticky over L0's whole-window denominator. L0 does not filter by
+    // origin, so rq3 (auxiliary, but attr='exclusive') counts in E's numerator too —
+    // that is the point of the bridge rung being a DIFFERENT population from L2/L3.
+    expect(headline.e_prime_pct).toBeCloseTo(((10 + 1000) / headline.L0.total) * 100, 6);
+  });
+
+  test("--since / --hook-merge style windowing: `until` is exclusive", () => {
+    seedTask(h.db, TID, { session: "s1" });
+    request(h.db, "early", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID, ts: "2026-08-01T00:00:00Z" });
+    request(h.db, "boundary", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID, ts: "2026-08-05T00:00:00Z" });
+    request(h.db, "late", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID, ts: "2026-08-10T00:00:00Z" });
+
+    const pre = computeHeadline(h.db, { since: "2026-08-01T00:00:00Z", until: "2026-08-05T00:00:00Z" });
+    const post = computeHeadline(h.db, { since: "2026-08-05T00:00:00Z" });
+
+    expect(pre.L2.total).toBe(10); // only "early"
+    expect(post.L2.total).toBe(20); // "boundary" + "late"
+  });
+
+  test("empty corpus is a defined answer (0 coverage, not NaN/crash)", () => {
+    const headline = computeHeadline(h.db, { since: "2026-01-01T00:00:00Z" });
+    expect(headline.coverage_pct).toBe(0);
+    expect(headline.L2.total).toBe(0);
+  });
+
+  test("D12: e_prime_pct (July's unweighted currency) and e_prime_priced_pct (live priced wcet) diverge under asymmetric pricing", () => {
+    // Every OTHER fixture in this file relies on seedPrices' usd_out=usd_cw=1, which
+    // makes priced wcet numerically identical to out_tok+cw_tok — so a regression that
+    // silently swapped E' to priced wcet would be invisible to those tests. Re-price
+    // TEST_FAMILY asymmetrically (usd_out != usd_cw) so the two rungs can only agree
+    // by coincidence; the ref model (seedPrices' REF_MODEL row) stays at usd_out=1,
+    // so wcet = out_tok*2 + cw_cost(usd_cw=3), NOT out_tok+cw_tok.
+    price(h.db, TEST_FAMILY, { in: 1, out: 2, cw: 3, cr: 1 });
+    seedTask(h.db, TID, { session: "s1" });
+    request(h.db, "rq1", { session: "s1", origin: "main", out: 10, cw: 0, attr: "exclusive", tid: TID });
+    request(h.db, "rq2", { session: "s1", origin: "main", out: 4, cw: 2, attr: "none" });
+
+    const headline = computeHeadline(h.db, { since: "2026-01-01T00:00:00Z" });
+
+    // L0legacy (out_tok + cw_tok, unweighted, July's currency): rq1=10, rq2=6, total=16.
+    expect(headline.e_prime_pct).toBeCloseTo((10 / 16) * 100, 6);
+    // L0 priced wcet: rq1 = 10*2 + 0*3 = 20; rq2 = 4*2 + 2*3 = 14; total=34.
+    expect(headline.e_prime_priced_pct).toBeCloseTo((20 / 34) * 100, 6);
+    // The regression this guards against: swapping E' to priced wcet must be visible.
+    expect(Math.abs(headline.e_prime_pct - headline.e_prime_priced_pct)).toBeGreaterThan(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// currencySensitivity — D4
+// ---------------------------------------------------------------------------
+
+describe("currencySensitivity", () => {
+  test("wcet_priced, out+cw, in+out+cw and request-count move independently", () => {
+    seedTask(h.db, TID, { session: "s1" });
+    // seedPrices makes usd_out = usd_cw = usd_in = 1, so wcet == out_tok + cw_tok.
+    request(h.db, "rq1", { session: "s1", origin: "main", in: 3, out: 10, cw: 2, attr: "exclusive", tid: TID });
+    request(h.db, "rq2", { session: "s1", origin: "main", in: 1, out: 4, cw: 0, attr: "ambiguous", tid: TID });
+
+    const cs = currencySensitivity(h.db, { since: "2026-01-01T00:00:00Z" });
+    // wcet excludes `in_tok` by construction (v_wcet: out*usd_out + cw_cost only).
+    expect(cs.wcet_priced!.total).toBe(16); // (10+2)+(4+0), usd_out=usd_cw=1
+    expect(cs.out_plus_cw!.total).toBe(16);
+    expect(cs.in_out_cw!.total).toBe(20);
+    expect(cs.request_count!.total).toBe(2);
+    expect(cs.request_count!.coverage_pct).toBeCloseTo(50, 6); // 1 of 2 requests exclusive
+  });
+});
+
+// ---------------------------------------------------------------------------
+// unpricedShare — the PASS guard's metric. Three drop classes: family absent from
+// `model_price` entirely; the REQUEST's family priced only from a vintage that
+// postdates the request (`v_priced`'s join fails on `MAX(effective_from) <= ts`
+// returning NULL, so `v_wcet` never emits a row at all); and the REF model priced
+// only from a vintage that postdates the request (`v_wcet`'s `ref_out` scalar
+// subselect returns NULL, so `v_wcet` DOES emit a row, just with `wcet` NULL) — the
+// first two `v_unpriced` (family-membership only) cannot see, and the third a
+// `NOT EXISTS`-only guard cannot see either, since the row is present.
+// ---------------------------------------------------------------------------
+
+describe("unpricedShare", () => {
+  test("counts requests with no v_wcet row: family absent from model_price entirely", () => {
+    seedTask(h.db, TID, { session: "s1" });
+    request(h.db, "rq-priced", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID });
+    request(h.db, "rq-nofamily", {
+      session: "s1",
+      origin: "main",
+      family: "totally-unpriced-family",
+      out: 15,
+      attr: "none",
+    });
+
+    const u = unpricedShare(h.db, { since: "2026-01-01T00:00:00Z" });
+    expect(u.count).toBe(1);
+    expect(u.out_plus_cw).toBe(15);
+    expect(u.window_total_out_plus_cw).toBe(25); // 10 + 15
+    expect(u.share_pct).toBeCloseTo((15 / 25) * 100, 6);
+  });
+
+  test("also counts a request predating its family's first effective_from — the class v_unpriced (family membership only) misses", () => {
+    seedTask(h.db, TID, { session: "s1" });
+    request(h.db, "rq-priced", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID });
+    // "vintage-family" IS present in model_price — just not effective until Aug 5 — so
+    // the OLD `v_unpriced` (family-membership-only) guard would have missed this row
+    // entirely: it counts as priced by family lookup, but `v_priced`'s join on
+    // `effective_from <= ts` fails and it never reaches `v_wcet`.
+    price(h.db, "vintage-family", { in: 1, out: 1, cw: 1, cr: 1 }, "2026-08-05T00:00:00Z");
+    request(h.db, "rq-prevint", {
+      session: "s1",
+      origin: "main",
+      family: "vintage-family",
+      out: 20,
+      ts: "2026-08-01T00:00:00Z",
+      attr: "none",
+    });
+
+    const u = unpricedShare(h.db, { since: "2026-01-01T00:00:00Z" });
+    expect(u.count).toBe(1);
+    expect(u.out_plus_cw).toBe(20);
+    expect(u.window_total_out_plus_cw).toBe(30); // 10 + 20
+    expect(u.share_pct).toBeCloseTo((20 / 30) * 100, 6);
+  });
+
+  test("also counts a request predating the REF model's first effective_from — v_wcet emits a row with wcet NULL, not zero rows", () => {
+    // The REQUEST's own family (TEST_FAMILY) is priced from the epoch by seedPrices,
+    // so `v_priced` joins fine and `v_wcet` emits a row for every request below. The
+    // hole is on the OTHER side of `v_wcet`'s arithmetic: `ref_out` is a scalar
+    // subselect keyed on `config.ref_model` (seeded to REF_MODEL, schema.sql), and
+    // seedPrices' epoch row for REF_MODEL is replaced here with a vintage that only
+    // starts Aug 5 — so a request timestamped before that has `ref_out IS NULL`,
+    // hence `wcet IS NULL`, on a `v_wcet` row that still EXISTS. A `NOT EXISTS`-only
+    // guard would call this request priced; `SUM(wcet)` elsewhere silently drops it.
+    h.db.query("DELETE FROM model_price WHERE family = ?").run(REF_MODEL);
+    price(h.db, REF_MODEL, { in: 1, out: 1, cw: 1, cr: 1 }, "2026-08-05T00:00:00Z");
+
+    seedTask(h.db, TID, { session: "s1" });
+    request(h.db, "rq-post-ref", {
+      session: "s1",
+      origin: "main",
+      out: 10,
+      ts: "2026-08-06T00:00:00Z",
+      attr: "exclusive",
+      tid: TID,
+    });
+    request(h.db, "rq-pre-ref", {
+      session: "s1",
+      origin: "main",
+      out: 100,
+      ts: "2026-08-02T00:00:00Z",
+      attr: "none",
+    });
+
+    // Sanity: v_wcet has a row for BOTH requests (family priced fine); only the
+    // pre-ref one's wcet is NULL. If this fails, the fixture stopped exercising the
+    // scalar-subselect hole and the assertions below would pass for the wrong reason.
+    const wcetRows = h.db
+      .query<{ request_id: string; wcet: number | null }, []>(
+        "SELECT request_id, wcet FROM v_wcet ORDER BY request_id",
+      )
+      .all();
+    expect(wcetRows).toEqual([
+      { request_id: "rq-post-ref", wcet: 10 },
+      { request_id: "rq-pre-ref", wcet: null },
+    ]);
+
+    const u = unpricedShare(h.db, { since: "2026-01-01T00:00:00Z" });
+    expect(u.count).toBe(1);
+    expect(u.out_plus_cw).toBe(100);
+    expect(u.window_total_out_plus_cw).toBe(110); // 10 + 100
+    expect(u.share_pct).toBeCloseTo((100 / 110) * 100, 6);
+  });
+
+  test("zero when every in-window request has a v_wcet row", () => {
+    seedTask(h.db, TID, { session: "s1" });
+    request(h.db, "rq1", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID });
+    const u = unpricedShare(h.db, { since: "2026-01-01T00:00:00Z" });
+    expect(u).toEqual({ count: 0, out_plus_cw: 0, window_total_out_plus_cw: 10, share_pct: 0 });
+  });
+});
+
+describe("runLive — unpriced-spend PASS guard, wired end to end", () => {
+  test("a request predating its family's first effective_from blocks PASS even at 100% coverage with a clean ledger", async () => {
+    turn(h.db, { session: "s1", prompt: "p1", at: "2026-08-02T00:00:00Z" });
+    seedTask(h.db, TID, { session: "s1", prompt: "p1", createdAt: "2026-08-02T00:00:00Z" });
+    request(h.db, "rq1", { session: "s1", origin: "main", prompt: "p1", out: 10, ts: "2026-08-02T00:00:10Z" });
+    attributeTasks(h.db);
+
+    // Sanity: without the pre-vintage row, this fixture is a clean PASS (mirrors the
+    // "PASS carries the D14 licence text" runLive test above).
+    const clean = await runLive(h.db, { since: "2026-08-01T00:00:00Z", skipX1: true });
+    expect(clean.verdict).toBe("PASS");
+
+    price(h.db, "vintage-family", { in: 1, out: 1, cw: 1, cr: 1 }, "2026-08-05T00:00:00Z");
+    request(h.db, "rq-prevint", {
+      session: "s1",
+      origin: "main",
+      family: "vintage-family",
+      out: 5,
+      ts: "2026-08-02T00:00:10Z",
+      attr: "none",
+    });
+
+    const dirty = await runLive(h.db, { since: "2026-08-01T00:00:00Z", skipX1: true });
+    expect(dirty.unpriced_window.count).toBe(1);
+    expect(dirty.anomaly_preconditions).toEqual({ hook_bind_conflict: 0, alias_split_identity: 0 });
+    expect(dirty.verdict).toBe("ESCALATE");
+    expect(dirty.licenses).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// byDimension — origin / model family reweighting sensitivity
+// ---------------------------------------------------------------------------
+
+describe("byDimension", () => {
+  test("shares sum to 100 and each key's coverage is scoped to itself", () => {
+    seedTask(h.db, TID, { session: "s1" });
+    request(h.db, "rq1", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID });
+    request(h.db, "rq2", { session: "s1", origin: "subagent", out: 30, attr: "ambiguous", tid: TID });
+
+    const byOrigin = byDimension(h.db, "origin", { since: "2026-01-01T00:00:00Z" });
+    const main = byOrigin.find((o) => o.key === "main")!;
+    const sub = byOrigin.find((o) => o.key === "subagent")!;
+    expect(main.coverage_pct).toBeCloseTo(100, 6);
+    expect(sub.coverage_pct).toBeCloseTo(0, 6);
+    expect(main.share_pct + sub.share_pct).toBeCloseTo(100, 6);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// taskCensus — D7
+// ---------------------------------------------------------------------------
+
+describe("taskCensus", () => {
+  test("opened/finalized/still-open/never-attributed and the alias mix", () => {
+    seedTask(h.db, TID, { session: "s1", createdAt: "2026-08-02T00:00:00Z" });
+    seedTask(h.db, TID2, { session: "s2", createdAt: "2026-08-03T00:00:00Z" });
+    alias(h.db, TID, "agent", "s1", "ag1", "hook");
+
+    // TID gets an outcome (finalized) and an attributed request; TID2 gets neither.
+    finalize(h.db, TID, "2026-08-04T00:00:00Z");
+    request(h.db, "rq1", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID });
+
+    const census = taskCensus(h.db, { since: "2026-08-01T00:00:00Z" });
+    expect(census.opened_in_window).toBe(2);
+    expect(census.finalized_in_window).toBe(1);
+    expect(census.still_open_now).toBe(1); // TID2
+    expect(census.never_attributed_pct).toBeCloseTo(50, 6); // TID2 only
+    const hookAlias = census.alias_counts.find((a) => a.id_kind === "agent" && a.source === "hook");
+    expect(hookAlias?.n).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// anomalyPreconditions — D9
+// ---------------------------------------------------------------------------
+
+describe("anomalyPreconditions", () => {
+  test("counts only the two ALERTING kinds, ignores everything else", () => {
+    anomaly(h.db, "hook_bind_conflict");
+    anomaly(h.db, "hook_bind_conflict");
+    anomaly(h.db, "alias_split_identity");
+    anomaly(h.db, "hook_bind_superseded"); // BENIGN, not counted
+    anomaly(h.db, "malformed_line"); // unrelated, not counted
+
+    const p = anomalyPreconditions(h.db);
+    expect(p.hook_bind_conflict).toBe(2);
+    expect(p.alias_split_identity).toBe(1);
+  });
+
+  test("zero when the ledger is clean — the common case before hook-binding lands", () => {
+    const p = anomalyPreconditions(h.db);
+    expect(p).toEqual({ hook_bind_conflict: 0, alias_split_identity: 0 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// staleClosedShare — D10
+// ---------------------------------------------------------------------------
+
+describe("staleClosedShare", () => {
+  test("pre_task spend INSIDE a bound task's window is stale-closed; before it is not", () => {
+    seedTask(h.db, TID, { session: "s1", createdAt: "2026-08-02T00:00:00Z" });
+    // Inside the task's window (ts >= created_at) but attr fell to pre_task (staleness).
+    request(h.db, "rq-stale", { session: "s1", origin: "main", out: 7, attr: "pre_task", ts: "2026-08-03T00:00:00Z" });
+    // Before the task existed at all — genuinely pre-task, not stale-closed.
+    request(h.db, "rq-pre", { session: "s1", origin: "main", out: 3, attr: "pre_task", ts: "2026-08-01T00:00:00Z" });
+    // The base-population denominator needs something in it too.
+    request(h.db, "rq-base", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID, ts: "2026-08-02T00:00:00Z" });
+
+    const share = staleClosedShare(h.db, { since: "2026-08-01T00:00:00Z" });
+    // denominator (L2 base) = 7 + 3 + 10 = 20; numerator (stale-closed only) = 7.
+    expect(share).toBeCloseTo((7 / 20) * 100, 6);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// coverageExHook / stalenessGrid — D9/D10, the mutation-requiring recomputes
+// ---------------------------------------------------------------------------
+
+describe("coverageExHook", () => {
+  test("deleting a hook alias and re-attributing can only move coverage down or flat", () => {
+    // Two candidate tasks in one session; TID2's ONLY claim is a hook-sourced agent
+    // alias, so removing it should give its turn's spend back to residual/ambiguous.
+    turn(h.db, { session: "s1", prompt: "p1", at: "2026-08-02T10:00:00Z" });
+    seedTask(h.db, TID, { session: "s1", prompt: "p1", createdAt: "2026-08-02T10:00:00Z", bindSession: false });
+    seedTask(h.db, TID2, { session: "s1", prompt: "p1", createdAt: "2026-08-02T10:00:00Z", bindSession: false });
+    alias(h.db, TID, "session", "s1", "s1", "manual");
+    alias(h.db, TID2, "agent", "s1", "ag1", "hook");
+    agentRun(h.db, "ag1", { session: "s1", launchPrompt: "p1", startedAt: "2026-08-02T10:00:10Z", endedAt: "2026-08-02T10:05:00Z" });
+    request(h.db, "rq-agent", { session: "s1", origin: "subagent", agent: "ag1", out: 40, ts: "2026-08-02T10:01:00Z" });
+    request(h.db, "rq-main", { session: "s1", origin: "main", prompt: "p1", out: 10, ts: "2026-08-02T10:00:10Z" });
+
+    attributeTasks(h.db);
+    const live = computeHeadline(h.db, { since: "2026-08-01T00:00:00Z" });
+
+    // Snapshot the master copy the way `runLive` does: VACUUM INTO, then run the
+    // ex-hook shadow against the COPY, never the harness's own `h.db`.
+    const { mkdtempSync, rmSync, copyFileSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const { join } = require("node:path") as typeof import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "g-attr-live-test-"));
+    const masterPath = join(dir, "master.db");
+    const quoted = masterPath.replace(/'/g, "''");
+    h.db.exec(`VACUUM INTO '${quoted}'`);
+    try {
+      const exHook = coverageExHook(masterPath, { since: "2026-08-01T00:00:00Z" });
+      expect(exHook).toBeLessThanOrEqual(live.coverage_pct);
+
+      // The harness's own database must be completely untouched by the shadow run.
+      const stillHook = h.db
+        .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_alias WHERE source = 'hook'")
+        .get()!.n;
+      expect(stillHook).toBe(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a session tracked ONLY via a hook alias stays in the ex-hook DENOMINATOR as uncovered, not dropped from it", () => {
+    // s1 anchors the task (a real, non-hook alias) with a small main-turn spend.
+    // s2 hosts the delegated agent and has NO OTHER alias — the hook binding is its
+    // only route into `task_alias`. Live: s2's spend is exclusive via the hook, so
+    // s2 reads as fully "tracked". The uncontaminated counterfactual must still
+    // charge s2's spend to the SAME denominator once the hook alias is gone, not
+    // let s2 quietly leave the tracked-session population altogether.
+    turn(h.db, { session: "s1", prompt: "p1", at: "2026-08-02T10:00:00Z" });
+    seedTask(h.db, TID, { session: "s1", prompt: "p1", createdAt: "2026-08-02T10:00:00Z", bindSession: false });
+    alias(h.db, TID, "session", "s1", "s1", "manual");
+    request(h.db, "rq-main", { session: "s1", origin: "main", prompt: "p1", out: 10, ts: "2026-08-02T10:00:10Z" });
+
+    alias(h.db, TID, "agent", "s2", "ag1", "hook");
+    agentRun(h.db, "ag1", { session: "s2", launchPrompt: null, startedAt: "2026-08-02T10:00:20Z", endedAt: "2026-08-02T11:00:00Z" });
+    request(h.db, "rq-agent", { session: "s2", origin: "subagent", agent: "ag1", out: 90, ts: "2026-08-02T10:05:00Z" });
+
+    attributeTasks(h.db);
+    const live = computeHeadline(h.db, { since: "2026-08-01T00:00:00Z" });
+    expect(live.L2.total).toBe(100);
+    expect(live.coverage_pct).toBeCloseTo(100, 6);
+
+    const { mkdtempSync, rmSync, copyFileSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const { join } = require("node:path") as typeof import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "g-attr-live-test-"));
+    const masterPath = join(dir, "master.db");
+    h.db.exec(`VACUUM INTO '${masterPath.replace(/'/g, "''")}'`);
+    try {
+      const exHook = coverageExHook(masterPath, { since: "2026-08-01T00:00:00Z" });
+      // The TRUE same-denominator counterfactual: only s1's 10 stays covered out of
+      // a 100-total base. If the denominator had silently shrunk to just s1 (the
+      // bug), this would read 100 instead — hook_lift would be masked at ~0.
+      expect(exHook).toBeCloseTo(10, 6);
+      expect(live.coverage_pct - exHook).toBeCloseTo(90, 6);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("stalenessGrid", () => {
+  test("a tighter quiet-turns bound cannot raise coverage above the shipped setting", () => {
+    turn(h.db, { session: "s1", prompt: "anchor", at: "2026-08-02T10:00:00Z" });
+    seedTask(h.db, TID, { session: "s1", prompt: "anchor", createdAt: "2026-08-02T10:00:00Z" });
+    for (let i = 0; i < 6; i += 1) {
+      turn(h.db, { session: "s1", prompt: `t${i}`, at: `2026-08-02T10:0${i + 1}:00Z` });
+    }
+    request(h.db, "rq-anchor", { session: "s1", prompt: "anchor", out: 10, ts: "2026-08-02T10:00:10Z" });
+    for (let i = 0; i < 6; i += 1) {
+      request(h.db, `rq-t${i}`, { session: "s1", prompt: `t${i}`, out: 10, ts: `2026-08-02T10:0${i + 1}:10Z` });
+    }
+    attributeTasks(h.db);
+
+    const { mkdtempSync, rmSync } = require("node:fs") as typeof import("node:fs");
+    const { tmpdir } = require("node:os") as typeof import("node:os");
+    const { join } = require("node:path") as typeof import("node:path");
+    const dir = mkdtempSync(join(tmpdir(), "g-attr-live-test-"));
+    const masterPath = join(dir, "master.db");
+    const quoted = masterPath.replace(/'/g, "''");
+    h.db.exec(`VACUUM INTO '${quoted}'`);
+    try {
+      const grid = stalenessGrid(masterPath, { since: "2026-08-01T00:00:00Z" }, [1, 5], [120]);
+      const tight = grid.find((g) => g.turns === 1)!;
+      const loose = grid.find((g) => g.turns === 5)!;
+      expect(tight.coverage_pct).toBeLessThanOrEqual(loose.coverage_pct);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// verdictOf — D14
+// ---------------------------------------------------------------------------
+
+describe("verdictOf", () => {
+  test("below threshold escalates regardless of a clean anomaly ledger", () => {
+    expect(verdictOf(69.9, { hook_bind_conflict: 0, alias_split_identity: 0 })).toBe("ESCALATE");
+  });
+  test("at/above threshold with a clean ledger passes", () => {
+    expect(verdictOf(70, { hook_bind_conflict: 0, alias_split_identity: 0 })).toBe("PASS");
+  });
+  test("above threshold but an unclean ledger still escalates (D9: coverage cannot validate the binder)", () => {
+    expect(verdictOf(95, { hook_bind_conflict: 1, alias_split_identity: 0 })).toBe("ESCALATE");
+    expect(verdictOf(95, { hook_bind_conflict: 0, alias_split_identity: 1 })).toBe("ESCALATE");
+  });
+  const CLEAN = { hook_bind_conflict: 0, alias_split_identity: 0 };
+  test("nonzero unpriced-spend count escalates even with a clean ledger and full coverage", () => {
+    expect(verdictOf(95, CLEAN, 3)).toBe("ESCALATE");
+    expect(verdictOf(95, CLEAN, 1)).toBe("ESCALATE");
+  });
+  test("zero unpriced-spend count does not itself escalate", () => {
+    expect(verdictOf(95, CLEAN, 0)).toBe("PASS");
+  });
+  test("GLS §3: no hook aliases present, but a large hook_lift, escalates (broken shadow harness)", () => {
+    expect(
+      verdictOf(95, CLEAN, 0, { hookAliasesPresent: false, hookLiftPct: 5 }),
+    ).toBe("ESCALATE");
+    expect(
+      verdictOf(95, CLEAN, 0, { hookAliasesPresent: false, hookLiftPct: -5 }),
+    ).toBe("ESCALATE"); // the check is on |lift|, not just positive lift
+  });
+  test("GLS §3: no hook aliases present, lift within tolerance, passes", () => {
+    expect(
+      verdictOf(95, CLEAN, 0, { hookAliasesPresent: false, hookLiftPct: 0 }),
+    ).toBe("PASS");
+    expect(
+      verdictOf(95, CLEAN, 0, {
+        hookAliasesPresent: false,
+        hookLiftPct: HOOK_LIFT_SELF_CHECK_TOLERANCE_PP / 2,
+      }),
+    ).toBe("PASS");
+  });
+  test("GLS §3: a large hook_lift is fine when hook aliases ARE present — that's the point of D9", () => {
+    expect(
+      verdictOf(95, CLEAN, 0, { hookAliasesPresent: true, hookLiftPct: 40 }),
+    ).toBe("PASS");
+  });
+  test("4-arg default (no hookSelfCheck passed) behaves exactly like the 3-arg form", () => {
+    expect(verdictOf(95, CLEAN, 0)).toBe("PASS");
+    expect(verdictOf(69.9, CLEAN, 0)).toBe("ESCALATE");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// guardJsonOut — the frozen-baseline write guard
+// ---------------------------------------------------------------------------
+
+describe("guardJsonOut", () => {
+  test("refuses to write the frozen baseline path without --force", () => {
+    expect(() => guardJsonOut(FROZEN_BASELINE_PATH, false)).toThrow(FrozenBaselineWriteError);
+  });
+  test("a relative path resolving to the same file is caught too", () => {
+    // gates/g-attr.json, resolved from the process cwd (this test file runs from the
+    // package root under `bun test`) — the exact habitual invocation the finding names.
+    expect(() => guardJsonOut("gates/g-attr.json", false)).toThrow(FrozenBaselineWriteError);
+  });
+  test("--force overrides the refusal", () => {
+    expect(() => guardJsonOut(FROZEN_BASELINE_PATH, true)).not.toThrow();
+  });
+  test("a different --json path is never blocked", () => {
+    expect(() => guardJsonOut("/tmp/some-other-report.json", false)).not.toThrow();
+    expect(() => guardJsonOut("gates/g-attr-2026-08.json", false)).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runLive — end to end, skipping X1 (transcript corpus is out of scope for a
+// DB-fixture unit test), and asserting the live handle is never mutated.
+// ---------------------------------------------------------------------------
+
+describe("runLive", () => {
+  test("end-to-end report shape, and the live db is untouched afterwards", async () => {
+    seedTask(h.db, TID, { session: "s1", createdAt: "2026-08-02T00:00:00Z" });
+    request(h.db, "rq1", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID, ts: "2026-08-02T00:00:00Z" });
+    request(h.db, "rq2", { session: "s1", origin: "subagent", out: 5, attr: "ambiguous", tid: TID, ts: "2026-08-02T00:00:00Z" });
+
+    const before = h.db
+      .query<{ tid: string | null; attr: string }, [string]>("SELECT tid, attr FROM request WHERE request_id = ?")
+      .get("rq2");
+
+    const report = await runLive(h.db, { since: "2026-08-01T00:00:00Z", skipX1: true });
+
+    expect(report.headline.coverage_pct).toBeCloseTo((10 / 15) * 100, 6);
+    expect(report.task_census.opened_in_window).toBe(1);
+    expect(report.anomaly_preconditions).toEqual({ hook_bind_conflict: 0, alias_split_identity: 0 });
+    expect(report.verdict).toBe("ESCALATE"); // well under 70%
+    expect(report.licenses).toBeNull();
+    expect(report.hook_aliases_present).toBe(false);
+    // `coverage_ex_hook` is always a FULL re-sweep (D9), never merely "coverage minus
+    // hook rows" — this fixture seeds `request.attr` directly rather than through
+    // `attributeTasks` (no `turn` rows), so the shadow re-derives a different number.
+    // What must hold regardless of fixture realism is the algebraic identity D9 defines.
+    expect(report.hook_lift_pct).toBeCloseTo(report.headline.coverage_pct - (report.coverage_ex_hook_pct ?? 0), 6);
+    expect(report.coverage_ex_hook_pct).toBeGreaterThanOrEqual(0);
+    expect(report.coverage_ex_hook_pct).toBeLessThanOrEqual(100);
+    expect(report.staleness_grid.length).toBeGreaterThan(0);
+    // GLS §3 self-check: this fixture's `request.attr` was set directly rather than
+    // derived by `attributeTasks`, so the ex-hook re-sweep is EXPECTED to diverge from
+    // it even though no hook aliases exist to delete — exactly the "sweeper/config
+    // skew" class the self-check exists to catch. It must therefore read false here.
+    expect(report.hook_self_check_ok).toBe(false);
+
+    // The live handle passed in must read back EXACTLY as it did before the run —
+    // every mutating step in `runLive` operates on a `VACUUM INTO` temp copy.
+    const after = h.db
+      .query<{ tid: string | null; attr: string }, [string]>("SELECT tid, attr FROM request WHERE request_id = ?")
+      .get("rq2");
+    expect(after).toEqual(before);
+  });
+
+  test("PASS carries the D14 licence text; a clean anomaly ledger is required, not just the threshold", async () => {
+    // Driven through the REAL attribution pass (`turn` + `attributeTasks`), unlike the
+    // fixture above — a fixture where the shadow harness genuinely reproduces the
+    // baseline is required to observe a legitimate, self-check-clean PASS (GLS §3).
+    turn(h.db, { session: "s1", prompt: "p1", at: "2026-08-02T00:00:00Z" });
+    seedTask(h.db, TID, { session: "s1", prompt: "p1", createdAt: "2026-08-02T00:00:00Z" });
+    request(h.db, "rq1", { session: "s1", origin: "main", prompt: "p1", out: 10, ts: "2026-08-02T00:00:10Z" });
+    attributeTasks(h.db);
+
+    const clean = await runLive(h.db, { since: "2026-08-01T00:00:00Z", skipX1: true });
+    expect(clean.headline.coverage_pct).toBeCloseTo(100, 6);
+    expect(clean.hook_aliases_present).toBe(false);
+    expect(clean.hook_self_check_ok).toBe(true); // no hook rows, and the re-sweep agrees
+    expect(clean.verdict).toBe("PASS");
+    expect(clean.licenses).toContain("P2.11");
+    expect(clean.licenses).toContain("Not a validation of the binder");
+
+    anomaly(h.db, "hook_bind_conflict");
+    const dirty = await runLive(h.db, { since: "2026-08-01T00:00:00Z", skipX1: true });
+    expect(dirty.headline.coverage_pct).toBeCloseTo(100, 6); // unchanged — same requests
+    expect(dirty.verdict).toBe("ESCALATE"); // but the ledger is unclean now
+    expect(dirty.licenses).toBeNull();
+  });
+
+  test("GLS §3 self-check: a large hook_lift with no hook aliases present blocks PASS", () => {
+    // The exact hazard the finding names: `request.attr` set directly (never routed
+    // through `attributeTasks`), no `source='hook'` rows to delete, so the ex-hook
+    // shadow's full re-sweep has nothing anchoring it to the stored attr and diverges
+    // sharply. Coverage alone (100%) and the anomaly ledger (clean) would both permit
+    // a PASS; the self-check must be the thing that blocks it.
+    seedTask(h.db, TID, { session: "s1", createdAt: "2026-08-02T00:00:00Z" });
+    request(h.db, "rq1", { session: "s1", origin: "main", out: 10, attr: "exclusive", tid: TID, ts: "2026-08-02T00:00:00Z" });
+
+    return runLive(h.db, { since: "2026-08-01T00:00:00Z", skipX1: true }).then((report) => {
+      expect(report.headline.coverage_pct).toBeCloseTo(100, 6);
+      expect(report.anomaly_preconditions).toEqual({ hook_bind_conflict: 0, alias_split_identity: 0 });
+      expect(report.hook_aliases_present).toBe(false);
+      expect(report.hook_self_check_ok).toBe(false);
+      expect(report.verdict).toBe("ESCALATE");
+      expect(report.licenses).toBeNull();
+    });
+  });
+});
