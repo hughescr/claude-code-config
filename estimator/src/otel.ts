@@ -681,7 +681,7 @@ UPDATE otel_request SET joined = 1
  * `v_velocity`'s `origin IN ('main','subagent')` filter means this spend can never
  * reach a calibration multiplier however it is later attributed.
  */
-const INSERT_AUXILIARY_SQL = `
+export const INSERT_AUXILIARY_SQL = `
 INSERT INTO request (request_id, message_id, is_sidechain, session_id, prompt_id, origin,
                      agent_id, run_id, wf_launch_id, model, model_family,
                      attribution_agent, attribution_skill, ts,
@@ -705,7 +705,7 @@ ON CONFLICT(request_id) DO NOTHING
  * landing on a transcript row is still a collision and is still only counted, because
  * the transcript stays the source of truth for every counter (§2).
  */
-const SUPERSEDE_AUXILIARY_SQL = `
+export const SUPERSEDE_AUXILIARY_SQL = `
 UPDATE request
    SET ts = $ts, in_tok = $in_tok, out_tok = $out_tok, cw_tok = $cw_tok, cr_tok = $cr_tok,
        duration_ms = $duration_ms

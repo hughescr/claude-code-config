@@ -380,8 +380,10 @@ function deltaPct(ours: number, theirs: number | null): number | null {
   return ((ours - theirs) / theirs) * 100;
 }
 
+// CACHE-TTL-PRICING.md D3: cw_cost replaces the flat cw_tok*usd_cw — it is the
+// TTL-aware, clamped cache-write cost v_wcet already computes per row.
 const OURS_USD_SQL = `
-SELECT COALESCE(SUM((in_tok*usd_in + out_tok*usd_out + cw_tok*usd_cw + cr_tok*usd_cr) / 1000000.0), 0) AS v
+SELECT COALESCE(SUM((in_tok*usd_in + out_tok*usd_out + cw_cost + cr_tok*usd_cr) / 1000000.0), 0) AS v
 FROM v_wcet WHERE ts >= ? AND ts < ?
 `;
 

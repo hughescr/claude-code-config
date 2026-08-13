@@ -22,12 +22,14 @@ import {
   contextSuffixTokens,
   currentPrice,
   EPOCH_ZERO,
+  fillCw1h,
   FIXTURE_DIR,
   LITELLM_URL,
   newestSnapshot,
   normalizeModelId,
   parseLiteLLM,
   priceFamily,
+  resolveCw1h,
   setManualPrice,
   showPrices,
   sync,
@@ -214,12 +216,16 @@ describe("the committed LiteLLM fixture", () => {
       usd_out: 25,
       usd_cw: 6.25,
       usd_cr: 0.5,
+      // CACHE-TTL-PRICING.md D5: 0.00001/token upstream -> 10/Mtok, exactly 2x
+      // usd_in, so this is the RAW candidate parseLiteLLM reports (ungated).
+      usd_cw1h: 10,
     });
     expect(table.get("claude-sonnet-5")!.rates).toEqual({
       usd_in: 2,
       usd_out: 10,
       usd_cw: 2.5,
       usd_cr: 0.2,
+      usd_cw1h: 4,
     });
     expect(table.get("claude-fable-5")!.rates.usd_out).toBe(50);
   });
@@ -931,5 +937,286 @@ describe("manual override — `est prices --set`", () => {
     // An unparseable vintage is a usage error, not a string SQLite compares wrong.
     expect(await run(argv("--set", "claude-zeta-1", ...rates, "--at", "yesterday"), io)).toBe(1);
     expect(err.join("\n")).toContain("--at");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CACHE-TTL-PRICING.md D5 — resolveCw1h, the plausibility gate
+// ---------------------------------------------------------------------------
+
+describe("resolveCw1h — the D5 plausibility gate", () => {
+  const BAND = { min: 1.5, max: 2.5, dflt: 2 };
+
+  test("a plausible published candidate (exactly 2x usd_in) is accepted at face value", () => {
+    const r = resolveCw1h(10, 5, 6.25, BAND, "litellm");
+    expect(r).toEqual({ rate: 10, src: "litellm", implausible: false });
+  });
+
+  test("an implausible published candidate (the claude-3-haiku 24x case) is rejected and reported", () => {
+    // usd_in=0.25, usd_cw=0.3: a candidate of 6 is 24x usd_in, way outside [1.5x,2.5x].
+    const r = resolveCw1h(6, 0.25, 0.3, BAND, "litellm");
+    expect(r).toEqual({ rate: 0.5, src: "derived_from_input", implausible: true }); // 2 * 0.25
+  });
+
+  test("an implausible candidate BELOW the family's own 5m rate is rejected too (the claude-3-opus case)", () => {
+    // usd_cw (5m) = 18.75, candidate = 6 — below its own 5m rate, plainly wrong.
+    const r = resolveCw1h(6, 15, 18.75, BAND, "litellm");
+    expect(r.src).toBe("derived_from_input");
+    expect(r.implausible).toBe(true);
+  });
+
+  test("an ABSENT key falls back the same way but is NOT reported implausible", () => {
+    const r = resolveCw1h(null, 3, 3.75, BAND, "litellm");
+    expect(r).toEqual({ rate: 6, src: "derived_from_input", implausible: false }); // 2 * 3
+  });
+
+  test("usd_cw = 0 (a pre-caching family) writes NOTHING, whatever the candidate says", () => {
+    const r = resolveCw1h(999, 5, 0, BAND, "litellm");
+    expect(r).toEqual({ rate: null, src: "unrecorded", implausible: false });
+  });
+
+  test("the gate is against the ROW'S OWN usd_in, not a fixed number", () => {
+    const cheap = resolveCw1h(4, 2, 2.5, BAND, "litellm"); // 2x a small usd_in
+    const rich = resolveCw1h(4, 100, 125, BAND, "litellm"); // same absolute candidate, huge usd_in
+    expect(cheap.implausible).toBe(false);
+    expect(rich.implausible).toBe(true); // 4 is nowhere near 1.5-2.5x of 100
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CACHE-TTL-PRICING.md D2/D5 — sync() writes the gated 1h rate
+// ---------------------------------------------------------------------------
+
+describe("sync — the cache-write 1h rate (D2/D5)", () => {
+  test("the committed fixture's published 1h rate is accepted at face value for a plausible family", async () => {
+    await sync(db, { ...offline, now: T0 });
+    const opus = currentPrice(db, "claude-opus-5")!;
+    // Fixture: cache_creation_input_token_cost_above_1hr = 0.00001/token = 10/Mtok,
+    // exactly 2x usd_in(5) — inside [1.5x, 2.5x] of usd_in(5).
+    expect(opus.usd_cw1h).toBe(10);
+    expect(opus.usd_cw1h_src).toBe("litellm");
+  });
+
+  test("an implausible published rate is rejected, falls back to derived_from_input, and raises price_cw_1h_implausible exactly once", async () => {
+    const liveTable = {
+      "claude-3-haiku-20240307": {
+        input_cost_per_token: 2.5e-7,
+        output_cost_per_token: 1.25e-6,
+        cache_creation_input_token_cost: 3e-7,
+        cache_creation_input_token_cost_above_1hr: 6e-6, // 24x usd_in — the real upstream bug
+        cache_read_input_token_cost: 3e-8,
+      },
+    };
+    const liveFetch = ((url: string) =>
+      Promise.resolve(
+        url === LITELLM_URL
+          ? new Response(JSON.stringify(liveTable), { status: 200 })
+          : new Response("{}", { status: 404, statusText: "Not Found" }),
+      )) as unknown as typeof fetch;
+
+    await sync(db, { fetchImpl: liveFetch, now: T0 });
+    const haiku = currentPrice(db, "claude-3-haiku")!;
+    expect(haiku.usd_cw1h_src).toBe("derived_from_input");
+    expect(haiku.usd_cw1h).toBe(2 * haiku.usd_in); // config.price_cw_1h_default_multiple
+
+    const implausible = anomalies("price_cw_1h_implausible");
+    expect(implausible).toHaveLength(1);
+    expect(implausible[0]!.detail).toContain("claude-3-haiku");
+
+    // A second, unchanged sync must not re-raise the same finding.
+    await sync(db, { fetchImpl: liveFetch, now: T1 });
+    expect(anomalies("price_cw_1h_implausible")).toHaveLength(1);
+  });
+
+  test("a family with NO published 1h key falls back to derived_from_input and raises NO anomaly", async () => {
+    const liveTable = {
+      "claude-4-opus-20250514": {
+        input_cost_per_token: 1.5e-5,
+        output_cost_per_token: 7.5e-5,
+        cache_creation_input_token_cost: 1.875e-5,
+        cache_read_input_token_cost: 1.5e-6,
+        // no cache_creation_input_token_cost_above_1hr key at all
+      },
+    };
+    const liveFetch = ((url: string) =>
+      Promise.resolve(
+        url === LITELLM_URL
+          ? new Response(JSON.stringify(liveTable), { status: 200 })
+          : new Response("{}", { status: 404, statusText: "Not Found" }),
+      )) as unknown as typeof fetch;
+
+    await sync(db, { fetchImpl: liveFetch, now: T0 });
+    const row = currentPrice(db, "claude-4-opus")!;
+    expect(row.usd_cw1h_src).toBe("derived_from_input");
+    expect(row.usd_cw1h).toBe(2 * row.usd_in);
+    expect(anomalies("price_cw_1h_implausible")).toHaveLength(0);
+
+    // Twice over, per the design's explicit test requirement.
+    await sync(db, { fetchImpl: liveFetch, now: T1 });
+    expect(anomalies("price_cw_1h_implausible")).toHaveLength(0);
+  });
+
+  test("a family with usd_cw = 0 (pre-caching) stays usd_cw1h NULL / 'unrecorded'", async () => {
+    const liveTable = {
+      "claude-instant-1": {
+        input_cost_per_token: 1e-6,
+        output_cost_per_token: 1e-6,
+        // no cache cost keys at all -> usd_cw resolves to 0
+      },
+    };
+    const liveFetch = ((url: string) =>
+      Promise.resolve(
+        url === LITELLM_URL
+          ? new Response(JSON.stringify(liveTable), { status: 200 })
+          : new Response("{}", { status: 404, statusText: "Not Found" }),
+      )) as unknown as typeof fetch;
+
+    await sync(db, { fetchImpl: liveFetch, now: T0 });
+    const row = currentPrice(db, "claude-instant-1")!;
+    expect(row.usd_cw).toBe(0);
+    expect(row.usd_cw1h).toBeNull();
+    expect(row.usd_cw1h_src).toBe("unrecorded");
+  });
+
+  test("ratesEqual compares usd_cw1h too: a re-sync that changes ONLY the 1h rate opens a new vintage", async () => {
+    await sync(db, { ...offline, now: T0 });
+    const before = currentPrice(db, "claude-opus-5")!;
+
+    const liveTable = {
+      "claude-opus-5": {
+        input_cost_per_token: 5e-6, // unchanged
+        output_cost_per_token: 2.5e-5, // unchanged
+        cache_creation_input_token_cost: 6.25e-6, // unchanged
+        cache_creation_input_token_cost_above_1hr: 1.1e-5, // CHANGED: 11/Mtok now
+        cache_read_input_token_cost: 5e-7, // unchanged
+      },
+    };
+    const liveFetch = ((url: string) =>
+      Promise.resolve(
+        url === LITELLM_URL
+          ? new Response(JSON.stringify(liveTable), { status: 200 })
+          : new Response("{}", { status: 404, statusText: "Not Found" }),
+      )) as unknown as typeof fetch;
+
+    await sync(db, { fetchImpl: liveFetch, now: T1 });
+    const after = currentPrice(db, "claude-opus-5")!;
+    expect(after.usd_cw1h).toBe(11);
+    expect(after.effective_from).not.toBe(before.effective_from);
+    expect(vintages("claude-opus-5").length).toBeGreaterThan(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CACHE-TTL-PRICING.md D6 — est prices --fill-cw-1h
+// ---------------------------------------------------------------------------
+
+describe("fillCw1h — the one-shot historical fill (D6)", () => {
+  test("fills every usd_cw1h IS NULL vintage from the source chain, and is idempotent on a second run", async () => {
+    // A manual, unpriced-1h vintage, exactly the "48 days of pre-fix history" shape.
+    setManualPrice(db, "claude-opus-5", { usd_in: 5, usd_out: 25, usd_cw: 6.25, usd_cr: 0.5 }, {
+      at: EPOCH_ZERO === "1970-01-01T00:00:00Z" ? new Date(0) : undefined,
+      now: T0,
+    });
+    expect(currentPrice(db, "claude-opus-5")!.usd_cw1h).toBeNull();
+
+    const first = await fillCw1h(db, { ...offline, now: T1 });
+    expect(first.n_filled).toBe(1);
+    const filled = currentPrice(db, "claude-opus-5")!;
+    // The committed LiteLLM fixture publishes a plausible 2x rate for this family.
+    expect(filled.usd_cw1h).toBe(10);
+    expect(filled.usd_cw1h_src).toBe("litellm");
+    // Every OTHER column is untouched.
+    expect(filled.usd_in).toBe(5);
+    expect(filled.usd_out).toBe(25);
+    expect(filled.usd_cw).toBe(6.25);
+    expect(filled.provisional).toBe(0);
+    expect(filled.source).toBe("manual");
+
+    const stampAfterFirst = db
+      .query<{ v: string }, []>("SELECT v FROM config WHERE k = 'cw_ttl_price_fix_at'")
+      .get()!.v;
+
+    const second = await fillCw1h(db, { ...offline, now: T2 });
+    expect(second.n_filled).toBe(0); // nothing left to fill — no recorded rate overwritten
+    expect(currentPrice(db, "claude-opus-5")!.usd_cw1h).toBe(10); // unchanged
+    // Both a price_sync row AND the watermark advance on EVERY call, including a no-op.
+    expect(syncRows().filter((r) => r.source === "manual").length).toBeGreaterThanOrEqual(2);
+    const stampAfterSecond = db
+      .query<{ v: string }, []>("SELECT v FROM config WHERE k = 'cw_ttl_price_fix_at'")
+      .get()!.v;
+    expect(stampAfterSecond).not.toBe(stampAfterFirst);
+  });
+
+  test("one anomaly(cw_1h_price_backfilled) is recorded per run — a ts-keyed audit trail, not deduped", async () => {
+    setManualPrice(db, "claude-opus-5", { usd_in: 5, usd_out: 25, usd_cw: 6.25, usd_cr: 0.5 }, { now: T0 });
+    await fillCw1h(db, { ...offline, now: T1 });
+    await fillCw1h(db, { ...offline, now: T2 });
+    expect(anomalies("cw_1h_price_backfilled").length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CACHE-TTL-PRICING.md D5 — `est prices --set` and `--cw-1h`
+// ---------------------------------------------------------------------------
+
+describe("est prices --set --cw-1h (D5)", () => {
+  const cliRun = async (cliDb: string, ...rest: string[]) => {
+    const out: string[] = [];
+    const err: string[] = [];
+    const code = await run(
+      ["prices", "--db", cliDb, "--lock", `${cliDb}.lock`, ...rest],
+      { out: (s: string) => out.push(s), err: (s: string) => err.push(s) },
+    );
+    return { code, out: out.join("\n"), err: err.join("\n") };
+  };
+
+  test("--set without --cw-1h on a family whose latest vintage HAS a recorded 1h rate is refused", async () => {
+    const cliDb = join(dir, "cli2.db");
+    const r1 = await cliRun(cliDb, "--sync", "--source", "fixture"); // seeds claude-opus-5 with a recorded 1h rate
+    expect(r1.code).toBe(0);
+
+    const rates = ["--in", "1", "--out", "2", "--cw", "3", "--cr", "0.5"];
+    const r2 = await cliRun(cliDb, "--set", "claude-opus-5", ...rates);
+    expect(r2.code).toBe(1);
+    expect(r2.err).toContain("--cw-1h");
+  });
+
+  test("--cw-1h-unrecorded is the explicit escape hatch, and the vintage shows up in v_cw_1h_price_gap", async () => {
+    const cliDb = join(dir, "cli3.db");
+    await cliRun(cliDb, "--sync", "--source", "fixture");
+    const rates = ["--in", "1", "--out", "2", "--cw", "3", "--cr", "0.5"];
+    const r = await cliRun(cliDb, "--set", "claude-opus-5", ...rates, "--cw-1h-unrecorded");
+    expect(r.code).toBe(0);
+
+    const other = openDb({ path: cliDb });
+    try {
+      expect(currentPrice(other, "claude-opus-5")!.usd_cw1h).toBeNull();
+      other
+        .query(
+          `INSERT INTO request (request_id, session_id, origin, model, model_family, ts, cw_tok)
+           VALUES ('g1', 's1', 'main', 'claude-opus-5', 'claude-opus-5', '2026-08-01T00:00:00Z', 10)`,
+        )
+        .run();
+      const gap = other
+        .query<{ family: string }, []>("SELECT family FROM v_cw_1h_price_gap WHERE family = 'claude-opus-5'")
+        .all();
+      expect(gap).toHaveLength(1);
+    } finally {
+      other.close();
+    }
+  });
+
+  test("on a family with NO prior recorded rate, --cw-1h stays optional", async () => {
+    const cliDb = join(dir, "cli4.db");
+    const rates = ["--in", "1", "--out", "2", "--cw", "3", "--cr", "0.5"];
+    const r = await cliRun(cliDb, "--set", "claude-zeta-9", ...rates);
+    expect(r.code).toBe(0);
+    const other = openDb({ path: cliDb });
+    try {
+      expect(currentPrice(other, "claude-zeta-9")!.usd_cw1h).toBeNull();
+      expect(currentPrice(other, "claude-zeta-9")!.usd_cw1h_src).toBe("unrecorded");
+    } finally {
+      other.close();
+    }
   });
 });

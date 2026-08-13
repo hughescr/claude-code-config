@@ -25,6 +25,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   appendFileSync,
+  chmodSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -36,6 +37,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import {
+  agentRun,
   makeHarness,
   openArgs,
   request,
@@ -44,16 +46,26 @@ import {
   type Harness,
 } from "./support.ts";
 import {
+  AGENT_BINDS_FILE,
   BOARD_MARKER,
+  clearFocusMarker,
   COMPLIANCE_FILE,
-  MICROSWEEP_MARKER,
-  TASK_EVENTS_FILE,
   drainSpool,
+  focusMarkerFile,
+  FOCUS_MARKER_PREFIX,
+  FOCUS_MARKER_TTL_MS,
+  MICROSWEEP_MARKER,
   overrunMarkerFile,
   parseComplianceLines,
+  parseSpawnBindLines,
   parseTaskEventLines,
   pruneMarkers,
+  readFocusMarker,
+  serializeSpawnBindLine,
   spoolDirFrom,
+  TASK_EVENTS_FILE,
+  writeFocusMarker,
+  type SpawnBindRecord,
 } from "../src/spool.ts";
 import { INSERT_TASK_EVENT_SQL } from "../src/ingest.ts";
 import { attributeTasks } from "../src/attribute.ts";
@@ -90,6 +102,51 @@ function drain(): ReturnType<typeof drainSpool> {
   }).immediate();
   result.cleanup();
   return result;
+}
+
+/** A minimal open task, for the agent-binds drain tests — no estimate, no aliases. */
+function seedTask(tid: string, session = "s1"): void {
+  h.db.run(
+    "INSERT INTO task (tid,kind,status,created_at,anchor_session,anchor_prompt) VALUES (?,?,?,?,?,?)",
+    [tid, "implement", "in_progress", LONG_AGO, session, "p1"],
+  );
+  h.db.run(
+    `INSERT INTO task_scope (tid,seq,ts,subject,description,dod_json,scope_hash,source)
+     VALUES (?,1,?,?,?,?,?,?)`,
+    [tid, LONG_AGO, "test task", null, "[]", "deadbeef", "est_open"],
+  );
+}
+
+function aliasRow(tid: string, idKind: string, sessionId: string, localId: string, source: string): void {
+  h.db.run(
+    "INSERT INTO task_alias (tid,id_kind,session_id,local_id,first_seen,source) VALUES (?,?,?,?,?,?)",
+    [tid, idKind, sessionId, localId, LONG_AGO, source],
+  );
+}
+
+/** HOOK-BINDING-SPEC.md §4: one spawn-bind record, with sane defaults. */
+function bindRecord(over: Partial<SpawnBindRecord> = {}): SpawnBindRecord {
+  return {
+    ts: LONG_AGO,
+    v: 2,
+    src: "posttooluse",
+    sid: "s1",
+    tuid: "toolu_1",
+    tool: "Agent",
+    spawn_at: LONG_AGO,
+    kind: "agent",
+    local_id: "agent-1",
+    wf_launch_id: null,
+    parent_agent: null,
+    att: 0,
+    tid: null,
+    basis: "no_bound",
+    ...over,
+  };
+}
+
+function appendBind(record: SpawnBindRecord): void {
+  appendFileSync(join(spool, AGENT_BINDS_FILE), `${JSON.stringify(record)}\n`, "utf8");
 }
 
 // ---------------------------------------------------------------------------
@@ -561,5 +618,432 @@ describe("P1.11 mandatory regression — a deletion whose tool_result was never 
     rmSync(join(spool, TASK_EVENTS_FILE), { force: true });
     drain();
     expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_event").get()?.n).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HOOK-BINDING-SPEC.md §4 — the agent-binds drain
+// ---------------------------------------------------------------------------
+
+describe("parseSpawnBindLines / serializeSpawnBindLine", () => {
+  test("a well-formed line round-trips through serialize -> parse", () => {
+    const rec = bindRecord({ tid: "t1", basis: "sole_active", na: 1, nb: 1, k: ["session_id", "tool_name"] });
+    const line = serializeSpawnBindLine(rec);
+    expect(line).not.toBeNull();
+    const parsed = parseSpawnBindLines(`${line}\n`);
+    expect(parsed.malformed).toBe(0);
+    expect(parsed.rows).toHaveLength(1);
+    expect(parsed.rows[0]).toMatchObject({ tid: "t1", basis: "sole_active", local_id: "agent-1" });
+  });
+
+  test("a line missing a required field is malformed, not silently dropped uncounted", () => {
+    const parsed = parseSpawnBindLines(`${JSON.stringify({ ts: LONG_AGO })}\n`);
+    expect(parsed.malformed).toBe(1);
+    expect(parsed.rows).toHaveLength(0);
+  });
+
+  // HOOK-BINDING-SPEC.md §14.9#10 (REV3): the focus_drop pipeline — parse, serialize
+  // under the PIPE_BUF budget, and the drain/report wiring below — had zero coverage.
+  test("focus_drop round-trips through serialize -> parse, within the byte budget", () => {
+    const rec = bindRecord({
+      tid: null,
+      basis: "multi_active",
+      na: 2,
+      nb: 2,
+      k: ["session_id", "tool_name"],
+      focus_drop: "idle",
+    });
+    const line = serializeSpawnBindLine(rec);
+    expect(line).not.toBeNull();
+    expect(Buffer.byteLength(line!)).toBeLessThanOrEqual(511);
+    const parsed = parseSpawnBindLines(`${line}\n`);
+    expect(parsed.malformed).toBe(0);
+    expect(parsed.rows[0]?.focus_drop).toBe("idle");
+  });
+
+  test("an unknown focus_drop reason is ignored, not malformed — SPAWN_BIND_FOCUS_DROPS filters, it does not reject", () => {
+    const raw = JSON.stringify({ ...bindRecord({ tid: "t1", basis: "sole_active" }), focus_drop: "nope" });
+    const parsed = parseSpawnBindLines(`${raw}\n`);
+    expect(parsed.malformed).toBe(0);
+    expect(parsed.rows).toHaveLength(1);
+    expect(parsed.rows[0]?.focus_drop).toBeUndefined();
+  });
+
+  test("budget fallback: `k` is sacrificed FIRST, `focus_drop` survives", () => {
+    const rec = bindRecord({
+      focus_drop: "contested",
+      k: Array.from({ length: 40 }, (_, i) => `key_name_number_${i}`),
+    });
+    const line = serializeSpawnBindLine(rec);
+    expect(line).not.toBeNull();
+    expect(line).not.toContain('"k"');
+    expect(line).toContain('"focus_drop":"contested"');
+    expect(Buffer.byteLength(line!)).toBeLessThanOrEqual(511);
+  });
+
+  test("budget fallback: `focus_drop` is sacrificed SECOND and the survivor still parses (§14.9#10)", () => {
+    let n = 200;
+    while (
+      Buffer.byteLength(JSON.stringify(bindRecord({ local_id: "a".repeat(n), focus_drop: "idle" }))) <= 511
+    ) {
+      n += 1;
+    }
+    const rec = bindRecord({ local_id: "a".repeat(n), focus_drop: "idle", basis: "sole_active", tid: "t1" });
+    const line = serializeSpawnBindLine(rec);
+    expect(line).not.toBeNull();
+    expect(Buffer.byteLength(line!)).toBeLessThanOrEqual(511);
+    expect(line!.includes("focus_drop")).toBe(false);
+    const parsed = parseSpawnBindLines(`${line}\n`);
+    expect(parsed.malformed).toBe(0);
+    expect(parsed.rows[0]?.basis).toBe("sole_active");
+  });
+});
+
+describe("agent-binds drain — HOOK-BINDING-SPEC.md §4.1", () => {
+  test("a resolved bind record becomes a source='hook' task_alias row", () => {
+    seedTask("t1");
+    appendBind(bindRecord({ tid: "t1", basis: "sole_active", na: 1, nb: 1 }));
+    const result = drain();
+    expect(result.binds).toMatchObject({ read: 1, bound: 1 });
+    const row = h.db
+      .query<{ tid: string; source: string }, [string]>(
+        "SELECT tid, source FROM task_alias WHERE id_kind = 'agent' AND local_id = ?",
+      )
+      .get("agent-1");
+    expect(row).toEqual({ tid: "t1", source: "hook" });
+  });
+
+  test("a witness record (tid: null) writes no alias, only counts into binds_basis", () => {
+    appendBind(bindRecord({ tid: null, basis: "multi_active", na: 2, nb: 2 }));
+    const result = drain();
+    expect(result.binds.bound).toBe(0);
+    expect(result.binds.basis.multi_active).toBe(1);
+    expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_alias").get()?.n).toBe(0);
+    expect(result.anomalies.map((a) => a.kind)).toContain("hook_bind_multi_active");
+  });
+
+  test("focus_drop is counted per-reason on the drain, additive to basis, not a replacement (§14.8)", () => {
+    seedTask("t1");
+    appendBind(bindRecord({ tuid: "toolu_fd1", tid: "t1", basis: "sole_active", focus_drop: "contested" }));
+    appendBind(bindRecord({ tuid: "toolu_fd2", tid: null, basis: "multi_active", na: 2, nb: 2, focus_drop: "idle" }));
+    appendBind(bindRecord({ tuid: "toolu_fd3", tid: "t1", basis: "sole_active" }));
+    const result = drain();
+    expect(result.binds.focus_drop).toEqual({ contested: 1, idle: 1 });
+    expect(result.binds.basis.sole_active).toBe(2);
+  });
+
+  test("no_bound and db_unavailable witnesses never raise an anomaly", () => {
+    appendBind(bindRecord({ tuid: "toolu_a", tid: null, basis: "no_bound", na: 0, nb: 0 }));
+    appendBind(bindRecord({ tuid: "toolu_b", tid: null, basis: "db_unavailable" }));
+    const result = drain();
+    expect(result.binds.basis.no_bound).toBe(1);
+    expect(result.binds.basis.db_unavailable).toBe(1);
+    expect(result.anomalies).toHaveLength(0);
+  });
+
+  test("a disagreeing tuid group is dropped WHOLE, with hook_bind_conflict, and no alias survives", () => {
+    seedTask("t1");
+    seedTask("t2");
+    appendBind(bindRecord({ tuid: "toolu_x", tid: "t1", basis: "sole_active" }));
+    appendBind(bindRecord({ tuid: "toolu_x", tid: "t2", basis: "sole_active" }));
+    const result = drain();
+    expect(result.binds.dropped).toBe(1);
+    expect(result.anomalies.map((a) => a.kind)).toContain("hook_bind_conflict");
+    expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_alias").get()?.n).toBe(0);
+  });
+
+  test("an agreeing group: the earliest record WITH a tid wins over a leading tid:null witness", () => {
+    seedTask("t1");
+    appendBind(bindRecord({ tuid: "toolu_y", ts: "2026-01-01T00:00:00Z", tid: null, basis: "multi_active" }));
+    appendBind(bindRecord({ tuid: "toolu_y", ts: "2026-01-01T00:00:05Z", tid: "t1", basis: "sole_active" }));
+    const result = drain();
+    expect(result.binds.bound).toBe(1);
+    const row = h.db
+      .query<{ tid: string }, [string]>("SELECT tid FROM task_alias WHERE id_kind = 'agent' AND local_id = ?")
+      .get("agent-1");
+    expect(row?.tid).toBe("t1");
+  });
+
+  test("owner pre-check: an est_bind row already owns the identity -> hook_bind_deferred_to_human, skip", () => {
+    seedTask("t1");
+    seedTask("t2");
+    aliasRow("t1", "agent", "s1", "agent-1", "est_bind");
+    appendBind(bindRecord({ tid: "t2", basis: "sole_active" }));
+    const result = drain();
+    expect(result.binds.deferred_human).toBe(1);
+    expect(result.anomalies.map((a) => a.kind)).toContain("hook_bind_deferred_to_human");
+    const rows = h.db.query<{ tid: string }, []>("SELECT tid FROM task_alias WHERE local_id = 'agent-1'").all();
+    expect(rows).toEqual([{ tid: "t1" }]); // untouched
+  });
+
+  test("owner pre-check: another hook alias already owns it (cross-drain drift) -> hook_bind_superseded", () => {
+    seedTask("t1");
+    seedTask("t2");
+    aliasRow("t1", "agent", "s1", "agent-1", "hook");
+    appendBind(bindRecord({ tid: "t2", basis: "sole_active" }));
+    const result = drain();
+    expect(result.binds.superseded).toBe(1);
+    expect(result.anomalies.map((a) => a.kind)).toContain("hook_bind_superseded");
+  });
+
+  test("owner pre-check: a different, non-est_bind/non-hook source -> hook_bind_conflict (ALERTING)", () => {
+    seedTask("t1");
+    seedTask("t2");
+    aliasRow("t1", "agent", "s1", "agent-1", "sweeper");
+    appendBind(bindRecord({ tid: "t2", basis: "sole_active" }));
+    const result = drain();
+    expect(result.binds.conflict).toBe(1);
+    expect(result.anomalies.map((a) => a.kind)).toContain("hook_bind_conflict");
+  });
+
+  test("owner pre-check is IDENTITY-WIDE: catches a split across sessions a session-scoped check would miss", () => {
+    // HOOK-BINDING-SPEC.md §4.1 step 3 / §5.2: `ux_alias_exclusive` is session-scoped,
+    // so `agent-1` under session s1 pointing at t1 and under session s2 pointing at t2
+    // are BOTH physically legal rows. A session-scoped pre-check (like bindTask's own)
+    // would not see the s2 row when writing under s1's session — the identity-wide
+    // query here must.
+    seedTask("t1");
+    seedTask("t2");
+    aliasRow("t1", "agent", "s1", "agent-1", "sweeper");
+    appendBind(bindRecord({ sid: "s2", tid: "t2", basis: "sole_active" }));
+    const result = drain();
+    expect(result.binds.conflict).toBe(1);
+    const rows = h.db.query<{ session_id: string }, []>("SELECT session_id FROM task_alias WHERE local_id = 'agent-1'").all();
+    expect(rows).toEqual([{ session_id: "s1" }]); // the drain never wrote the s2 row
+  });
+
+  test("orphan tid: the named task vanished before the drain ran -> hook_bind_orphan_tid, no throw", () => {
+    appendBind(bindRecord({ tid: "t-vanished", basis: "sole_active" }));
+    const result = drain();
+    expect(result.binds.unbound).toBe(1);
+    expect(result.anomalies.map((a) => a.kind)).toContain("hook_bind_orphan_tid");
+  });
+
+  test("re-binding the same identity to the same tid twice is an idempotent no-op (dup)", () => {
+    seedTask("t1");
+    appendBind(bindRecord({ tuid: "toolu_1", tid: "t1", basis: "sole_active" }));
+    expect(drain().binds.bound).toBe(1);
+    appendBind(bindRecord({ tuid: "toolu_2", tid: "t1", basis: "sole_active" }));
+    const second = drain();
+    expect(second.binds.dup).toBe(1);
+    expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_alias").get()?.n).toBe(1);
+  });
+
+  test("nested fixpoint: a parent bound in the SAME batch resolves the child in one drain", () => {
+    seedTask("t1");
+    appendBind(bindRecord({ tuid: "toolu_parent", kind: "agent", local_id: "parent-agent", tid: "t1", basis: "sole_active" }));
+    appendBind(
+      bindRecord({
+        tuid: "toolu_child",
+        kind: "agent",
+        local_id: "child-agent",
+        tid: null,
+        basis: "nested",
+        parent_agent: "parent-agent",
+      }),
+    );
+    const result = drain();
+    expect(result.binds.bound).toBe(1); // the parent
+    expect(result.binds.nested_bound).toBe(1); // the child, resolved in the SAME pass
+    const child = h.db
+      .query<{ tid: string }, [string]>("SELECT tid FROM task_alias WHERE local_id = ?")
+      .get("child-agent");
+    expect(child?.tid).toBe("t1");
+  });
+
+  test("a nested record whose parent has no alias yet is deferred, not dropped", () => {
+    appendBind(
+      bindRecord({
+        tuid: "toolu_child",
+        kind: "agent",
+        local_id: "child-agent",
+        tid: null,
+        basis: "nested",
+        parent_agent: "parent-not-bound-yet",
+        att: 0,
+      }),
+    );
+    const result = drain();
+    expect(result.binds.nested_deferred).toBe(1);
+    expect(h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_alias").get()?.n).toBe(0);
+
+    // Re-appended to the LIVE file with att+1, so the NEXT drain sees it again.
+    const live = JSON.parse(readFileSync(join(spool, AGENT_BINDS_FILE), "utf8").trim()) as SpawnBindRecord;
+    expect(live.att).toBe(1);
+    expect(live.basis).toBe("nested");
+  });
+
+  test("a nested record deferred through att=3 gives up: hook_spawn_depth_unbound, discarded", () => {
+    appendBind(
+      bindRecord({
+        tuid: "toolu_child",
+        kind: "agent",
+        local_id: "child-agent",
+        tid: null,
+        basis: "nested",
+        parent_agent: "still-not-bound",
+        att: 3,
+      }),
+    );
+    const result = drain();
+    expect(result.anomalies.map((a) => a.kind)).toContain("hook_spawn_depth_unbound");
+    expect(result.binds.nested_deferred).toBe(0);
+    expect(existsSync(join(spool, AGENT_BINDS_FILE))).toBe(false); // nothing re-appended
+  });
+
+  test("SweepReport.spool carries binds_* counters, binds_basis, binds_focus_drop, and a binds_keysets histogram (§4.1 step 6 / §9.1 / §14.9#10)", async () => {
+    // Every assertion here is `undefined` before src/cli.ts's SweepReport.spool wires
+    // spool.binds.* through — src/spool.ts's DrainResult already carries it.
+    const { runSweep } = await import("../src/cli.ts");
+    seedTask("t-r1");
+    appendBind(
+      bindRecord({ tuid: "toolu_r1", tid: "t-r1", basis: "sole_active", k: ["session_id", "tool_name"] }),
+    );
+    appendBind(
+      bindRecord({
+        tuid: "toolu_r2",
+        tid: null,
+        basis: "multi_active",
+        k: ["session_id", "tool_name", "agent_id"], // deliberately a DIFFERENT key set
+      }),
+    );
+    appendBind(bindRecord({ tuid: "toolu_r3", tid: null, basis: "multi_active", focus_drop: "idle" }));
+    const emptyRoot = join(h.dir, "empty-projects-binds");
+    mkdirSync(emptyRoot, { recursive: true });
+    const report = await runSweep(h.db, { root: emptyRoot, spoolDir: spool });
+    expect(report.spool.binds_read).toBe(3);
+    expect(report.spool.binds_focus_drop.idle).toBe(1);
+    expect(report.spool.binds_bound).toBe(1);
+    expect(report.spool.binds_basis.multi_active).toBe(2); // toolu_r2 and the new toolu_r3
+    expect(Object.keys(report.spool.binds_keysets)).toHaveLength(3); // r1's, r2's, and toolu_r3's "(absent)"
+  });
+
+  test("hook_bind_enabled=0: the drain discards the whole batch unread — no alias, nothing re-appended, no anomaly, no .draining residue (§8.1)", () => {
+    seedTask("t1");
+    h.db.run("UPDATE config SET v = ? WHERE k = ?", ["0", "hook_bind_enabled"]);
+    // One record that WOULD bind, and one nested record whose parent has no alias yet
+    // (which, with the switch on, would be deferred and re-appended with att+1).
+    appendBind(bindRecord({ tuid: "toolu_gate1", tid: "t1", basis: "sole_active" }));
+    appendBind(
+      bindRecord({
+        tuid: "toolu_gate2",
+        kind: "agent",
+        local_id: "child-agent-gate",
+        tid: null,
+        basis: "nested",
+        parent_agent: "parent-not-bound-gate",
+      }),
+    );
+    const result = drain();
+    expect(
+      h.db
+        .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_alias WHERE source = 'hook'")
+        .get()?.n,
+    ).toBe(0);
+    expect(result.binds.disabled_dropped).toBe(2);
+    expect(result.binds.bound).toBe(0);
+    expect(result.binds.nested_deferred).toBe(0);
+    expect(result.anomalies.map((a) => a.kind)).not.toContain("hook_spawn_depth_unbound");
+    expect(result.anomalies.filter((a) => a.kind.startsWith("hook_"))).toHaveLength(0);
+    expect(existsSync(join(spool, AGENT_BINDS_FILE))).toBe(false); // nothing re-appended
+    expect(readdirSync(spool).some((f) => f.includes(".draining"))).toBe(false);
+  });
+
+  test("attributeTasks: a 'hook' alias resolves exclusive, same as 'est_bind'", () => {
+    seedTask("t1");
+    appendBind(bindRecord({ tid: "t1", basis: "sole_active" }));
+    drain();
+    turn(h.db, { session: "s1", prompt: "p1", at: LONG_AGO, durationMs: 1000 });
+    agentRun(h.db, "agent-1", { session: "s1", launchPrompt: "p1", startedAt: LONG_AGO, endedAt: null });
+    request(h.db, "r1", { session: "s1", prompt: null, origin: "subagent", agent: "agent-1", out: 100 });
+    attributeTasks(h.db);
+    const row = h.db
+      .query<{ tid: string; attr: string }, []>("SELECT tid, attr FROM request WHERE request_id = 'r1'")
+      .get()!;
+    expect(row).toEqual({ tid: "t1", attr: "exclusive" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HOOK-BINDING-SPEC.md §3.2a — the focus marker
+// ---------------------------------------------------------------------------
+
+describe("focus marker — HOOK-BINDING-SPEC.md §3.2a", () => {
+  test("write then read round-trips, and clear only removes a marker naming the given tid", () => {
+    writeFocusMarker("s1", "t1", "est_open", spool, new Date(LONG_AGO));
+    expect(readFocusMarker("s1", spool)).toEqual({ tid: "t1", ts: new Date(LONG_AGO).toISOString(), by: "est_open" });
+
+    // Clearing for a DIFFERENT tid than the one the marker actually names must not
+    // remove it — a session can host several open tasks (schema v6).
+    clearFocusMarker("s1", "t-other", spool);
+    expect(readFocusMarker("s1", spool)).not.toBeNull();
+
+    clearFocusMarker("s1", "t1", spool);
+    expect(readFocusMarker("s1", spool)).toBeNull();
+  });
+
+  test("a later write overwrites the earlier one (last writer wins)", () => {
+    writeFocusMarker("s1", "t1", "est_open", spool);
+    writeFocusMarker("s1", "t2", "est_focus", spool);
+    expect(readFocusMarker("s1", spool)).toMatchObject({ tid: "t2", by: "est_focus" });
+  });
+
+  test("the write is atomic: no .tmp. staging file survives a normal write", () => {
+    writeFocusMarker("s1", "t1", "est_open", spool);
+    const names = readdirSync(spool);
+    expect(names).toContain(focusMarkerFile("s1"));
+    expect(names.some((n) => n.includes(".tmp."))).toBe(false);
+  });
+
+  test("readFocusMarker returns null for a missing or malformed marker", () => {
+    expect(readFocusMarker("s-never-focused", spool)).toBeNull();
+    writeFileSync(join(spool, focusMarkerFile("s-bad")), "not json");
+    expect(readFocusMarker("s-bad", spool)).toBeNull();
+  });
+
+  test("pruneMarkers learns .focus.<sid> — reaped past its 7-day ceiling, kept inside it", () => {
+    const touch = (name: string, ageMs: number): void => {
+      const path = join(spool, name);
+      writeFileSync(path, "x");
+      const when = new Date(Date.now() - ageMs);
+      utimesSync(path, when, when);
+    };
+    expect(FOCUS_MARKER_PREFIX).toBe(".focus.");
+    touch(focusMarkerFile("s-stale"), FOCUS_MARKER_TTL_MS + 60_000);
+    touch(focusMarkerFile("s-fresh"), 60_000);
+    expect(pruneMarkers(spool)).toBe(1);
+    expect(existsSync(join(spool, focusMarkerFile("s-stale")))).toBe(false);
+    expect(existsSync(join(spool, focusMarkerFile("s-fresh")))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// §4.2 / §10 step 1a — the claim() read-failure regression
+// ---------------------------------------------------------------------------
+
+describe("claim() read-failure regression — a .draining file the reader cannot open survives", () => {
+  afterEach(() => {
+    // Best-effort: restore permissions so the harness's own cleanup can remove it.
+    try {
+      chmodSync(join(spool, `${TASK_EVENTS_FILE}.draining`), 0o644);
+    } catch {
+      // already gone / already restored
+    }
+  });
+
+  test("an unreadable .draining file is left in place, not deleted by cleanup()", () => {
+    appendLine(TASK_EVENTS_FILE, { ts: LONG_AGO, session_id: "s1", task_num: "1", to_status: "deleted" });
+    const drainingPath = join(spool, `${TASK_EVENTS_FILE}.draining`);
+    renameSync(join(spool, TASK_EVENTS_FILE), drainingPath);
+    chmodSync(drainingPath, 0o000); // simulate a read failure on the recovery branch
+
+    const result = drain(); // must not throw, must not report the record as read
+    expect(result.task_events.read).toBe(0);
+    expect(existsSync(drainingPath)).toBe(true); // NOT deleted — this is the fix
+
+    chmodSync(drainingPath, 0o644);
+    const recovered = drain();
+    expect(recovered.task_events.inserted).toBe(1);
+    expect(existsSync(drainingPath)).toBe(false);
   });
 });

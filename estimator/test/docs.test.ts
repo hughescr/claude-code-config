@@ -15,7 +15,7 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { COMMANDS } from "../src/cli.ts";
+import { COMMANDS, HELP } from "../src/cli.ts";
 
 const ROOT = join(import.meta.dir, "..");
 const README = readFileSync(join(ROOT, "README.md"), "utf8");
@@ -68,5 +68,24 @@ describe("README operational coverage", () => {
     expect(README).toContain("scripts/statusline-burn.ts");
     // The launchd job is installed; the table must not claim otherwise.
     expect(README).not.toContain("**NOT INSTALLED**");
+  });
+});
+
+describe("est help — focus TTL basis", () => {
+  test("the focus entry describes the TTL on its implemented idle-gap basis (REV3, §14.4)", () => {
+    const start = HELP.indexOf("focus <tid>:");
+    const end = HELP.indexOf("scope <tid>:");
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const entry = HELP.slice(start, end);
+    expect(entry).toContain("hook_focus_ttl_min");
+    // resolveLadder's `focusVerdict` bridges the SESSION's own turn stream
+    // (scripts/nudge.ts) — the behaviour is pinned by nudge.test.ts's §14.9 cases,
+    // headlined by "a focus marker survives well past hook_focus_ttl_min while its
+    // session keeps producing turns". This test pins the USER-FACING half: the entry
+    // must describe an idle gap, and must NOT claim a fixed age from when it was set
+    // (the rev-2 reading this test used to pin, now its inverse).
+    expect(entry.toLowerCase()).toContain("idle");
+    expect(entry).not.toMatch(/when it was SET|time it was set/);
   });
 });

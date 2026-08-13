@@ -62,6 +62,10 @@ estimator/gates/*.md
 # covered by the weekly backups/ snapshot, not by git
 estimator/DESIGN.md
 estimator/DECISIONS.md
+# design docs (e.g. HOOK-BINDING-SPEC.md) are drafted alongside DESIGN.md/DECISIONS.md
+# and carry the same private-corpus caveats even when they avoid quoting numbers
+# directly — local only, not part of the committed source (HOOK-BINDING-SPEC.md §10 step 0)
+estimator/design/
 # `bun install` materialises the two typecheck-only devDependencies here. Runtime
 # dependencies are still zero; `bun.lock` IS committed, so `bun run typecheck`
 # reproduces exactly the compiler the last recorded run used.

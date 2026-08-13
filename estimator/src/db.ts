@@ -53,6 +53,74 @@ export const DB_PATH: string = process.env.EST_DB ?? join(DATA_ROOT, "estimator.
 /**
  * Must match the config.schema_version seed in schema.sql.
  *
+ * 21 — hook-based spawn-time attribution binding (HOOK-BINDING-SPEC.md, Craig
+ *     2026-08-12). CONFIG ROWS ONLY — no CREATE, no ALTER, no new table, no new
+ *     index, no new view, no CHECK change (spec §8.1). Four seeds:
+ *     `hook_bind_enabled` (master switch; `0` makes the drain discard the whole
+ *     agent-binds batch unread — the rollback lever, enforced at drain time per
+ *     §7.1's "zero hot-path DB work inside a worker" rather than hook-side),
+ *     `hook_focus_ttl_min` (the longest IDLE GAP an `est focus` pointer's session may
+ *     sit across and still be believed — REV3, §14.4 — deliberately equal to
+ *     `attr_stale_minutes`'s default; NOT an age from the marker's own timestamp, and
+ *     NOT renewed by the focused task's own attributed liveness window either (INV-TTL,
+ *     §14.2 — a bound task's spans must not feed back into its own marker's
+ *     believability), only by the session's raw turn stream continuing to transact),
+ *     `hook_bind_marker` (whether the `[est:<tid8>]` description marker is
+ *     honoured; off by default — model-controlled text must not mint an
+ *     exclusive-grade alias on its own), `hook_bind_batch_max` (drain batch cap).
+ *     `task_alias.source = 'hook'` is a new documented VALUE of an existing
+ *     unchecked column (`schema.sql:86`, no CHECK) — not a schema object, so it is
+ *     not a migration step. New `anomaly.kind` values are documented in
+ *     `src/spool.ts`'s module doc rather than in `schema.sql`'s in-DDL catalogue
+ *     comment, because editing a comment inside a `CREATE` body IS a schema change
+ *     under `test/schema.test.ts`'s byte-identity assertion (spec §8.2, Q3).
+ * 20 — the cache-write TTL pricing fix (CACHE-TTL-PRICING.md D1-D6, Craig 2026-08-12).
+ *     Anthropic prices a cache write by the TTL requested (1.25x base input for 5m,
+ *     2.00x for 1h); `model_price` had exactly one cache-write column and every 1h
+ *     write in the corpus was priced at 62.5% of its true rate, invisibly, because
+ *     nothing recorded that a TTL distinction existed. Six ADD COLUMNs, two tables
+ *     widened, no row dropped, rewritten or moved:
+ *       - `request.cw5m_tok` / `cw1h_tok` / `cw_ttl_src` (D1). A DECOMPOSITION of
+ *         `cw_tok`, not a replacement — `cw_tok` stays the authoritative aggregate
+ *         and the only thing OTEL can write. `cw_ttl_src='unrecorded'` is the
+ *         honest default for every pre-fix row and every OTEL-only row.
+ *       - `model_price.usd_cw1h` / `usd_cw1h_src` (D2), honestly nullable: an
+ *         unsynced vintage says so via `'unrecorded'` rather than defaulting to a
+ *         number nobody measured. The pairing CHECK is column-level, attached to
+ *         `usd_cw1h_src` and referencing the already-declared `usd_cw1h` — a
+ *         *table*-level CHECK cannot be added by ALTER TABLE, this can.
+ *       - `outcome.cw_ttl_unknown_share`, nullable (not `DEFAULT 0`, unlike its
+ *         `unattrib_share` / `ambiguous_share` neighbours): every outcome revision
+ *         written before this fix was priced at 100% unknown TTL, and a `0`
+ *         default would stamp "fully known" onto exactly the rows that were not.
+ *     `v_priced` / `v_wcet` / `v_task_actual_epoch` are recreated with the D3
+ *     pricing expression: the 5m leg is filled first and every leg is clamped so
+ *     the three always sum to exactly `cw_tok` in both directions (an over-split
+ *     row — two divergent replays of one `request_id` — prices at the LOWER rate,
+ *     never the higher one). The residual unknown-TTL leg prices at the recorded
+ *     5m rate (D4) — deliberately NOT a config knob, because a
+ *     `cw_ttl_unknown_policy` setting would let one `est config set` restate every
+ *     historical actual, the exact hazard `ref_model` / `estimand` are unit-pinned
+ *     against. Two new views make coverage visible rather than merely guarded:
+ *     `v_cw_ttl_exposure` (request-side: unknown-TTL and over-split tokens, based
+ *     on `v_request_live` so an unpriced family's exposure is still visible) and
+ *     `v_cw_1h_price_gap` (price-side: a vintage with cache-write spend but no
+ *     recorded 1h rate). Four config seeds: the plausibility band and default
+ *     multiple `est prices --sync` gates a published 1h rate against
+ *     (`price_cw_1h_min_multiple` / `_max_multiple` / `_default_multiple`), and
+ *     `cw_ttl_unknown_warn_share` (`est report`'s threshold — reporting only,
+ *     never a pricing lever). `est prices --fill-cw-1h` (D6) is the one-shot,
+ *     idempotent, human-run command that fills every `usd_cw1h IS NULL` vintage
+ *     from the same source chain and gate as a sync; it restates no recorded
+ *     rate (`WHERE usd_cw1h IS NULL`) and touches no other column.
+ *
+ *     NOT in this step, deliberately scoped out (see the worktree report for
+ *     est/cache-ttl-pricing): D8's closed-outcome re-heal on a pure repricing
+ *     event (`outcome` still heals only when new spend lands after
+ *     `finalized_at`) and D10's `cw_ttl_unrecorded` / `cw_split_mismatch` daily
+ *     sweep-time anomaly rows. `price_cw_1h_implausible` and
+ *     `cw_1h_price_backfilled` (the two anomalies D5's gate and D6's fill
+ *     naturally produce) ARE recorded.
  * 19 — a REFUSED rate stops being scoreable, and the anchor registry stops being
  *     evadable (Craig 2026-07-31). Two ADD COLUMNs, one table, one view, three triggers;
  *     no row is dropped, rewritten or moved.
@@ -281,7 +349,7 @@ export const DB_PATH: string = process.env.EST_DB ?? join(DATA_ROOT, "estimator.
  *     `v_phase_actual.phase_conf`, auxiliary origin excluded from calibration.
  * 1 — initial R3 §4.2 shape.
  */
-export const SCHEMA_VERSION = "19";
+export const SCHEMA_VERSION = "21";
 
 /**
  * Forward-only, additive migrations, applied by {@link openDb} on a WRITABLE
@@ -1410,6 +1478,173 @@ LEFT JOIN sp_anchor_repair r
         );
       }
     },
+  },
+  {
+    from: "19",
+    to: "20",
+    // The cache-write TTL pricing fix (see the SCHEMA_VERSION doc comment above).
+    //
+    // Three tables gain six ADD COLUMNs total; five views are recreated with the D3
+    // pricing expression (three replaced, two new); four config seeds. Nothing in the
+    // append-only spine is read, rewritten or moved: ADD COLUMN widens every existing
+    // row in place with the honest default (`'unrecorded'` for the two src columns,
+    // `0` for the two counters, NULL for the two nullable rate/share columns), views
+    // hold no rows, and the seeds are `INSERT OR IGNORE` so a value Craig has already
+    // tuned is never restated (migration rule 2).
+    //
+    // The COLUMNS are in `apply` below, because SQLite has no `ADD COLUMN IF NOT
+    // EXISTS` and rule 3 requires this step to survive a file that already has the
+    // shape — the same route the 14 -> 15, 16 -> 17 and 18 -> 19 steps take, and for
+    // the same reason: `request`, `model_price` and `outcome` cannot be rebuilt (each
+    // is referenced by other tables and/or carries append-only triggers whose whole
+    // point is that rows are never copied anywhere).
+    //
+    // The VIEW definitions below MUST stay byte-identical to schema.sql's, because
+    // `test/schema.test.ts` diffs a migrated file's `sqlite_master` against a fresh
+    // one. `IF EXISTS` / `IF NOT EXISTS` for the reason v8 and every step since
+    // documents: SQLite strips the clause before storing, so idempotence costs
+    // nothing in fidelity.
+    sql: `
+DROP VIEW IF EXISTS v_priced;
+CREATE VIEW IF NOT EXISTS v_priced AS
+SELECT r.*, p.usd_in, p.usd_out, p.usd_cw, p.usd_cr, p.usd_cw1h, p.provisional,
+  MIN(r.cw5m_tok, r.cw_tok) AS cw5m_priced_tok,
+  MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)) AS cw1h_priced_tok,
+  r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)
+           - MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)) AS cw_ttl_unknown_tok
+FROM v_request_tiered r
+JOIN model_price p ON p.family = r.price_family
+ AND p.effective_from = (SELECT MAX(effective_from) FROM model_price
+                         WHERE family = r.price_family AND effective_from <= r.ts);
+
+DROP VIEW IF EXISTS v_wcet;
+CREATE VIEW IF NOT EXISTS v_wcet AS
+SELECT v.*,
+  CAST((v.out_tok*v.usd_out + v.cw_cost) / v.ref_out AS INTEGER) AS wcet,
+  CAST((v.in_tok*v.usd_in + v.out_tok*v.usd_out
+        + v.cw_cost + v.cr_tok*v.usd_cr) / v.ref_out AS INTEGER) AS scet
+FROM (SELECT p.*,
+        p.cw1h_priced_tok * COALESCE(p.usd_cw1h, p.usd_cw)
+          + p.cw5m_priced_tok * p.usd_cw
+          + p.cw_ttl_unknown_tok * p.usd_cw AS cw_cost,
+        (SELECT usd_out FROM model_price
+          WHERE family = (SELECT v FROM config WHERE k='ref_model')
+            AND effective_from <= p.ts
+          ORDER BY effective_from DESC LIMIT 1) AS ref_out
+      FROM v_priced p) v;
+
+CREATE VIEW IF NOT EXISTS v_cw_ttl_exposure AS
+SELECT ts, model_family, tid, cw_tok, cw5m_tok, cw1h_tok, cw_ttl_src,
+       MAX(cw_tok - cw5m_tok - cw1h_tok, 0) AS cw_ttl_unknown_tok,
+       MAX(cw5m_tok + cw1h_tok - cw_tok, 0) AS cw_ttl_over_tok
+FROM v_request_live
+WHERE cw_tok > 0
+  AND (cw_ttl_src = 'unrecorded'
+       OR cw5m_tok + cw1h_tok <> cw_tok);
+
+CREATE VIEW IF NOT EXISTS v_cw_1h_price_gap AS
+SELECT p.family, p.effective_from, p.usd_cw1h_src
+FROM model_price p
+WHERE p.usd_cw1h IS NULL
+  AND EXISTS (SELECT 1 FROM v_priced r WHERE r.price_family = p.family AND r.cw_tok > 0);
+
+DROP VIEW IF EXISTS v_task_actual_epoch;
+CREATE VIEW IF NOT EXISTS v_task_actual_epoch AS
+SELECT r.tid,
+  SUM(CAST((CASE e.estimand
+              WHEN 'out'         THEN r.out_tok*pe.usd_out
+              WHEN 'work_cet'    THEN r.out_tok*pe.usd_out
+                + MIN(r.cw5m_tok, r.cw_tok) * pe.usd_cw
+                + MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)) * COALESCE(pe.usd_cw1h, pe.usd_cw)
+                + (r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)
+                            - MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok))) * pe.usd_cw
+              WHEN 'out_cw_in'   THEN r.out_tok*pe.usd_out + r.in_tok*pe.usd_in
+                + MIN(r.cw5m_tok, r.cw_tok) * pe.usd_cw
+                + MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)) * COALESCE(pe.usd_cw1h, pe.usd_cw)
+                + (r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)
+                            - MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok))) * pe.usd_cw
+              WHEN 'story_point' THEN r.out_tok*pe.usd_out
+                + MIN(r.cw5m_tok, r.cw_tok) * pe.usd_cw
+                + MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)) * COALESCE(pe.usd_cw1h, pe.usd_cw)
+                + (r.cw_tok - MIN(r.cw5m_tok, r.cw_tok)
+                            - MIN(r.cw1h_tok, r.cw_tok - MIN(r.cw5m_tok, r.cw_tok))) * pe.usd_cw
+            END) / rf.usd_out AS INTEGER)) AS wcet_at_epoch,
+  e.price_epoch, e.eid AS eid_at_start
+FROM v_request_live r
+JOIN estimate e ON e.eid = (SELECT MIN(eid) FROM estimate WHERE tid = r.tid)
+-- Same per-request context tier as v_priced, but resolved AT THE EPOCH rather than
+-- at the request's own ts: reusing v_request_tiered here would pick a companion
+-- family that may not exist at price_epoch, and this INNER JOIN would then drop the
+-- request silently instead of pricing it. The \`NOT LIKE '%]'\` guard is the same
+-- one v_request_tiered carries and for the same reason: a bracketed family's own
+-- row already carries the long-context rate.
+JOIN model_price pe
+  ON pe.family = CASE WHEN (r.in_tok + r.cw_tok + r.cr_tok) > 200000
+                       AND r.model_family NOT LIKE '%]'
+                       AND EXISTS (SELECT 1 FROM model_price hi
+                                    WHERE hi.family = r.model_family || '@above_200k'
+                                      AND hi.effective_from <= e.price_epoch)
+                      THEN r.model_family || '@above_200k'
+                      ELSE r.model_family END
+ AND pe.effective_from = (SELECT MAX(effective_from) FROM model_price
+                          WHERE family = pe.family AND effective_from <= e.price_epoch)
+-- The normaliser. \`e.ref_model\`, not config: the whole view is an INNER JOIN to
+-- \`estimate\`, so the snapshot is always available and config could only ever be a
+-- late substitute for it.
+JOIN model_price rf ON rf.family = e.ref_model
+ AND rf.effective_from = (SELECT MAX(effective_from) FROM model_price
+                          WHERE family = rf.family AND effective_from <= e.price_epoch)
+WHERE r.tid IS NOT NULL AND r.attr <> 'overhead'
+  AND r.origin IN ('main','subagent')   -- task effort only; 'auxiliary' excluded (§4.6)
+GROUP BY r.tid;
+
+INSERT OR IGNORE INTO config (k, v) VALUES
+  ('price_cw_1h_min_multiple',    '1.5'),
+  ('price_cw_1h_max_multiple',    '2.5'),
+  ('price_cw_1h_default_multiple', '2'),
+  ('cw_ttl_unknown_warn_share',    '0.02');
+`,
+    apply: (db: Database): void => {
+      // Each definition is written EXACTLY as schema.sql spells it: SQLite splices
+      // this text into the stored CREATE TABLE and `test/schema.test.ts` diffs a
+      // migrated file's `sqlite_master` against a fresh one byte for byte.
+      if (!hasColumn(db, "request", "cw5m_tok")) {
+        db.exec("ALTER TABLE request ADD COLUMN cw5m_tok INTEGER NOT NULL DEFAULT 0 CHECK (cw5m_tok >= 0)");
+      }
+      if (!hasColumn(db, "request", "cw1h_tok")) {
+        db.exec("ALTER TABLE request ADD COLUMN cw1h_tok INTEGER NOT NULL DEFAULT 0 CHECK (cw1h_tok >= 0)");
+      }
+      if (!hasColumn(db, "request", "cw_ttl_src")) {
+        db.exec(
+          "ALTER TABLE request ADD COLUMN cw_ttl_src TEXT NOT NULL DEFAULT 'unrecorded' CHECK (cw_ttl_src IN ('transcript','unrecorded'))",
+        );
+      }
+      if (!hasColumn(db, "model_price", "usd_cw1h")) {
+        db.exec("ALTER TABLE model_price ADD COLUMN usd_cw1h REAL CHECK (usd_cw1h IS NULL OR usd_cw1h >= 0)");
+      }
+      if (!hasColumn(db, "model_price", "usd_cw1h_src")) {
+        db.exec(
+          "ALTER TABLE model_price ADD COLUMN usd_cw1h_src TEXT NOT NULL DEFAULT 'unrecorded' CHECK (usd_cw1h_src IN ('litellm','models_dev','manual','derived_from_input','unrecorded') AND ((usd_cw1h IS NULL) = (usd_cw1h_src = 'unrecorded')))",
+        );
+      }
+      if (!hasColumn(db, "outcome", "cw_ttl_unknown_share")) {
+        db.exec("ALTER TABLE outcome ADD COLUMN cw_ttl_unknown_share REAL");
+      }
+    },
+  },
+  {
+    from: "20",
+    to: "21",
+    // Hook-based spawn-time attribution binding (see the SCHEMA_VERSION doc comment
+    // above). Config rows only — no DDL at all, following the v4 -> v5 precedent that
+    // seeded attr_stale_turns/attr_stale_minutes the same way.
+    sql: `
+INSERT OR IGNORE INTO config (k, v) VALUES
+  ('hook_bind_enabled',    '1'),
+  ('hook_focus_ttl_min',   '120'),
+  ('hook_bind_marker',     '0'),
+  ('hook_bind_batch_max',  '5000');
+`,
   },
 ];
 

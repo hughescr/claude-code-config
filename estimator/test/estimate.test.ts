@@ -41,6 +41,7 @@ import {
 } from "../src/tasks.ts";
 import { BURN_SCHEMA } from "../src/burn.ts";
 import { attributeTasks } from "../src/attribute.ts";
+import { readFocusMarker, SPOOL_DIR } from "../src/spool.ts";
 
 let h: Harness;
 
@@ -622,6 +623,135 @@ describe("est bind — P1.3", () => {
 
   test("an unknown tid is REJECTED (exit 2)", async () => {
     expect((await h.cli("bind", "no-such-tid", "--session", "s2")).code).toBe(2);
+  });
+
+  test("--replace: unbind-then-bind, one transaction, when the identity already belongs elsewhere", async () => {
+    const a = await open();
+    const other = await openOther();
+    expect((await h.cli("bind", a, "--session", "s9", "--agent", "ag-r1")).code).toBe(0);
+    const r = await h.cli("bind", other, "--session", "s9", "--agent", "ag-r1", "--replace", "--json");
+    expect(r.code).toBe(0);
+    const owner = h.db
+      .query<{ tid: string }, []>("SELECT tid FROM task_alias WHERE id_kind='agent' AND local_id='ag-r1'")
+      .get()!;
+    expect(owner.tid).toBe(other);
+    // The identity was never left unowned — exactly one row for it, always.
+    const n = h.db
+      .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_alias WHERE id_kind='agent' AND local_id='ag-r1'")
+      .get()!.n;
+    expect(n).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HOOK-BINDING-SPEC.md §3.2a / §5.3 — est focus, est unbind
+// ---------------------------------------------------------------------------
+
+describe("est focus — HOOK-BINDING-SPEC.md §3.2a", () => {
+  // A session id nothing else in this suite plausibly reuses — the shared spool
+  // directory (`EST_SPOOL_DIR`, test/preload.ts) is one per PROCESS, not per test.
+  const FS = "focus-test-session-9f3a1c";
+
+  test("est open writes the session focus marker", async () => {
+    const r = await h.cli(...openArgs(), "--session", FS, "--prompt", "p1", "--json");
+    expect(r.code).toBe(0);
+    const tid = r.json<{ tid: string }>().tid;
+    const marker = readFocusMarker(FS, SPOOL_DIR);
+    expect(marker).toMatchObject({ tid, by: "est_open" });
+  });
+
+  test("est bind --session writes the marker too; est bind without --session does not", async () => {
+    const tid = await open("--session", `${FS}-b`, "--prompt", "px");
+    const other = await openOther("--session", `${FS}-b2`, "--prompt", "px");
+    expect((await h.cli("bind", other, "--agent", "ag-fs1")).code).toBe(0); // no --session
+    expect(readFocusMarker(`${FS}-b2`, SPOOL_DIR)).not.toBeNull(); // from openOther's own est open
+    expect((await h.cli("bind", tid, "--session", `${FS}-b3`)).code).toBe(0);
+    expect(readFocusMarker(`${FS}-b3`, SPOOL_DIR)).toMatchObject({ tid, by: "est_bind" });
+  });
+
+  test("est focus <tid> --session <sid> sets it explicitly; --clear disarms it", async () => {
+    const tid = await open("--session", `${FS}-c`, "--prompt", "px");
+    const set = await h.cli("focus", tid, "--session", `${FS}-c2`);
+    expect(set.code).toBe(0);
+    expect(readFocusMarker(`${FS}-c2`, SPOOL_DIR)).toMatchObject({ tid, by: "est_focus" });
+
+    const cleared = await h.cli("focus", tid, "--session", `${FS}-c2`, "--clear");
+    expect(cleared.code).toBe(0);
+    expect(readFocusMarker(`${FS}-c2`, SPOOL_DIR)).toBeNull();
+  });
+
+  test("est focus on an unknown tid is REJECTED (exit 2)", async () => {
+    const r = await h.cli("focus", "no-such-tid", "--session", `${FS}-d`);
+    expect(r.code).toBe(2);
+  });
+
+  test("est close clears the focus marker for every session that aliases the closed tid", async () => {
+    const s1 = `${FS}-e1`;
+    const s2 = `${FS}-e2`;
+    const tid = await open("--session", s1, "--prompt", "px");
+    expect((await h.cli("bind", tid, "--session", s2)).code).toBe(0); // second session, same tid
+    expect(readFocusMarker(s1, SPOOL_DIR)).not.toBeNull();
+    expect(readFocusMarker(s2, SPOOL_DIR)).not.toBeNull();
+    expect((await h.cli("close", tid, "--force")).code).toBeLessThanOrEqual(3);
+    expect(readFocusMarker(s1, SPOOL_DIR)).toBeNull();
+    expect(readFocusMarker(s2, SPOOL_DIR)).toBeNull();
+  });
+});
+
+describe("est unbind — HOOK-BINDING-SPEC.md §5.3", () => {
+  test("removes a hook-written (or otherwise non-est_bind) alias without --force", async () => {
+    const tid = await open();
+    h.db.run(
+      "INSERT INTO task_alias (tid,id_kind,session_id,local_id,first_seen,source) VALUES (?,?,?,?,?,?)",
+      [tid, "agent", "s1", "ag-u1", "2026-01-01T00:00:00Z", "hook"],
+    );
+    const r = await h.cli("unbind", "--agent", "ag-u1", "--json");
+    expect(r.code).toBe(0);
+    const n = h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_alias WHERE local_id='ag-u1'").get()!.n;
+    expect(n).toBe(0);
+  });
+
+  test("refuses to remove a source='est_bind' alias without --force (exit 2)", async () => {
+    const tid = await open();
+    expect((await h.cli("bind", tid, "--session", "s9", "--agent", "ag-u2")).code).toBe(0);
+    const refused = await h.cli("unbind", "--agent", "ag-u2");
+    expect(refused.code).toBe(2);
+    const stillThere = h.db
+      .query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_alias WHERE local_id='ag-u2'")
+      .get()!.n;
+    expect(stillThere).toBe(1);
+
+    const forced = await h.cli("unbind", "--agent", "ag-u2", "--force");
+    expect(forced.code).toBe(0);
+    const gone = h.db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM task_alias WHERE local_id='ag-u2'").get()!.n;
+    expect(gone).toBe(0);
+  });
+
+  test("nothing bound to the identity is a no-op, exit 0", async () => {
+    const r = await h.cli("unbind", "--agent", "ag-never-bound");
+    expect(r.code).toBe(0);
+  });
+
+  test("--task requires --session (a Task-tool number is session-scoped)", async () => {
+    const r = await h.cli("unbind", "--task", "7");
+    expect(r.code).toBe(1);
+  });
+
+  test("giving more than one identity flag is a usage error", async () => {
+    const r = await h.cli("unbind", "--agent", "a1", "--run", "r1");
+    expect(r.code).toBe(1);
+  });
+
+  test("writes a class-only alias_unbound anomaly — never the ids", async () => {
+    const tid = await open();
+    h.db.run(
+      "INSERT INTO task_alias (tid,id_kind,session_id,local_id,first_seen,source) VALUES (?,?,?,?,?,?)",
+      [tid, "agent", "s1", "ag-u3", "2026-01-01T00:00:00Z", "hook"],
+    );
+    expect((await h.cli("unbind", "--agent", "ag-u3")).code).toBe(0);
+    const row = h.db.query<{ kind: string; detail: string }, []>("SELECT kind, detail FROM anomaly WHERE kind='alias_unbound'").get()!;
+    expect(row.detail).not.toContain("ag-u3");
+    expect(row.detail).not.toContain(tid);
   });
 });
 

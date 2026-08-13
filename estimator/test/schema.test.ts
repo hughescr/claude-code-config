@@ -15,9 +15,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb, SCHEMA_VERSION, schemaVersion } from "../src/db.ts";
-import { BACKFILL_TASK_EVENT_TID_SQL, INSERT_TASK_EVENT_SQL } from "../src/ingest.ts";
+import { BACKFILL_TASK_EVENT_TID_SQL, INSERT_TASK_EVENT_SQL, UPSERT_REQUEST_SQL } from "../src/ingest.ts";
 import { CLOSE_PASS_CANDIDATE_SQL } from "../src/autoclose.ts";
 import { ABOVE_200K_SUFFIX, LONG_CONTEXT_THRESHOLD } from "../src/prices.ts";
+import { INSERT_AUXILIARY_SQL, SUPERSEDE_AUXILIARY_SQL } from "../src/otel.ts";
 
 let dir: string;
 let db: Database;
@@ -39,14 +40,23 @@ afterEach(() => {
 /** USD per Mtok, effective from `from` (default: covers all history). */
 function price(
   family: string,
-  rates: { in: number; out: number; cw: number; cr: number },
+  rates: { in: number; out: number; cw: number; cr: number; cw1h?: number },
   from = "1970-01-01T00:00:00Z",
 ): void {
   db.query(
     `INSERT INTO model_price (family, effective_from, usd_in, usd_out, usd_cw, usd_cr,
-                              provisional, source, synced_epoch, ingested_at)
-     VALUES (?,?,?,?,?,?,0,'manual',NULL,'1970-01-01T00:00:00Z')`,
-  ).run(family, from, rates.in, rates.out, rates.cw, rates.cr);
+                              usd_cw1h, usd_cw1h_src, provisional, source, synced_epoch, ingested_at)
+     VALUES (?,?,?,?,?,?,?,?,0,'manual',NULL,'1970-01-01T00:00:00Z')`,
+  ).run(
+    family,
+    from,
+    rates.in,
+    rates.out,
+    rates.cw,
+    rates.cr,
+    rates.cw1h ?? null,
+    rates.cw1h === undefined ? "unrecorded" : "manual",
+  );
 }
 
 interface ReqOpts {
@@ -56,6 +66,9 @@ interface ReqOpts {
   out_tok?: number;
   cw_tok?: number;
   cr_tok?: number;
+  cw5m_tok?: number;
+  cw1h_tok?: number;
+  cw_ttl_src?: string;
   ts?: string;
   tid?: string | null;
   attr?: string;
@@ -66,8 +79,9 @@ function request(id: string, o: ReqOpts = {}): void {
   const family = o.family ?? "claude-test-1";
   db.query(
     `INSERT INTO request (request_id, session_id, origin, model, model_family, ts,
-                          in_tok, out_tok, cw_tok, cr_tok, tid, attr, agent_id)
-     VALUES (?, 's1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                          in_tok, out_tok, cw_tok, cr_tok, cw5m_tok, cw1h_tok, cw_ttl_src,
+                          tid, attr, agent_id)
+     VALUES (?, 's1', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     id,
     o.origin ?? "main",
@@ -78,6 +92,9 @@ function request(id: string, o: ReqOpts = {}): void {
     o.out_tok ?? 0,
     o.cw_tok ?? 0,
     o.cr_tok ?? 0,
+    o.cw5m_tok ?? 0,
+    o.cw1h_tok ?? 0,
+    o.cw_ttl_src ?? "unrecorded",
     o.tid ?? null,
     o.attr ?? "none",
     o.agent_id ?? null,
@@ -1088,5 +1105,500 @@ describe("schema migration", () => {
     expect(
       db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM otel_request").get()?.n,
     ).toBe(0);
+  });
+
+  /**
+   * The obligation every ADD COLUMN step carries (see the v14 test above and its
+   * counterpart in test/story-points.test.ts): a migrated file must be byte-identical
+   * to a fresh one. For v19 -> v20 this needs a GENUINELY v19-shaped database, not
+   * one fabricated by dropping columns from THIS repo's own (already-v20) schema.sql
+   * — that would reintroduce v20-only comments into a "v19" file and corrupt the very
+   * placement being tested. So the three v19 view bodies are inlined verbatim below
+   * (from the pre-cutover schema, the same source `git show <pre-fix rev>:schema.sql`
+   * would give), the same way the v14 chain test inlines the pre-v15 v_task_actual_epoch.
+   *
+   * DROP VIEW / CREATE VIEW ordering matters: `ALTER TABLE ... DROP COLUMN`
+   * re-validates every remaining view in the schema and fails outright if one
+   * references the column being dropped or selects from a view that would no longer
+   * resolve. v_cw_ttl_exposure and v_cw_1h_price_gap name v20 columns directly, so
+   * they drop and stay dropped; v_task_actual (unchanged since v19) selects from
+   * v_wcet, which selects from v_priced, so those two must be put back in their v19
+   * shape rather than merely dropped, or every later DROP COLUMN below fails with an
+   * opaque "error in view ...: no such column" the instant it is reached.
+   * DROP COLUMN order within model_price also matters: usd_cw1h_src's CHECK
+   * references usd_cw1h, so the _src column has to go first.
+   */
+  test("a genuinely v19-shaped database migrates to exactly the shape schema.sql builds", () => {
+    db.exec(`
+      DROP VIEW v_cw_ttl_exposure;
+      DROP VIEW v_cw_1h_price_gap;
+      DROP VIEW v_task_actual_epoch;
+      DROP VIEW v_wcet;
+      DROP VIEW v_priced;
+      CREATE VIEW v_priced AS
+      SELECT r.*, p.usd_in, p.usd_out, p.usd_cw, p.usd_cr, p.provisional
+      FROM v_request_tiered r
+      JOIN model_price p ON p.family = r.price_family
+       AND p.effective_from = (SELECT MAX(effective_from) FROM model_price
+                               WHERE family = r.price_family AND effective_from <= r.ts);
+      CREATE VIEW v_wcet AS
+      SELECT v.*,
+        CAST((v.out_tok*v.usd_out + v.cw_tok*v.usd_cw) / v.ref_out AS INTEGER) AS wcet,
+        CAST((v.in_tok*v.usd_in + v.out_tok*v.usd_out
+              + v.cw_tok*v.usd_cw + v.cr_tok*v.usd_cr) / v.ref_out AS INTEGER) AS scet
+      FROM (SELECT p.*,
+              (SELECT usd_out FROM model_price
+                WHERE family = (SELECT v FROM config WHERE k='ref_model')
+                  AND effective_from <= p.ts
+                ORDER BY effective_from DESC LIMIT 1) AS ref_out
+            FROM v_priced p) v;
+      CREATE VIEW v_task_actual_epoch AS
+      SELECT r.tid,
+        SUM(CAST((CASE e.estimand
+                    WHEN 'out'         THEN r.out_tok*pe.usd_out
+                    WHEN 'work_cet'    THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw
+                    WHEN 'out_cw_in'   THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw + r.in_tok*pe.usd_in
+                    WHEN 'story_point' THEN r.out_tok*pe.usd_out + r.cw_tok*pe.usd_cw
+                  END) / rf.usd_out AS INTEGER)) AS wcet_at_epoch,
+        e.price_epoch, e.eid AS eid_at_start
+      FROM v_request_live r
+      JOIN estimate e ON e.eid = (SELECT MIN(eid) FROM estimate WHERE tid = r.tid)
+      JOIN model_price pe
+        ON pe.family = CASE WHEN (r.in_tok + r.cw_tok + r.cr_tok) > 200000
+                             AND r.model_family NOT LIKE '%]'
+                             AND EXISTS (SELECT 1 FROM model_price hi
+                                          WHERE hi.family = r.model_family || '@above_200k'
+                                            AND hi.effective_from <= e.price_epoch)
+                            THEN r.model_family || '@above_200k'
+                            ELSE r.model_family END
+       AND pe.effective_from = (SELECT MAX(effective_from) FROM model_price
+                                WHERE family = pe.family AND effective_from <= e.price_epoch)
+      JOIN model_price rf ON rf.family = e.ref_model
+       AND rf.effective_from = (SELECT MAX(effective_from) FROM model_price
+                                WHERE family = rf.family AND effective_from <= e.price_epoch)
+      WHERE r.tid IS NOT NULL AND r.attr <> 'overhead'
+        AND r.origin IN ('main','subagent')
+      GROUP BY r.tid;
+      ALTER TABLE outcome DROP COLUMN cw_ttl_unknown_share;
+      ALTER TABLE model_price DROP COLUMN usd_cw1h_src;
+      ALTER TABLE model_price DROP COLUMN usd_cw1h;
+      ALTER TABLE request DROP COLUMN cw_ttl_src;
+      ALTER TABLE request DROP COLUMN cw1h_tok;
+      ALTER TABLE request DROP COLUMN cw5m_tok;
+      DELETE FROM config WHERE k IN ('price_cw_1h_min_multiple','price_cw_1h_max_multiple',
+                                     'price_cw_1h_default_multiple','cw_ttl_unknown_warn_share');
+      UPDATE config SET v = '19' WHERE k = 'schema_version';
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+
+    db = openDb({ path }); // migrates on open
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    // The four config seeds this step is responsible for come back at their defaults.
+    const seed = (k: string): string | undefined =>
+      db.query<{ v: string }, [string]>("SELECT v FROM config WHERE k = ?").get(k)?.v;
+    expect(seed("price_cw_1h_min_multiple")).toBe("1.5");
+    expect(seed("price_cw_1h_max_multiple")).toBe("2.5");
+    expect(seed("price_cw_1h_default_multiple")).toBe("2");
+    expect(seed("cw_ttl_unknown_warn_share")).toBe("0.02");
+
+    // This is the assertion that would have caught the D1 comment-placement bug:
+    // it fails on `table:request` against the pre-fix schema.sql and passes once
+    // schema.sql's ADD COLUMN splice matches where ALTER actually leaves it.
+    const freshDir = mkdtempSync(join(tmpdir(), "estimator-schema-v20-"));
+    const fresh = openDb({ path: join(freshDir, "estimator.db") });
+    try {
+      const objects = (d: Database): unknown =>
+        d
+          .query<unknown, []>(
+            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+          )
+          .all();
+      expect(objects(db)).toEqual(objects(fresh));
+    } finally {
+      fresh.close();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+  });
+
+  test("migration rule 2: a tuned cache-write-1h knob survives the v19 -> v20 step", () => {
+    db.exec(`
+      UPDATE config SET v = '1.4' WHERE k = 'price_cw_1h_min_multiple';
+      UPDATE config SET v = '19' WHERE k = 'schema_version';
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    // `INSERT OR IGNORE`: a value Craig has already tuned is never restated by a
+    // migration that lands on a file already carrying the v20 shape.
+    expect(
+      db.query<{ v: string }, []>("SELECT v FROM config WHERE k = 'price_cw_1h_min_multiple'").get()?.v,
+    ).toBe("1.4");
+  });
+
+  test("the v19 -> v20 step lands on a file that already has the shape and only lacks the marker", () => {
+    db.query("UPDATE config SET v='19' WHERE k='schema_version'").run();
+    const path = join(dir, "estimator.db");
+    db.close();
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(
+      db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM v_cw_ttl_exposure").get()?.n,
+    ).toBe(0);
+  });
+
+  // ---------------------------------------------------------------------------
+  // HOOK-BINDING-SPEC.md -- hook-based spawn-time attribution binding (v21)
+  // ---------------------------------------------------------------------------
+
+  test("a genuinely v20-shaped database migrates to exactly the shape schema.sql builds (v21, config rows only)", () => {
+    db.exec(`
+      DELETE FROM config WHERE k IN
+        ('hook_bind_enabled','hook_focus_ttl_min','hook_bind_marker','hook_bind_batch_max');
+      UPDATE config SET v = '20' WHERE k = 'schema_version';
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+
+    db = openDb({ path }); // migrates on open
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+
+    const seed = (k: string): string | undefined =>
+      db.query<{ v: string }, [string]>("SELECT v FROM config WHERE k = ?").get(k)?.v;
+    expect(seed("hook_bind_enabled")).toBe("1");
+    expect(seed("hook_focus_ttl_min")).toBe("120");
+    expect(seed("hook_bind_marker")).toBe("0");
+    expect(seed("hook_bind_batch_max")).toBe("5000");
+
+    // v21 is config-only: no CREATE, no ALTER. `sqlite_master` must be byte-identical
+    // to a fresh database's (test/schema.test.ts's own byte-identity discipline, §8.2).
+    const freshDir = mkdtempSync(join(tmpdir(), "estimator-schema-v21-"));
+    const fresh = openDb({ path: join(freshDir, "estimator.db") });
+    try {
+      const objects = (d: Database): unknown =>
+        d
+          .query<unknown, []>(
+            "SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+          )
+          .all();
+      expect(objects(db)).toEqual(objects(fresh));
+    } finally {
+      fresh.close();
+      rmSync(freshDir, { recursive: true, force: true });
+    }
+  });
+
+  test("migration rule 2: a tuned hook_focus_ttl_min knob survives the v20 -> v21 step", () => {
+    db.exec(`
+      UPDATE config SET v = '45' WHERE k = 'hook_focus_ttl_min';
+      UPDATE config SET v = '20' WHERE k = 'schema_version';
+    `);
+    const path = join(dir, "estimator.db");
+    db.close();
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    // `INSERT OR IGNORE`: a value Craig has already tuned is never restated by a
+    // migration that lands on a file already carrying the v21 shape.
+    expect(
+      db.query<{ v: string }, []>("SELECT v FROM config WHERE k = 'hook_focus_ttl_min'").get()?.v,
+    ).toBe("45");
+  });
+
+  test("the v20 -> v21 step lands on a file that already has the shape and only lacks the marker", () => {
+    db.query("UPDATE config SET v='20' WHERE k='schema_version'").run();
+    const path = join(dir, "estimator.db");
+    db.close();
+    db = openDb({ path });
+    expect(schemaVersion(db)).toBe(SCHEMA_VERSION);
+    expect(
+      db.query<{ v: string }, []>("SELECT v FROM config WHERE k = 'hook_bind_enabled'").get()?.v,
+    ).toBe("1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CACHE-TTL-PRICING.md — the cache-write TTL pricing fix (v20)
+// ---------------------------------------------------------------------------
+
+describe("cache-write TTL pricing (D1-D5)", () => {
+  const RATES = { in: 1, out: 1, cw: 1, cr: 1, cw1h: 2 };
+
+  beforeEach(() => {
+    price("claude-sonnet-4-5", RATES); // config.ref_model
+    price("claude-test-1", RATES);
+  });
+
+  const wcetOf = (id: string): number =>
+    db.query<{ wcet: number }, [string]>("SELECT wcet FROM v_wcet WHERE request_id = ?").get(id)!.wcet;
+
+  test("a 5m-only cache write prices at exactly cw_tok * usd_cw", () => {
+    request("r5m", { cw_tok: 100, cw5m_tok: 100, cw1h_tok: 0, cw_ttl_src: "transcript" });
+    expect(wcetOf("r5m")).toBe(100 * RATES.cw);
+  });
+
+  test("a 1h-only cache write prices at exactly cw_tok * usd_cw1h (2x usd_in here)", () => {
+    request("r1h", { cw_tok: 100, cw5m_tok: 0, cw1h_tok: 100, cw_ttl_src: "transcript" });
+    expect(wcetOf("r1h")).toBe(100 * RATES.cw1h);
+  });
+
+  test("a mixed request prices the weighted sum of both legs", () => {
+    request("rmix", { cw_tok: 100, cw5m_tok: 60, cw1h_tok: 40, cw_ttl_src: "transcript" });
+    expect(wcetOf("rmix")).toBe(60 * RATES.cw + 40 * RATES.cw1h);
+  });
+
+  test("D4: an unrecorded-TTL request is priced EXACTLY as it was pre-fix — cw_tok * usd_cw", () => {
+    request("runk", { cw_tok: 100, cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded" });
+    expect(wcetOf("runk")).toBe(100 * RATES.cw);
+  });
+
+  test("D3: an over-split row (cw5m+cw1h > cw_tok) is clamped to price exactly cw_tok tokens, at the LOWER (5m-filled-first) rate", () => {
+    // 80 + 80 = 160 > cw_tok(100). 5m fills first: 5m_priced=80, 1h_priced=min(80,20)=20.
+    request("rover", { cw_tok: 100, cw5m_tok: 80, cw1h_tok: 80, cw_ttl_src: "transcript" });
+    const naive1hFirst = 80 * RATES.cw1h + 20 * RATES.cw; // the rejected, higher-priced order
+    const fiveMFirst = 80 * RATES.cw + 20 * RATES.cw1h; // what the view actually computes
+    expect(wcetOf("rover")).toBe(fiveMFirst);
+    expect(wcetOf("rover")).toBeLessThan(naive1hFirst);
+
+    const row = db
+      .query<{ cw5m_priced_tok: number; cw1h_priced_tok: number; cw_ttl_unknown_tok: number }, [string]>(
+        "SELECT cw5m_priced_tok, cw1h_priced_tok, cw_ttl_unknown_tok FROM v_priced WHERE request_id = ?",
+      )
+      .get("rover")!;
+    // The three legs always sum to exactly cw_tok, in both directions.
+    expect(row.cw5m_priced_tok + row.cw1h_priced_tok + row.cw_ttl_unknown_tok).toBe(100);
+  });
+
+  // v_cw_ttl_exposure (D3/D10) is deliberately NOT keyed by request_id — it is
+  // the diagnostic/reporting surface, so rows are distinguished by `ts` here.
+  test("v_cw_ttl_exposure surfaces unknown-TTL and over-split rows, and only those", () => {
+    request("known", { cw_tok: 100, cw5m_tok: 60, cw1h_tok: 40, cw_ttl_src: "transcript", ts: "2026-01-01T00:00:01Z" });
+    request("unk", { cw_tok: 100, cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded", ts: "2026-01-01T00:00:02Z" });
+    request("over", { cw_tok: 100, cw5m_tok: 80, cw1h_tok: 80, cw_ttl_src: "transcript", ts: "2026-01-01T00:00:03Z" });
+    request("nocache", { cw_tok: 0, ts: "2026-01-01T00:00:04Z" });
+
+    const rows = db
+      .query<{ ts: string; cw_ttl_unknown_tok: number; cw_ttl_over_tok: number }, []>(
+        "SELECT ts, cw_ttl_unknown_tok, cw_ttl_over_tok FROM v_cw_ttl_exposure ORDER BY ts",
+      )
+      .all();
+    expect(rows.map((r) => r.ts)).toEqual(["2026-01-01T00:00:02Z", "2026-01-01T00:00:03Z"]);
+    expect(rows.find((r) => r.ts === "2026-01-01T00:00:02Z")).toMatchObject({
+      cw_ttl_unknown_tok: 100,
+      cw_ttl_over_tok: 0,
+    });
+    expect(rows.find((r) => r.ts === "2026-01-01T00:00:03Z")).toMatchObject({
+      cw_ttl_unknown_tok: 0,
+      cw_ttl_over_tok: 60,
+    });
+  });
+
+  test("v_cw_ttl_exposure is reachable for an UNPRICED family too", () => {
+    // "claude-unpriced-1" has NO model_price row at all — v_priced's INNER JOIN
+    // would drop it entirely, which is exactly the blind spot this view exists
+    // to avoid.
+    request("unpriced_unk", {
+      family: "claude-unpriced-1",
+      cw_tok: 50,
+      cw_ttl_src: "unrecorded",
+      ts: "2026-01-01T00:00:09Z",
+    });
+    const row = db
+      .query<{ n: number }, []>(
+        "SELECT COUNT(*) AS n FROM v_cw_ttl_exposure WHERE ts = '2026-01-01T00:00:09Z'",
+      )
+      .get()!;
+    expect(row.n).toBe(1);
+    expect(
+      db
+        .query<{ n: number }, []>(
+          "SELECT COUNT(*) AS n FROM v_priced WHERE request_id = 'unpriced_unk'",
+        )
+        .get()!.n,
+    ).toBe(0);
+  });
+
+  test("v_cw_1h_price_gap names a family with cache-write spend but no recorded 1h rate, and only that one", () => {
+    price("claude-test-2", { in: 1, out: 1, cw: 1, cr: 1 }); // no cw1h — 'unrecorded'
+    request("gapped", { family: "claude-test-2", cw_tok: 10 });
+    request("covered", { family: "claude-test-1", cw_tok: 10, cw5m_tok: 10, cw_ttl_src: "transcript" });
+
+    const gap = db.query<{ family: string }, []>("SELECT family FROM v_cw_1h_price_gap").all();
+    expect(gap.map((r) => r.family)).toEqual(["claude-test-2"]);
+
+    db.exec("UPDATE model_price SET usd_cw1h = 2, usd_cw1h_src = 'manual' WHERE family = 'claude-test-2'");
+    expect(db.query<{ n: number }, []>("SELECT COUNT(*) AS n FROM v_cw_1h_price_gap").get()!.n).toBe(0);
+  });
+
+  test("D3: v_wcet and v_task_actual_epoch agree on the same cw_cost expression", () => {
+    task("t1");
+    estimate("t1", {
+      price_epoch: "2026-01-01T00:00:00Z",
+      ref_model: "claude-sonnet-4-5",
+      estimand: "work_cet",
+    });
+    request("rtask", {
+      tid: "t1",
+      attr: "exclusive",
+      origin: "main",
+      cw_tok: 100,
+      cw5m_tok: 60,
+      cw1h_tok: 40,
+      cw_ttl_src: "transcript",
+      ts: "2026-01-01T00:00:00Z",
+    });
+
+    const fromWcet = db
+      .query<{ wcet_task_effort: number }, []>(
+        "SELECT wcet_task_effort FROM v_task_actual WHERE tid = 't1'",
+      )
+      .get()!.wcet_task_effort;
+    const fromEpoch = db
+      .query<{ wcet_at_epoch: number }, []>(
+        "SELECT wcet_at_epoch FROM v_task_actual_epoch WHERE tid = 't1'",
+      )
+      .get()!.wcet_at_epoch;
+    expect(fromEpoch).toBe(fromWcet);
+    expect(fromWcet).toBe(60 * RATES.cw + 40 * RATES.cw1h);
+  });
+
+  test("D1/D7: OTEL never names the three new request columns — it has no TTL information", () => {
+    expect(INSERT_AUXILIARY_SQL).not.toContain("cw5m_tok");
+    expect(INSERT_AUXILIARY_SQL).not.toContain("cw1h_tok");
+    expect(INSERT_AUXILIARY_SQL).not.toContain("cw_ttl_src");
+    expect(SUPERSEDE_AUXILIARY_SQL).not.toContain("cw5m_tok");
+    expect(SUPERSEDE_AUXILIARY_SQL).not.toContain("cw1h_tok");
+    expect(SUPERSEDE_AUXILIARY_SQL).not.toContain("cw_ttl_src");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CACHE-TTL-PRICING.md D1/D7 — ingest-side dedup ratchet (UPSERT_REQUEST_SQL)
+// ---------------------------------------------------------------------------
+
+describe("cache-write TTL dedup ratchet (D7)", () => {
+  const upsert = (row: {
+    request_id: string;
+    model: string;
+    cw_tok: number;
+    cw5m_tok: number;
+    cw1h_tok: number;
+    cw_ttl_src: string;
+  }): void => {
+    db.query(UPSERT_REQUEST_SQL).run({
+      $request_id: row.request_id,
+      $message_id: null,
+      $is_sidechain: 0,
+      $session_id: "s1",
+      $prompt_id: null,
+      $origin: "main",
+      $agent_id: null,
+      $run_id: null,
+      $wf_launch_id: null,
+      $model: row.model,
+      $model_family: row.model,
+      $attribution_agent: null,
+      $attribution_skill: null,
+      $ts: "2026-01-01T00:00:00Z",
+      $in_tok: 0,
+      $out_tok: 0,
+      $cw_tok: row.cw_tok,
+      $cr_tok: 0,
+      $cw5m_tok: row.cw5m_tok,
+      $cw1h_tok: row.cw1h_tok,
+      $cw_ttl_src: row.cw_ttl_src,
+    } as never);
+  };
+
+  const stored = () =>
+    db
+      .query<
+        { cw_tok: number; cw5m_tok: number; cw1h_tok: number; cw_ttl_src: string; model: string },
+        []
+      >("SELECT cw_tok, cw5m_tok, cw1h_tok, cw_ttl_src, model FROM request WHERE request_id = 'rid1'")
+      .get()!;
+
+  test("same model, unrecorded THEN transcript: knowledge ratchets up and counters MAX", () => {
+    upsert({ request_id: "rid1", model: "claude-test-1", cw_tok: 50, cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded" });
+    upsert({ request_id: "rid1", model: "claude-test-1", cw_tok: 100, cw5m_tok: 60, cw1h_tok: 40, cw_ttl_src: "transcript" });
+    expect(stored()).toMatchObject({ cw_tok: 100, cw5m_tok: 60, cw1h_tok: 40, cw_ttl_src: "transcript" });
+  });
+
+  test("same model, transcript THEN a later line with no split: the label does NOT ratchet down, and cw_tok can still rise ahead of the split (the honest residual D3 prices)", () => {
+    upsert({ request_id: "rid1", model: "claude-test-1", cw_tok: 100, cw5m_tok: 60, cw1h_tok: 40, cw_ttl_src: "transcript" });
+    upsert({ request_id: "rid1", model: "claude-test-1", cw_tok: 150, cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded" });
+    const row = stored();
+    expect(row.cw_ttl_src).toBe("transcript");
+    expect(row.cw_tok).toBe(150); // MAX ratchets the aggregate...
+    expect(row.cw5m_tok).toBe(60); // ...but the split counters do NOT follow it,
+    expect(row.cw1h_tok).toBe(40); // which is the visible residual D3's clamp prices.
+  });
+
+  test("a TAKEOVER by an unrecorded row over a stored transcript row yields unrecorded WITH the winner's counters — never 'transcript' over 0/0", () => {
+    // Model A wins first (bigger total), model B (smaller) is the loser.
+    upsert({ request_id: "rid1", model: "claude-test-1", cw_tok: 100, cw5m_tok: 60, cw1h_tok: 40, cw_ttl_src: "transcript" });
+    // A DIFFERENT, LARGER-total model with no split takes over the row.
+    db.query(UPSERT_REQUEST_SQL).run({
+      $request_id: "rid1",
+      $message_id: null,
+      $is_sidechain: 0,
+      $session_id: "s1",
+      $prompt_id: null,
+      $origin: "main",
+      $agent_id: null,
+      $run_id: null,
+      $wf_launch_id: null,
+      $model: "claude-test-9",
+      $model_family: "claude-test-9",
+      $attribution_agent: null,
+      $attribution_skill: null,
+      $ts: "2026-01-01T00:00:01Z",
+      $in_tok: 0,
+      $out_tok: 1000, // forces a bigger EXCLUDED_TOTAL, so this row TAKES OVER
+      $cw_tok: 0,
+      $cr_tok: 0,
+      $cw5m_tok: 0,
+      $cw1h_tok: 0,
+      $cw_ttl_src: "unrecorded",
+    } as never);
+    const row = stored();
+    expect(row.model).toBe("claude-test-9");
+    expect(row.cw_ttl_src).toBe("unrecorded"); // NEVER 'transcript' over a 0/0 split
+    expect(row.cw5m_tok).toBe(0);
+    expect(row.cw1h_tok).toBe(0);
+  });
+
+  test("a CONTESTED non-takeover by a transcript row over a stored unrecorded row leaves the stored row's label AND counters untouched", () => {
+    // The STORED row has the larger total, so the challenger below is contested
+    // but does NOT take over (RID_TAKEOVER needs a STRICTLY larger excluded total).
+    upsert({ request_id: "rid1", model: "claude-test-9", cw_tok: 1000, cw5m_tok: 0, cw1h_tok: 0, cw_ttl_src: "unrecorded" });
+    db.query(UPSERT_REQUEST_SQL).run({
+      $request_id: "rid1",
+      $message_id: null,
+      $is_sidechain: 0,
+      $session_id: "s1",
+      $prompt_id: null,
+      $origin: "main",
+      $agent_id: null,
+      $run_id: null,
+      $wf_launch_id: null,
+      $model: "claude-test-1", // a DIFFERENT, SMALLER-total model: contested, no takeover
+      $model_family: "claude-test-1",
+      $attribution_agent: null,
+      $attribution_skill: null,
+      $ts: "2026-01-01T00:00:01Z",
+      $in_tok: 0,
+      $out_tok: 0,
+      $cw_tok: 100,
+      $cr_tok: 0,
+      $cw5m_tok: 60,
+      $cw1h_tok: 40,
+      $cw_ttl_src: "transcript",
+    } as never);
+    const row = stored();
+    expect(row.model).toBe("claude-test-9"); // the stored winner is untouched
+    expect(row.cw_ttl_src).toBe("unrecorded");
+    expect(row.cw_tok).toBe(1000);
   });
 });

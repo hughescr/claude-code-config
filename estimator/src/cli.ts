@@ -103,7 +103,17 @@ import {
   type TranscriptIndexEntry,
 } from "./ingest.ts";
 import { LOCK_PATH, LockBusyError, withLock } from "./lock.ts";
-import { isoSeconds, setManualPrice, showPrices, sync, type SyncResult } from "./prices.ts";
+import {
+  currentPrice,
+  fillCw1h,
+  isoSeconds,
+  priceFamily,
+  setManualPrice,
+  showPrices,
+  sync,
+  type FillCw1hResult,
+  type SyncResult,
+} from "./prices.ts";
 import { attributeTasks } from "./attribute.ts";
 import {
   BURN_SCHEMA,
@@ -112,6 +122,7 @@ import {
   classifyOpenError,
   refreshBurnCache,
   renderBurn,
+  resolveSession,
   type BurnJson,
 } from "./burn.ts";
 import { closeTask, healClosedOutcomes, type FinalStatus } from "./close.ts";
@@ -121,7 +132,16 @@ import { DEFAULT_BOARD_LIMIT, regenerateBoardIfDue, renderBoardFiles } from "./b
 import { promoteStartedTasks } from "./promote.ts";
 import { emptyJobsResult, JOBS_ROOT, reconcileJobs } from "./jobs.ts";
 import { otelDump, otelPort, otelStatus, renderOtelDump, renderOtelStatus } from "./otel-status.ts";
-import { drainSpool, emptyDrain, ensureSpool, spoolDirFrom, SPOOL_DIR } from "./spool.ts";
+import {
+  clearFocusMarker,
+  drainSpool,
+  emptyDrain,
+  ensureSpool,
+  readFocusMarker,
+  spoolDirFrom,
+  writeFocusMarker,
+  SPOOL_DIR,
+} from "./spool.ts";
 import {
   DEFAULT_OTEL_SPOOL_RETENTION_DAYS,
   drainOtel,
@@ -161,6 +181,7 @@ import {
   refclass,
   REFCLASS_BUDGET_CHARS,
   TASK_KINDS,
+  unbindTask,
   UsageError,
   type EstimateReason,
   type TaskKind,
@@ -187,6 +208,13 @@ export const COMMANDS = [
   "open",
   "block",
   "bind",
+  // HOOK-BINDING-SPEC.md §5.3: the correction path for a hook-written alias. `unbind`
+  // is a distinct verb rather than only `bind --replace` (§11 Q6 left this open) —
+  // `--replace` covers "I know what it should be instead"; `unbind` alone covers "I
+  // just want this identity un-owned", which has no natural spelling as a bind.
+  "unbind",
+  // HOOK-BINDING-SPEC.md §3.2a: the human pointer the hook's ladder rungs 2-4 read.
+  "focus",
   "scope",
   "burn",
   "close",
@@ -221,7 +249,10 @@ export const COMMAND_FLAGS: Record<Command, FlagSpec> = {
   init: { booleans: [], values: [] },
   sweep: { booleans: ["blocking", "strict"], values: ["budget", "root", "chunk"] },
   backfill: { booleans: ["strict"], values: ["budget", "root", "chunk", "top"] },
-  prices: { booleans: ["sync", "show"], values: ["source", "set", "in", "out", "cw", "cr", "at"] },
+  prices: {
+    booleans: ["sync", "show", "fill-cw-1h", "cw-1h-unrecorded"],
+    values: ["source", "set", "in", "out", "cw", "cr", "cw-1h", "at"],
+  },
   census: { booleans: [], values: ["limit", "root"] },
   config: { booleans: [], values: [] },
   anchor: { booleans: [], values: ["note"] },
@@ -256,7 +287,13 @@ export const COMMAND_FLAGS: Record<Command, FlagSpec> = {
     ],
   },
   block: { booleans: [], values: ["phase", "title", "p50", "p90", "exp-agents", "model"] },
-  bind: { booleans: [], values: ["session", "task", "run", "agent"] },
+  // `--replace` (HOOK-BINDING-SPEC.md §5.3): unbind-then-bind, one transaction, so an
+  // identity is never momentarily unowned. Kept on `est bind <tid> ...`'s existing
+  // positional-tid shape rather than the spec's illustrative `--tid` flag form — one
+  // calling convention for one verb, and §11 Q6 left the exact surface open.
+  bind: { booleans: ["replace"], values: ["session", "task", "run", "agent"] },
+  unbind: { booleans: ["force"], values: ["session", "task", "run", "agent"] },
+  focus: { booleans: ["clear"], values: ["session"] },
   scope: { booleans: [], values: ["reason", "subject", "description", "dod"] },
   burn: { booleans: ["refresh"], values: ["session"] },
   // `accept` takes a VALUE — the human's verbatim acceptance — because a boolean
@@ -556,6 +593,24 @@ export const BENIGN_ANOMALY_KINDS: ReadonlySet<string> = new Set([
   // ledger row: it is the only visible difference between "nobody planted" and
   // "somebody planted something this database cannot resolve".
   "plant_unlinked",
+  // HOOK-BINDING-SPEC.md §8.4 (v21): hook-based spawn-time attribution binding. Every
+  // kind below is a WITNESS OR STAND-DOWN, never a wrong write — the design's whole
+  // safety story is that a hook alias is only ever exact-grade, so the failure modes
+  // it can produce are "recorded nothing" (a measurement) or "deferred to a more
+  // authoritative source" (the intended precedence), not corrupted spend. The two
+  // kinds that describe an actual identity DISAGREEING with itself —
+  // `hook_bind_conflict` and `alias_split_identity` — are deliberately NOT in this
+  // set; they are ALERTING (§9.4 A1) because either one being nonzero is a design
+  // defect, not ordinary traffic.
+  "hook_bind_multi_active", // genuinely ambiguous spawn instant; no alias written
+  "hook_bind_no_active", // every bound task had gone quiet; no alias written
+  "hook_focus_disagrees", // stale focus pointer vs a live active set; no alias written
+  "hook_marker_unresolved", // a mistyped/stale [est:...] prefix; ignored, not obeyed
+  "hook_spawn_depth_unbound", // nested spawn whose parent never got an alias after 3 deferrals
+  "hook_bind_orphan_tid", // the task named at spawn time was deleted before the drain ran
+  "hook_bind_deferred_to_human", // an est_bind row already owns the identity; the hook stood down
+  "hook_bind_superseded", // hook-vs-hook ladder drift across a drain boundary; first writer keeps it
+  "alias_unbound", // est unbind / est bind --replace audit trail
   // NOTE: `board_render_failed` (P2.7) is deliberately ABSENT from this set — it
   // does not go through `report.anomalies` at all (see the sweep's board-regen
   // step). The design's "never fails the sweep" is unconditional: `--strict`
@@ -718,6 +773,27 @@ export interface SweepReport {
     malformed: number;
     /** Stale `.microsweep` / `.overrun-notified.*` marker files reaped this sweep. */
     markers_pruned: number;
+    /** HOOK-BINDING-SPEC.md §4.1 step 6: the agent-binds drain's own counters. */
+    binds_read: number;
+    binds_bound: number;
+    binds_nested_bound: number;
+    binds_nested_deferred: number;
+    binds_conflict: number;
+    binds_superseded: number;
+    binds_deferred_human: number;
+    binds_unbound: number;
+    binds_dup: number;
+    binds_dropped: number;
+    /** §8.1 master switch: lines discarded whole because `hook_bind_enabled` was off. */
+    binds_disabled_dropped: number;
+    /** `{basis: count}` over every surviving agent-binds record (§9 denominator). */
+    binds_basis: Record<string, number>;
+    /** `{sorted-key-names: count}` — §9.1's payload key-set regression detector. */
+    binds_keysets: Record<string, number>;
+    /** `{reason: count}` (§14.8, REV3) over every survivor that read a focus marker
+     *  and had it DROPPED by the idle-bridge predicate rather than believed —
+     *  additive to `binds_basis`, not a replacement. */
+    binds_focus_drop: Record<string, number>;
   };
   /**
    * P2.3/P2.4: what the OTEL spool contributed. Every field is 0 when no receiver is
@@ -1087,6 +1163,20 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
       compliance_db_unavailable: 0,
       malformed: 0,
       markers_pruned: 0,
+      binds_read: 0,
+      binds_bound: 0,
+      binds_nested_bound: 0,
+      binds_nested_deferred: 0,
+      binds_conflict: 0,
+      binds_superseded: 0,
+      binds_deferred_human: 0,
+      binds_unbound: 0,
+      binds_dup: 0,
+      binds_dropped: 0,
+      binds_disabled_dropped: 0,
+      binds_basis: {},
+      binds_keysets: {},
+      binds_focus_drop: {},
     },
     otel: {
       logs_read: 0,
@@ -1405,6 +1495,20 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     compliance_db_unavailable: spool.compliance.db_unavailable,
     malformed: spool.task_events.malformed + spool.compliance.malformed,
     markers_pruned: spool.markers_pruned,
+    binds_read: spool.binds.read,
+    binds_bound: spool.binds.bound,
+    binds_nested_bound: spool.binds.nested_bound,
+    binds_nested_deferred: spool.binds.nested_deferred,
+    binds_conflict: spool.binds.conflict,
+    binds_superseded: spool.binds.superseded,
+    binds_deferred_human: spool.binds.deferred_human,
+    binds_unbound: spool.binds.unbound,
+    binds_dup: spool.binds.dup,
+    binds_dropped: spool.binds.dropped,
+    binds_disabled_dropped: spool.binds.disabled_dropped,
+    binds_basis: spool.binds.basis,
+    binds_keysets: spool.binds.keysets,
+    binds_focus_drop: spool.binds.focus_drop,
   };
 
   // 1a2. **Link the lifecycle stream to its tasks.** Both `task_event` writers have
@@ -1473,6 +1577,8 @@ export async function runSweep(db: Database, opts: SweepOptions = {}): Promise<S
     requests: attribution.requests_assigned,
     by_attr: attribution.by_attr,
   };
+  // HOOK-BINDING-SPEC.md §5.2, §9.4 A1: `alias_split_identity` must stay 0.
+  pendingAnomalies.push(...attribution.anomalies);
 
   // v10: give estimates whose EFFECTIVE estimator family is still the repairable
   // `'unknown'` sentinel a concrete one, by APPENDING to `estimate_identity_repair`.
@@ -1742,7 +1848,7 @@ SELECT %KEY% AS key,
   COALESCE(SUM(in_tok),0) AS in_tok, COALESCE(SUM(out_tok),0) AS out_tok,
   COALESCE(SUM(cw_tok),0) AS cw_tok, COALESCE(SUM(cr_tok),0) AS cr_tok,
   COALESCE(SUM(wcet),0) AS wcet, COALESCE(SUM(scet),0) AS scet,
-  COALESCE(SUM((in_tok*usd_in + out_tok*usd_out + cw_tok*usd_cw + cr_tok*usd_cr) / 1000000.0),0) AS usd
+  COALESCE(SUM((in_tok*usd_in + out_tok*usd_out + cw_cost + cr_tok*usd_cr) / 1000000.0),0) AS usd
 FROM v_wcet GROUP BY %KEY% ORDER BY wcet DESC, n_req DESC
 `;
 
@@ -2208,9 +2314,13 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
   const wantSync = flagBool(p, "sync");
   const wantShow = flagBool(p, "show");
   const setModel = flagString(p, "set");
+  // CACHE-TTL-PRICING.md D6: the one-shot historical fill.
+  const wantFillCw1h = flagBool(p, "fill-cw-1h");
 
-  if (!wantSync && !wantShow && setModel === null) {
-    ctx.err("est prices: nothing to do — pass --sync, --show or --set <model> --in .. --out .. --cw .. --cr ..");
+  if (!wantSync && !wantShow && setModel === null && !wantFillCw1h) {
+    ctx.err(
+      "est prices: nothing to do — pass --sync, --show, --fill-cw-1h or --set <model> --in .. --out .. --cw .. --cr ..",
+    );
     return 1;
   }
 
@@ -2258,7 +2368,7 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
     return 1;
   }
 
-  const writes = setModel !== null || wantSync;
+  const writes = setModel !== null || wantSync || wantFillCw1h;
   const body = async (db: Database): Promise<number> => {
     let result: SyncResult | null = null;
 
@@ -2281,7 +2391,30 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
         );
         return 1;
       }
-      const rates = { usd_in, usd_out, usd_cw, usd_cr };
+      // CACHE-TTL-PRICING.md D5: `--cw-1h` is REQUIRED when the family's most
+      // recent existing vintage already carries a recorded (non-'unrecorded')
+      // 1h rate — a bare `--set` that omitted it used to silently revert every
+      // future 1h cache write on that family to the 5m fallback, with NO signal
+      // anywhere (`cw_ttl_unrecorded` watches request-side capture,
+      // `v_cw_ttl_exposure` watches request-side unknowns; neither watches
+      // price-side coverage — that is what `v_cw_1h_price_gap` is for).
+      // `--cw-1h-unrecorded` is the explicit escape hatch for "I really do mean
+      // unknown". A family with no prior recorded rate stays optional.
+      const cw1hFlag = rate("cw-1h");
+      const cw1hUnrecorded = flagBool(p, "cw-1h-unrecorded");
+      const priorFamily = priceFamily(setModel);
+      const prior = currentPrice(db, priorFamily);
+      const priorRecorded = prior !== null && prior.usd_cw1h !== null;
+      if (priorRecorded && cw1hFlag === null && !cw1hUnrecorded) {
+        ctx.err(
+          `est prices --set ${setModel}: this family's most recent vintage carries a recorded ` +
+            `1h cache-write rate (src=${prior!.usd_cw1h_src}, usd_cw1h=${prior!.usd_cw1h}) — ` +
+            `pass --cw-1h <rate> to carry it forward, or --cw-1h-unrecorded to deliberately drop it`,
+        );
+        return 1;
+      }
+      const usd_cw1h = cw1hUnrecorded ? null : cw1hFlag;
+      const rates = { usd_in, usd_out, usd_cw, usd_cr, usd_cw1h };
       const set = setManualPrice(db, setModel, rates, { at: at ?? undefined });
       if (ctx.json) {
         ctx.out(JSON.stringify(set, null, 2));
@@ -2317,6 +2450,19 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
       }
     }
 
+    if (wantFillCw1h) {
+      const fillResult: FillCw1hResult = await fillCw1h(db, { source });
+      if (ctx.json) {
+        ctx.out(JSON.stringify(fillResult, null, 2));
+      } else if (!ctx.quiet) {
+        ctx.out(
+          `est prices --fill-cw-1h: epoch ${fillResult.price_epoch}, ` +
+            `${fillResult.n_filled} vintage row(s) filled (${fillResult.n_implausible} implausible, ` +
+            `fell back to derived_from_input)`,
+        );
+      }
+    }
+
     if (wantShow) {
       // The same parsed instant --set uses, normalised to the second so it
       // compares against `effective_from` the way SQLite actually compares it.
@@ -2326,13 +2472,16 @@ async function cmdPrices(ctx: Ctx): Promise<number> {
       } else {
         ctx.out(
           renderTable(
-            ["family", "from", "in", "out", "cache_w", "cache_r", "src", "prov"],
+            ["family", "from", "in", "out", "cache_w", "cw_1h", "cache_r", "src", "prov"],
             rows.map((r) => [
               r.family,
               r.effective_from.slice(0, 10),
               String(r.usd_in),
               String(r.usd_out),
               String(r.usd_cw),
+              // CACHE-TTL-PRICING.md D5: 'unrecorded' is the honest label for a
+              // vintage nobody has priced the 1h premium for yet.
+              r.usd_cw1h === null ? "unrecorded" : String(r.usd_cw1h),
               String(r.usd_cr),
               r.source,
               r.provisional ? "yes" : "",
@@ -3034,6 +3183,12 @@ async function cmdOpen(ctx: Ctx): Promise<number> {
           });
         }
 
+        // HOOK-BINDING-SPEC.md §3.2a, resolved YES (Q1): `est open` writes the session
+        // focus marker. Best-effort and OUTSIDE the transaction `openTask` already
+        // committed — a lost focus write degrades to the hook's later ladder rungs,
+        // exactly like every other marker in this design; it must never fail the open.
+        writeFocusMarker(result.anchor.sessionId, result.tid, "est_open", SPOOL_DIR, now);
+
         if (ctx.json) {
           ctx.out(
             JSON.stringify({
@@ -3295,18 +3450,24 @@ async function cmdBind(ctx: Ctx): Promise<number> {
   const tid = positional(ctx, 0);
   if (tid === null) throw new UsageError("est bind: missing <tid>");
   const p = ctx.parsed;
+  const session = flagString(p, "session");
   return await withLock(
     (): number => {
       const db = openDb({ path: ctx.dbPath });
       try {
+        const now = new Date();
         const r = bindTask(db, {
           tid,
-          session: flagString(p, "session"),
+          session,
           task: flagString(p, "task"),
           run: flagString(p, "run"),
           agent: flagString(p, "agent"),
-          now: new Date(),
+          replace: flagBool(p, "replace"),
+          now,
         });
+        // HOOK-BINDING-SPEC.md §3.2a: `est bind --session` is the other explicit
+        // human act that writes the focus marker (`est open` is the first, §3.2a).
+        if (session !== null) writeFocusMarker(session, tid, "est_bind", SPOOL_DIR, now);
         if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...r }));
         else if (!ctx.quiet) {
           for (const w of r.written) {
@@ -3319,6 +3480,80 @@ async function cmdBind(ctx: Ctx): Promise<number> {
       }
     },
     { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("bind") },
+  );
+}
+
+async function cmdUnbind(ctx: Ctx): Promise<number> {
+  const p = ctx.parsed;
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
+        const r = unbindTask(db, {
+          agent: flagString(p, "agent"),
+          run: flagString(p, "run"),
+          task: flagString(p, "task"),
+          session: flagString(p, "session"),
+          force: flagBool(p, "force"),
+          now: new Date(),
+        });
+        if (ctx.json) ctx.out(JSON.stringify({ schema: 1, ...r }));
+        else if (!ctx.quiet) {
+          if (r.removed.length === 0) {
+            ctx.out("est unbind: nothing bound to that identity");
+          } else {
+            // Printed BEFORE the caller sees the removal confirmed below — §5.3:
+            // "a correction is a decision, not a surprise".
+            for (const b of r.before) {
+              ctx.out(
+                `tid ${b.tid} currently carries ${b.actual_wcet === null ? "no priced actual yet" : `${num(b.actual_wcet)} Work-CET`}`,
+              );
+            }
+            for (const w of r.removed) {
+              ctx.out(`unbound ${w.id_kind}=${w.local_id} (session ${w.session_id}) from tid ${w.tid}`);
+            }
+          }
+        }
+        return 0;
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("unbind") },
+  );
+}
+
+async function cmdFocus(ctx: Ctx): Promise<number> {
+  const tid = positional(ctx, 0);
+  if (tid === null) throw new UsageError("est focus: missing <tid>");
+  const p = ctx.parsed;
+  const clear = flagBool(p, "clear");
+  const session = resolveSession(flagString(p, "session"));
+  if (session === null) {
+    throw new UsageError("est focus: --session <sid> is required (or set CLAUDE_SESSION_ID)");
+  }
+  return await withLock(
+    (): number => {
+      const db = openDb({ path: ctx.dbPath });
+      try {
+        const task = db.query<{ tid: string }, [string]>("SELECT tid FROM task WHERE tid = ?").get(tid);
+        if (task === null || task === undefined) {
+          throw new InvariantError(`unknown tid: ${tid}`, "run `est open` to mint a task first");
+        }
+        if (clear) {
+          clearFocusMarker(session, tid, SPOOL_DIR);
+          if (!ctx.quiet) ctx.out(`focus cleared: session ${session} (was ${tid})`);
+        } else {
+          writeFocusMarker(session, tid, "est_focus", SPOOL_DIR, new Date());
+          if (!ctx.quiet) ctx.out(`focus set: session ${session} → ${tid}`);
+        }
+        if (ctx.json) ctx.out(JSON.stringify({ schema: 1, session, tid, cleared: clear }));
+        return 0;
+      } finally {
+        db.close();
+      }
+    },
+    { path: ctx.lockPath, timeoutMs: 10_000, note: lockNote("focus") },
   );
 }
 
@@ -4317,6 +4552,8 @@ commands:
   open                    mint or re-estimate a task; prints the calibrated band
   block                   one estimate per declared workflow phase, before the launch
   bind                    attach a session / task number / run / agent to a tid
+  unbind                  the correction path: remove a non-session alias (§5.3)
+  focus                   set/clear this session's pointer for the hook's ladder
   scope                   append a scope revision (the scope_change precondition)
   burn                    consumption against the band (--json is the statusline contract)
   close                   finalize by arithmetic
@@ -4428,6 +4665,24 @@ block <tid>:
                           so far, which should converge on the band already issued.
 
 bind <tid>:               [--session <sid>] [--task <n>] [--run <runId>] [--agent <agentId>]
+                          [--replace]   unbind-then-bind, one transaction, when the
+                            identity already belongs to a different tid (spec §5.3)
+unbind:                   (--agent <id> | --run <id> | --task <n> --session <sid>) [--force]
+                          the correction path for a hook-written (source='hook') alias.
+                          Refuses to remove a human-written (source='est_bind') alias
+                          without --force. Prints the owning tid and its current
+                          actual before acting.
+focus <tid>:              [--session <sid>] [--clear]
+                          a session-scoped pointer the hook's PostToolUse ladder
+                          reads (HOOK-BINDING-SPEC.md §14.4); believed until the
+                          SESSION goes hook_focus_ttl_min minutes without a turn —
+                          an idle gap, not an age from when it was set, so a
+                          still-running task keeps it alive on its own. Re-running
+                          est focus RE-POINTS it to a different task; it is not a
+                          chore you owe the system to keep this one alive.
+                          Written automatically by est open and est bind --session;
+                          this verb is for the two-tasks-open-at-once case, or
+                          --clear to disarm it early.
 scope <tid>:              --reason <text> [--subject <t>] [--description <t>] [--dod <json|@file>]
 burn [<tid>]:             [--session <sid>] [--refresh]      read-only; never writes; always exits 0
 close <tid>:              [--status completed|abandoned|deleted|reopened]
@@ -4531,6 +4786,10 @@ export async function run(argv: readonly string[], io: RunOptions = {}): Promise
         return await verb(ctx, () => cmdBlock(ctx));
       case "bind":
         return await verb(ctx, () => cmdBind(ctx));
+      case "unbind":
+        return await verb(ctx, () => cmdUnbind(ctx));
+      case "focus":
+        return await verb(ctx, () => cmdFocus(ctx));
       case "scope":
         return await verb(ctx, () => cmdScope(ctx));
       case "burn":

@@ -443,6 +443,34 @@ export function retro(
     );
   }
 
+  // CACHE-TTL-PRICING.md D8/D9: `cw_ttl_price_fix_at` is stamped once by `est prices
+  // --fill-cw-1h` (src/prices.ts) and marks the boundary where cw5m/cw1h-aware
+  // pricing became available. healClosedOutcomes' candidate filter only re-fires on
+  // outcomes whose `request` rows moved AFTER `finalized_at` (src/close.ts) — a pure
+  // repricing event moves no request row, so outcomes finalized before the fix are
+  // never restated and stay in the ledger measured under the old, coarser rate.
+  // Fitting velocity across that boundary with no signal at all is exactly the
+  // forward-only hazard D9 rejected; this says the refusal out loud instead, the
+  // same pattern the G-ATTR and unit_refusal alerts above already establish.
+  const fixAt = getConfig(db, "cw_ttl_price_fix_at");
+  if (fixAt !== null) {
+    const nStale = num(
+      db,
+      `SELECT COUNT(*) AS v FROM v_outcome_current
+        WHERE final_status <> 'reopened' AND finalized_at < ?`,
+      [fixAt],
+    );
+    if (nStale > 0) {
+      alerts.push(
+        `cw_ttl_repricing_boundary: ${nStale} closed outcome(s) were finalized before the ` +
+          `${fixAt} cache-TTL repricing fix and carry actuals measured under the old, coarser ` +
+          "rate, while outcomes finalized after it do not — this fit pools both without " +
+          "distinction. Remedy: D8's re-heal (rerun the close pass over the stale outcomes so " +
+          "their actuals are restated at the corrected rate), not a hand edit.",
+      );
+    }
+  }
+
   // The check-back panel. Scored on EVERY retro, dry-run included: the comparison is
   // what licenses the shipped model to keep issuing bands, and a `--dry-run` that
   // skipped it would hide the one number that says whether the `?` is coming off.
