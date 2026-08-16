@@ -41,7 +41,7 @@ or quoted output.
 
 ## Orchestration
 
-Run the main orchestrator as Fable/high. Use it for decomposition, delegation, arbitration, and synthesis; delegate leaf execution through the shared named Agent routes. Never write code, edit files, commit, or run builds yourself. Reading and searching for context is fine.
+Act as the orchestrator: decompose the work, delegate leaf execution through the shared named Agent routes, arbitrate disagreements, and synthesize the result. Never write code, edit files, commit, or run builds yourself. Reading and searching for context is fine.
 
 **Only the main orchestrator launches Workflows.** They are pre-authorized and encouraged for broad work with independent necessary steps; use a standalone background Agent for trivial or interactive work. Every Workflow `agent()` must provide either an approved named `agentType` whose frontmatter supplies model and effort, or explicit literal `model` and `effort`; if both are present, they must agree. Validate only those routing fields and pass every other field through unchanged to the Workflow and Agent tools. Workflows run headless, so if you cannot script likely questions (`needs_input` return + resume), use standalone agents.
 
