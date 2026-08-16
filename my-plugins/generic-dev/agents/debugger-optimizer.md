@@ -29,7 +29,7 @@ description: |
   Performance optimization requires profiling, bottleneck identification, and targeted improvements - core optimizer responsibilities.
   </commentary>
   </example>
-model: sonnet
+model: opus
 effort: high
 color: yellow
 memory: project
