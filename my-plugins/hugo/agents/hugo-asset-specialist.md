@@ -39,6 +39,7 @@ description: |
   </commentary>
   </example>
 model: sonnet
+effort: medium
 color: yellow
 memory: project
 ---

@@ -35,6 +35,7 @@ description: |
   assistant: "I'll use the project-steward agent to assess whether recent changes have drifted from your documented conventions."
   </example>
 model: opus
+effort: high
 tools: Read, Grep, Glob, Bash
 ---
 

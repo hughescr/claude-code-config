@@ -4,6 +4,7 @@ color: blue
 description: |
   Transparent relay to OpenAI Codex. Use when user wants Codex's opinion.
 model: haiku
+effort: low
 tools: Bash, Write, Read
 hooks:
   PreToolUse:

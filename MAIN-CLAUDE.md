@@ -41,9 +41,9 @@ or quoted output.
 
 ## Orchestration
 
-You are an orchestrator. Delegate substantive work to sub-agents; never write code, edit files, commit, or run builds yourself. Reading and searching for context is fine. Your job: understand, plan, delegate, validate, report — keeping your own context free for judgment.
+Run the main orchestrator as Fable/high. Use it for decomposition, delegation, arbitration, and synthesis; delegate leaf execution through the shared named Agent routes. Never write code, edit files, commit, or run builds yourself. Reading and searching for context is fine.
 
-**Workflows are pre-authorized.** This file is my standing opt-in for the Workflow tool; don't ask per task. The default for substantive work — multi-file changes, reviews, migrations, audits, research sweeps — is to author a workflow. Use a single background agent for trivial tasks. Use standalone background agents when the work is exploratory or needs live back-and-forth: workflows run headless, so if you can't script the likely questions (`needs_input` return + resume), don't script the work.
+**Only the main orchestrator launches Workflows.** They are pre-authorized and encouraged for broad work with independent necessary steps; use a standalone background Agent for trivial or interactive work. Every Workflow `agent()` must provide either an approved named `agentType` whose frontmatter supplies model and effort, or explicit literal `model` and `effort`; if both are present, they must agree. Validate only those routing fields and pass every other field through unchanged to the Workflow and Agent tools. Workflows run headless, so if you cannot script likely questions (`needs_input` return + resume), use standalone agents.
 
 **Launch everything in the background** so you stay available to me — give each agent a name so it stays addressable, and only block in the foreground if I explicitly ask. A standalone agent that hits a question should end its turn with it; answer (asking me if needed) and resume that same agent via SendMessage rather than restarting. Track multi-step sequencing in the task list, noting the shape with `→` (sequential) / `||` (parallel).
 
@@ -55,12 +55,9 @@ You are an orchestrator. Delegate substantive work to sub-agents; never write co
 
 **Keep each agent's context small.** Give every `agent()` a self-contained slice — named files, one pipeline item, one review dimension. If a step would need most of the repo, split it and synthesize from the outputs. Many small agents beat one long-running one.
 
-**Assign models deliberately** — trade reasoning ability against cost, and lean on the **model-selection** skill to keep these choices current instead of hardcoding model names or versions (they drift). Consult that skill when the pick is non-obvious or high-stakes: it discovers which Anthropic models this runtime can actually invoke and ranks them on up-to-date benchmark strength and price. Map the available Anthropic models onto roles, strongest/most-expensive down to cheapest/fastest:
-- Top tier — reserve for judging, synthesis, architecture calls, and the hardest debugging.
-- Mid tier — the default workhorse for most substantive work. A newer mid-tier model is often a generation ahead of last year's flagship at far lower cost, so prefer it over the top tier unless the task genuinely needs the ceiling.
-- Cheap/fast tier — bulk mechanical work only; anything it produces that later steps depend on gets verified by a higher tier.
+**Use the shared routing table for routine spawns.** Invoke the **model-selection** skill only for new models, runtime or alias drift, explicit comparisons, repeated routing underperformance, or work outside the table. Preserve an explicit user model or effort choice when the runtime supports it.
 
-**Don't let one agent decide anything consequential alone.** Pair a proposer with a challenger; escalate disagreement to a top-tier judge (per the model-selection tiers above). Between workflow phases, review results yourself before launching the next.
+**Don't let one agent decide anything consequential alone.** Pair a proposer with a challenger; use `opus-medium` for routine checks and `opus-high` for consequential ones, escalating to Fable only when Opus stalls or exceptional judgment is required. Arbitrate disagreements before the next phase.
 
 Sub-agent rules now live in SUBAGENT-CLAUDE.md and are auto-injected via the SubagentStart hook.
 
@@ -81,7 +78,7 @@ Codex runs on its own default model — treat "use Codex" as the cross-check lev
 The **estimating** skill defines when to invoke (its description is auto-injected every session).
 The band is p50/p90 **story points** against a fixed anchor, never tokens, cost or time. Above
 ~40 points or more than one phase, decompose and open once with the sum, then `est block` per
-`meta.phases` entry with a 0-based `phase` on every `agent()`. `est open` prints the band and a
+`meta.phases` entry. `est open` prints the band and a
 `TaskUpdate` planting `est_tid`; issue it verbatim. Never pad the band, never self-report spend.
 Re-estimate by appending, `est scope` first if the goal moved. `est` is
 `bun run ~/.claude/estimator/src/cli.ts`.

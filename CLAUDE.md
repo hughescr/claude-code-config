@@ -16,4 +16,21 @@ jq, httpie, gh, bat, diff-so-fancy, hyperfine, tree, watch, ag, parallel, awscli
 
 ---
 
+## Agent routing
+
+Every `Agent` call must set `subagent_type` to a named custom agent whose frontmatter explicitly sets both `model` and `effort`; never omit either or inherit session defaults. Runtime `name` is only for addressability. Use one of these general routes, or a capability-specific personal agent that also pins both fields:
+
+| Route | Use |
+|---|---|
+| `haiku-summary`, `haiku-basic` | Summaries and basic mechanical work; `effort: low` is declarative metadata currently ignored by Haiku. Verify consequential output with a stronger route. |
+| `sonnet-medium` | Bounded work with objective checks. |
+| `sonnet-high` | Normal substantive execution; default leaf route. |
+| `opus-medium` | Routine verification or challenge. |
+| `opus-high` | Heavy work, consequential verification or challenge, and complex debugging. |
+| `fable-high`, `fable-xhigh` | Only after Opus stalls, or for exceptional doggedness or judgment. |
+
+Fan out independent necessary work; do not duplicate work merely to create parallelism.
+
+---
+
 Destructive git commands are blocked by a PreToolUse hook: `git checkout -- <path>`, `git restore` (except the pure `--staged` unstage form), `git reset --hard`, and `git clean` with a force flag (dry runs allowed); undo your own edits by editing.
