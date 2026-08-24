@@ -25,7 +25,7 @@ Each agent has full access to the codebase, git history, and all tools. Do NOT p
 
 Launch each reviewer agent asynchronously (`run_in_background: true`) with a distinct name, consistent with the orchestrator rules in `~/.claude/CLAUDE.md`.
 
-1. **A Codex-based agent** (mandatory — use whatever codex/OpenAI agent is available). Have it review the uncommitted changes for architectural soundness, potential bugs, and unintended side-effects.
+1. **A GPT agent** (mandatory — `gpt-terra-high`, or `gpt-sol-high` when the diff is consequential). Have it review the uncommitted changes for architectural soundness, potential bugs, and unintended side-effects. If the `utraque` proxy is down, fall back to the `codex` relay agent.
 
 2. **A code reviewer agent** — focused on correctness, code quality, potential bugs, edge cases, and completeness vs. the plan.
 

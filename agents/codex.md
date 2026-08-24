@@ -2,7 +2,9 @@
 name: codex
 color: blue
 description: |
-  Transparent relay to OpenAI Codex. Use when user wants Codex's opinion.
+  Fallback relay to the OpenAI Codex CLI. Prefer the native gpt-* routes for
+  cross-checks. Use this only when the utraque proxy is down, or when the task
+  needs Codex's own agent loop, its own sandbox, or a resumable Codex session.
 model: haiku
 effort: low
 tools: Bash, Write, Read
@@ -20,6 +22,35 @@ hooks:
       hooks:
         - type: command
           command: "/Users/craig/.claude/hooks/codex/validate-bash.sh"
+---
+
+# Status: fallback path
+
+The everyday cross-check no longer goes through this agent. The `gpt-*` routes
+(`agents/gpt-sol-high.md` and its siblings) reach the same OpenAI models
+directly over the local `utraque` proxy, inside Claude Code's own harness, with
+real tool use and explicit effort control.
+
+This relay is kept because three things it does are not covered by those routes:
+
+1. **Codex's own agent loop.** The `gpt-*` routes give you the model; this relay
+   gives you the Codex CLI harness — its own file reading, tool use, sandbox and
+   planning. That is a genuinely different reviewer, not the same reviewer more
+   cheaply. Use it when the value is the second scaffold, not just the second
+   model.
+2. **Resumable sessions.** `codex-get-session-id.sh` lets a follow-up question
+   continue Codex's prior thread. A `gpt-*` spawn starts from empty context
+   every time.
+3. **Detached long runs.** `codex-wait.sh` tolerates 30+ minute runs decoupled
+   from the calling turn.
+
+It is also the only cross-family path that works when the `utraque` proxy is
+stopped or its Codex credential is stale, because it calls the Codex CLI
+directly and does not use `ANTHROPIC_BASE_URL` at all.
+
+Everything below this section is unchanged and still describes exactly how to
+run the relay.
+
 ---
 
 # ⛔ ABSOLUTE PROHIBITIONS ⛔

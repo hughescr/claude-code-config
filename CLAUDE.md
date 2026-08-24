@@ -28,6 +28,13 @@ Every `Agent` call must set `subagent_type` to a named custom agent whose frontm
 | `opus-medium` | Routine verification or challenge. |
 | `opus-high` | Heavy work, consequential verification or challenge, and complex debugging. |
 | `fable-high`, `fable-xhigh` | Only after Opus stalls, or for exceptional doggedness or judgment. |
+| `gpt-luna-low`, `gpt-luna-medium` | Cross-family peers of the Haiku and `sonnet-medium` rows. Short inputs only — long-context recall is weak. |
+| `gpt-terra-medium`, `gpt-terra-high` | Cross-family peer of `sonnet-high`; the default GPT leaf route. |
+| `gpt-sol-medium` | Cross-family peer of `opus-medium`: routine verification or challenge. |
+| `gpt-sol-high`, `gpt-sol-xhigh` | Cross-family peer of `opus-high`: consequential challenge and complex debugging. |
+| `gpt-spark-high` | Fast, bounded edit-test-lint loops; 128k context; never planning or review. |
+
+The `gpt-*` routes reach OpenAI models through the local `utraque` proxy on `127.0.0.1:8317` and bill the Codex subscription; their context window is 272k tokens (128k for `gpt-spark-high`). Pair one with a Claude proposer for cross-family challenge; never make a `gpt-*` route the only reviewer. If the proxy is not running they fail immediately, and the Claude routes are unaffected.
 
 Fan out independent necessary work; do not duplicate work merely to create parallelism.
 
