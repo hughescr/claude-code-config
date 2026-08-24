@@ -39,7 +39,74 @@ built-in list.
 
 ---
 
-## 3. Think before adding — `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
+## 3. Required — `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`
+
+```jsonc
+"_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL": "1"
+```
+
+**Do not skip this one.** Without it, pointing `ANTHROPIC_BASE_URL` at the proxy silently
+costs every Claude model 800k tokens of context, and can trap a long session in an
+auto-compact loop it never escapes.
+
+Claude Code decides a model's context window on the client side, and the check that
+grants a model its native window is gated on the base URL being Anthropic's own host:
+
+```js
+function urn(){ let e = process.env.ANTHROPIC_BASE_URL;
+                if (!e) return true;
+                return O4e(e) }              // host must be exactly api.anthropic.com
+function hf(){ if (te._CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL) return true;
+               return urn() }
+```
+
+`hf()` feeds the predicate that returns the 1M window. The client's built-in model table
+does record the truth — `claude-opus-5`, `claude-fable-5` and `claude-sonnet-5` all carry
+`context:{window:1e6, native_1m:true}`, and `claude-haiku-4-5` correctly does not — but
+with a non-Anthropic host in `ANTHROPIC_BASE_URL` that predicate returns false and every
+Claude model falls through to the 200000 default.
+
+The failure mode is worse than a smaller window. Once a session's live context is already
+past the clamp, auto-compact has to summarise a history larger than the limit it is
+compacting to. That request fails, the context never shrinks, and compaction re-fires
+immediately — forever. Observed in practice on Opus 5.
+
+Setting this variable restores native window detection from the model table. It is safe
+because it only tells the client to treat the configured base URL as first-party, which
+is exactly what utraque is: a transparent pass-through to `api.anthropic.com` carrying
+the client's own credential.
+
+It does not apply to Remote Control sessions, which the client says explicitly.
+
+**One clamp it does not defeat.** A second path exists, gated on a flag the *server* sets
+when 1M context needs credits the plan does not cover:
+
+```js
+function SHs(e,t){ return Fir() && Xmf()===undefined && Qmf(e,t) > nye }   // nye = 200000
+function Fir(){ return or.longContext1mCreditsBlocked }
+```
+
+If that is what clamps you, this variable will not help, and the same clamp would apply
+on a direct connection with no proxy at all — so it is not something utraque caused. Check
+with `/context`: 1M means the base-URL cause is handled; 200k means it is this one.
+
+The only local override for *that* path is a blunt one, and it costs more than it is
+worth in most sessions:
+
+```sh
+DISABLE_COMPACT=1 CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000 claude
+```
+
+Under `DISABLE_COMPACT`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is read first and returned
+before either clamp is consulted. But that path ignores the model argument entirely, so
+the number becomes the window for **every** model including the `gpt-*` routes — it
+destroys the clean separation described in the next section — and it turns auto-compact
+off, so a session that outgrows the real window fails instead of compacting. Treat it as
+a diagnostic, not a configuration.
+
+---
+
+## 4. Think before adding — `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
 
 ```jsonc
 "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "272000"
@@ -57,15 +124,23 @@ live GPT route — `gpt-sol-*`, `gpt-terra-*`, `gpt-luna-*` all show a 272000-to
 (OpenAI's own API docs quote a larger figure for some of these models, but the Codex
 subscription caps them at 272000, and that is the number that governs here.)
 
-Why it is risky as a global setting — this is one number applied to every model id,
-recognised or not:
+**It cannot touch the Claude routes.** An earlier revision of this document warned that
+it could; the client's own code says otherwise:
 
-- **It overrides the models the client already knows.** Claude Code has correct built-in
-  windows for Claude model ids. A global 272000 tells a 200k-window Claude session to
-  keep going past its real limit, so compaction fires too late and the session fails with
-  a context overflow instead of compacting. On a 1M-context Claude model it does the
-  opposite: it throws away roughly three quarters of a window you are paying for.
-- **It is wrong for one GPT route in the other direction.** `gpt-spark-high` has a
+```js
+let n = te.CLAUDE_CODE_MAX_CONTEXT_TOKENS;
+if (n !== undefined && n > 0 && !Eo(ns(e)).startsWith("claude-")) return n;
+return ebr;                                   // ebr = 200000
+```
+
+The value is applied only when the resolved model name does **not** start with
+`claude-`. So it sizes the `gpt-*` routes and is inert for every Claude model. Section 3
+is what governs the Claude side.
+
+Why it still needs thought — it is one number across GPT routes whose real windows
+differ:
+
+- **It is wrong for one GPT route.** `gpt-spark-high` has a
   **128000**-token window, not 272000. A global 272000 lets a spark session grow to more
   than twice its real limit before the client thinks about compacting; the request then
   fails upstream. Spark's role — fast, bounded edit-test-lint loops — keeps sessions
@@ -74,10 +149,11 @@ recognised or not:
   including spark and including 200k Claude models, at the cost of compacting GPT
   sessions less than halfway into a window they could have used.
 
-There is no single correct global value, because the client applies one number to models
-with three different real windows (128k, 272k, and Claude's 200k/1M). Omitting the key
-leaves each model on the client's own default, which is the least-surprising behaviour;
-add it per-session when a specific GPT run needs the full 272k.
+There is no single correct global value, because the client applies one number across GPT
+routes with two different real windows (128k for spark, 272k for the rest). Omitting the
+key leaves every GPT route on the client's undocumented default for an unrecognised id,
+which is the least-surprising behaviour but not necessarily a safe one; add it when a
+specific GPT run needs the full 272k.
 
 One caveat on that recommended path: what Claude Code's default window is for a model id
 it does not recognise is undocumented, and it is almost certainly above spark's real
@@ -90,7 +166,7 @@ CLAUDE_CODE_MAX_CONTEXT_TOKENS=128000 claude
 
 ---
 
-## 4. Required — wire the health hook
+## 5. Required — wire the health hook
 
 **Merge this branch first.** `~/.claude` is this git repo, so `hooks/utraque-health.sh`
 only exists at the path below once `utraque-integration` is merged into the live branch.
@@ -122,7 +198,7 @@ listening socket — so the first session of the day warms the proxy for free.
 
 ---
 
-## 5. Security — decide deliberately
+## 6. Security — decide deliberately
 
 The proxy currently runs **unauthenticated**. Any local process can reach
 `127.0.0.1:8317` and spend both the Anthropic and the Codex subscription through it.
@@ -141,7 +217,7 @@ this repo's tracked one. And the health hook needs no change either way, because
 
 ---
 
-## 6. Optional — `permissions.allow`
+## 7. Optional — `permissions.allow`
 
 ```jsonc
 "Bash(curl -s http://127.0.0.1:8317/healthz*)"
@@ -153,7 +229,7 @@ with this entry; the hook is the reliable path.
 
 ---
 
-## 7. Reverting
+## 8. Reverting
 
 **Remove `ANTHROPIC_BASE_URL`.** That is the whole rollback. Everything else is inert
 without it:
@@ -166,14 +242,16 @@ without it:
 - Claude routes are untouched throughout — they never stopped going to Anthropic
   directly, they were only being forwarded.
 
-To back out further: remove the SessionStart hook entry, and remove
-`CLAUDE_CODE_MAX_CONTEXT_TOKENS` if you added it (that one does change Claude session
-behaviour, so it is the only key worth removing promptly). Uninstall the launchd agent
+To back out further: remove the SessionStart hook entry. Also remove
+`_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL`: it is harmless with the proxy gone (the base
+URL is then genuinely first-party) but it is misleading to leave a claim about the base
+URL in place once there is no proxy to claim it for. `CLAUDE_CODE_MAX_CONTEXT_TOKENS` can
+stay or go — with no GPT routes reachable there is nothing left for it to size. Uninstall the launchd agent
 with `deploy/uninstall.sh --unload` in the utraque repo.
 
 ---
 
-## 8. Why the agent files name `sol-high` and not `sol`
+## 9. Why the agent files name `sol-high` and not `sol`
 
 **Do not "tidy" the `model:` values back to bare aliases.** Every `gpt-*` agent names an
 effort-suffixed model (`model: sol-high`, `terra-medium`, `luna-low`, `spark-high`)
@@ -205,7 +283,7 @@ table does not define an `ultra` tier. Reach it, if ever, by naming `sol-ultra` 
 
 ---
 
-## 9. Pre-merge requirement — publish the `model-selection` submodule commit
+## 10. Pre-merge requirement — publish the `model-selection` submodule commit
 
 This branch bumps the `skills/model-selection` submodule pointer to `d5b1327`, the tip of
 local branch `utraque-routing` (which also carries `0d2f986`, "Add GPT gateway routes and
