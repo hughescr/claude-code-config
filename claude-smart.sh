@@ -96,5 +96,15 @@ for dir in "${PLUGIN_DIRS[@]}"; do
     [[ -d "$dir" ]] && CLAUDE_FLAGS+=(--plugin-dir "$dir")
 done
 
+# Route through the local utraque proxy when it is healthy, so Claude models bill
+# the Max subscription and gpt-* routes reach OpenAI on the Codex subscription.
+# If the proxy is not answering, leave the variables unset: Claude Code then talks
+# to api.anthropic.com directly, exactly as it did before utraque existed.
+if curl -sf --max-time 1 http://127.0.0.1:8317/healthz >/dev/null 2>&1; then
+    export ANTHROPIC_BASE_URL="http://127.0.0.1:8317"
+    export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+    export CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
+fi
+
 # Launch the native binary
 exec "$CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" "$@"
