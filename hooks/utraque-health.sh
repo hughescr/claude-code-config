@@ -114,7 +114,7 @@ SUMMARY="$(jq -er --arg url "$URL" --arg repo "$REPO" '
     then " (token expires in \(.codex_auth.expires_in_s)s)" else "" end;
   def advice:
     ((if ((.codex_auth.status // "") != "ok")
-      then [" Run `codex login` (see " + $repo + ") to refresh the Codex credential; gpt-* routes will fail until it is ok. The `codex` relay agent shares that credential, so it will not work around this either."]
+      then [" Run `codex login` (see " + $repo + ") to refresh the Codex credential; gpt-* routes will fail until it is ok."]
       else [] end)
      + (if ((.codex_catalog.state // "") | IN("failed","unavailable"))
         then [" The model catalog is " + .codex_catalog.state + (if .codex_catalog.last_error then " (" + (.codex_catalog.last_error|tostring) + ")" else "" end) + "; routing is falling back to the compiled-in seed list."]

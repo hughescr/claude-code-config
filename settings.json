@@ -31,11 +31,7 @@
       "Read(//tmp/claude/**)",
       "Edit(//tmp/claude/**)",
       "Read(//private/tmp/claude-*/**)",
-      "Edit(//private/tmp/claude-*/**)",
-      "Bash(mktemp /tmp/claude/codex-query.XXXXXX)",
-      "Bash(~/.claude/scripts/codex/codex-start.sh *)",
-      "Bash(~/.claude/scripts/codex/codex-wait.sh *)",
-      "Bash(~/.claude/scripts/codex/codex-get-session-id.sh *)"
+      "Edit(//private/tmp/claude-*/**)"
     ],
     "defaultMode": "auto"
   },

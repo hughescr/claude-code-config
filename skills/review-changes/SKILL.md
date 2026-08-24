@@ -1,47 +1,54 @@
 ---
 name: review-changes
-description: Use after implementation is complete and lint/tests pass to run a multi-agent review of uncommitted changes. Delegates to multiple perspectives (Codex, code reviewer, code architect, project-steward) checking for bugs, wiring/call-graph, dead code, and long-term project alignment.
+description: Use before committing a substantial change — several subsystems, a reshaped abstraction, or security, data integrity, concurrency, or a migration. Spawns ONE cross-family verifier to check the diff for bugs, wiring gaps, dead code, and alignment. Not for small or routine changes.
 ---
 
 # Review Changes
 
-Conduct a thorough multi-agent review of all uncommitted changes in the repository.
+One independent opinion on the uncommitted changes before they are committed.
 
-> Distinct from the built-in `/code-review` skill: review-changes is a multi-perspective pre-commit gate that includes project-steward alignment, whereas `/code-review` is a diff-focused bug + cleanup pass (with an ultra cloud mode).
+> **Not a panel.** One verifier. Most changes need none. If you were yourself spawned to review, do not run this — review does not recurse.
+>
+> Distinct from `/code-review`, which is a diff-focused bug + cleanup pass with an ultra cloud mode.
 
-## What to Review
+## When to run it
 
-- Compare the uncommitted changes against the plan from this conversation
-- Look for potential bugs or logic errors
-- Identify places where these changes could have unintended consequences on other parts of the system
-- Verify that everything is wired up correctly — imports, exports, registrations, config, AND the call graph. Trace the code paths to confirm new features are actually invoked from the appropriate entry points. (This is critical: a common failure mode is implementing a feature but never hooking it into the code that calls it.)
-- Check whether these changes have made other portions of code redundant or dead, and flag anything that can be pruned
+Run it when the change is substantial in at least one way:
 
-## How to Review
+- spans several files or subsystems
+- introduces or reshapes an abstraction
+- touches security, data integrity, concurrency, or a migration
+- would be costly to reverse
 
-Delegate this review to **at least 4 different agents running in parallel**. Use different models and agent specializations for diverse perspectives. More agents are welcome if additional specialized agents are available — 4 is the minimum, not the target.
+Otherwise skip it. A one-file fix, docs edit, test-only change, or mechanical rename does not earn a verifier. "No verifier needed — one-file fix" is a valid outcome of considering this skill.
 
-Each agent has full access to the codebase, git history, and all tools. Do NOT pre-read diffs or gather context before delegating — just invoke the agents with their instructions and let each one do its own investigation. This preserves orchestrator context.
+## Which verifier
 
-Launch each reviewer agent asynchronously (`run_in_background: true`) with a distinct name, consistent with the orchestrator rules in `~/.claude/CLAUDE.md`.
+Prefer a **different model family**: it fails differently than this session does. Pair off the session's own model: `gpt-sol-high` for a `fable-*` or `opus-high` session, `gpt-terra-high` for `sonnet-high`. Load `model-selection` only if the session model is neither — its table covers the rest. When in doubt use `gpt-sol-high`; this runs on work already believed finished, so a missed defect costs more than the stronger reviewer.
 
-1. **A GPT agent** (mandatory). Pick it from the cross-family pairing table in the `model-selection` skill, using the session's own model as the proposer: `gpt-sol-high` for a `fable-*` or `opus-high` session, `gpt-terra-high` for a `sonnet-high` session. When in doubt use `gpt-sol-high` — this gate runs on work already believed finished, so the cost of a missed defect is higher than the cost of the stronger reviewer. Have it review the uncommitted changes for architectural soundness, potential bugs, and unintended side-effects. If `ANTHROPIC_BASE_URL` does not name the `utraque` proxy, or the proxy is down, fall back to the `codex` relay agent — do not drop to a same-family reviewer without saying so in the report.
+No proxy (`ANTHROPIC_BASE_URL` not naming `utraque`, or it is down) means no cross-family route: use `opus-high` (or `fable-high`) and report that the check was same-family.
 
-2. **A code reviewer agent** — focused on correctness, code quality, potential bugs, edge cases, and completeness vs. the plan.
+When alignment is the *only* material risk, use `project-steward` instead — it covers alignment and deliberately does not audit bugs, edge cases, or wiring. If the change carries correctness risk too, use a general verifier; the last checklist bullet already covers alignment.
 
-3. **A code architect agent** — focused on *in-codebase* structural integrity: wiring/call-graph verification, dead code detection, and whether new code integrates cleanly with existing modules and abstractions.
+Add a second verifier only when one agent cannot cover the change well — a diff that is both a security change and a migration, say. That is the exception.
 
-4. **A `project-steward` agent** (mandatory — definition at `~/.claude/agents/project-steward.md`) — focused on the forest, not the trees: long-term project alignment, documentation compliance, and maintainability. It reads the project's orientation docs (README, CLAUDE.md, ARCHITECTURE, ROADMAP, ADRs) before assessing the diff, and checks whether the changes are consistent with stated project direction, conventions, and documented decisions. Unlike the code architect, which evaluates internal code structure, project-steward assesses whether the diff honors the project's stated direction and documented decisions as captured in those orientation docs. This complements — does not replace — the code-level reviewers above.
+## What it checks
 
-5. **Additional agents** — if other specialized agents are available (e.g., security, performance, testing), include them too. The more perspectives, the better.
+Hand it this list in full — one agent covers all of it, not one agent per bullet:
 
-Using multiple agents with different underlying models provides broader coverage and catches issues that a single reviewer would miss.
+- the changes against the plan from this conversation
+- bugs and logic errors; unintended consequences elsewhere
+- wiring: imports, exports, registrations, config, **and the call graph**. Trace the paths to confirm new code is actually invoked from its entry points — implementing a feature and never hooking it up is a common failure
+- code made dead or redundant by the change
+- alignment with the project's stated direction, conventions, and documented decisions
+
+Do not pre-read the diff or gather context first; let the verifier investigate itself and keep orchestrator context free. Launch it with `run_in_background: true` and a distinct name.
 
 ## Output
 
-Consolidate the findings from all agents into a clear summary:
-- Issues found (by severity: critical, major, minor)
-- Whether the changes match the plan
-- Any dead code or redundancies to clean up
-- Alignment with project goals / docs / long-term maintainability — `project-steward`'s alignment verdict and any documentation or maintainability concerns it raised
-- Overall assessment: are we in good shape?
+- issues by severity (critical / major / minor)
+- whether the changes match the plan
+- dead code to prune
+- alignment concerns
+- overall: are we in good shape?
+- which verifier ran, and whether the check was cross-family or same-family
