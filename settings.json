@@ -39,7 +39,6 @@
     ],
     "defaultMode": "auto"
   },
-  "model": "fable",
   "hooks": {
     "PreToolUse": [
       {
@@ -234,7 +233,7 @@
     }
   },
   "alwaysThinkingEnabled": true,
-  "effortLevel": "high",
+  "advisorModel": "opus",
   "promptSuggestionEnabled": false,
   "awaySummaryEnabled": false,
   "pluginConfigs": {
