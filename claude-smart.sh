@@ -103,6 +103,13 @@ done
 if curl -sf --max-time 1 http://127.0.0.1:8317/healthz >/dev/null 2>&1; then
     export ANTHROPIC_BASE_URL="http://127.0.0.1:8317"
     export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+    # A non-api.anthropic.com base URL makes Claude Code treat every model as
+    # third-party, which drops claude-* models from their true 1M window to the
+    # 200000 default and can trap a long session in an auto-compact loop. This
+    # variable restores native window detection from the built-in model table.
+    export _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1
+    # Only applies to models whose name does not start with "claude-", so this
+    # sizes the gpt-* routes and never touches the Claude models above.
     export CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
 fi
 
