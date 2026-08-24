@@ -25,7 +25,7 @@ Each agent has full access to the codebase, git history, and all tools. Do NOT p
 
 Launch each reviewer agent asynchronously (`run_in_background: true`) with a distinct name, consistent with the orchestrator rules in `~/.claude/CLAUDE.md`.
 
-1. **A GPT agent** (mandatory — `gpt-terra-high`, or `gpt-sol-high` when the diff is consequential). Have it review the uncommitted changes for architectural soundness, potential bugs, and unintended side-effects. If the `utraque` proxy is down, fall back to the `codex` relay agent.
+1. **A GPT agent** (mandatory). Pick it from the cross-family pairing table in the `model-selection` skill, using the session's own model as the proposer: `gpt-sol-high` for a `fable-*` or `opus-high` session, `gpt-terra-high` for a `sonnet-high` session. When in doubt use `gpt-sol-high` — this gate runs on work already believed finished, so the cost of a missed defect is higher than the cost of the stronger reviewer. Have it review the uncommitted changes for architectural soundness, potential bugs, and unintended side-effects. If `ANTHROPIC_BASE_URL` does not name the `utraque` proxy, or the proxy is down, fall back to the `codex` relay agent — do not drop to a same-family reviewer without saying so in the report.
 
 2. **A code reviewer agent** — focused on correctness, code quality, potential bugs, edge cases, and completeness vs. the plan.
 
