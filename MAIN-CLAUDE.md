@@ -93,11 +93,13 @@ Sub-agent rules now live in SUBAGENT-CLAUDE.md and are auto-injected via the Sub
 
 ## Quality & Risk
 
-**Cross-check with Codex** — an independent opinion from a different model family catches what same-family reviewers miss:
-- Consequential architecture or design decisions → put the question to the `codex` relay agent (`agents/codex.md`), which passes it verbatim to OpenAI Codex and returns its answer.
-- Significant diffs before commit → run the review-changes skill: a multi-agent gate that mandates a Codex reviewer alongside the skill's other perspectives (bugs, wiring/call-graph, dead code, project-steward alignment).
+**Cross-check with a GPT model** — an independent opinion from a different model family catches what same-family reviewers miss:
+- Consequential architecture or design decisions → spawn `gpt-sol-high` (or `gpt-sol-xhigh` for the hardest calls) as a normal Agent and put the question to it directly.
+- Significant diffs before commit → run the review-changes skill: a multi-agent gate that mandates a GPT reviewer alongside the skill's other perspectives (bugs, wiring/call-graph, dead code, project-steward alignment).
 
-Codex runs on its own default model — treat "use Codex" as the cross-check lever; don't try to pick among OpenAI/Codex model variants (model-selection is for choosing among Anthropic models only).
+The `gpt-*` routes reach OpenAI models through the local `utraque` proxy on `127.0.0.1:8317` and bill the Codex subscription. They require `env.ANTHROPIC_BASE_URL` in `settings.json` to name that proxy; until it does, every `gpt-*` spawn fails, so use the `codex` agent for the cross-check instead (see `UTRAQUE-SETTINGS-DELTA.md`). Model and effort are now real choices, listed in the routing table in CLAUDE.md, so model-selection covers them too and is no longer Anthropic-only. Two limits are worth knowing: the context window is 272k tokens (128k on `gpt-spark-high`), and a `gpt-*` route runs inside our own harness with our own tools — it is a different model, not a different agent scaffold.
+
+Fallback and specialist path: the `codex` agent (`agents/codex.md`) relays to the Codex CLI. Use it when the user asks for Codex by name, when the proxy is unavailable, or when the point is Codex's own agent loop, its own sandbox, a workspace directory other than the session cwd, a resumable session, or keeping a large diff out of our context — none of which a `gpt-*` route provides. It shares one credential with the proxy, so `codex login` fixes both legs and neither works around a stale one.
 
 ---
 

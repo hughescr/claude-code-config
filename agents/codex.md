@@ -2,7 +2,11 @@
 name: codex
 color: blue
 description: |
-  Transparent relay to OpenAI Codex. Use when user wants Codex's opinion.
+  Relay to the OpenAI Codex CLI. Use when the user asks for Codex's opinion by
+  name, when the utraque proxy is unavailable, or when the task needs Codex's
+  own agent loop, its own sandbox, a workspace directory other than the session
+  cwd, or a resumable Codex session. For an ordinary cross-family cross-check,
+  prefer the native gpt-* routes.
 model: haiku
 effort: low
 tools: Bash, Write, Read
@@ -20,6 +24,47 @@ hooks:
       hooks:
         - type: command
           command: "/Users/craig/.claude/hooks/codex/validate-bash.sh"
+---
+
+# Status: specialist path, no longer the default cross-check
+
+The everyday cross-check no longer goes through this agent. The `gpt-*` routes
+(`agents/gpt-sol-high.md` and its siblings) reach the same OpenAI models
+directly over the local `utraque` proxy, inside Claude Code's own harness, with
+real tool use and explicit effort control.
+
+This relay is kept because five things it does are not covered by those routes.
+An explicit user request for Codex is reason enough on its own:
+
+1. **Codex's own agent loop.** The `gpt-*` routes give you the model; this relay
+   gives you the Codex CLI harness — its own file reading, tool use, sandbox and
+   planning. That is a genuinely different reviewer, not the same reviewer more
+   cheaply. Use it when the value is the second scaffold, not just the second
+   model.
+2. **Resumable sessions.** `codex-get-session-id.sh` lets a follow-up question
+   continue Codex's prior thread. A `gpt-*` spawn starts from empty context
+   every time.
+3. **Detached long runs.** `codex-wait.sh` tolerates 30+ minute runs decoupled
+   from the calling turn.
+4. **An explicit workspace directory.** `codex-start.sh /path/to/workspace ...`
+   points Codex at any repo, not just the session's cwd. A `gpt-*` subagent
+   works where the session works.
+5. **Context isolation.** Codex reads files into its own context. A `gpt-*`
+   reviewer spends its 272k window on Claude Code's system prompt, tool schemas
+   and file reads, which matters most on exactly the large diffs worth a second
+   opinion.
+
+It is also the cross-family path that survives the `utraque` proxy being
+stopped, because it calls the Codex CLI directly and does not use
+`ANTHROPIC_BASE_URL` at all.
+
+It does **not** survive a stale Codex credential. utraque and the Codex CLI read
+the same `CODEX_HOME/auth.json`, so `codex login` fixes both legs and nothing
+works around a bad credential. The health hook says the same thing.
+
+Everything below this section is unchanged and still describes exactly how to
+run the relay.
+
 ---
 
 # ⛔ ABSOLUTE PROHIBITIONS ⛔
