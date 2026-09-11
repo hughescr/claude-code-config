@@ -95,11 +95,9 @@ Sub-agent rules now live in SUBAGENT-CLAUDE.md and are auto-injected via the Sub
 
 **A second opinion is for complex work, not for everything.** Most changes need none. Add exactly one — never a panel — for a consequential design decision, a change spanning several subsystems, or anything touching security, data integrity, concurrency, or a migration. A one-file fix, docs edit, test tweak, or mechanical rename does not qualify.
 
-Prefer a different model family for that check; it fails differently than you do. Design and architecture calls go straight to `gpt-sol-high` (`gpt-sol-xhigh` for the hardest) as a normal Agent; a substantial diff before commit goes to the review-changes skill.
+Prefer a different model family for that check; it fails differently than you do. Design and architecture calls go straight to `gpt-astra-medium` (`gpt-astra-high` for the hardest) as a normal Agent; a substantial diff before commit goes to the review-changes skill. A non-Claude route runs inside our own harness with our own tools — it is a different model, not a different agent scaffold.
 
-The `gpt-*` routes reach OpenAI models through the local `utraque` proxy on `127.0.0.1:8317` and bill the Codex subscription. They work only when `ANTHROPIC_BASE_URL` names that proxy; the `claude` alias sets it at launch when the proxy is healthy, so check the environment variable, not `settings.json`. Unset, every `gpt-*` spawn fails (see `UTRAQUE-SETTINGS-DELTA.md`). Model and effort are now real choices, listed in the routing table in CLAUDE.md, so model-selection covers them too and is no longer Anthropic-only. Two limits are worth knowing: the context window is 272k tokens (128k on `gpt-spark-high`), and a `gpt-*` route runs inside our own harness with our own tools — it is a different model, not a different agent scaffold.
-
-With the proxy down or unconfigured there is no cross-family route: if the work warranted a verifier, use `opus-high` (or `fable-high`) and report the check as same-family. The proxy authenticates with the Codex subscription credential, so `codex login` refreshes it when `gpt-*` routes start failing on auth.
+The routing table in CLAUDE.md names the routes; the `model-selection` skill holds the facts behind them — proxy availability, billing, limits, and the cross-family pairing table — and is the place to update when a model changes. With the proxy down or unconfigured there is no cross-family route: if the work warranted a verifier, use `opus-high` (or `fable-high`) and report the check as same-family.
 
 ---
 
