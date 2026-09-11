@@ -32,11 +32,10 @@ Every `Agent` call must set `subagent_type` to a named custom agent whose frontm
 | `gpt-terra-medium`, `gpt-terra-high` | Cross-family peer of `sonnet-high`; the default GPT leaf route. |
 | `gpt-sol-medium` | Cross-family peer of `opus-medium`: routine verification or challenge. |
 | `gpt-sol-high`, `gpt-sol-xhigh` | Cross-family peer of `opus-high`: consequential challenge and complex debugging. |
-| `gpt-spark-high` | Fast, bounded edit-test-lint loops; 128k context; never planning or review. |
 
 **The `gpt-*` routes are unavailable unless `ANTHROPIC_BASE_URL` points at the local `utraque` proxy on `127.0.0.1:8317`; that key is not set by default.** `claude-smart.sh` (the `claude` shell alias) sets it automatically at launch when the utraque proxy answers healthy on `127.0.0.1:8317` — so from inside a session, check the `ANTHROPIC_BASE_URL` environment variable itself, not `settings.json`. With it unset, a `gpt-*` spawn sends an unknown model name to `api.anthropic.com` and fails. See `UTRAQUE-SETTINGS-DELTA.md`, which documents the `settings.json` alternative.
 
-When they are available, the `gpt-*` routes reach OpenAI models through that proxy and bill the Codex subscription; their context window is 272k tokens (128k for `gpt-spark-high`). Pair one with a Claude proposer for cross-family challenge; never make a `gpt-*` route the only reviewer. If the proxy is configured but not running they fail immediately, and the Claude routes are unaffected.
+When they are available, the `gpt-*` routes reach OpenAI models through that proxy and bill the Codex subscription; their context window is 272k tokens. Pair one with a Claude proposer for cross-family challenge; never make a `gpt-*` route the only reviewer. If the proxy is configured but not running they fail immediately, and the Claude routes are unaffected.
 
 Fan out independent necessary work; do not duplicate work merely to create parallelism.
 
