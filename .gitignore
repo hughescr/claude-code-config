@@ -72,3 +72,9 @@ estimator/design/
 estimator/node_modules/
 daemon-auth-cooldown
 daemon-auth-status.json
+# Server-managed settings caches written by the harness
+policy-limits.json
+policy-limits.json.signature*.json
+remote-settings.json
+remote-settings.json.signature*.json
+remote-settings-consent.json
