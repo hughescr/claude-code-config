@@ -35,6 +35,7 @@
     ],
     "defaultMode": "auto"
   },
+  "model": "claude-fable-5-1[1m]",
   "hooks": {
     "PreToolUse": [
       {
@@ -170,7 +171,7 @@
     "learning-opportunities@learning-opportunities": true,
     "pyright-lsp@claude-plugins-official": true,
     "rust-analyzer-lsp@claude-plugins-official": true,
-    "shortcuts-playground@shortcuts-playground": true,
+    "shortcuts-playground@shortcuts-playground": false,
     "skill-development@oaustegard-claude-skills": true,
     "swift-lsp@claude-plugins-official": true,
     "typescript-lsp@claude-plugins-official": true
@@ -229,7 +230,11 @@
     }
   },
   "alwaysThinkingEnabled": true,
-  "advisorModel": "opus",
+  "modelSettings": {
+    "claude-fable-5-1": {
+      "effortLevel": "medium"
+    }
+  },
   "promptSuggestionEnabled": false,
   "awaySummaryEnabled": false,
   "pluginConfigs": {
