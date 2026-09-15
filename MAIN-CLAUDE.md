@@ -77,7 +77,7 @@ Act as the orchestrator: decompose the work, delegate leaf execution through the
 
 **Authority travels in spawn prompts, not relays.** Sub-delegation is fine — an implementer handing mechanical sub-tasks to a cheaper model is healthy — but never send a sub-agent a mid-run message carrying instructions that require authorization (new scope, config/settings edits, anything privileged): it arrives as an unverifiable peer message, and a well-behaved agent will refuse it. Either stop the agent and respawn with the updated spec in its spawn prompt, or act on the privileged instruction yourself as the delegator. Mid-run messages are for answering questions the agent itself asked.
 
-**Checkpoint before delegating.** Commit each phase (WIP fine) before launching the next; collapse into one or more meaningful commits (`git reset --soft` + recommit) before pushing. Uncommitted work is invisible to `git diff` and dies to a stray `git checkout`. Verify by diff — gates can't catch a change tuned to pass them.
+**Checkpoint before delegating.** Commit each phase (WIP fine) before launching the next; collapse into one or more meaningful commits (`git reset --soft` + recommit) before pushing. Untracked files never appear in `git diff`, and uncommitted work dies to a stray `git checkout`. Verify by diff — gates can't catch a change tuned to pass them.
 
 **Isolate agents that break code.** Mutation testing, speculative refactors, anything editing code it doesn't own → `isolation: "worktree"`. Give reviewers read-only tool sets, not a "don't edit" instruction (`Bash` still writes) — instructions lose to the agent's task.
 
@@ -85,9 +85,9 @@ Act as the orchestrator: decompose the work, delegate leaf execution through the
 
 **Use the shared routing table for routine spawns.** Invoke the **model-selection** skill only for new models, runtime or alias drift, explicit comparisons, repeated routing underperformance, or work outside the table. Preserve an explicit user model or effort choice when the runtime supports it.
 
-**Don't let one agent decide anything consequential alone.** Pair a proposer with a challenger; use `opus-medium` for routine checks and `opus-high` for consequential ones, escalating to Fable only when Opus stalls or exceptional judgment is required. Arbitrate disagreements before the next phase.
+**Don't let one agent decide anything consequential alone.** Pair a proposer with a challenger, routed per Quality & Risk below (a cross-family route first; `opus-medium` for routine checks and `opus-high` for consequential ones only when the proxy is unavailable, escalating to Fable when Opus stalls). Arbitrate disagreements before the next phase.
 
-Sub-agent rules now live in SUBAGENT-CLAUDE.md and are auto-injected via the SubagentStart hook.
+Sub-agent rules live in SUBAGENT-CLAUDE.md, auto-injected via the SubagentStart hook.
 
 ---
 

@@ -183,7 +183,7 @@ Load appropriate quality skill for your project language. This agent provides ge
 - **Async**: Proper async/await handling where applicable
 - **Error handling**: Consistent error handling patterns
 - **Testing**: Write tests for new functionality
-  - **MANDATORY**: Use fake timers for any timer-dependent code (`setTimeout`, `setInterval`, `Date`)
+  - For timer-dependent code, follow the language skill's testing standards (for JS/TS: fake timers per `testing-standards`)
   - Never rely on real timers - they cause slow, flaky tests
   - Always clean up fake timers in `afterEach` to prevent test pollution
 

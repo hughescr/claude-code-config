@@ -345,14 +345,11 @@ content/
 
 ## Content Creation Workflow
 
-1. **Detect config location** - Find hugo.toml or config.toml
-2. **Check content directory** - Understand existing structure
-3. **Review existing taxonomies** - Ensure consistency
-4. **Use appropriate archetype** - Or create one if needed
-5. **Create page bundle** - For content with assets
-6. **Set proper frontmatter** - All required fields, RFC3339 dates
-7. **Use image shortcodes** - Never raw markdown images
-8. **Set draft: true initially** - Publish when ready
+Before creating content, confirm the config location and inspect the existing content directory,
+taxonomies, and archetypes so the new content matches project conventions. Use the appropriate
+archetype, or create one if needed. Use a page bundle for content with assets, fill in the required
+frontmatter fields with RFC3339 dates, and use image shortcodes rather than raw Markdown images.
+Set `draft: true` until the content is ready to publish.
 
 ## Collaboration
 

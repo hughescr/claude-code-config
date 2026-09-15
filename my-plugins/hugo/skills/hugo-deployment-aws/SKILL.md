@@ -5,11 +5,9 @@ description: This skill should be used when the user mentions "deploy", "deploym
 
 # Hugo AWS Deployment Guide
 
-## CRITICAL: Deployment Rules
+## Deployment Rules
 
-**NEVER run `serverless deploy` manually from the command line.**
-
-All deployments MUST go through GitHub CI. This ensures:
+Deployments go through GitHub CI only — do not run `serverless deploy` from the command line. This is because CI gives:
 - Consistent build environment
 - Proper secret management
 - Audit trail of all deployments
@@ -437,9 +435,8 @@ If a bad deployment goes out:
 
 ## Cost Optimization
 
-- CloudFront: First 1TB/month is free tier eligible
-- S3: Minimal cost for static sites (~$0.023/GB/month)
-- Invalidations: First 1000 paths/month free
-- Route53: $0.50/hosted zone/month
+Estimate S3 storage and requests, CloudFront transfer and invalidations, and Route53 hosted-zone
+and query charges using current AWS pricing for the account and region. Check applicable free-tier
+terms rather than assuming eligibility or fixed rates.
 
 **Tip**: Use `hugo --gc` to clean up unused cache files before deploy.

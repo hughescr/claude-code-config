@@ -1,8 +1,8 @@
-# Reference: re-estimation, and the near-duplicate incidents
+# Reference: re-estimation, and the near-duplicate warning
 
-Covers the three re-estimate reasons in full, why exit code 2 is never worked around, and the two
-2026-07-30 incidents the near-duplicate warning was built from. `est --help` and the code win any
-disagreement with this file.
+Covers the three re-estimate reasons in full, why exit code 2 is never worked around, and why the
+near-duplicate warning calls for stopping rather than merely noting the overlap. `est --help`
+and the code win any disagreement with this file.
 
 ## The reasons
 
@@ -76,7 +76,7 @@ Sugar for the common case: binds the current session to the task and appends a r
 call. Equivalent to `est bind <tid> --session <sid>` followed by `est open --tid <tid> --reason
 refinement`.
 
-## The near-duplicate warning, and the two incidents it came from
+## The near-duplicate warning, and why it exists
 
 When a session already has an open task whose subject overlaps yours, `est open` prints a warning
 to stderr and carries `near_duplicates: [{tid, subject, status, overlap}]` in its `--json` output.
@@ -84,18 +84,19 @@ It still mints, and the exit code is still `0` — nothing gates. Overlap is the
 `|A ∩ B| / min(|A|, |B|)` over content tokens, plus a fallback exact-match on the normalised
 subject for terse subjects that tokenise to nothing.
 
-Two real incidents on 2026-07-30:
+Two near-duplicate shapes to recognize:
 
-1. **A session re-opened for work it was already tracking.** The subject had grown — "sweeper close
-   pass" became "sweeper close pass, cron recon, SessionStart hook and the near-duplicate warning"
-   — and a second `est open` felt like the natural move. It was a `refinement`.
-2. **A sub-agent minted its own tid** for a slice its orchestrator had already estimated. It should
-   have run `est bind`.
+1. **The same goal, re-opened.** A subject grows from "sweeper close pass" to "sweeper close pass,
+   cron recon, SessionStart hook and the near-duplicate warning". Use `refinement` against the
+   existing tid, not a new `est open`.
+2. **Delegated work minting its own tid.** A sub-agent receives a slice its orchestrator already
+   estimated. Use `est bind` rather than opening a fresh estimate.
 
 Both split one session's spend across two tasks, so **both** actuals come out wrong and neither
 task looks broken afterwards: each has a plausible band and a plausible burn, and only the sum is
-nonsense. That silence is why the warning was added, and why the rule in SKILL.md is to stop rather
-than to note it and continue.
+nonsense. That silent failure is why the rule in SKILL.md is to stop rather than note the warning
+and continue.
 
 Jaccard was rejected for the overlap measure because it punishes a long subject for being long:
-the pair in incident 1 scores ~0.3 under Jaccard and slips under any threshold worth having.
+the subject pair in the first example scores ~0.3 under Jaccard and slips under any threshold
+worth having.

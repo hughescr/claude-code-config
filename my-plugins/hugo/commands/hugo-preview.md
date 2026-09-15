@@ -65,9 +65,7 @@ Start the Hugo development server with optimal flags for local development and p
 
 5. **Optional: Open in browser**
 
-   If the user wants to open the site in their browser, you can use Chrome MCP tools:
-   - First load the navigate tool with MCPSearch
-   - Then use `mcp__claude-in-chrome__navigate` to open the URL
+   If the user wants to open the site in their browser, check for a configured browser-automation MCP tool (e.g. a `navigate` tool under whatever browser MCP server is currently connected) via tool search, and use it to open the URL.
 
 ## Notes
 

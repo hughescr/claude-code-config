@@ -158,9 +158,8 @@ All API functions return structured dictionaries:
 
 ## Related Skills
 
-This skill consolidates and replaces:
-- `sampling-bluesky-zeitgeist` (deprecated) - Firehose sampling now built-in
+Firehose sampling is built in (`zeitgeist-sample.js`); there is no separate sampling skill.
 
 ## Version
 
-0.5.0
+0.5.1

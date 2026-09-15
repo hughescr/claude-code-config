@@ -1,6 +1,6 @@
 ---
 name: testing-standards
-description: This skill should be used when the user mentions "write tests", "unit test", "fake timers", "mock timers", "test setTimeout", "test setInterval", "flaky tests", "test timing", "test concurrency", "mutation testing quality gate", "test quality", or any testing of JavaScript/TypeScript code. Provides mandatory standards for testing time-dependent code and mutation testing as a secondary quality gate.
+description: Use when writing or reviewing JavaScript/TypeScript tests, especially time-dependent code (timers, dates) or test concurrency/flakiness, or when applying mutation testing as a quality gate. Provides mandatory standards for testing time-dependent code and mutation testing as a secondary quality gate.
 ---
 
 # JavaScript/TypeScript Testing Standards

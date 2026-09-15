@@ -7,9 +7,11 @@ description: This skill should be used when the user mentions "scss", "sass", "c
 
 ## Overview
 
-Hugo Pipes is Hugo's built-in asset processing pipeline that replaces traditional bundlers like webpack, Vite, or esbuild. **Hugo projects DO have a build step** - it's just handled by Hugo itself, not external tools.
+Hugo Pipes is Hugo's built-in asset processing pipeline. Hugo projects have a build step handled
+by Hugo itself.
 
-**CRITICAL**: When working on Hugo projects, use Hugo Pipes for all asset processing. Do NOT add webpack, Vite, Rollup, or other JavaScript bundlers - Hugo handles this natively.
+Use Hugo Pipes for all asset processing rather than adding webpack, Vite, Rollup, or another
+JavaScript bundler: Hugo already provides the asset-processing capabilities described below.
 
 ## Hugo Extended Requirement
 
@@ -224,20 +226,10 @@ Import in your SCSS:
 <script src="{{ $js.RelPermalink }}"></script>
 ```
 
-### ES Modules with Imports
+### Bundling ES Modules for a Classic Script Tag
 
-assets/js/main.js:
-```javascript
-import { initNav } from './components/navigation.js';
-import { setupForms } from './components/forms.js';
+Use an IIFE output for a bundle loaded through a classic script tag:
 
-document.addEventListener('DOMContentLoaded', () => {
-  initNav();
-  setupForms();
-});
-```
-
-Template:
 ```go-html-template
 {{ $opts := dict
     "targetPath" "js/bundle.js"

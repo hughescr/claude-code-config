@@ -1,6 +1,6 @@
 ---
 name: typescript-quality
-description: This skill should be used when the user asks to "fix type errors", "fix tsc errors", "add TypeScript types", "enable strict mode", "strict null checks", "noImplicitAny", "add TSDoc", "install @types", "run typecheck", "handle implicit any", or needs guidance on TypeScript type safety, strict mode compliance, TSDoc documentation, or DefinitelyTyped packages.
+description: Use for TypeScript type-safety work - fixing type/tsc errors, adding types or TSDoc, enabling strict mode, or sourcing @types packages. Provides guidance on strict mode compliance, TSDoc documentation, and DefinitelyTyped packages.
 ---
 
 # TypeScript Quality Standards
@@ -15,7 +15,7 @@ bun run typecheck     # Preferred - uses project tsconfig.json
 bunx tsc --noEmit     # Only if no typecheck script exists
 ```
 
-**CRITICAL: NEVER run tsc with individual file arguments.** TypeScript needs the full project context for proper type-checking. The `block-tsc-with-files` hook will prevent this, but avoid attempting it.
+Run tsc against the full project, not individual files — TypeScript needs full project context for correct type-checking. A `block-tsc-with-files` hook blocks per-file invocations, so use `bun run typecheck` (preferred) or `bunx tsc --noEmit`.
 
 ## Strict Mode Compliance
 

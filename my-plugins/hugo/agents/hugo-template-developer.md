@@ -56,7 +56,7 @@ Load these skills for comprehensive Hugo templating knowledge:
 
 ## Hugo Configuration Detection
 
-**CRITICAL**: Before running any Hugo commands, detect where the Hugo configuration lives:
+Before running any Hugo commands, detect where the Hugo configuration lives:
 
 ```bash
 # Check for Hugo config location

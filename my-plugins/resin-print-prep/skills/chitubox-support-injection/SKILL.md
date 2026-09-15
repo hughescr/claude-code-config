@@ -48,9 +48,6 @@ Re-run the specimen ladder from the reference doc: empty project ->
 72-byte stride, and index pair are the things to re-locate first; the
 `Project` parser's asserts are designed to fail loudly on drift.
 
-## Companion (planned)
+## Companion
 
-A support *placement* skill ("magic support" equivalent: island
-detection, density sampling, routing, raft MST) will generate the
-support descriptions that this skill injects. Until it exists, this
-skill is used with manually specified or cloned support positions.
+The sibling skill `support-placement` (currently a design-phase draft) generates support descriptions — island detection, density sampling, routing, raft MST — that this skill injects. Until it ships, use manually specified or cloned support positions.

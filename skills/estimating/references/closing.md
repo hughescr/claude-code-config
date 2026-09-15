@@ -11,9 +11,9 @@ signal or staleness; no attributable request inside the quiet window (`quiesce_m
 minutes); no open turn; no live session; every bound agent still accounted for. If a condition
 fails it exits `2` and names it.
 
-Since 2026-07-30 the remedy that exit-`2` message points at begins **"do nothing"** — the sweeper's
-close pass really does finalize quiet tasks, through the same gate with no bypass. Waiting is the
-correct move whenever the work actually finished and the harness recorded it.
+The remedy that exit-`2` message points at begins **"do nothing"** — the sweeper's close pass really
+does finalize quiet tasks, through the same gate with no bypass. Waiting is the correct move whenever
+the work actually finished and the harness recorded it.
 
 The pass runs on every *eligible* sweep, not every sweep: it is throttled by
 `close_pass_min_interval_min` (default 10) via the mtime of a `.closepass.<db>` marker

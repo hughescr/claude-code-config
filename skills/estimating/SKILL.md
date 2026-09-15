@@ -225,7 +225,7 @@ Three regimes, none of them a number to copy:
    `near_duplicates` almost always means you should not have minted. Same goal, estimate moved →
    `est open --tid <named tid> --reason refinement`. Delegated work under an existing estimate →
    `est bind <named tid>`. Mint anyway only when the overlap is genuinely coincidental, and say so
-   in one clause when you show the band. [The two incidents this came from →](references/re-estimation.md)
+   in one clause when you show the band. [Why the warning requires stopping →](references/re-estimation.md)
 4. **`--dod`, on that same call** — capture Definition of Done now, each item tagged `deterministic` (machine-checkable
    command) or `human` (the user judges). Capturing it at estimate time is what stops "done" being
    renegotiated later to fit whatever got built.
@@ -238,10 +238,10 @@ Three regimes, none of them a number to copy:
    **Issue that call verbatim** when a Task-tool task exists — `est` cannot write Task metadata, you
    are the only actor who can, and the planted key stitches the task together across sessions. No
    Task-tool task → skip it; the tid stands alone.
-6. **Show one line to the user** — the p50/p90 points and whatever else `est open` actually printed:
+6. **Report what `est open` printed** — the p50/p90 points and whatever else it actually output,
    nothing it did not. There is no active-time band; and until a points→Work-CET rate exists for the
-   bucket there is no Work-CET or spend line either. Do not invent one. That line is the entire
-   user-facing friction. Do not narrate the ceremony.
+   bucket there is no Work-CET or spend line either. Do not invent one. The estimating steps
+   themselves aren't worth narrating to the user — save narration for the work itself.
 
 If `est` errors or is unavailable, say so in one clause and get on with the work. **Never fabricate
 a band to satisfy the ceremony.**
@@ -340,7 +340,7 @@ you must never do. `--force` is Craig's tool, never yours.
 ## References
 
 - `references/unit-and-calibration.md` — the story point and its anchor, points→Work-CET velocity, the calibration pipeline, why the estimand changed, why nothing gates, why this skill's own spend is excluded, and the open question about p90.
-- `references/re-estimation.md` — the three reasons in full, the exit-2 rationale, the two 2026-07-30 near-duplicate incidents.
+- `references/re-estimation.md` — the three reasons in full, the exit-2 rationale, the near-duplicate warning and two shapes to recognize.
 - `references/closing.md` — the quiescence gate, right-censoring, `--accept` verification, reopening after a sweep close, how the retro scores.
 - `references/cli-surface.md` — every verb outside the ceremony, global flags, the tunable constants.
 

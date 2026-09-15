@@ -1,6 +1,6 @@
 ---
 name: hugo-fundamentals
-description: This skill should be used when the user mentions "hugo basics", "hugo config", "hugo commands", "project structure", "hugo setup", "hugo.toml", "config.toml", "hugo serve", "hugo build", "content directory", "layouts directory", "static directory", "assets directory", "hugo configuration", "module mounts", "hugo environment", ".Site.Author", "author config", "site params", or any general Hugo static site generator questions. Provides foundational Hugo knowledge including project structure, configuration patterns, essential commands, and migration guidance for deprecated features.
+description: Use for general Hugo static site generator questions about project structure, configuration locations and syntax, CLI commands, module mounts, environment-aware configuration, or deprecated configuration features such as .Site.Author and author data in site parameters.
 ---
 
 # Hugo Fundamentals

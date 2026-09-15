@@ -22,7 +22,7 @@ Every `Agent` call must set `subagent_type` to a named custom agent whose frontm
 
 | Route | Use |
 |---|---|
-| `haiku-summary`, `haiku-basic` | Summaries and basic mechanical work; `effort: low` is declarative metadata currently ignored by Haiku. Verify consequential output with a stronger route. |
+| `haiku-basic` | Summaries and basic mechanical work. Whether Haiku honours `effort` is tracked in the `model-selection` skill — check there before relying on it. Verify consequential output with a stronger route. |
 | `sonnet-medium` | Bounded work with objective checks. |
 | `sonnet-high` | Normal substantive execution; default leaf route. |
 | `opus-medium` | Routine verification or challenge. |

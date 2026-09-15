@@ -1,143 +1,9 @@
 ---
 name: hugo-templating
-description: This skill should be used when the user mentions "go template", "hugo template", "partial", "shortcode", "template syntax", "layout", "baseof", "block define", "{{ range }}", "{{ if }}", "{{ with }}", "{{ partial }}", "template lookup", "layout hierarchy", or any Hugo templating concepts. Provides comprehensive guidance on Go template syntax, layouts, partials, shortcodes, and template debugging.
+description: This skill should be used for Hugo templating concepts — Go template syntax, layouts and layout lookup, partials, shortcodes, and template debugging.
 ---
 
 # Hugo Templating
-
-## Go Template Syntax Fundamentals
-
-Hugo uses Go's text/template and html/template packages with additional Hugo-specific functions. Understanding the core syntax is essential for all Hugo development.
-
-### Variables
-
-```go-html-template
-{{/* Defining variables */}}
-{{ $title := "My Page Title" }}
-{{ $count := 5 }}
-{{ $items := slice "one" "two" "three" }}
-
-{{/* Accessing page variables (front matter and built-in) */}}
-{{ .Title }}           {{/* Page title */}}
-{{ .Content }}         {{/* Rendered content */}}
-{{ .Params.author }}   {{/* Custom front matter parameter */}}
-{{ .Date }}            {{/* Page date */}}
-{{ .Permalink }}       {{/* Full URL to page */}}
-{{ .RelPermalink }}    {{/* Relative URL to page */}}
-
-{{/* Reassigning variables (note the = not :=) */}}
-{{ $count = 10 }}
-```
-
-### Conditionals
-
-```go-html-template
-{{/* Basic if statement */}}
-{{ if .Params.featured }}
-  <span class="featured">Featured</span>
-{{ end }}
-
-{{/* if-else */}}
-{{ if .Params.draft }}
-  <span class="draft">Draft</span>
-{{ else }}
-  <span class="published">Published</span>
-{{ end }}
-
-{{/* if-else if-else chain */}}
-{{ if eq .Type "post" }}
-  <article class="post">...</article>
-{{ else if eq .Type "page" }}
-  <div class="page">...</div>
-{{ else }}
-  <div class="default">...</div>
-{{ end }}
-
-{{/* Comparison operators */}}
-{{ if eq $a $b }}     {{/* equal */}}
-{{ if ne $a $b }}     {{/* not equal */}}
-{{ if lt $a $b }}     {{/* less than */}}
-{{ if le $a $b }}     {{/* less than or equal */}}
-{{ if gt $a $b }}     {{/* greater than */}}
-{{ if ge $a $b }}     {{/* greater than or equal */}}
-
-{{/* Logical operators */}}
-{{ if and .Params.featured .Params.image }}
-{{ if or .Params.author .Site.Params.defaultAuthor }}
-{{ if not .Params.hidden }}
-```
-
-### Loops with range
-
-```go-html-template
-{{/* Iterate over pages */}}
-{{ range .Pages }}
-  <h2>{{ .Title }}</h2>
-{{ end }}
-
-{{/* With index */}}
-{{ range $index, $page := .Pages }}
-  <div class="item-{{ $index }}">{{ $page.Title }}</div>
-{{ end }}
-
-{{/* Iterate over maps */}}
-{{ range $key, $value := .Params.metadata }}
-  <dt>{{ $key }}</dt>
-  <dd>{{ $value }}</dd>
-{{ end }}
-
-{{/* Range with else (for empty collections) */}}
-{{ range .Pages }}
-  <li>{{ .Title }}</li>
-{{ else }}
-  <li>No pages found</li>
-{{ end }}
-
-{{/* Limit iterations */}}
-{{ range first 5 .Pages }}
-  <li>{{ .Title }}</li>
-{{ end }}
-```
-
-### Pipes and Function Chaining
-
-```go-html-template
-{{/* Pipes pass output to the next function */}}
-{{ .Title | upper }}
-{{ .Title | lower | truncate 50 }}
-{{ .Content | plainify | truncate 200 "..." }}
-
-{{/* Common pipe operations */}}
-{{ .Date | time.Format "January 2, 2006" }}
-{{ .Params.tags | sort | uniq }}
-{{ .Summary | safeHTML }}
-
-{{/* Multiple arguments with pipes */}}
-{{ .Title | truncate 50 "..." }}    {{/* truncate to 50 chars, add "..." */}}
-{{ .Content | replaceRE "<[^>]*>" "" }}  {{/* strip HTML tags */}}
-```
-
-### Context: The Dot (.) and Global Context ($)
-
-```go-html-template
-{{/* The dot represents current context */}}
-{{ .Title }}  {{/* In page context, this is the page title */}}
-
-{{/* Inside range, dot changes to the current item */}}
-{{ range .Pages }}
-  {{ .Title }}  {{/* This is now the iterated page's title */}}
-{{ end }}
-
-{{/* Use $ to access global/root context from within range */}}
-{{ range .Pages }}
-  {{ $.Site.Title }}: {{ .Title }}
-{{ end }}
-
-{{/* with changes context like range */}}
-{{ with .Params.author }}
-  <span class="author">{{ . }}</span>  {{/* dot is now the author value */}}
-{{ end }}
-```
 
 ## Layout Hierarchy and Lookup Order
 
@@ -205,8 +71,8 @@ layouts/
     baseof.html      # Master template
     single.html      # Default single page
     list.html        # Default list page
-    terms.html       # Taxonomy list (tags, categories)
-    taxonomy.html    # Individual taxonomy term
+    taxonomy.html    # Taxonomy list page (all tags, all categories)
+    term.html        # Single term page (posts tagged "hugo")
   blog/
     single.html      # Blog post template
     list.html        # Blog listing template

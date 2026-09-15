@@ -41,7 +41,7 @@ _GEMINI_CLIENT_PATH = "/mnt/skills/user/invoking-gemini/scripts"
 _MODEL_REGISTRY = {
     # Anthropic
     "haiku": ("anthropic", "claude-haiku-4-5-20251001"),
-    "opus":  ("anthropic", "claude-opus-4-7"),
+    "opus":  ("anthropic", "claude-opus-5"),
     # Gemini — recommended order: lite for routine, flash for token-perfect,
     # 3.5-flash for premium reasoning alongside transcription.
     "gemini-lite":       ("gemini", "gemini-2.5-flash-lite"),

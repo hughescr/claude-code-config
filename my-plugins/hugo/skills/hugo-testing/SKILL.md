@@ -1,6 +1,6 @@
 ---
 name: hugo-testing
-description: This skill should be used when the user mentions "test javascript", "bun test", "unit test", "happy-dom", "test client-side js", "dom mocking", "browser tests", "test theme toggle", "test scroll handlers", or any testing of JavaScript code in Hugo projects. Provides comprehensive guidance for testing client-side JavaScript using Bun's test runner with happy-dom for DOM environment simulation.
+description: This skill should be used when testing client-side JavaScript in Hugo projects — Bun's test runner, DOM mocking with happy-dom, and browser-dependent code such as theme toggles or scroll handlers.
 ---
 
 # Testing Client-Side JavaScript in Hugo Projects
@@ -153,9 +153,6 @@ Bun automatically discovers test files matching these patterns:
     "test": "bun test",
     "test:watch": "bun test --watch",
     "test:coverage": "bun test --coverage"
-  },
-  "devDependencies": {
-    "happy-dom": "^15.0.0"
   }
 }
 ```
@@ -171,12 +168,14 @@ Bun automatically discovers test files matching these patterns:
     "test:watch": "bun test --watch",
     "test:coverage": "bun test --coverage",
     "test:js": "bun test tests/js/"
-  },
-  "devDependencies": {
-    "happy-dom": "^15.0.0"
   }
 }
 ```
+
+These examples show the scripts, not a complete dependency manifest. Preserve the project's
+existing dependencies. For a new setup, use the installation command above (`bun add -D happy-dom`)
+to record a compatible current dependency version and lockfile, then run the tests. For an existing
+setup, check compatibility and release notes before changing its pinned version.
 
 ## Testing Strategies for Client-Side JavaScript
 
@@ -466,23 +465,15 @@ jobs:
 
 ## Best Practices
 
-### 1. Separate Pure Logic from DOM Code
-
-Extract testable pure functions from DOM-manipulating code. This makes testing easier and code more maintainable.
-
-### 2. Clean Up After Each Test
+### 1. Clean Up After Each Test
 
 Always clean up global state and close happy-dom windows in `afterEach` to prevent test pollution.
 
-### 3. Use Dynamic Imports for Module Isolation
+### 2. Use Dynamic Imports for Module Isolation
 
 Use `await import()` inside tests to ensure fresh module state and proper global setup timing.
 
-### 4. Test Behavior, Not Implementation
-
-Focus on what the code does (theme changes, elements appear) rather than how it does it internally.
-
-### 5. Prefer bun run test Over bun test
+### 3. Prefer bun run test Over bun test
 
 Using the package.json script ensures consistent configuration and makes it easier to add options later.
 

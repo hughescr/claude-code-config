@@ -1,15 +1,15 @@
 ---
 name: bun-runtime
-description: This skill should be used when the user mentions "bun", "bunx", "npm install", "npm run", "node script.js", "npx", "yarn add", "pnpm", "package manager", "run tests", "bundle for distribution", or any Node.js/npm commands. Also use for JavaScript or TypeScript package management, testing, or script execution. Provides Bun-first runtime standards - all npm/node commands should use Bun equivalents.
+description: Use for any JavaScript/TypeScript package management, script execution, testing, or bundling task, or when the user's command uses npm/node/yarn/pnpm tooling instead of Bun. Provides Bun-first runtime standards - all npm/node commands should use Bun equivalents.
 ---
 
 # JavaScript Runtime Standards
 
 ## Runtime & Tooling Requirements
 
-### Bun Runtime (CRITICAL)
+### Bun Runtime
 
-**ALWAYS use Bun instead of Node.js or npm for all JavaScript and TypeScript work.**
+Use Bun instead of Node.js or npm for all JavaScript and TypeScript work (see Exception Cases below).
 
 #### Package Management
 ```bash
@@ -38,7 +38,7 @@ bun run start
 npm run script-name
 ```
 
-#### Prefer package.json Scripts (IMPORTANT)
+#### Prefer package.json Scripts
 
 **If a script exists in package.json, always use it instead of running the tool directly.**
 
@@ -108,7 +108,7 @@ npm test
 npm run jest
 ```
 
-#### Fake Timers (MANDATORY for timer tests)
+#### Fake Timers for Timer Tests
 
 When testing code with `setTimeout`, `setInterval`, or `Date`, **always use fake timers**:
 

@@ -1,6 +1,6 @@
 ---
 name: development-workflow
-description: This skill should be used when the user asks about "development workflow", "quality workflow", "symbol-based editing", "LSP navigation", "find references", "go to definition", "replace symbol body", "rename across codebase", "before making changes", "after making changes", or needs language-agnostic code editing and quality patterns. Covers built-in LSP tools and MCP symbol modification tools.
+description: Use when the user needs language-agnostic code navigation or symbol-level editing (LSP lookups, symbol renames, before/after-change quality checks), or wants guidance on development workflow and quality gates for a codebase. Covers built-in LSP tools and MCP symbol modification tools.
 ---
 
 # Development Workflow Standards

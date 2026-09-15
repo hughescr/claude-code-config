@@ -1,6 +1,6 @@
 ---
 name: stryker-mutation-testing
-description: This skill should be used when the user mentions "stryker", "mutation testing", "mutant", "mutation score", "survived mutant", "NoCoverage", "stryker disable", "mutation report", "equivalent mutant", "stryker incremental", "stryker cache", or any mutation testing of JavaScript/TypeScript code. Provides comprehensive Stryker mutation testing patterns, disable comment syntax, and strategies for handling survived mutants and NoCoverage results.
+description: Use for any mutation testing task on JavaScript/TypeScript code with Stryker - interpreting mutation scores and survived/NoCoverage mutants, writing disable comments, or managing the incremental cache. Provides comprehensive Stryker mutation testing patterns, disable comment syntax, and strategies for handling survived mutants and NoCoverage results.
 ---
 
 # Stryker Mutation Testing
