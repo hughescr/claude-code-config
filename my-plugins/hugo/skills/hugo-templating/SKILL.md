@@ -73,7 +73,7 @@ layouts/
     list.html        # Default list page
     taxonomy.html    # Taxonomy list page (all tags, all categories)
     term.html        # Single term page (posts tagged "hugo")
-    # legacy sites may name these terms.html (all terms) / taxonomy.html (one term); the swap is honoured under _default/ only
+    # legacy sites: terms.html (all terms) / taxonomy.html (one term); honoured under _default/ only, where the legacy taxonomy.html outranks term.html — modernise by moving both to layouts/ top level
   blog/
     single.html      # Blog post template
     list.html        # Blog listing template
