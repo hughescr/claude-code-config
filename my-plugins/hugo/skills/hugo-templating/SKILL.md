@@ -73,6 +73,7 @@ layouts/
     list.html        # Default list page
     taxonomy.html    # Taxonomy list page (all tags, all categories)
     term.html        # Single term page (posts tagged "hugo")
+    # legacy sites may name these terms.html (all terms) / taxonomy.html (one term); the swap is honoured under _default/ only
   blog/
     single.html      # Blog post template
     list.html        # Blog listing template
@@ -88,188 +89,20 @@ layouts/
 
 ## Block Definitions
 
-Blocks enable template inheritance, allowing child templates to override sections of the base template.
-
-### Defining and Using Blocks
-
-```go-html-template
-{{/* In baseof.html - define block with default content */}}
-{{ block "main" . }}
-  <p>This is the default content if not overridden</p>
-{{ end }}
-
-{{/* In single.html - override the block */}}
-{{ define "main" }}
-  <article>
-    <h1>{{ .Title }}</h1>
-    {{ .Content }}
-  </article>
-{{ end }}
-
-{{/* Empty block (placeholder only) */}}
-{{ block "sidebar" . }}{{ end }}
-
-{{/* Override with content */}}
-{{ define "sidebar" }}
-  {{ partial "sidebar/recent-posts.html" . }}
-{{ end }}
-```
-
-### Block Best Practices
-
-```go-html-template
-{{/* Always pass context to blocks */}}
-{{ block "main" . }}{{ end }}  {{/* CORRECT: passes current context */}}
-{{ block "main" }}{{ end }}     {{/* WRONG: no context passed */}}
-
-{{/* Common block pattern */}}
-{{ define "main" }}
-  {{/* Access page data through the passed context */}}
-  <h1>{{ .Title }}</h1>
-
-  {{/* Can still access global context */}}
-  <p>Site: {{ $.Site.Title }}</p>
-{{ end }}
-```
+- Blocks (`{{ block "name" . }}` in `baseof.html`, overridden via `{{ define "name" }}` in child templates) are how template inheritance works.
+- Always pass context explicitly: `{{ block "main" . }}` (correct — passes current context) vs `{{ block "main" }}` (wrong — no context passed).
+- Inside a block/define, `.` is whatever context was passed in; `$` always still refers to the original top-level context regardless of nesting — use `{{ $.Site.Title }}` to reach site data from inside a block that received a narrower context (e.g. a single page).
 
 ## Partials
 
-Partials are reusable template fragments stored in `layouts/partials/`.
-
-### Basic Partial Usage
-
-```go-html-template
-{{/* Include a partial - ALWAYS pass context */}}
-{{ partial "header.html" . }}
-{{ partial "components/card.html" . }}
-
-{{/* Passing custom context */}}
-{{ partial "author-bio.html" .Params.author }}
-
-{{/* Passing a dict for multiple values */}}
-{{ partial "card.html" (dict "title" .Title "image" .Params.image "link" .Permalink) }}
-```
-
-### Partials That Return Values
-
-```go-html-template
-{{/* layouts/partials/get-reading-time.html */}}
-{{ $wordCount := len (split .Content " ") }}
-{{ $readingTime := div $wordCount 200 }}
-{{ return $readingTime }}
-
-{{/* Using the partial */}}
-{{ $time := partial "get-reading-time.html" . }}
-<span>{{ $time }} min read</span>
-```
-
-### Cached Partials
-
-```go-html-template
-{{/* partialCached caches output based on cache key */}}
-{{ partialCached "expensive-partial.html" . .Section }}
-
-{{/* Cache key can be multiple values */}}
-{{ partialCached "nav.html" . .Section .Kind }}
-
-{{/* For truly static content, use context-independent key */}}
-{{ partialCached "global-nav.html" . "global" }}
-```
-
-### Inline Partials
-
-```go-html-template
-{{/* Define an inline partial */}}
-{{ define "partials/inline-card.html" }}
-  <div class="card">
-    <h3>{{ .title }}</h3>
-    <p>{{ .description }}</p>
-  </div>
-{{ end }}
-
-{{/* Use it */}}
-{{ partial "inline-card.html" (dict "title" "Hello" "description" "World") }}
-```
+- `partial` re-executes on every call; `partialCached` caches its output keyed by whatever extra arguments follow the context — `{{ partialCached "nav.html" . .Section }}` caches once per distinct `.Section` value, `{{ partialCached "global-nav.html" . "global" }}` (a constant key) caches exactly once, globally. Passing only `.` as the effective key defeats caching if the context differs per page.
+- A partial can return a value with `{{ return $value }}` and be called as an expression: `{{ $time := partial "get-reading-time.html" . }}`.
+- Partials never receive context implicitly — always pass it explicitly: `{{ partial "header.html" . }}`. Pass `.Params.author`, or a `dict`, to hand the partial a narrower or custom context instead of the whole page.
 
 ## Shortcodes
 
-Shortcodes add dynamic functionality to Markdown content. They bridge content and templates.
-
-### Shortcode Syntax in Content
-
-```markdown
-{{</* Basic shortcode */>}}
-{{< youtube id="dQw4w9WgXcQ" >}}
-
-{{</* Named parameters */>}}
-{{< figure src="/images/photo.jpg" title="My Photo" alt="Description" >}}
-
-{{</* Positional parameters */>}}
-{{< highlight go >}}
-fmt.Println("Hello")
-{{< /highlight >}}
-
-{{</* With inner content (paired shortcode) */>}}
-{{< notice type="warning" >}}
-This is a warning message.
-{{< /notice >}}
-
-{{</* Markdown processing: < vs % */>}}
-{{< shortcode >}}   {{</* Inner content NOT processed as Markdown */>}}
-{{% shortcode %}}   {{%/* Inner content IS processed as Markdown */%}}
-```
-
-### Creating Shortcode Templates
-
-```go-html-template
-{{/* layouts/shortcodes/youtube.html */}}
-{{ $id := .Get "id" | default (.Get 0) }}
-<div class="video-wrapper">
-  <iframe src="https://www.youtube.com/embed/{{ $id }}"
-          allowfullscreen></iframe>
-</div>
-
-{{/* layouts/shortcodes/notice.html */}}
-{{ $type := .Get "type" | default "info" }}
-<div class="notice notice-{{ $type }}">
-  {{ .Inner | markdownify }}
-</div>
-
-{{/* layouts/shortcodes/figure.html - comprehensive example */}}
-{{ $src := .Get "src" }}
-{{ $title := .Get "title" }}
-{{ $alt := .Get "alt" | default $title }}
-{{ $class := .Get "class" }}
-
-<figure{{ with $class }} class="{{ . }}"{{ end }}>
-  <img src="{{ $src }}" alt="{{ $alt }}">
-  {{ with $title }}<figcaption>{{ . }}</figcaption>{{ end }}
-</figure>
-```
-
-### Shortcode Context and Methods
-
-```go-html-template
-{{/* Accessing parameters */}}
-{{ .Get "name" }}       {{/* Get named parameter */}}
-{{ .Get 0 }}            {{/* Get first positional parameter */}}
-{{ .Params }}           {{/* All parameters as map */}}
-
-{{/* Inner content */}}
-{{ .Inner }}            {{/* Raw inner content */}}
-{{ .Inner | markdownify }}  {{/* Process as Markdown */}}
-{{ .InnerDeindent }}    {{/* Inner content with indentation removed */}}
-
-{{/* Parent context */}}
-{{ .Page }}             {{/* The page containing the shortcode */}}
-{{ .Page.Title }}
-{{ .Site }}             {{/* Site configuration */}}
-
-{{/* Check if parameter exists */}}
-{{ if .Get "title" }}
-  <h3>{{ .Get "title" }}</h3>
-{{ end }}
-```
+- `{{< shortcode >}}` — inner content is **not** processed as Markdown. `{{% shortcode %}}` — inner content **is** run through the Markdown renderer. Picking the wrong delimiter is a common source of literal `**bold**` markers or unrendered raw HTML showing up in output.
+- Inside a shortcode template: `.Get "name"` (named param) / `.Get 0` (positional param), `.Inner` (raw inner content, only for paired shortcodes — `.Inner | markdownify` to render it as Markdown), `.Params` (all params as a map), `.Page` (the containing page).
 
 ### Shortcodes vs Partials
 
@@ -280,134 +113,7 @@ This is a warning message.
 | Per-content customization | Site-wide components |
 | Dynamic content embeds | Header, footer, navigation |
 
-## Common Hugo Functions
-
-### Data Structure Functions
-
-```go-html-template
-{{/* Create a dictionary (map) */}}
-{{ $data := dict "name" "John" "age" 30 "active" true }}
-{{ $data.name }}
-
-{{/* Create a slice (array) */}}
-{{ $items := slice "apple" "banana" "cherry" }}
-{{ index $items 0 }}  {{/* "apple" */}}
-
-{{/* Merge dictionaries */}}
-{{ $merged := merge $defaults $overrides }}
-
-{{/* Scratch for mutable state */}}
-{{ $.Scratch.Set "counter" 0 }}
-{{ $.Scratch.Add "counter" 1 }}
-{{ $.Scratch.Get "counter" }}
-```
-
-### Context Functions
-
-```go-html-template
-{{/* with - changes context if value is truthy */}}
-{{ with .Params.author }}
-  <span>By {{ . }}</span>
-{{ else }}
-  <span>Anonymous</span>
-{{ end }}
-
-{{/* range - iterate with changed context */}}
-{{ range .Pages }}
-  {{ .Title }}
-{{ end }}
-
-{{/* Conditional assignment */}}
-{{ $author := .Params.author | default .Site.Params.author }}
-```
-
-### Asset Pipeline Functions
-
-```go-html-template
-{{/* Get resource from assets/ directory */}}
-{{ $css := resources.Get "css/main.css" }}
-{{ $js := resources.Get "js/app.js" }}
-
-{{/* Process SCSS */}}
-{{ $style := resources.Get "scss/main.scss" | toCSS }}
-
-{{/* Fingerprint for cache busting */}}
-{{ $style := $style | fingerprint }}
-<link rel="stylesheet" href="{{ $style.RelPermalink }}">
-
-{{/* Concatenate files */}}
-{{ $bundle := slice $js1 $js2 | resources.Concat "js/bundle.js" }}
-
-{{/* Minify */}}
-{{ $min := $style | minify }}
-```
-
 ## Template Debugging
 
-### Inspecting Variables
-
-```go-html-template
-{{/* Print variable structure */}}
-{{ printf "%#v" . }}
-
-{{/* Print type */}}
-{{ printf "%T" .Params }}
-
-{{/* Pretty print for development */}}
-<pre>{{ debug.Dump . }}</pre>
-
-{{/* Print to terminal during build */}}
-{{ warnf "Current page: %s" .Title }}
-{{ errorf "Missing required param: %s" "author" }}  {{/* Stops build */}}
-```
-
-### Common Errors and Solutions
-
-```go-html-template
-{{/* ERROR: can't evaluate field X */}}
-{{/* Solution: Check if field exists first */}}
-{{ with .Params.author }}{{ . }}{{ end }}
-
-{{/* ERROR: range can't iterate over nil */}}
-{{/* Solution: Use default or check first */}}
-{{ range .Params.tags | default slice }}
-
-{{/* ERROR: wrong type for value */}}
-{{/* Solution: Check types with printf "%T" */}}
-{{ printf "%T" .Params.date }}  {{/* Might be string, not time.Time */}}
-
-{{/* ERROR: partial not found */}}
-{{/* Solution: Check path is relative to layouts/partials/ */}}
-{{ partial "components/card.html" . }}  {{/* File: layouts/partials/components/card.html */}}
-```
-
-### Build with Template Metrics
-
-```bash
-# Show template execution times
-hugo --templateMetrics
-
-# With detailed hints
-hugo --templateMetrics --templateMetricsHints
-
-# Example output helps identify slow templates
-```
-
-### Development Helpers
-
-```go-html-template
-{{/* Conditional debug output */}}
-{{ if site.IsServer }}
-  <div class="debug">
-    Page: {{ .Title }}<br>
-    Kind: {{ .Kind }}<br>
-    Type: {{ .Type }}<br>
-    Section: {{ .Section }}
-  </div>
-{{ end }}
-
-{{/* Check what variables are available */}}
-{{ range $key, $value := .Params }}
-  {{ $key }}: {{ $value }}<br>
-{{ end }}
-```
+- `{{ warnf "..." }}` prints a warning during build without stopping it. `{{ errorf "..." }}` prints and **stops the build** — use `errorf` for a required param you want to hard-fail on, `warnf` for anything non-fatal.
+- `hugo --templateMetrics` (add `--templateMetricsHints` for suggestions) reports per-template execution time and call count — use it to find which template is actually slow instead of guessing.

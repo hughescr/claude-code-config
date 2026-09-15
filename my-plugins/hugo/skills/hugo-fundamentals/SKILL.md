@@ -7,272 +7,42 @@ description: Use for general Hugo static site generator questions about project 
 
 ## Hugo Project Structure
 
-Hugo follows a convention-over-configuration approach with a well-defined directory structure. Understanding each directory's purpose is essential for effective Hugo development.
+| Directory | Purpose | Processed? |
+|-----------|---------|------------|
+| content/ | Markdown content; `_index.md` = section/list page (has `.Pages`), files without underscore = single pages | Rendered |
+| layouts/ | HTML templates | - |
+| assets/ | SCSS, JS, images for Hugo Pipes | Hugo Pipes (explicit, via `resources.Get`) |
+| static/ | Pre-optimized/legacy files | Copied as-is, no processing |
+| data/ | Structured data, accessible as `.Site.Data` | - |
+| archetypes/ | Content templates for `hugo new` | - |
+| resources/ | Generated cache (resized images, compiled SCSS) | Generated |
 
-### Core Directories
-
-#### content/
-The `content/` directory holds all Markdown content files organized into sections. Each subdirectory becomes a section with its own list page.
-
-```
-content/
-  _index.md           # Homepage content
-  about.md            # Single page at /about/
-  blog/
-    _index.md         # Blog section list page
-    first-post.md     # Blog post at /blog/first-post/
-    2024/
-      year-review.md  # Nested at /blog/2024/year-review/
-  docs/
-    _index.md         # Docs section list page
-    getting-started/
-      _index.md       # Subsection list
-      install.md      # /docs/getting-started/install/
-```
-
-**Key concepts:**
-- `_index.md` defines section/list pages (has `.Pages` in templates)
-- Files without underscore are single pages
-- Directory structure maps directly to URL paths
-- Front matter controls metadata, dates, taxonomies
-
-#### layouts/
-Templates that control HTML rendering. Hugo's lookup order searches here before theme layouts.
-
-```
-layouts/
-  _default/
-    baseof.html       # Base template all pages extend
-    list.html         # Default list/section template
-    single.html       # Default single page template
-  partials/
-    header.html       # Reusable header partial
-    footer.html       # Reusable footer partial
-    meta.html         # SEO meta tags
-  shortcodes/
-    youtube.html      # Custom shortcode
-    figure.html       # Enhanced figure shortcode
-  blog/
-    single.html       # Blog-specific single template
-    list.html         # Blog-specific list template
-  index.html          # Homepage template (overrides _default)
-  404.html            # Custom 404 page
-```
-
-**Template inheritance:** All templates extend `baseof.html` using `{{ define "main" }}` blocks.
-
-#### assets/
-Files processed by Hugo Pipes (SCSS compilation, JS bundling, image processing, fingerprinting).
-
-```
-assets/
-  scss/
-    main.scss         # Compiled to CSS via Hugo Pipes
-    _variables.scss   # Sass partials
-  js/
-    app.js            # Bundled/minified via Hugo Pipes
-  images/
-    hero.jpg          # Processed for responsive images
-```
-
-**Critical distinction:** Files in `assets/` are NOT automatically published. They must be explicitly processed in templates using `resources.Get` and Hugo Pipes.
-
-#### static/
-Files copied directly to the output with no processing. Use for files that don't need transformation.
-
-```
-static/
-  favicon.ico         # Copied to /favicon.ico
-  robots.txt          # Copied to /robots.txt
-  downloads/
-    guide.pdf         # Copied to /downloads/guide.pdf
-```
-
-**When to use static/ vs assets/:**
-- `static/`: Pre-optimized images, PDFs, fonts, legacy JS/CSS
-- `assets/`: SCSS, modern JS, images needing processing
-
-#### data/
-Structured data files accessible in templates via `.Site.Data`.
-
-```
-data/
-  team.yaml           # Access as .Site.Data.team
-  products.json       # Access as .Site.Data.products
-  config/
-    features.toml     # Access as .Site.Data.config.features
-```
-
-Useful for: navigation menus, team members, product catalogs, feature flags.
-
-#### archetypes/
-Content templates for `hugo new` command.
-
-```
-archetypes/
-  default.md          # Default for all content
-  blog.md             # Template for hugo new blog/post.md
-  docs.md             # Template for hugo new docs/page.md
-```
-
-#### resources/
-Hugo's generated cache directory. Contains processed assets (resized images, compiled SCSS). Should be gitignored or committed for faster builds depending on your workflow.
+- **Template precedence**: `layouts/` in the project root is searched before theme layouts of the same path — local always wins over the theme.
+- **`assets/` vs `static/`**: files in `assets/` are NOT automatically published — they must be explicitly loaded via `resources.Get` and piped through Hugo Pipes. `static/` files are copied verbatim with no processing.
+- **`_index.md` vs `index.md`**: `_index.md` (underscore) = branch bundle / section list page, has `.Pages`. `index.md` (no underscore) = leaf bundle, a single page bundled with its own resources.
 
 ## Configuration File Locations
 
-Hugo supports multiple configuration patterns. Detection order matters.
-
-### Single File Configuration (Most Common)
-```
-project/
-  hugo.toml           # Primary (preferred name)
-  # OR
-  config.toml         # Legacy name (still supported)
-  # OR
-  hugo.yaml           # YAML format
-  # OR
-  hugo.json           # JSON format
-```
-
-### Nested Configuration (Monorepo Pattern)
-For projects where Hugo lives in a subdirectory:
-```
-project/
-  hugo/
-    hugo.toml         # Config at hugo/hugo.toml
-    content/
-    layouts/
-```
-
-Run with: `hugo -s hugo` or `hugo serve -s hugo`
-
-### Configuration Directory (Environment-Based)
-For complex sites with environment-specific settings:
-```
-project/
-  config/
-    _default/
-      hugo.toml       # Base configuration
-      menus.toml      # Menu definitions
-      params.toml     # Site parameters
-    production/
-      hugo.toml       # Production overrides
-    staging/
-      hugo.toml       # Staging overrides
-```
-
-**Detection logic when working with a project:**
-1. Check for `hugo.toml` or `config.toml` in root
-2. Check for `hugo/hugo.toml` (nested pattern)
-3. Check for `config/_default/` directory (config dir pattern)
-4. Examine build scripts or CI config for `-s` flag usage
+Detection order when working with a project:
+1. `hugo.toml` / `config.toml` / `hugo.yaml` / `hugo.json` in the project root (single-file, most common).
+2. `hugo/hugo.toml` nested pattern — requires `-s hugo` (or `hugo serve -s hugo`) on every invocation. Check build scripts/CI config for the `-s` flag; a missing one silently builds from the wrong (or no) config.
+3. `config/_default/` directory pattern — base config plus per-environment override directories (e.g. `config/production/`, `config/staging/`) merged on top of `_default`.
 
 ## Essential Hugo Commands
 
-### Development Server
-
-```bash
-# Full development command with all useful flags
-hugo serve --watch --renderToMemory --minify --disableFastRender
-
-# Common variations
-hugo serve -D              # Include draft content
-hugo serve -F              # Include future-dated content
-hugo serve -D -F           # Both drafts and future
-hugo serve -s hugo         # Source in hugo/ subdirectory
-hugo serve --bind 0.0.0.0  # Expose to network (for mobile testing)
-hugo serve --port 3000     # Custom port
-```
-
-**Flag explanations:**
-- `--watch`: Auto-rebuild on file changes (default: true)
-- `--renderToMemory`: Faster, no disk writes during dev
-- `--minify`: Minify output (catches minification bugs early)
-- `--disableFastRender`: Full rebuild on every change (more reliable)
-- `-D` / `--buildDrafts`: Include content with `draft: true`
-- `-F` / `--buildFuture`: Include content with future dates
-- `-s` / `--source`: Specify source directory
-- `--navigateToChanged`: Auto-navigate browser to changed content
-
-### Production Build
-
-```bash
-# Standard build
-hugo
-
-# With common production flags
-hugo --minify --gc
-
-# Nested source directory
-hugo -s hugo --minify
-
-# Include drafts (preview environments)
-hugo -D --minify
-
-# Specify output directory
-hugo -d public --minify
-```
-
-**Flag explanations:**
-- `--minify`: Minify HTML, CSS, JS, JSON, XML
-- `--gc`: Garbage collect unused cache files after build
-- `-d` / `--destination`: Output directory (default: public/)
-- `--cleanDestinationDir`: Remove files from destination not in source
-
-### Content Validation & Debugging
-
-```bash
-# List all content with metadata
-hugo list all
-
-# List only drafts
-hugo list drafts
-
-# List future-dated content
-hugo list future
-
-# List expired content
-hugo list expired
-
-# Show configuration
-hugo config
-
-# Show configuration for specific environment
-hugo config --environment production
-
-# Debug template rendering
-hugo --templateMetrics --templateMetricsHints
-```
+Flags worth calling out because they change build/serve *reliability*, not just convenience:
+- `--disableFastRender`: forces a full rebuild on every change instead of Hugo's partial fast-render — use when fast-render is producing stale or incorrect dev output.
+- `--renderToMemory`: serves from memory instead of disk during `hugo serve` — faster, and avoids stale files left on disk from a previous build.
+- `--gc`: garbage-collects unused cache files after a production build — prevents `resources/` cache bloat over time.
+- `--templateMetrics` (add `--templateMetricsHints`): reports per-template execution time, useful for finding what's actually slow rather than guessing.
 
 ## Key Configuration Sections
 
-### Essential Settings
-
-```toml
-# hugo.toml
-
-baseURL = "https://example.com/"  # Required for absolute URLs
-title = "Site Title"
-languageCode = "en-us"
-
-# Output directory (default: public)
-publishDir = "public"
-
-# URL style
-uglyURLs = false                  # false: /about/ (pretty)
-                                  # true: /about.html (ugly)
-
-# Disable automatic generation
-disableKinds = ["taxonomy", "term", "RSS"]
-```
-
 ### Module Mounts (Importing npm Packages)
 
-Use module mounts to bring npm packages into Hugo's asset pipeline:
+Mount pattern to bring npm packages into Hugo's asset pipeline:
 
 ```toml
-# hugo.toml
-
 [module]
   [[module.mounts]]
     source = "assets"
@@ -281,80 +51,13 @@ Use module mounts to bring npm packages into Hugo's asset pipeline:
   [[module.mounts]]
     source = "node_modules/bootstrap/scss"
     target = "assets/scss/vendor/bootstrap"
-
-  [[module.mounts]]
-    source = "node_modules/@fortawesome/fontawesome-free/webfonts"
-    target = "static/fonts"
-
-  [[module.mounts]]
-    source = "node_modules/alpinejs/dist"
-    target = "assets/js/vendor/alpine"
 ```
 
-Then in templates:
-```go-html-template
-{{ $bootstrap := resources.Get "scss/vendor/bootstrap/bootstrap.scss" }}
-{{ $alpine := resources.Get "js/vendor/alpine/cdn.min.js" }}
-```
-
-### Taxonomies
-
-```toml
-[taxonomies]
-  tag = "tags"
-  category = "categories"
-  author = "authors"
-  series = "series"
-```
-
-### Pagination
-
-```toml
-paginate = 10                     # Items per page
-paginatePath = "page"             # URL path: /blog/page/2/
-```
+Then in templates: `{{ resources.Get "scss/vendor/bootstrap/bootstrap.scss" }}` — the mounted path is addressable exactly as if it physically lived under `assets/`.
 
 ### Related Content
 
-```toml
-[related]
-  includeNewer = true
-  threshold = 80
-  toLower = true
-
-  [[related.indices]]
-    name = "tags"
-    weight = 100
-
-  [[related.indices]]
-    name = "categories"
-    weight = 50
-
-  [[related.indices]]
-    name = "date"
-    weight = 10
-```
-
-### Params Section (Site-wide Variables)
-
-```toml
-[params]
-  description = "Site description for SEO"
-
-  [params.author]
-    name = "Author Name"
-    email = "author@example.com"
-
-  [params.social]
-    twitter = "@handle"
-    github = "username"
-
-  [params.features]
-    darkMode = true
-    search = true
-```
-
-Access in templates: `{{ .Site.Params.description }}`, `{{ .Site.Params.social.twitter }}`
+`[related]` indices have **tunable weights**, not fixed defaults — `[[related.indices]]` entries (e.g. `tags` weight 100, `categories` weight 50, `date` weight 10) control each index's relative influence on the relatedness score.
 
 ### .Site.Author Deprecation (Hugo v0.156.0+)
 
@@ -365,7 +68,9 @@ Access in templates: `{{ .Site.Params.description }}`, `{{ .Site.Params.social.t
 [author]
   name = "Author Name"
 
-# New — see [params.author] in Params Section above
+# New — under [params]
+[params.author]
+  name = "Author Name"
 ```
 
 - **Site-level**: `{{ .Site.Params.author.name }}` — from `hugo.toml` `[params.author]`
@@ -373,86 +78,5 @@ Access in templates: `{{ .Site.Params.description }}`, `{{ .Site.Params.social.t
 
 ## Environment Detection
 
-Hugo provides built-in variables for environment-aware processing.
-
-### hugo.IsServer
-
-True when running `hugo serve`, false during `hugo build`.
-
-```go-html-template
-{{ if hugo.IsServer }}
-  <!-- Development-only: LiveReload, debug info -->
-  <script>console.log('Development mode');</script>
-{{ end }}
-```
-
-### hugo.IsProduction
-
-True when `--environment production` or `HUGO_ENVIRONMENT=production`.
-
-```go-html-template
-{{ if hugo.IsProduction }}
-  <!-- Production-only: Analytics, minified assets -->
-  {{ partial "analytics.html" . }}
-{{ else }}
-  <!-- Non-production: Debug toolbar -->
-  {{ partial "debug-toolbar.html" . }}
-{{ end }}
-```
-
-### Conditional Asset Processing
-
-```go-html-template
-{{ $styles := resources.Get "scss/main.scss" | toCSS }}
-
-{{ if hugo.IsProduction }}
-  {{ $styles = $styles | minify | fingerprint }}
-{{ end }}
-
-<link rel="stylesheet" href="{{ $styles.RelPermalink }}">
-```
-
-### Environment-Specific Configuration
-
-```go-html-template
-{{ $env := hugo.Environment }}  <!-- "development", "production", etc. -->
-
-{{ if eq $env "staging" }}
-  <meta name="robots" content="noindex">
-{{ end }}
-```
-
-### Setting Environment
-
-```bash
-# Via flag
-hugo --environment production
-
-# Via environment variable
-HUGO_ENVIRONMENT=production hugo
-
-# Development server (automatically sets development)
-hugo serve  # hugo.Environment = "development"
-```
-
-## Quick Reference
-
-| Task | Command |
-|------|---------|
-| Dev server | `hugo serve -D` |
-| Production build | `hugo --minify` |
-| Nested project dev | `hugo serve -s hugo -D` |
-| Nested project build | `hugo -s hugo --minify` |
-| List all content | `hugo list all` |
-| Show config | `hugo config` |
-| Template debugging | `hugo --templateMetrics` |
-
-| Directory | Purpose | Processed? |
-|-----------|---------|------------|
-| content/ | Markdown content | Rendered |
-| layouts/ | HTML templates | - |
-| assets/ | SCSS, JS, images | Hugo Pipes |
-| static/ | Direct copy files | No |
-| data/ | Structured data | - |
-| archetypes/ | Content templates | - |
-| resources/ | Build cache | Generated |
+- `hugo.IsServer`, `hugo.IsProduction`, and `hugo.Environment` are three **distinct** checks, not synonyms: `hugo.IsServer` is true only under `hugo serve`; `hugo.IsProduction` is true only when `--environment production` or `HUGO_ENVIRONMENT=production`; `hugo.Environment` is the raw environment name string (e.g. `"development"`, `"staging"`, `"production"`). A custom environment like `staging` is neither server nor production.
+- Set the environment via `hugo --environment production`, `HUGO_ENVIRONMENT=production hugo`, or implicitly: `hugo serve` sets `development`, a plain `hugo` build sets `production`.

@@ -86,12 +86,10 @@ git push origin develop
 
 ```yaml
 service: your-site-name
-frameworkVersion: '3'
 
 provider:
   name: aws
   region: us-east-1  # Required for CloudFront
-  runtime: nodejs18.x
 
 plugins:
   - serverless-s3-sync
@@ -272,7 +270,7 @@ jobs:
           fetch-depth: 0  # Needed for .GitInfo
 
       - name: Setup Bun
-        uses: oven-sh/setup-bun@v1
+        uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 

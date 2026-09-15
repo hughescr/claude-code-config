@@ -115,36 +115,12 @@ date: 2026-01-07T10:00:00-08:00
 
 ### Common Fields
 
-```yaml
----
-title: "Complete Guide to Hugo"
-date: 2026-01-07T10:00:00-08:00
-lastmod: 2026-01-07T15:30:00-08:00
-description: "Everything you need to know about Hugo static site generator"
-summary: "A shorter summary for list pages"
-draft: false
-image: "featured.jpg"
-tags: ["hugo", "static-sites", "web-development"]
-categories: ["tutorials"]
-author: "Jane Doe"
-weight: 10
-slug: "custom-url-slug"
-aliases: ["/old-url/", "/another-old-url/"]
----
-```
+Required: `title`, `date` (RFC3339 with timezone — Hugo parses strictly). Everything else is optional.
 
-**Field Reference:**
-- `title` - Page title (required)
-- `date` - Publication date (required)
-- `lastmod` - Last modification date
-- `description` - Meta description for SEO
-- `summary` - Short summary for list pages (auto-generated if omitted)
-- `draft` - Set to `true` to hide in production
-- `image` - Featured image path (relative to page bundle or static/)
-- `tags` / `categories` - Built-in taxonomies
-- `weight` - Manual ordering (lower = first)
-- `slug` - Override URL slug
-- `aliases` - Redirects from old URLs
+- `draft: true` hides the page from `hugo` (production) builds; visible only with `hugo -D`/`--buildDrafts` or `hugo server -D`.
+- A future `date` hides the page too, but by a **separate** mechanism from `draft` — needs `hugo -F`/`--buildFuture` to include, independent of the draft flag.
+- `lastmod` is independent of `date`: it drives "last modified" in sitemap/RSS-style output only, and has no effect on build inclusion.
+- Other optional fields (`description`, `summary`, `image`, `tags`/`categories`, `author`, `weight`, `slug`, `aliases`) carry no build-inclusion semantics — they're metadata or affect templates/URLs only.
 
 ### Custom Fields via Params
 
@@ -200,7 +176,7 @@ categories: ["tutorials"]
 
 ### Custom Taxonomies
 
-Define additional taxonomies in `hugo.toml`:
+Config shape in `hugo.toml` — `singular = "plural"`:
 
 ```toml
 [taxonomies]
@@ -211,54 +187,13 @@ Define additional taxonomies in `hugo.toml`:
   show = "shows"
 ```
 
-**Syntax:** `singular = "plural"`
-
-Use custom taxonomies in frontmatter:
-
-```yaml
----
-title: "Episode 42"
-series: ["web-development-fundamentals"]
-authors: ["jane-doe", "john-smith"]
-shows: ["tech-talk"]
----
-```
+Use the **plural** key in frontmatter (e.g. `series: ["web-development-fundamentals"]`).
 
 ### Taxonomy Templates
 
-Create templates for taxonomy pages:
-
-```
-layouts/
-├── _default/
-│   ├── taxonomy.html   # List of terms (e.g., all tags)
-│   └── term.html       # Pages with specific term (e.g., posts tagged "hugo")
-└── tags/
-    ├── taxonomy.html   # Override for tags specifically
-    └── term.html
-```
-
-**taxonomy.html** - Lists all terms:
-
-```go-html-template
-<h1>{{ .Title }}</h1>
-<ul>
-{{ range .Pages }}
-  <li><a href="{{ .RelPermalink }}">{{ .Title }} ({{ .Count }})</a></li>
-{{ end }}
-</ul>
-```
-
-**term.html** - Lists pages with a specific term:
-
-```go-html-template
-<h1>Posts tagged "{{ .Title }}"</h1>
-{{ range .Pages }}
-  <article>
-    <h2><a href="{{ .RelPermalink }}">{{ .Title }}</a></h2>
-  </article>
-{{ end }}
-```
+- `taxonomy.html` = list of all terms for a taxonomy (e.g. all tags); `term.html` = pages carrying one specific term (e.g. posts tagged "hugo"). The names read backwards from what you'd guess, so it's easy to put logic in the wrong one.
+- **Legacy naming**: in older Hugo versions these two were swapped — `terms.html` was the all-terms list (today's `taxonomy.html`), and `taxonomy.html` was the single-term page (today's `term.html`). If an older theme has either filename, verify which behavior it implements rather than trusting the name. The legacy swapped names are honoured only as `_default/` fallbacks. A per-taxonomy directory (e.g. `layouts/series/`) must use the canonical `taxonomy.html` (all terms) and `term.html` (one term) — a `layouts/series/taxonomy.html` intended as the term page is ignored for that kind and the page silently falls through to `_default/taxonomy.html` (observed on Hugo v0.166).
+- `.GetTerms "tags"` on a page returns that page's terms for a taxonomy; `.Site.Taxonomies.tags` gives the site-wide taxonomy map, with `.Count` per term.
 
 ### Listing Taxonomy Terms in Templates
 
@@ -282,74 +217,10 @@ Display tags/categories on any page:
 
 ## Archetype Templates
 
-### Location and Purpose
-
-Archetypes are templates for `hugo new` command:
-
-```
-archetypes/
-├── default.md        # Fallback for all content
-├── blog.md           # For hugo new blog/post-name.md
-├── docs.md           # For hugo new docs/page-name.md
-└── review/
-    └── index.md      # For page bundles: hugo new review/product-name
-```
-
-### Default Archetype
-
-```markdown
----
-title: "{{ replace .File.ContentBaseName "-" " " | title }}"
-date: {{ .Date }}
-draft: true
----
-```
-
-### Content-Type Specific Archetypes
-
-`archetypes/blog.md`:
-
-```markdown
----
-title: "{{ replace .File.ContentBaseName "-" " " | title }}"
-date: {{ .Date }}
-draft: true
-description: ""
-tags: []
-categories: []
-image: ""
----
-
-## Introduction
-
-## Main Content
-
-## Conclusion
-```
-
-### Creating Content with Archetypes
-
-```bash
-# Uses archetypes/default.md
-hugo new about.md
-
-# Uses archetypes/blog.md
-hugo new blog/my-first-post.md
-
-# Creates page bundle using archetypes/blog/ directory
-hugo new blog/my-bundled-post/
-
-# Specify archetype explicitly
-hugo new --kind blog posts/special-post.md
-```
-
-### Dynamic Values in Archetypes
-
-Available variables:
-- `{{ .Date }}` - Current timestamp (RFC3339)
-- `{{ .File.ContentBaseName }}` - Filename without extension
-- `{{ .File.Dir }}` - Directory path
-- `{{ .Site.Title }}` - Site title from config
+- `archetypes/default.md` is the fallback; `archetypes/<type>.md` (e.g. `blog.md`) applies to `hugo new <type>/...`.
+- A directory archetype (`archetypes/review/index.md`) is used for page-bundle creation: `hugo new review/product-name` creates a bundle, not a single file.
+- `hugo new --kind blog posts/special-post.md` explicitly selects an archetype regardless of path, overriding path-based type inference.
+- Archetype template vars: `{{ .Date }}`, `{{ .File.ContentBaseName }}`, `{{ .File.Dir }}`, `{{ .Site.Title }}`.
 
 ## Draft and Future Content
 
@@ -395,85 +266,11 @@ date: 2026-02-01T09:00:00-08:00
 
 ## Related Content Configuration
 
-### Configuration
-
-In `hugo.toml`:
-
-```toml
-[related]
-  includeNewer = true
-  threshold = 80
-  toLower = true
-
-  [[related.indices]]
-    applyFilter = false
-    cardinalityThreshold = 0
-    name = "tags"
-    pattern = ""
-    toLower = true
-    type = "basic"
-    weight = 100
-
-  [[related.indices]]
-    name = "keywords"
-    weight = 80
-
-  [[related.indices]]
-    name = "date"
-    weight = 10
-    pattern = "2006"
-```
-
-**Options:**
-- `threshold` - Minimum score (0-100) to be considered related
-- `includeNewer` - Include content newer than current page
-- `weight` - Relative importance of each index
-
-### Using Related Content in Templates
-
-```go-html-template
-{{ $related := .Site.RegularPages.Related . | first 5 }}
-{{ with $related }}
-  <aside class="related">
-    <h3>Related Posts</h3>
-    <ul>
-      {{ range . }}
-        <li><a href="{{ .RelPermalink }}">{{ .Title }}</a></li>
-      {{ end }}
-    </ul>
-  </aside>
-{{ end }}
-```
-
-### Keywords for Better Matching
-
-Add keywords to frontmatter for finer control:
-
-```yaml
----
-title: "Advanced CSS Techniques"
-tags: ["css", "web-design"]
-keywords: ["flexbox", "grid", "animations", "transitions"]
----
-```
+- `[related]` indices (`[[related.indices]]`) have **tunable weights**, not fixed defaults — each index's `weight` controls its relative influence on the relatedness score; `threshold` (0-100, minimum score to count as related) and `includeNewer` (include pages newer than the current one) are likewise tunable.
+- Use `.Site.RegularPages.Related .` in templates (typically piped through `first N`) to get related pages for the current page.
+- Add a `keywords` frontmatter field for finer-grained matching beyond the built-in taxonomy indices.
 
 ## Content Best Practices
-
-### Use Page Bundles for Posts with Images
-
-**Correct - Keep assets with content:**
-```
-content/blog/my-post/
-├── index.md
-├── hero.jpg
-└── diagram.png
-```
-
-**Avoid - Separated assets:**
-```
-content/blog/my-post.md
-static/images/blog/my-post/hero.jpg  # Hard to maintain
-```
 
 ### Image Handling
 

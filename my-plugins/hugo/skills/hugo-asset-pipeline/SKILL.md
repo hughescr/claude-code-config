@@ -59,12 +59,12 @@ Merge multiple files into one:
 Compile SCSS to CSS (requires Hugo Extended):
 
 ```go-html-template
-{{ $opts := dict "transpiler" "libsass" "targetPath" "css/style.css" }}
+{{ $opts := dict "transpiler" "dartsass" "targetPath" "css/style.css" }}
 {{ $styles := resources.Get "scss/main.scss" | toCSS $opts }}
 ```
 
 Options:
-- `transpiler`: "libsass" (default) or "dartsass"
+- `transpiler`: `"dartsass"` (Dart Sass, requires the `sass` binary or embedded Dart Sass) — `"libsass"` is deprecated
 - `targetPath`: Output path relative to publishDir
 - `outputStyle`: "nested", "expanded", "compact", "compressed"
 - `precision`: Decimal precision for calculations
@@ -264,72 +264,14 @@ Alpine.start();
 
 ## Image Processing
 
-### Basic Resizing
-
-```go-html-template
-{{ $image := resources.Get "images/hero.jpg" }}
-{{ $resized := $image.Resize "800x" }}
-<img src="{{ $resized.RelPermalink }}" width="{{ $resized.Width }}" height="{{ $resized.Height }}">
-```
-
-### Resize Operations
-
-```go-html-template
-{{/* Resize to width, maintain aspect ratio */}}
-{{ $img := $image.Resize "800x" }}
-
-{{/* Resize to height, maintain aspect ratio */}}
-{{ $img := $image.Resize "x600" }}
-
-{{/* Resize to exact dimensions (may distort) */}}
-{{ $img := $image.Resize "800x600" }}
-
-{{/* Fit within bounds, maintain aspect ratio */}}
-{{ $img := $image.Fit "800x600" }}
-
-{{/* Fill dimensions, crop as needed */}}
-{{ $img := $image.Fill "800x600 Center" }}
-```
-
-Fill anchor positions: `Center`, `TopLeft`, `Top`, `TopRight`, `Left`, `Right`, `BottomLeft`, `Bottom`, `BottomRight`, `Smart`
-
-### WebP Conversion
-
-```go-html-template
-{{ $original := resources.Get "images/photo.jpg" }}
-{{ $webp := $original.Resize "800x webp" }}
-{{ $jpg := $original.Resize "800x" }}
-
-<picture>
-  <source srcset="{{ $webp.RelPermalink }}" type="image/webp">
-  <img src="{{ $jpg.RelPermalink }}" alt="Photo">
-</picture>
-```
-
-### Responsive Images with srcset
-
-```go-html-template
-{{ $image := resources.Get "images/hero.jpg" }}
-{{ $small := $image.Resize "400x" }}
-{{ $medium := $image.Resize "800x" }}
-{{ $large := $image.Resize "1200x" }}
-
-<img
-  src="{{ $medium.RelPermalink }}"
-  srcset="{{ $small.RelPermalink }} 400w,
-          {{ $medium.RelPermalink }} 800w,
-          {{ $large.RelPermalink }} 1200w"
-  sizes="(max-width: 400px) 400px, (max-width: 800px) 800px, 1200px"
-  alt="Hero image">
-```
-
-### Image Fingerprinting
-
-```go-html-template
-{{ $image := resources.Get "images/logo.png" }}
-{{ $processed := $image.Resize "200x" | fingerprint }}
-<img src="{{ $processed.RelPermalink }}" alt="Logo">
-```
+- `.Resize "800x"` — resize to width (or `"x600"` for height), aspect ratio preserved; `.Resize "800x600"` — exact dimensions, may distort.
+- `.Fit "800x600"` — resize to fit within bounds, aspect ratio preserved, no cropping.
+- `.Fill "800x600 Center"` — fill exact dimensions, crops as needed. Anchor options: `Center`, `TopLeft`, `Top`, `TopRight`, `Left`, `Right`, `BottomLeft`, `Bottom`, `BottomRight`, `Smart` (content-aware crop).
+- `.Fit "WxH"` is a bounding box, not an exact size, and Hugo never upscales — a requested width larger than the source silently yields the source width. When building a `srcset` from candidate widths, skip candidates with `gt $w $img.Width` so you don't emit duplicate entries.
+- WebP: append ` webp` to the resize spec, e.g. `$image.Resize "800x webp"`, to produce a WebP variant alongside an original-format resize.
+- Fallback pattern: generate a WebP resource and an original-format resource, serve via `<picture>` with `<source srcset="..." type="image/webp">` before the `<img>` fallback, so browsers without WebP support still get an image.
+- For multiple sizes of one format, build a `srcset` with width descriptors (`400w`, `800w`, `1200w`, ...) plus a matching `sizes` attribute — don't rely on a single `<img src>` for responsive layouts.
+- Resized/converted image resources still need `| fingerprint` for cache-busting, same as CSS/JS.
 
 ## Subresource Integrity (SRI)
 
@@ -438,14 +380,3 @@ Full hugo.toml example with multiple npm packages:
 - Image must be in `assets/` directory
 - Use `resources.Get`, not direct path references
 - Check supported formats: jpg, png, gif, webp, tiff, bmp
-
-## Key Differences from Traditional Bundlers
-
-| Traditional | Hugo Pipes |
-|-------------|------------|
-| webpack.config.js | hugo.toml + templates |
-| npm run build | hugo (builds everything) |
-| npm run dev | hugo server |
-| dist/ folder | public/ folder |
-| Manual cache busting | Built-in fingerprint |
-| Complex configuration | Template-based, declarative |
