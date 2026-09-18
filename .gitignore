@@ -45,31 +45,6 @@ __pycache__/
 /plugins/.last_inuse_sweep
 gh-pr-status-cache.json
 
-# estimator — the CLI's source is committed; all its runtime data lives in the
-# sibling estimator-data/ directory (DATA_ROOT in estimator/src/db.ts, default
-# resolve(ROOT, "..", "estimator-data"), overridable via EST_DATA_ROOT) and is
-# never committed (design R3 §4, §10 Q11): estimator.db (+ -wal/-shm sidecars),
-# sweep.lock, spool/, backups/, board.html and board.md all land there — one
-# directory to ignore instead of one entry per artifact, and `git clean` in the
-# checkout can never touch the corpus.
-estimator-data/
-# gate probes: the .ts scanners are code and committed; everything they PRODUCE is
-# corpus-derived data and stays local — this repo is public (decision 11: no
-# estimate/actual/spend data, no prompt or conversation content, ever)
-estimator/gates/*.json
-estimator/gates/*.md
-# the spec and decision log quote private prompts and real usage data — local only,
-# covered by the weekly backups/ snapshot, not by git
-estimator/DESIGN.md
-estimator/DECISIONS.md
-# design docs (e.g. HOOK-BINDING-SPEC.md) are drafted alongside DESIGN.md/DECISIONS.md
-# and carry the same private-corpus caveats even when they avoid quoting numbers
-# directly — local only, not part of the committed source (HOOK-BINDING-SPEC.md §10 step 0)
-estimator/design/
-# `bun install` materialises the two typecheck-only devDependencies here. Runtime
-# dependencies are still zero; `bun.lock` IS committed, so `bun run typecheck`
-# reproduces exactly the compiler the last recorded run used.
-estimator/node_modules/
 daemon-auth-cooldown
 daemon-auth-status.json
 # Server-managed settings caches written by the harness

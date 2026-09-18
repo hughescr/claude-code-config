@@ -1,19 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "cleanupPeriodDays": 365,
-  "env": {
-    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
-    "OTEL_METRICS_EXPORTER": "otlp",
-    "OTEL_LOGS_EXPORTER": "otlp",
-    "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
-    "OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:4318",
-    "OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE": "delta",
-    "OTEL_METRIC_EXPORT_INTERVAL": "60000",
-    "OTEL_LOGS_EXPORT_INTERVAL": "5000",
-    "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
-    "OTEL_METRICS_INCLUDE_VERSION": "true",
-    "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "false"
-  },
+  "env": {},
   "attribution": {
     "commit": "",
     "pr": "",
@@ -35,7 +23,6 @@
     ],
     "defaultMode": "auto"
   },
-  "model": "claude-fable-5-1[1m]",
   "hooks": {
     "PreToolUse": [
       {
@@ -57,69 +44,11 @@
             "timeout": 5
           }
         ]
-      },
-      {
-        "matcher": "TaskUpdate",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/estimator/scripts/capture-delete-hook.sh",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Agent",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/estimator/scripts/nudge-hook.sh",
-            "timeout": 5
-          }
-        ]
-      },
-      {
-        "matcher": "Workflow",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/estimator/scripts/nudge-hook.sh",
-            "timeout": 5
-          }
-        ]
-      },
-      {
-        "matcher": "Task",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/estimator/scripts/nudge-hook.sh",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/estimator/scripts/prompt-sweep-hook.sh",
-            "timeout": 5
-          }
-        ]
       }
     ],
     "SessionStart": [
       {
         "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/estimator/scripts/session-start-hook.sh",
-            "timeout": 5
-          },
           {
             "type": "command",
             "command": "${HOME}/.claude/hooks/inject-main-context.sh",
@@ -135,17 +64,6 @@
             "type": "command",
             "command": "${HOME}/.claude/hooks/inject-subagent-context.sh",
             "timeout": 5
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/estimator/scripts/session-end-sweep.sh",
-            "timeout": 30
           }
         ]
       }
@@ -174,7 +92,8 @@
     "shortcuts-playground@shortcuts-playground": false,
     "skill-development@oaustegard-claude-skills": true,
     "swift-lsp@claude-plugins-official": true,
-    "typescript-lsp@claude-plugins-official": true
+    "typescript-lsp@claude-plugins-official": true,
+    "typesafe@typesafe-ai": true
   },
   "extraKnownMarketplaces": {
     "craigs-claude-plugins": {
@@ -213,6 +132,12 @@
         "source": "github",
         "repo": "wakatime/claude-code-wakatime"
       }
+    },
+    "typesafe-ai": {
+      "source": {
+        "source": "github",
+        "repo": "typesafe-ai/skills"
+      }
     }
   },
   "sandbox": {
@@ -224,8 +149,7 @@
     },
     "filesystem": {
       "allowWrite": [
-        "~/Library/Caches/Mozilla.sccache",
-        "~/.claude/estimator-data"
+        "~/Library/Caches/Mozilla.sccache"
       ]
     }
   },

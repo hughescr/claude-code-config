@@ -98,15 +98,3 @@ Sub-agent rules live in SUBAGENT-CLAUDE.md, auto-injected via the SubagentStart 
 Prefer a different model family for that check; it fails differently than you do. Design and architecture calls go straight to `gpt-astra-medium` (`gpt-astra-high` for the hardest) as a normal Agent; a substantial diff before commit goes to the review-changes skill. A non-Claude route runs inside our own harness with our own tools — it is a different model, not a different agent scaffold.
 
 The routing table in CLAUDE.md names the routes; the `model-selection` skill holds the facts behind them — proxy availability, billing, limits, and the cross-family pairing table — and is the place to update when a model changes. With the proxy down or unconfigured there is no cross-family route: if the work warranted a verifier, use `opus-high` (or `fable-high`) and report the check as same-family.
-
----
-
-## Effort estimation
-
-The **estimating** skill defines when to invoke (its description is auto-injected every session).
-The band is p50/p90 **story points** against a fixed anchor, never tokens, cost or time. Above
-~40 points or more than one phase, decompose and open once with the sum, then `est block` per
-`meta.phases` entry. `est open` prints the band and a
-`TaskUpdate` planting `est_tid`; issue it verbatim. Never pad the band, never self-report spend.
-Re-estimate by appending, `est scope` first if the goal moved. `est` is
-`bun run ~/.claude/estimator/src/cli.ts`.
