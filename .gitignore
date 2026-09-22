@@ -53,3 +53,8 @@ policy-limits.json.signature*.json
 remote-settings.json
 remote-settings.json.signature*.json
 remote-settings-consent.json
+plugins/synced
+policy-limits.json.stamp.json
+skills/synced
+state
+plugins/.trash
