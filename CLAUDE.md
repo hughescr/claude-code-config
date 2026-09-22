@@ -27,7 +27,8 @@ Every `Agent` call must set `subagent_type` to a named custom agent whose frontm
 | `sonnet-high` | Normal substantive execution; default leaf route. |
 | `opus-medium` | Routine verification or challenge. |
 | `opus-high` | Heavy work, consequential verification or challenge, and complex debugging. |
-| `fable-high`, `fable-xhigh` | Only after Opus stalls, or for exceptional doggedness or judgment. |
+| `opus-xhigh` | Escalation above `opus-high`, and the hardest Claude-side work. |
+| `fable-high`, `fable-xhigh` | A second Claude view, and held pending a Fable update — Fable 5.1 now scores below Opus 5.5, so it is no longer the escalation step above Opus. |
 | `gpt-luna-low`, `gpt-luna-medium` | Cross-family peers of the Haiku and `sonnet-medium` rows. Short inputs only. |
 | `gpt-terra-medium`, `gpt-terra-high` | Cross-family peer of `sonnet-high`; the default GPT leaf route. |
 | `gpt-sol-medium` | Cross-family peer of `opus-medium`: routine verification or challenge. |

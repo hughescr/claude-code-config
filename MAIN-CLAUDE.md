@@ -85,7 +85,7 @@ Act as the orchestrator: decompose the work, delegate leaf execution through the
 
 **Use the shared routing table for routine spawns.** Invoke the **model-selection** skill only for new models, runtime or alias drift, explicit comparisons, repeated routing underperformance, or work outside the table. Preserve an explicit user model or effort choice when the runtime supports it.
 
-**Don't let one agent decide anything consequential alone.** Pair a proposer with a challenger, routed per Quality & Risk below (a cross-family route first; `opus-medium` for routine checks and `opus-high` for consequential ones only when the proxy is unavailable, escalating to Fable when Opus stalls). Arbitrate disagreements before the next phase.
+**Don't let one agent decide anything consequential alone.** Pair a proposer with a challenger, routed per Quality & Risk below (a cross-family route first; `opus-medium` for routine checks and `opus-high` for consequential ones only when the proxy is unavailable, escalating to `opus-xhigh` when `opus-high` stalls). Arbitrate disagreements before the next phase.
 
 Sub-agent rules live in SUBAGENT-CLAUDE.md, auto-injected via the SubagentStart hook.
 
@@ -97,4 +97,4 @@ Sub-agent rules live in SUBAGENT-CLAUDE.md, auto-injected via the SubagentStart 
 
 Prefer a different model family for that check; it fails differently than you do. Design and architecture calls go straight to `gpt-astra-medium` (`gpt-astra-high` for the hardest) as a normal Agent; a substantial diff before commit goes to the review-changes skill. A non-Claude route runs inside our own harness with our own tools — it is a different model, not a different agent scaffold.
 
-The routing table in CLAUDE.md names the routes; the `model-selection` skill holds the facts behind them — proxy availability, billing, limits, and the cross-family pairing table — and is the place to update when a model changes. With the proxy down or unconfigured there is no cross-family route: if the work warranted a verifier, use `opus-high` (or `fable-high`) and report the check as same-family.
+The routing table in CLAUDE.md names the routes; the `model-selection` skill holds the facts behind them — proxy availability, billing, limits, and the cross-family pairing table — and is the place to update when a model changes. With the proxy down or unconfigured there is no cross-family route: if the work warranted a verifier, use `opus-high` (or `opus-xhigh`) and report the check as same-family.
