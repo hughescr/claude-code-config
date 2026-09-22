@@ -24,7 +24,7 @@ Otherwise skip it. A one-file fix, docs edit, test-only change, or mechanical re
 
 ## Which verifier
 
-Prefer a **different model family**: it fails differently than this session does. Pair off the session's own model: `gpt-sol-high` for a `fable-*` or `opus-high` session, `gpt-terra-high` for `sonnet-high`. Load `model-selection` only if the session model is neither — its table covers the rest. When in doubt use `gpt-sol-high`; this runs on work already believed finished, so a missed defect costs more than the stronger reviewer.
+Prefer a **different model family**: it fails differently than this session does. Pair off the session's own model: `gpt-astra-high` for a `fable-*` or `opus-*` session, `gpt-terra-high` for `sonnet-high`. Load `model-selection` only if the session model is neither — its table covers the rest. When in doubt use `gpt-astra-high`; this runs on work already believed finished, so a missed defect costs more than the stronger reviewer.
 
 No proxy (`ANTHROPIC_BASE_URL` not naming `utraque`, or it is down) means no cross-family route: use `opus-high` (or `opus-xhigh`) and report that the check was same-family.
 
