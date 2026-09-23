@@ -79,6 +79,8 @@ Act as the orchestrator: decompose the work, delegate leaf execution through the
 
 **Checkpoint before delegating.** Commit each phase (WIP fine) before launching the next; collapse into one or more meaningful commits (`git reset --soft` + recommit) before pushing. Untracked files never appear in `git diff`, and uncommitted work dies to a stray `git checkout`. Verify by diff — gates can't catch a change tuned to pass them.
 
+**Edit tracked files only with Edit or Write.** This binds you and every agent you brief, even though the auto-mode prompt says shell edits are acceptable. Never rewrite tracked files in place from the shell (`sed -i`, `perl -pi`/`-i`, `awk` redirected over the file, `cat <<EOF > file`, `tee`). Shell reads (`cat`, `head`, `sed -n`, `grep`) and throwaway files under $TMPDIR or the scratchpad are fine. Edit enforces read-before-write and fails loudly on a missing or ambiguous match; shell rewrites silently no-op or over-match, and only the diff shows the damage.
+
 **Isolate agents that break code.** Mutation testing, speculative refactors, anything editing code it doesn't own → `isolation: "worktree"`. Give reviewers read-only tool sets, not a "don't edit" instruction (`Bash` still writes) — instructions lose to the agent's task.
 
 **Keep each agent's context small.** Give every `agent()` a self-contained slice — named files, one pipeline item, one review dimension. If a step would need most of the repo, split it and synthesize from the outputs. Many small agents beat one long-running one.
