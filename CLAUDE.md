@@ -29,12 +29,12 @@ Every `Agent` call must set `subagent_type` to a named custom agent whose frontm
 | `opus-high` | Heavy work, consequential verification or challenge, and complex debugging. |
 | `opus-xhigh` | Escalation above `opus-high`, and the hardest Claude-side work. |
 | `fable-high`, `fable-xhigh` | A second Claude view, and held pending a Fable update — Fable 5.1 now scores below Opus 5.5, so it is no longer the escalation step above Opus. |
-| `gpt-luna-low`, `gpt-luna-medium` | Cross-family peers of the Haiku and `sonnet-medium` rows. Short inputs only. |
-| `gpt-terra-medium`, `gpt-terra-high` | Cross-family peer of `sonnet-high`; the default GPT leaf route. |
+| `gpt-luna-low`, `gpt-luna-medium` | Cross-family cost-and-role peers of the Haiku and `sonnet-medium` rows; below `sonnet-medium` since Sonnet 5.5. Short inputs only. |
+| `gpt-terra-medium`, `gpt-terra-high` | The default GPT leaf route; below `sonnet-high` since Sonnet 5.5. |
 | `gpt-sol-medium` | Cross-family peer of `opus-medium`: routine verification or challenge. |
 | `gpt-sol-high`, `gpt-sol-xhigh` | Cross-family peer of `opus-high`; the fallback when astra is unavailable. |
 | `gpt-astra-medium`, `gpt-astra-high`, `gpt-astra-xhigh` | First choice for consequential cross-family challenge and complex debugging; peers `opus-high` and `fable-*`. |
-| `deepseek-flash-low`, `deepseek-flash-medium`, `deepseek-flash-high` | The default DeepSeek route: third-family peers of the Haiku, `sonnet-medium`, and `sonnet-high` rows. |
+| `deepseek-flash-low`, `deepseek-flash-medium`, `deepseek-flash-high` | The default DeepSeek route: third-family cost peers of the Haiku, `sonnet-medium`, and `sonnet-high` rows; below `sonnet-medium` since Sonnet 5.5. |
 | `deepseek-v4-pro-low`, `deepseek-v4-pro-medium`, `deepseek-v4-pro-high` | Third-family peers of `sonnet-medium`, `opus-medium`, and `opus-high`; only for a need the intelligence index does not measure. |
 
 **The `gpt-*` and `deepseek-*` routes work only when `ANTHROPIC_BASE_URL` points at the local `utraque` proxy; check that environment variable, not `settings.json`.** Never make one of them the only reviewer. Everything else about these routes — billing, effort mechanics, context limits, the cross-family pairing and escalation table, and the intelligence-cost evidence behind the peerings — lives in the `model-selection` skill, which is the single source of truth. Update it, not this table, when a model changes.
