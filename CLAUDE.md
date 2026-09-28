@@ -30,9 +30,8 @@ Every `Agent` call must set `subagent_type` to a named custom agent whose frontm
 | `opus-xhigh` | Escalation above `opus-high`, and the hardest Claude-side work. |
 | `fable-high`, `fable-xhigh` | A second Claude view, and held pending a Fable update — Fable 5.1 now scores below Opus 5.5, so it is no longer the escalation step above Opus. |
 | `gpt-luna-low`, `gpt-luna-medium` | Cross-family cost-and-role peers of the Haiku and `sonnet-medium` rows; below `sonnet-medium` since Sonnet 5.5. Short inputs only. |
-| `gpt-terra-medium`, `gpt-terra-high` | The default GPT leaf route; below `sonnet-high` since Sonnet 5.5. |
-| `gpt-sol-medium` | Routine verification or challenge; the role peer of `opus-medium` (about 11 index points below it), and challenger for `sonnet-medium`. |
-| `gpt-sol-high`, `gpt-sol-xhigh` | The fallback when astra is unavailable; `sol-xhigh` challenges `sonnet-high`. Well below `opus-high` on the index. |
+| `gpt-sol-medium` | The default GPT leaf route; cross-family peer of `sonnet-medium`, role peer of `opus-medium` (about 11 index points below it). Also routine verification, and challenger for `sonnet-medium`. |
+| `gpt-sol-high`, `gpt-sol-xhigh` | Multi-file GPT leaf work; the fallback when astra is unavailable; `sol-xhigh` challenges `sonnet-high`. Well below `opus-high` on the index. |
 | `gpt-astra-medium`, `gpt-astra-high`, `gpt-astra-xhigh` | First choice for consequential cross-family challenge and complex debugging; peers `opus-high` and `fable-*`. |
 | `deepseek-flash-low`, `deepseek-flash-medium`, `deepseek-flash-high` | The default DeepSeek route: third-family cost peers of the Haiku, `sonnet-medium`, and `sonnet-high` rows; below `sonnet-medium` since Sonnet 5.5. |
 | `deepseek-v4-pro-low`, `deepseek-v4-pro-medium`, `deepseek-v4-pro-high` | Third-family peers of `sonnet-medium`, `opus-medium`, and `opus-high`; only for a need the intelligence index does not measure. |

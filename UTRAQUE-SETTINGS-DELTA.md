@@ -120,7 +120,7 @@ CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000 claude
 ```
 
 Why the value would be 272000: it is the real cap the Codex catalog reports for every
-live GPT route — `gpt-sol-*`, `gpt-terra-*`, `gpt-luna-*` all show a 272000-token window.
+live GPT route — `gpt-sol-*`, `gpt-luna-*` (and the since-retired `gpt-terra-*`) all show a 272000-token window.
 (OpenAI's own API docs quote a larger figure for some of these models, but the Codex
 subscription caps them at 272000, and that is the number that governs here.)
 
@@ -254,7 +254,7 @@ with `deploy/uninstall.sh --unload` in the utraque repo.
 ## 9. Why the agent files name `sol-high` and not `sol`
 
 **Do not "tidy" the `model:` values back to bare aliases.** Every `gpt-*` agent names an
-effort-suffixed model (`model: sol-high`, `terra-medium`, `luna-low`, `spark-high`)
+effort-suffixed model (`model: sol-high`, `sol-medium`, `luna-low`, `spark-high`)
 because the suffix is the **only** channel that carries effort to the proxy.
 
 This was checked in utraque's source, not assumed. `chooseEffort`
@@ -278,7 +278,7 @@ Confirm once when you first go live, using the proxy's per-request log line, whi
 a request-level effort field, these files can go back to bare aliases; until then the
 suffix is load-bearing.
 
-Note also that `ultra` (sol and terra only) has no agent route, because CLAUDE.md's route
+Note also that `ultra` (sol; the catalog also accepts it on terra, whose routes were retired 2026-09-28) has no agent route, because CLAUDE.md's route
 table does not define an `ultra` tier. Reach it, if ever, by naming `sol-ultra` directly.
 
 ---
