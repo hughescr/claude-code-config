@@ -19,10 +19,12 @@ Rules for every step below:
 
 ## (a) Is the flag stable? (all three, over several days)
 
-- [ ] `~/.claude/mods-flag.log` has a line for every session you started, CLI and desktop. Silence means off or
-      unknown (see `my-plugins/mods-probe/README.md`). `tail -n 30 ~/.claude/mods-flag.log`; per-day counts:
-      `cut -d' ' -f1 ~/.claude/mods-flag.log | cut -dT -f1 | sort | uniq -c`. A day with sessions and no lines
-      was a day the flag was off.
+- [ ] `~/.claude/mods-flag.log` has an `on` line for every `start` line (every session you started, CLI and
+      desktop). The hook `hooks/mods-flag-reconcile.ts` writes the `start` and, 2 minutes later, an
+      `inferred off` for any start that never got an `on` (see `my-plugins/mods-probe/README.md`). Run
+      `bun ~/.claude/hooks/mods-flag-reconcile.ts --report`: it prints starts, on and off per day plus the last
+      transition. Stable means `off` is 0 on every day of the window. `tail -n 30 ~/.claude/mods-flag.log` shows
+      the raw lines.
 - [ ] `jq '.cachedGrowthBookFeatures.tengu_plugin_hooks_modules' ~/.claude.json` prints `true` on each check, and
       did not print `false` between checks. It is a cache written by whichever process last refreshed it: a hint,
       not proof.

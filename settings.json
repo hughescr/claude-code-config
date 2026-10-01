@@ -53,6 +53,11 @@
             "type": "command",
             "command": "${HOME}/.claude/hooks/inject-main-context.sh",
             "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "/opt/homebrew/bin/bun ${HOME}/.claude/hooks/mods-flag-reconcile.ts",
+            "timeout": 3
           }
         ]
       }

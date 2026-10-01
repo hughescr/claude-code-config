@@ -19,20 +19,58 @@ On `session.start` its module does two things:
 
 ## Reading the log
 
-The module never runs while the flag is off, so **every line means "on"; silence means off or unknown** (the probe
-was not loaded, the session predates the install, the flag was off, or the write failed). The log cannot record
-"off".
+The module never runs while the flag is off, so the probe alone can only say "on": silence from it means off or
+unknown. The "off" half comes from a companion **SessionStart command hook**, `hooks/mods-flag-reconcile.ts` in
+the `~/.claude` repo (wired in `~/.claude/settings.json`, run with `/opt/homebrew/bin/bun`). Settings hooks are not
+gated by the flag, so it runs in every process and appends to the same log:
 
-```bash
-tail -n 20 ~/.claude/mods-flag.log          # recent sessions
-wc -l < ~/.claude/mods-flag.log             # total "on" sessions
-cut -d' ' -f1 ~/.claude/mods-flag.log | cut -dT -f1 | sort | uniq -c   # on-sessions per day
+```
+2026-10-01T12:34:56.000Z session=<id> source=<startup|resume|fork> pid=<claude pid|?> start
+2026-10-01T12:34:56.789Z session=<id> surface=terminal interactive=true version=2.1.287 on        # this plugin
+2026-10-01T12:38:10.000Z session=<id> pid=<claude pid|?> for_start=2026-10-01T12:34:56.000Z inferred off
 ```
 
-Compare against how many sessions you actually started: a day with sessions but no lines means the flag was off
-for those. A reload of the module while a session runs (hot reload, enable) raises `session.start` again, so a
-session can occasionally log twice. The file is trimmed to its newest 2000 lines. Two sessions starting in the same
-instant can lose one line.
+One grammar for all three: `<ISO time> key=value... <state>`, the **last token is the state** (`start`, `on`,
+`off`), `session=` is required. The rules:
+
+- Each new claude process writes one `start`. `/clear` and compact keep the process and the probe's
+  `session.start` does not fire for them, so they write nothing. A resume writes a `start` only for a new process
+  (a pid with no `start` since it launched).
+- A `start` older than 2 minutes with no `on` for the same session from 30 s before to 5 minutes after it gets
+  one `inferred off` line on the next session start in any process. That line is also the marker that stops it
+  being inferred again. The `on` of a session whose id the probe could not read (`session=?`) counts for any
+  start near it.
+- So **`on` = mods were on; `inferred off` = the process started and never logged `on`**. A `start` younger than
+  2 minutes is still pending.
+
+Report (read-only, also counts starts that are due an `off` but not yet marked; days are UTC, an off counts on its
+start's day):
+
+```bash
+bun ~/.claude/hooks/mods-flag-reconcile.ts --report
+# day         starts    on   off
+# 2026-10-01       6     4     2
+# total            6     4     2
+# latest: off at 2026-10-01T12:34:56.000Z
+# last transition: on -> off at 2026-10-01T12:34:56.000Z
+```
+
+Raw views (only `on`/`off` lines count; `start` lines are the denominator):
+
+```bash
+tail -n 20 ~/.claude/mods-flag.log
+grep ' on$' ~/.claude/mods-flag.log | cut -dT -f1 | sort | uniq -c    # on-sessions per day
+grep ' off$' ~/.claude/mods-flag.log | cut -dT -f1 | sort | uniq -c   # inferred offs per day (by inference time)
+```
+
+Limits. A reload of the module while a session runs (hot reload, enable) raises `session.start` again, so a
+session can occasionally log `on` twice. The probe trims the file to its newest 2000 lines on each `on`, by
+read-modify-write, so a `start` the hook appended during that instant can be lost (harmless: a lost `start` never
+produces an `off`). Two probes writing in the same instant can lose an `on`, which would show as a false `off`.
+The hook never rewrites the file except to trim an oversized one (over 1 MiB, only when mods have been off long
+enough for the probe not to trim), by an atomic rename. If the probe does not report the resumed session's id the
+way the hook sees it, a resumed process can look like an `off`. A claude pid that cannot be found (a sandboxed
+`ps`) is logged as `pid=?`.
 
 Cross-check the cached flag value with `jq '.cachedGrowthBookFeatures.tengu_plugin_hooks_modules' ~/.claude.json`.
 
