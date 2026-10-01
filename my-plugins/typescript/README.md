@@ -10,6 +10,8 @@ TypeScript-specific development tools for Claude Code.
 
 - **block-tsc-with-files**: Prevents running `tsc` with individual file arguments (TypeScript needs full project context)
 
+A staged in-process mod form of this guard (`hooks/register.ts`, `hooks/guard.ts`) is not wired yet; activation steps: `my-plugins/MODS-ACTIVATION.md`.
+
 ## Usage
 
 This plugin is automatically loaded for TypeScript projects (detected via `tsconfig.json` or typescript in package.json). It builds on:

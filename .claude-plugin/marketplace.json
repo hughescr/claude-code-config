@@ -43,6 +43,16 @@
       "name": "tmux",
       "source": "./my-plugins/tmux",
       "description": "Tmux MCP server integration for terminal multiplexer support"
+    },
+    {
+      "name": "git-guard",
+      "source": "./my-plugins/git-guard",
+      "description": "Blocks destructive git commands that discard uncommitted work (in-process tool.call mod)"
+    },
+    {
+      "name": "mods-probe",
+      "source": "./my-plugins/mods-probe",
+      "description": "Flag tracker: on session.start shows a notice and logs a line to ~/.claude/mods-flag.log when hooks modules are ON"
     }
   ]
 }

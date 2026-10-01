@@ -65,6 +65,8 @@ When both Hugo and JavaScript plugins load (common for Hugo projects with `packa
 |------|-------|---------|
 | `block-serverless-deploy` | PreToolUse | Prevents manual `serverless deploy` - all deployments must go through GitHub CI |
 
+A staged in-process mod form of this guard (`hooks/register.ts`, `hooks/guard.ts`) is not wired yet; activation steps: `my-plugins/MODS-ACTIVATION.md`.
+
 ---
 
 ## Agent Details

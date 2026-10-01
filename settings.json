@@ -93,7 +93,8 @@
     "skill-development@oaustegard-claude-skills": true,
     "swift-lsp@claude-plugins-official": true,
     "typescript-lsp@claude-plugins-official": true,
-    "typesafe@typesafe-ai": true
+    "typesafe@typesafe-ai": true,
+    "mods-probe@craigs-claude-plugins": true
   },
   "extraKnownMarketplaces": {
     "craigs-claude-plugins": {

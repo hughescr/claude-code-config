@@ -1,0 +1,104 @@
+// Golden parity corpus: every row's decision was taken from the retired hooks/git-guard.sh (bash 3.2 + BSD
+// grep 2.6.0, LANG=en_US.UTF-8) and is re-checked against the script by the parity run. Non-ASCII
+// characters and whitespace variants are written as escapes so the rows cannot be damaged by an editor.
+// Kept in its own file so bun can import it for the oracle harness (the test kit's module cannot be
+// imported outside `claude plugin test`).
+export type Row = { readonly command: string; readonly expect: 'allow' | 'deny' }
+
+const d = (command: string): Row => ({ command, expect: 'deny' })
+const a = (command: string): Row => ({ command, expect: 'allow' })
+
+export const CORPUS: readonly Row[] = [
+  // checkout --
+  d('git checkout -- src/a.ts'),
+  d('git checkout HEAD -- f'),
+  d('git checkout --ours -- f'),
+  d('git -C /tmp/r checkout -- .'),
+  d('git -c core.x=1 checkout -- f'),
+  d('git checkout\t--\tf'),
+  d('digit checkout -- f'),
+  d('git checkout --'),
+  d('git checkout x -- f; ls'),
+  a('git checkout x;y -- f'),
+  a('git -C checkout -- f'),
+  a('git checkout main'),
+  a('git checkout -b feature'),
+  a('git checkout --track origin/x'),
+  a('git checkout main && echo -- x'),
+  a('git checkout main | tee -- out'),
+  d('git checkout' + ' '.repeat(30) + ' ' + ' '.repeat(30) + '; git restore f'),
+  // restore
+  d('git restore f'),
+  a('git restore --staged f'),
+  d('git restore --staged --worktree f'),
+  d('git restore --staged -W f'),
+  d('git restore -S f'),
+  d('git restore-x'),
+  a('git restore --staged f -Wall'),
+  a('git restore . && git diff --staged'),
+  a('git restored'),
+  d('git -C git restore f'),
+  a('git restoreé f'),
+  a('git restore٣ f'),
+  d('git restore² f'),
+  d('git restoreⅣ f'),
+  d('git restore〇 f'),
+  d('git restore f; echo --staged --worktree²'),
+  d('git restore --staged -W① f'),
+  a('git restore --staged² f'),
+  d('git restore﻿ f'),
+  a('git﻿restore f'),
+  // restore: whitespace variants (JS \s minus U+FEFF are all [[:space:]] to grep)
+  d('git restore f'),
+  d('git　restore f'),
+  d('git restore\u000bf'),
+  d('git restore\u000cf'),
+  d('git restore f'),
+  d('git restore\u0085f'),
+  // restore: Unicode word-boundary rows beyond Latin (grep's table, not \p{L}\p{N})
+  d('git restore࢏ f'),
+  d('git restore¼ f'),
+  a('git restore_ f'),
+  a('git restoreก f'),
+  // reset --hard
+  d('git reset --hard'),
+  a('git reset --soft HEAD~1'),
+  a('git reset --hard-not-really'),
+  d('git reset HEAD~1; echo --hard'),
+  d('git reset\n--hard'),
+  d('git reset² --hard'),
+  d('git reset --hard'),
+  d('git reset --hard'),
+  a('git reset٣ --hard'),
+  a('git commit -m "reset --hard"'),
+  d('git -C a -C b -c x=y --no-pager reset --hard'),
+  a('git --unknown reset --hard'),
+  a('git -C reset --hard'),
+  a('git --git-dir= reset --hard'),
+  a('git -pX reset --hard'),
+  d('ls && git -C /d reset --hard HEAD'),
+  // clean
+  d('git clean -fd'),
+  a('git clean -n'),
+  a('git clean -fdn'),
+  a('git clean --dry-run --force'),
+  d('git clean -n1 -f'),
+  a('git clean -fz9'),
+  a('git clean --force=1'),
+  d('git clean¼ -f'),
+  d('echo git; git clean -f'),
+  a('find . -name x; git clean -fd'),
+  d('git clean -d; rm -f x'),
+  a('git clean -d'),
+  a('git clean -Fd'),
+  a('git -c clean.requireForce=false clean -d'),
+  a('git cleanup -f'),
+  // no opinion
+  a('git status'),
+  a('git push --force'),
+  a(''),
+  a('\n'),
+  a('git status\u0000'),
+  d('git rest\u0000ore f'),
+  d('git restore f\n\n'),
+]

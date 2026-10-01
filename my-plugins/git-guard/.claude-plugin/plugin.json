@@ -1,0 +1,8 @@
+{
+  "name": "git-guard",
+  "version": "1.0.0",
+  "description": "Denies Bash git commands that discard uncommitted work (checkout --, restore, reset --hard, clean -f)",
+  "author": {
+    "name": "hughescr"
+  }
+}
