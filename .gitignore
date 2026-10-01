@@ -58,3 +58,4 @@ policy-limits.json.stamp.json
 skills/synced
 state
 plugins/.trash
+/plugins/store
