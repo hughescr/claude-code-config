@@ -2,6 +2,8 @@
 
 Before calling significant work done: tests pass, lint clean, docs updated, and the change weighed for security, performance, data integrity, and deployment/rollback risk.
 
+When you update docs, skills, or config, replace superseded facts, estimates, and passed dates instead of keeping them "as history" or adding "superseded by" notes — git already has the history.
+
 ---
 
 ## Language Choice
