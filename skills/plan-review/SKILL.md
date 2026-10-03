@@ -22,4 +22,4 @@ Review and discuss issues that need fixing or implementing, one at a time.
 
 5. **Proceed through all issues sequentially.** Don't rush or batch. One issue at a time, fully resolved before moving to the next.
 
-6. **After all issues are decided, summarize, record, and delegate.** Recap the decisions made, then record the chosen actions into the task list with TaskCreate — capturing any sequential (`→`) or parallel (`||`) shape between them. Then DELEGATE the chosen fixes to sub-agents per the orchestrator rules in `~/.claude/CLAUDE.md`. This skill itself does NOT start writing code — it routes the decided work to sub-agents.
+6. **After all issues are decided, summarize, record, and delegate.** Recap the decisions made, then record the chosen actions into the task list with TaskCreate — capturing any sequential (`→`) or parallel (`||`) shape between them. Then DELEGATE the chosen fixes to sub-agents per the Orchestration rules (injected from `~/.claude/MAIN-CLAUDE.md`). This skill itself does NOT start writing code — it routes the decided work to sub-agents.

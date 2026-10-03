@@ -69,7 +69,7 @@ or quoted output.
 
 ## Orchestration
 
-Act as the orchestrator: decompose the work, delegate leaf execution through the shared named Agent routes, arbitrate disagreements, and synthesize the result. Never write code, edit files, commit, or run builds yourself. Reading and searching for context is fine.
+Act as the orchestrator: decompose the work, delegate leaf execution through the shared named Agent routes, arbitrate disagreements, and synthesize the result. Never write code, edit files, or run builds yourself; the checkpoint commits below are yours to make. Reading and searching for context is fine.
 
 **Only the main orchestrator launches Workflows.** They are pre-authorized and encouraged for broad work with independent necessary steps; use a standalone background Agent for trivial or interactive work. Every Workflow `agent()` must provide either an approved named `agentType` whose frontmatter supplies model and effort, or explicit literal `model` and `effort`; if both are present, they must agree. Validate only those routing fields and pass every other field through unchanged to the Workflow and Agent tools. Workflows run headless, so if you cannot script likely questions (`needs_input` return + resume), use standalone agents.
 
@@ -81,7 +81,7 @@ Act as the orchestrator: decompose the work, delegate leaf execution through the
 
 **Edit tracked files only with Edit or Write.** This binds you and every agent you brief, even though the auto-mode prompt says shell edits are acceptable. Never rewrite tracked files in place from the shell (`sed -i`, `perl -pi`/`-i`, `awk` redirected over the file, `cat <<EOF > file`, `tee`). Shell reads (`cat`, `head`, `sed -n`, `grep`) and throwaway files under $TMPDIR or the scratchpad are fine. Edit enforces read-before-write and fails loudly on a missing or ambiguous match; shell rewrites silently no-op or over-match, and only the diff shows the damage.
 
-**Isolate agents that break code.** Mutation testing, speculative refactors, anything editing code it doesn't own → `isolation: "worktree"`. Give reviewers read-only tool sets, not a "don't edit" instruction (`Bash` still writes) — instructions lose to the agent's task.
+**Isolate agents that break code.** Mutation testing, speculative refactors, anything editing code it doesn't own → `isolation: "worktree"`. Give reviewers read-only tool sets, not a "don't edit" instruction (`Bash` still writes) — instructions lose to the agent's task. A reviewer that must run git itself to read history or diffs (such as `project-steward`) may keep `Bash`.
 
 **Keep each agent's context small.** Give every `agent()` a self-contained slice — named files, one pipeline item, one review dimension. If a step would need most of the repo, split it and synthesize from the outputs. Many small agents beat one long-running one.
 
@@ -99,4 +99,4 @@ Sub-agent rules live in SUBAGENT-CLAUDE.md, auto-injected via the SubagentStart 
 
 Prefer a different model family for that check; it fails differently than you do. Design and architecture calls go straight to `gpt-astra-high` (`gpt-astra-xhigh` for the hardest) as a normal Agent; a substantial diff before commit goes to the review-changes skill. A non-Claude route runs inside our own harness with our own tools — it is a different model, not a different agent scaffold.
 
-The routing table in CLAUDE.md names the routes; the `model-selection` skill holds the facts behind them — proxy availability, billing, limits, and the cross-family pairing table — and is the place to update when a model changes. With the proxy down or unconfigured there is no cross-family route: if the work warranted a verifier, use `opus-high` (or `opus-xhigh`) and report the check as same-family.
+The routing table in CLAUDE.md names the routes; the `model-selection` skill holds the facts behind them — proxy availability, billing, limits, and the cross-family pairing table — and is the place to update when a model changes. With the proxy down or unconfigured there is no cross-family route: if the work warranted a verifier, use `opus-high` (`opus-medium` for a routine check; `opus-xhigh` if `opus-high` stalls) and report the check as same-family.

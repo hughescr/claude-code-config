@@ -282,7 +282,8 @@ All API functions return structured dicts with:
 - `author_name`: Display name
 - `likes`, `reposts`, `replies`: Engagement counts
 - `links`: Full URLs extracted from post facets (post text truncates URLs with "...")
-- `image_alts`: Alt text from embedded images
+- `images`: one `{alt, url, transcription}` dict per embedded image (see Read Embed Images)
+- `image_alts`: non-empty alt texts only (legacy)
 - `url`: Direct link to post on bsky.app
 
 Profile function returns: `handle`, `display_name`, `description`, `followers`, `following`, `posts`, `did`
