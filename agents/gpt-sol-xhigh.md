@@ -1,6 +1,6 @@
 ---
 name: gpt-sol-xhigh
-description: Provide a cross-family challenge on the hardest or most consequential decisions, or drive complex cross-family debugging.
+description: Perform substantive leaf work when the small gain over sol-high justifies its extra cost; use astra for consequential challenges and the hardest problems.
 model: sol-xhigh
 effort: xhigh
 ---

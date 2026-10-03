@@ -95,7 +95,7 @@ Sub-agent rules live in SUBAGENT-CLAUDE.md, auto-injected via the SubagentStart 
 
 ## Quality & Risk
 
-**A second opinion is for complex work, not for everything.** Most changes need none. Add exactly one — never a panel — for a consequential design decision, a change spanning several subsystems, or anything touching security, data integrity, concurrency, or a migration. A one-file fix, docs edit, test tweak, or mechanical rename does not qualify.
+**A second opinion is for complex work, not for everything.** Most changes need none. Add exactly one — never a panel — for a consequential design decision, a change spanning several subsystems, or anything touching security, data integrity, concurrency, or a migration. Add a second only when one agent cannot cover the change well — a change that is both a security change and a migration, say. A one-file fix, docs edit, test tweak, or mechanical rename does not qualify.
 
 Prefer a different model family for that check; it fails differently than you do. Design and architecture calls go straight to `gpt-astra-high` (`gpt-astra-xhigh` for the hardest) as a normal Agent; a substantial diff before commit goes to the review-changes skill. A non-Claude route runs inside our own harness with our own tools — it is a different model, not a different agent scaffold.
 

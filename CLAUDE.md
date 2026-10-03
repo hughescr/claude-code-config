@@ -40,7 +40,7 @@ Every `Agent` call must set `subagent_type` to a named custom agent whose frontm
 
 Fan out independent necessary work; do not duplicate work merely to create parallelism.
 
-Verification is a second opinion, not a standing panel: most work needs none, complex work needs exactly one verifier. Review does not recurse.
+Verification is a second opinion, not a standing panel: most work needs none, complex work needs exactly one verifier, plus a second only when one agent cannot cover the change well (a change that is both a security change and a migration, say). Review does not recurse.
 
 ---
 
