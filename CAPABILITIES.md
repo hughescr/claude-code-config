@@ -51,7 +51,7 @@ Tested 2026-10-07, with the marketplace `hughescr/claude-code-config` added on c
 - [x] **Add the marketplace** on claude.ai, Customize, Plugins, Add marketplace: `hughescr/claude-code-config`, with **Sync automatically** on.
 - [x] **Enable `craig-core`, `model-selection` and `bluesky`** on the account. Do not enable `mods-probe` in the Claude app: it is a Mac-only Claude Code diagnostic.
 - [x] **Delete the uploaded skills** on claude.ai: `browsing-bluesky`, `model-selection` and `my-writing-style`. `syncClaudeAiSkills: false` stops the sync.
-- [ ] **Rotate the Artificial Analysis key.** The old key sat in `creds.json` in the uploaded model-selection copy. Store the new key in 1Password (default ref `op://Private/Artificial Analysis/credential`, or set `ARTIFICIAL_ANALYSIS_OP_REF`) and, for cloud, as `ARTIFICIAL_ANALYSIS_API_KEY` on the environment.
+- [x] **Rotate the Artificial Analysis key.** The new key is in 1Password at `op://Private/Artificial Analysis/credential` (the default ref). The old key is invalidated and `creds.json` is deleted. Cloud sessions need `ARTIFICIAL_ANALYSIS_API_KEY` on the environment if model-selection queries are wanted there.
 - [ ] **Set `BSKY_APP_PASSWORD` per surface,** with a separate Bluesky app password for each so one can be revoked alone:
   - Mac: nothing to set; `op` reads the default item.
   - Cloud: the environment's **Environment variables** (not a network secret). Use a private environment. If network access is restricted, allow `bsky.social`, `*.host.bsky.network`, `public.api.bsky.app`, `api.bsky.app` and `cdn.bsky.app`.
