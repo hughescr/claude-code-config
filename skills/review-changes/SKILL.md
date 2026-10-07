@@ -24,9 +24,7 @@ Otherwise skip it. A one-file fix, docs edit, test-only change, or mechanical re
 
 ## Which verifier
 
-Prefer a **different model family**: it fails differently than this session does. Pair off the session's own model: `gpt-astra-high` for a `fable-*` or `opus-*` session, `gpt-sol-high` for `sonnet-high`. Load `model-selection` only if the session model is neither — its table covers the rest. When in doubt use `gpt-astra-high`; this runs on work already believed finished, so a missed defect costs more than the stronger reviewer.
-
-No proxy (`ANTHROPIC_BASE_URL` not naming `utraque`, or it is down) means no cross-family route: use `opus-medium` for routine checks and `opus-high` otherwise; escalate to `opus-xhigh` if `opus-high` stalls. Report the check as same-family.
+Prefer a **different model family**: it fails differently than this session does. Pair off the session's own model using the cross-family pairing table in `~/.claude/CLAUDE.md`, which also gives the same-family fallback when there is no proxy (`ANTHROPIC_BASE_URL` not naming `utraque`, or the proxy is down). When in doubt use `gpt-astra-high`; this runs on work already believed finished, so a missed defect costs more than the stronger reviewer.
 
 When alignment is the *only* material risk, use `project-steward` instead — it covers alignment and deliberately does not audit bugs, edge cases, or wiring. If the change carries correctness risk too, use a general verifier; the last checklist bullet already covers alignment.
 

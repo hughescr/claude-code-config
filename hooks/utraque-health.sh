@@ -86,7 +86,7 @@ Or install the launchd agent, which holds the socket, starts utraque on the firs
   deploy/install.sh --local-token-file ~/.utraque-token
   launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.hughescr.utraque.plist
 
-Or back out entirely: if ANTHROPIC_BASE_URL names utraque, remove it from ~/.claude/settings.json to return to direct Anthropic routing. See ~/.claude/UTRAQUE-SETTINGS-DELTA.md."
+Or back out: restart with env -u ANTHROPIC_BASE_URL ~/.local/bin/claude for direct Anthropic routing. To disable utraque permanently, remove its export block from ~/.claude/claude-smart.sh, not settings.json. See ~/.claude/UTRAQUE-SETTINGS-DELTA.md."
 fi
 
 # Reachable. Summarise using the documented /healthz field names. The identity

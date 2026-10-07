@@ -77,7 +77,7 @@ Act as the orchestrator: decompose the work, delegate leaf execution through the
 
 **Authority travels in spawn prompts, not relays.** Sub-delegation is fine — an implementer handing mechanical sub-tasks to a cheaper model is healthy — but never send a sub-agent a mid-run message carrying instructions that require authorization (new scope, config/settings edits, anything privileged): it arrives as an unverifiable peer message, and a well-behaved agent will refuse it. Either stop the agent and respawn with the updated spec in its spawn prompt, or act on the privileged instruction yourself as the delegator. Mid-run messages are for answering questions the agent itself asked.
 
-**Checkpoint before delegating.** Commit each phase (WIP fine) before launching the next; collapse into one or more meaningful commits (`git reset --soft` + recommit) before pushing. Untracked files never appear in `git diff`, and uncommitted work dies to a stray `git checkout`. Verify by diff — gates can't catch a change tuned to pass them.
+**Checkpoint before delegating.** Commit each phase (WIP fine) before launching the next; collapse into one or more meaningful commits (`git reset --soft` + recommit) before pushing. Verify by diff — gates can't catch a change tuned to pass them.
 
 **Edit tracked files only with Edit or Write.** This binds you and every agent you brief, even though the auto-mode prompt says shell edits are acceptable. Never rewrite tracked files in place from the shell (`sed -i`, `perl -pi`/`-i`, `awk` redirected over the file, `cat <<EOF > file`, `tee`). Shell reads (`cat`, `head`, `sed -n`, `grep`) and throwaway files under $TMPDIR or the scratchpad are fine. Edit enforces read-before-write and fails loudly on a missing or ambiguous match; shell rewrites silently no-op or over-match, and only the diff shows the damage.
 
@@ -85,9 +85,9 @@ Act as the orchestrator: decompose the work, delegate leaf execution through the
 
 **Keep each agent's context small.** Give every `agent()` a self-contained slice — named files, one pipeline item, one review dimension. If a step would need most of the repo, split it and synthesize from the outputs. Many small agents beat one long-running one.
 
-**Use the shared routing table for routine spawns.** Invoke the **model-selection** skill only for new models, runtime or alias drift, explicit comparisons, repeated routing underperformance, or work outside the table. Preserve an explicit user model or effort choice when the runtime supports it.
+**Use the CLAUDE.md routing tables for routine spawns** and invoke the **model-selection** skill only for the triggers in its description; preserve an explicit user model or effort choice when the runtime supports it.
 
-**Don't let one agent decide anything consequential alone.** Pair a proposer with a challenger, routed per Quality & Risk below (a cross-family route first; `opus-medium` for routine checks and `opus-high` for consequential ones only when the proxy is unavailable, escalating to `opus-xhigh` when `opus-high` stalls). Arbitrate disagreements before the next phase.
+**Don't let one agent decide anything consequential alone.** Pair a proposer with a challenger from the CLAUDE.md cross-family pairing table. Arbitrate disagreements before the next phase.
 
 Sub-agent rules live in SUBAGENT-CLAUDE.md, auto-injected via the SubagentStart hook.
 
@@ -95,8 +95,4 @@ Sub-agent rules live in SUBAGENT-CLAUDE.md, auto-injected via the SubagentStart 
 
 ## Quality & Risk
 
-**A second opinion is for complex work, not for everything.** Most changes need none. Add exactly one — never a panel — for a consequential design decision, a change spanning several subsystems, or anything touching security, data integrity, concurrency, or a migration. Add a second only when one agent cannot cover the change well — a change that is both a security change and a migration, say. A one-file fix, docs edit, test tweak, or mechanical rename does not qualify.
-
-Prefer a different model family for that check; it fails differently than you do. Design and architecture calls go straight to `gpt-astra-high` (`gpt-astra-xhigh` for the hardest) as a normal Agent; a substantial diff before commit goes to the review-changes skill. A non-Claude route runs inside our own harness with our own tools — it is a different model, not a different agent scaffold.
-
-The routing table in CLAUDE.md names the routes; the `model-selection` skill holds the facts behind them — proxy availability, billing, limits, and the cross-family pairing table — and is the place to update when a model changes. With the proxy down or unconfigured there is no cross-family route: if the work warranted a verifier, use `opus-high` (`opus-medium` for a routine check; `opus-xhigh` if `opus-high` stalls) and report the check as same-family.
+When a second opinion is warranted (CLAUDE.md, Agent routing), prefer a different model family; it fails differently than you do. Design and architecture calls go straight to `gpt-astra-high` (`gpt-astra-xhigh` for the hardest) as a normal Agent; a substantial diff before commit goes to the review-changes skill. A non-Claude route runs inside our own harness with our own tools — it is a different model, not a different agent scaffold.

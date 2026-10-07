@@ -78,7 +78,7 @@ When a function wraps an external API call and the mutation creates an equivalen
 ## Workflow
 
 1. Run all tests first — ensure they pass before mutation testing
-2. If the project has a `mutate` script in package.json, run `bun run mutate`
+2. If the project has a `mutate` script in package.json, run `bun run mutate` with `dangerouslyDisableSandbox: true` (the sandbox protects `stryker-incremental.json`)
 3. Review the HTML report at `reports/mutation/html/index.html`
 4. Address survived mutants:
    - Can you write a test that kills it? Write the test

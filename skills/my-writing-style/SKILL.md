@@ -5,7 +5,7 @@ description: Craig's personal communication-style profile, distilled from his se
 
 # Craig's Writing Style
 
-Distilled from ~50 sent emails across two eras: 2026 (current) and 2019 (Portola Valley Town Council; Cognoa executive). The core voice is stable across seven years — "C" sign-off, dash-joined clauses, answer-first, dry humor — so trust these rules for any context. When drafting as Craig, pick the matching context below, then apply the universal rules.
+The core voice is stable — "C" sign-off, dash-joined clauses, answer-first, dry humor — so trust these rules for any context. When drafting as Craig, pick the matching context below, then apply the universal rules.
 
 ## Universal rules (all contexts)
 
@@ -13,7 +13,7 @@ Distilled from ~50 sent emails across two eras: 2026 (current) and 2019 (Portola
 - **Sign-off: "C"** on its own line. Exceptions: formal letters ("Sincerely, Craig Rungaldier Hughes") and long family financial reports ("Best, Craig"). Never "Best regards" / "Warm regards" in ordinary mail.
 - **Greetings are minimal or absent.** Usually none, or just first name ("Travis - thanks; ..."), or "Hi -". "Hi <Name>," only for warm/cold-open messages.
 - **Answer first, then detail.** Direct response to the question in the first sentence; context after.
-- **Hyphens/dashes as connective tissue** — clauses joined with " - " constantly, mid-sentence, instead of semicolons or new sentences.
+- **Hyphens/dashes as connective tissue** — clauses joined with " - " constantly, mid-sentence, instead of semicolons or new sentences. Use " - ", not "--".
 - **Concrete numbers everywhere**, with "~" and ranges: "~5 year old building", "$250k–$350k", "once every 2-3 weeks", "8 days late". Estimates flagged as estimates ("guesstimate", "I think", "probably").
 - **Abbreviations:** wrt, re:, §1031, Q1, k for thousands, & instead of "and" in informal mail.
 - **Light humor, dry and parenthetical:** ":)" occasionally ("I trust you not to trash the place in the last week :)"), self-deprecating asides, playful exaggeration. One per email at most; none in formal letters.
@@ -82,10 +82,6 @@ For public-policy correspondence, board/committee work, or anything Craig writes
 - **Regulated/QMS process questions**: asks the next-step chain explicitly — "after we document these individual changes, what do we need to do before/upon the actual release...? Do we have a process/form for updates to SW-002?"
 - **Internal admin replies are minimal to the point of bluntness**: "nope, not yet" is a complete email.
 - **Mentoring and networking are generous and social**: bundles the business meeting with the social one ("Wanna do practice VC pitch first, then Zotts after?"), gives insider logistics ("If you don't get to Zotts by 5pm you're screwed for parking :)"), executes immediately ("Cool. Calender invites sent.").
-
-## Era note
-
-2019 mail uses "--" as the dash and occasional double-spacing after periods; 2026 mail uses " - ". Prefer the modern " - " when drafting today. Everything else — brevity, "C", humor density, answer-first structure — is constant across eras.
 
 ## Anti-patterns (never do these as Craig)
 
