@@ -8,7 +8,7 @@ Code tab, Cowork, cloud sessions, and (skills only) claude.ai chat.
 | `instructions/` | `COMMON-CLAUDE.md` (the global CLAUDE.md), `MAIN-CLAUDE.md` (main session), `SUBAGENT-CLAUDE.md` (sub-agents). The only copy of each. |
 | `hooks/` | `inject-instructions.sh`, run by `hooks.json` at SessionStart and SubagentStart. |
 | `agents/` | The Claude route agents and `craig-core:project-steward`. Plugin agents are namespaced: `subagent_type: "craig-core:sonnet-high"`. |
-| `skills/` | `review-changes`, `plan-review`, `my-writing-style` (invoked as `craig-core:<skill>`). |
+| `skills/` | `my-writing-style` (invoked as `craig-core:my-writing-style`). |
 | `tests/` | `inject-instructions.test.sh`. |
 
 The cross-family route agents (`gpt-*`, `deepseek-*`) are not here: they live in `~/.claude/agents/` on Craig's Mac,

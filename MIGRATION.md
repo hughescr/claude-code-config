@@ -4,7 +4,7 @@
 
 - **craig-core plugin** (`my-plugins/craig-core`): the only copy of the instructions (`instructions/COMMON-CLAUDE.md`,
   `MAIN-CLAUDE.md`, `SUBAGENT-CLAUDE.md`), the Claude route agents and `craig-core:project-steward` (all now `craig-core:<name>`), and
-  the review-changes, plan-review and my-writing-style skills. Its SessionStart and SubagentStart hooks inject the
+  the my-writing-style skill. Its SessionStart and SubagentStart hooks inject the
   instructions on surfaces that do not load `~/.claude/CLAUDE.md`.
 - **`CLAUDE.md`** is a tracked symlink to `my-plugins/craig-core/instructions/COMMON-CLAUDE.md`.
 - **settings.json**: the `inject-main-context.sh` and `inject-subagent-context.sh` hooks are gone (scripts deleted), so
@@ -46,7 +46,7 @@
    - The session context has a `<!-- craig-core: MAIN-CLAUDE.md -->` block ending in a "Cross-family routes:" line,
      and no `<!-- craig-core: CLAUDE.md` block (the symlink loads it natively).
    - An agent spawned as `craig-core:haiku-xhigh` receives the `<!-- craig-core: SUBAGENT-CLAUDE.md -->` block.
-   - `/skills` lists `craig-core:review-changes`, `craig-core:plan-review`, `craig-core:my-writing-style` and
+   - `/skills` lists `craig-core:my-writing-style` and
      `model-selection:model-selection`, `bluesky:bluesky` and `bluesky:bluesky-voice`, and no unprefixed
      `model-selection` or `browsing-bluesky`.
 8. **claude.ai and the other surfaces**: follow the setup steps in `CAPABILITIES.md` (add the marketplace, delete the

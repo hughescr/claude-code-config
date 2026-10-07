@@ -1,6 +1,6 @@
 {
   "name": "craig-core",
-  "description": "Craig's core setup on every surface: global instructions injected at session and sub-agent start, the Claude route agents (craig-core:<route>), and the review-changes, plan-review and my-writing-style skills",
+  "description": "Craig's core setup on every surface: global instructions injected at session and sub-agent start, the Claude route agents (craig-core:<route>), and the my-writing-style skill",
   "author": {
     "name": "hughescr",
     "url": "https://github.com/hughescr"

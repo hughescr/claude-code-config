@@ -50,7 +50,7 @@ my-plugins/<plugin-name>/
 ```
 
 Current plugins:
-- **craig-core** - Global instructions (CLAUDE.md, MAIN-CLAUDE.md, SUBAGENT-CLAUDE.md) injected at session and sub-agent start, the Claude route agents (`craig-core:<route>`), and the review-changes, plan-review and my-writing-style skills; see `my-plugins/craig-core/README.md`
+- **craig-core** - Global instructions (CLAUDE.md, MAIN-CLAUDE.md, SUBAGENT-CLAUDE.md) injected at session and sub-agent start, the Claude route agents (`craig-core:<route>`), and the my-writing-style skill; see `my-plugins/craig-core/README.md`
 - **model-selection** (from hughescr/model-selection) - Model comparison on Artificial Analysis data, and the facts behind the agent routes
 - **bluesky** - Read Bluesky posts, threads, profiles and search; draft in Craig's voice and post as @craig.rungie.com after a preview and explicit confirmation (a Node CLI plus the `bluesky` and `bluesky-voice` skills); see `my-plugins/bluesky/README.md`
 - **generic-dev** - General development agents and skills

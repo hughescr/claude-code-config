@@ -19,7 +19,7 @@ On the Mac, an installed plugin shadows the same-named `@synced` copy from claud
 | Main and sub-agent instructions | plugin hooks | plugin hooks | plugin hooks, unverified | plugin hooks, if installed | no |
 | `craig-core:*` route agents | yes | yes | yes | if installed | no (no agents) |
 | `gpt-*` and `deepseek-*` routes | only with the utraque proxy (`claude-smart.sh` sets `ANTHROPIC_BASE_URL`) | only if `ANTHROPIC_BASE_URL` points at the proxy | no: Claude-only pairings | no: Claude-only pairings | no |
-| my-writing-style, plan-review, review-changes | yes | yes | yes | if installed | my-writing-style; review-changes needs sub-agents, which chat lacks |
+| my-writing-style | yes | yes | yes | if installed | yes |
 | model-selection (facts and route evidence) | yes | yes | yes | if installed | yes |
 | model-selection live Artificial Analysis queries | env var or `op` | env var or `op` | unverified (no documented secret mechanism) | `ARTIFICIAL_ANALYSIS_API_KEY` on the environment | unverified |
 | Bluesky reading | tool | tool | tool if node or bun exists, else public endpoints | tool | public endpoints via web fetch |

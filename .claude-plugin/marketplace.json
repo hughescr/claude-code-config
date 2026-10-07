@@ -11,7 +11,7 @@
     {
       "name": "craig-core",
       "source": "./my-plugins/craig-core",
-      "description": "Craig's global instructions (injected at session and sub-agent start), Claude route agents (craig-core:<route>), and the review-changes, plan-review and my-writing-style skills"
+      "description": "Craig's global instructions (injected at session and sub-agent start), Claude route agents (craig-core:<route>), and the my-writing-style skill"
     },
     {
       "name": "model-selection",
