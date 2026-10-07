@@ -101,12 +101,20 @@ mkdir -p "$FIXTURE/.claude/my-plugins/goodplugin" \
          "$FIXTURE/.claude/plugins/legacyplugin" \
          "$FIXTURE/.claude/plugins/cache/some-marketplace/cachedplugin" \
          "$FIXTURE/.claude/plugins/marketplaces/mm/marketonly" \
-         "$FIXTURE/.claude/evil"
+         "$FIXTURE/.claude/evil" \
+         "$FIXTURE/.claude/.claude-plugin" \
+         "$FIXTURE/badmanifest/.claude/.claude-plugin"
+# Craig's own marketplace manifest lists a plugin installed from another repo.
+printf '%s\n' '{"name":"m","plugins":[{"name":"listedplugin","source":{"source":"github","repo":"o/r"}}]}' \
+  >"$FIXTURE/.claude/.claude-plugin/marketplace.json"
+printf 'not json' >"$FIXTURE/badmanifest/.claude/.claude-plugin/marketplace.json"
 
 assert allow "my-plugins plugin approved"     "$AP" "$(skill_json 'goodplugin:some-skill')"  HOME="$FIXTURE"
 assert allow "legacy plugins/ approved"       "$AP" "$(skill_json 'legacyplugin:some-skill')" HOME="$FIXTURE"
 assert none  "cache-only plugin -> prompt"    "$AP" "$(skill_json 'cachedplugin:some-skill')" HOME="$FIXTURE"
 assert none  "marketplace-only -> prompt"     "$AP" "$(skill_json 'marketonly:some-skill')"  HOME="$FIXTURE"
+assert allow "listed in own marketplace.json" "$AP" "$(skill_json 'listedplugin:some-skill')" HOME="$FIXTURE"
+assert none  "malformed manifest -> prompt"   "$AP" "$(skill_json 'listedplugin:some-skill')" HOME="$FIXTURE/badmanifest"
 assert none  "traversal name rejected"        "$AP" "$(skill_json '../evil:some-skill')"     HOME="$FIXTURE"
 assert none  "absolute-path name rejected"    "$AP" "$(skill_json '/tmp:some-skill')"        HOME="$FIXTURE"
 assert none  "empty plugin name rejected"     "$AP" "$(skill_json ':some-skill')"            HOME="$FIXTURE"

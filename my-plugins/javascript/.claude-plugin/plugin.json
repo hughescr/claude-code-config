@@ -1,6 +1,5 @@
 {
   "name": "javascript",
-  "version": "1.0.0",
   "description": "JavaScript/Node.js development tools - npm packages and Bun runtime",
   "mcpServers": "./.mcp.json"
 }

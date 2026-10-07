@@ -1,3 +1,0 @@
-[submodule "skills/model-selection"]
-	path = skills/model-selection
-	url = git@github.com:hughescr/model-selection.git

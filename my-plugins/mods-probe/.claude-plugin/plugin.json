@@ -1,6 +1,5 @@
 {
   "name": "mods-probe",
-  "version": "1.0.0",
   "description": "Flag probe: on session start, shows a notice and logs a line to ~/.claude/mods-flag.log, proving hooks modules are ON in this process",
   "author": {
     "name": "hughescr"

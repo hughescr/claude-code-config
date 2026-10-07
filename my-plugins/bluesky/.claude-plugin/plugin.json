@@ -1,0 +1,5 @@
+{
+  "name": "bluesky",
+  "description": "Read public Bluesky posts and profiles; preview and explicitly confirm posts and deletions.",
+  "author": { "name": "Craig R. Hughes" }
+}

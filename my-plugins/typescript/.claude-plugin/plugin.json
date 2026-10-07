@@ -1,5 +1,4 @@
 {
   "name": "typescript",
-  "version": "1.0.0",
   "description": "TypeScript-specific development tools - type checking, strict mode, and TSDoc"
 }

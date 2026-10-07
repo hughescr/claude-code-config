@@ -1,4 +1,7 @@
 .encryption_key
+# Secrets must never reach this public repo
+/.env
+/creds.json
 /config
 count_tokens.js
 leaderboard.json
@@ -41,7 +44,9 @@ daemon.status.json
 /teams/
 .last-update-result.json
 plugins/plugin-catalog-cache.json
+/plugins/plugin-directory-cache-v2.json
 __pycache__/
+node_modules/
 /plugins/.last_inuse_sweep
 gh-pr-status-cache.json
 

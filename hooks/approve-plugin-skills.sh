@@ -53,11 +53,15 @@ fi
 # 1. Post-migration home: ~/.claude/my-plugins/<plugin_name>/
 # 2. Transitional legacy location: ~/.claude/plugins/<plugin_name>/
 #    (direct subdirectories only, excluding infrastructure dirs)
+# 3. A plugin listed by name in Craig's own marketplace manifest
+#    (~/.claude/.claude-plugin/marketplace.json), for plugins it installs from
+#    another repo, such as model-selection from hughescr/model-selection.
 # Marketplace/cache dirs (~/.claude/plugins/cache, ~/.claude/plugins/
 # marketplaces) are NOT approval evidence — a skill whose plugin exists
 # only there falls through to a normal permission prompt.
 
 found=false
+marketplace="$HOME/.claude/.claude-plugin/marketplace.json"
 
 if [ -d "$HOME/.claude/my-plugins/$plugin_name" ]; then
   found=true
@@ -66,6 +70,11 @@ elif [ -d "$HOME/.claude/plugins/$plugin_name" ]; then
     cache|marketplaces|repos|data) : ;; # infrastructure dirs, not plugins
     *) found=true ;;
   esac
+fi
+
+if [ "$found" = false ] && [ -f "$marketplace" ] &&
+  jq -e --arg n "$plugin_name" 'any(.plugins[]?; .name == $n)' "$marketplace" >/dev/null 2>&1; then
+  found=true
 fi
 
 if [ "$found" = true ]; then

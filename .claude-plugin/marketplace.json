@@ -5,10 +5,27 @@
     "url": "https://github.com/hughescr"
   },
   "metadata": {
-    "description": "Craig Hughes' Claude Code plugins: language tooling, dev workflows, and 3D-print mesh prep",
-    "version": "1.0.0"
+    "description": "Craig Hughes' Claude Code plugins: core instructions and agent routes, model selection, Bluesky, language tooling, dev workflows, and 3D-print mesh prep"
   },
   "plugins": [
+    {
+      "name": "craig-core",
+      "source": "./my-plugins/craig-core",
+      "description": "Craig's global instructions (injected at session and sub-agent start), Claude route agents (craig-core:<route>), and the review-changes, plan-review and my-writing-style skills"
+    },
+    {
+      "name": "model-selection",
+      "source": {
+        "source": "github",
+        "repo": "hughescr/model-selection"
+      },
+      "description": "Compare language models on Artificial Analysis benchmarks, price, speed, and task fit; holds the facts behind the agent routes"
+    },
+    {
+      "name": "bluesky",
+      "source": "./my-plugins/bluesky",
+      "description": "Read Bluesky posts, threads, profiles and search; draft in Craig's voice and post or delete as @craig.rungie.com only after a preview and explicit confirmation"
+    },
     {
       "name": "resin-print-prep",
       "source": "./my-plugins/resin-print-prep",
