@@ -2,7 +2,7 @@
 name: browsing-bluesky
 description: Browse Bluesky content via API and firehose - search posts, fetch user activity, sample trending topics, read feeds and lists, analyze and categorize accounts. Supports authenticated access for personalized feeds. Use for Bluesky research, user monitoring, trend analysis, feed reading, firehose sampling, account categorization.
 metadata:
-  version: 0.5.1
+  version: 0.6.0
 ---
 
 # Browsing Bluesky
@@ -185,61 +185,25 @@ likes = get_likes("at://did:plc:.../app.bsky.feed.post/...")
 ### Read Embed Images
 
 Every parsed post carries an `images` field — a list of
-`{alt, url, transcription}` dicts, one per embed image. The legacy
-`image_alts: list[str]` field is preserved (non-empty alts only).
+`{alt, url}` dicts, one per embed image (`alt` is empty when the author wrote
+none). The legacy `image_alts: list[str]` field is preserved (non-empty alts
+only).
 
-When alt text is *missing* and the image content matters, opt in to model
-transcription via the `transcribe` parameter on any post-fetch function
-(`get_user_posts`, `search_posts`, `get_feed_posts`, `get_thread`,
-`get_quotes`):
+When images lack alt text and their content matters, read them with a haiku
+agent. Do it as one batch, not one round trip per image:
 
-```python
-# Routine/bulk work (zeitgeist, inbox review, news scans) —
-# gemini-2.5-flash-lite is the recommended default. Cheapest production
-# model anywhere ($0.10/$0.40 per 1M tokens), ~95% accuracy on dense
-# screenshots in May 2026 benchmarks:
-posts = get_user_posts("ayourtch.bsky.social", limit=40, transcribe="gemini-lite")
+1. Collect every `url` from `images` entries whose `alt` is empty, across all
+   the posts you fetched.
+2. Download them all in a single step into the session scratchpad (for
+   example one `curl` with `--parallel`, or one script loop). Name the files
+   by index so you can map them back to posts.
+3. Spawn ONE `haiku-xhigh` agent (Agent tool, `subagent_type: "haiku-xhigh"`)
+   and give it the list of file paths. Ask it to Read each image and return,
+   per path, the text in the image verbatim plus a one-line description.
+4. Map the results back to the posts by file path.
 
-# Token-perfect transcription, still cheap:
-posts = get_user_posts(..., transcribe="gemini-flash")
-
-# Frontier model with thinking_level=minimal — for cases where the image
-# content needs reasoning, not just transcription:
-posts = get_user_posts(..., transcribe="gemini-3.5-flash")
-
-# Anthropic single-vendor option (Haiku 5.5; transcription quality not yet
-# measured against Gemini):
-posts = get_user_posts(..., transcribe="haiku")
-
-# Interactive sessions where image is part of the active task and you want
-# conversation context to inform interpretation (only available on Anthropic):
-thread = get_thread(post_url, transcribe="opus")
-
-# Default (no transcription) — current behavior preserved:
-posts = get_user_posts("ayourtch.bsky.social", limit=40)
-```
-
-Policy is invariant across all callers: images with non-empty alt text are
-never transcribed (the author already described the image; trust it).
-Only images with missing or empty alt are sent to the model. Network or
-API failures leave `transcription` as `None`; callers degrade silently.
-
-**Cost/quality empirics** (May 2026, n=3 dense terminal screenshots, single
-run each — sample size is small, treat as directional):
-
-| Alias | Latency | $/image | Chord-token recall |
-|---|---|---|---|
-| `gemini-lite` | ~8s | ~$0.001 | 95% |
-| `gemini-flash` | ~10s | ~$0.003 | 100% |
-| `gemini-3.5-flash` | ~10s | ~$0.014 | 100% |
-
-The `haiku` (Haiku 5.5) and `opus` (Opus 5.5) aliases are not yet measured.
-
-Requires either `ANTHROPIC_API_KEY` (or `API_KEY` in `/mnt/project/claude.env`)
-for the `haiku` / `opus` aliases, or CF AI Gateway credentials in
-`/mnt/project/proxy.env` for the `gemini-*` aliases. Transcription only
-fires when the parameter is set, so callers without the relevant
-credentials can simply pick a different alias or leave the feature off.
+Images the author already alt-texted are trusted as-is. Do not send them to
+the agent.
 
 ### Explore Social Graph
 
@@ -281,7 +245,7 @@ All API functions return structured dicts with:
 - `author_name`: Display name
 - `likes`, `reposts`, `replies`: Engagement counts
 - `links`: Full URLs extracted from post facets (post text truncates URLs with "...")
-- `images`: one `{alt, url, transcription}` dict per embedded image (see Read Embed Images)
+- `images`: one `{alt, url}` dict per embedded image (see Read Embed Images)
 - `image_alts`: non-empty alt texts only (legacy)
 - `url`: Direct link to post on bsky.app
 

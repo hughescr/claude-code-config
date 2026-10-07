@@ -14,20 +14,6 @@ from pathlib import Path
 BASE = "https://api.bsky.app/xrpc"  # Public AppView for unauthenticated reads
 PDS_BASE = "https://bsky.social/xrpc"  # PDS for authenticated requests
 
-# Recognized values for the `transcribe` parameter on public read functions.
-# Default None disables transcription entirely. When set, see image_transcribe.py
-# for cost/quality empirics; the short version (as of May 2026):
-#   'gemini-lite'      — cheapest, fastest, ~95% accuracy. Best Pareto for routines.
-#   'gemini-flash'     — token-perfect, ~3x cost of lite.
-#   'gemini-3.5-flash' — frontier capability, ~19x cost of lite.
-#   'haiku'            — Anthropic single-vendor option (Haiku 5.5, not yet measured).
-#   'opus'             — Anthropic (Opus 5.5, not yet measured), for interactive use where
-#                        conversation context matters.
-_TRANSCRIBE_ALIASES = {
-    "haiku", "opus",
-    "gemini-lite", "gemini-flash", "gemini-3.5-flash",
-}
-
 # Module-level session cache (memory only, never persisted)
 _session_cache: Dict[str, Any] = {}
 
@@ -209,22 +195,16 @@ def get_profile(handle: str) -> Dict[str, Any]:
 def get_user_posts(
     handle: str,
     limit: int = 20,
-    transcribe: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Get recent posts from a user.
 
     Args:
         handle: Bluesky handle (with or without @)
         limit: Max posts to return (default 20, max 100)
-        transcribe: If set, transcribe images that have no alt text via
-            the named model. One of 'gemini-lite' (default routine choice —
-            cheapest, ~95% accuracy), 'gemini-flash' (token-perfect, cheap),
-            'gemini-3.5-flash' (frontier, premium cost), 'haiku' (Anthropic
-            single-vendor), or 'opus' (Anthropic, interactive). Default None
-            disables transcription. See image_transcribe.py for empirics.
 
     Returns:
-        List of post dicts
+        List of post dicts; each has `images`, a list of `{alt, url}` dicts
+        (`alt` is empty when the author wrote none).
     """
     handle = handle.lstrip("@")
     base, headers = _get_base_and_headers()
@@ -234,8 +214,7 @@ def get_user_posts(
         headers=headers
     )
     r.raise_for_status()
-    posts = [_parse_post(item["post"]) for item in r.json().get("feed", [])]
-    return _maybe_transcribe_posts(posts, transcribe)
+    return [_parse_post(item["post"]) for item in r.json().get("feed", [])]
 
 
 # @lat: [[bluesky#API Surface]]
@@ -246,7 +225,6 @@ def search_posts(
     until: Optional[str] = None,
     lang: Optional[str] = None,
     limit: int = 25,
-    transcribe: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Search posts with advanced filters.
 
@@ -259,7 +237,6 @@ def search_posts(
         until: End date YYYY-MM-DD (optional)
         lang: Language code like 'en' (optional)
         limit: Max results (default 25, max 100)
-        transcribe: 'haiku' | 'opus' | None — see get_user_posts.
 
     Returns:
         List of post dicts
@@ -281,14 +258,12 @@ def search_posts(
         headers=headers
     )
     r.raise_for_status()
-    posts = [_parse_post(p) for p in r.json().get("posts", [])]
-    return _maybe_transcribe_posts(posts, transcribe)
+    return [_parse_post(p) for p in r.json().get("posts", [])]
 
 
 def get_feed_posts(
     feed_uri: str,
     limit: int = 20,
-    transcribe: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Get posts from a feed or list.
 
@@ -300,7 +275,6 @@ def get_feed_posts(
     Args:
         feed_uri: Feed/list URL or AT-URI
         limit: Max posts (default 20, max 100)
-        transcribe: 'haiku' | 'opus' | None — see get_user_posts.
 
     Returns:
         List of post dicts
@@ -329,8 +303,7 @@ def get_feed_posts(
         )
 
     r.raise_for_status()
-    posts = [_parse_post(item["post"]) for item in r.json().get("feed", [])]
-    return _maybe_transcribe_posts(posts, transcribe)
+    return [_parse_post(item["post"]) for item in r.json().get("feed", [])]
 
 
 def get_trending(limit: int = 10) -> List[Dict[str, Any]]:
@@ -443,7 +416,6 @@ def get_thread(
     post_uri_or_url: str,
     depth: int = 6,
     parent_height: int = 80,
-    transcribe: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Get a post with its full thread context (parents and replies).
 
@@ -451,8 +423,6 @@ def get_thread(
         post_uri_or_url: AT-URI or bsky.app URL to a post
         depth: How many levels of replies to fetch (default 6, max 1000)
         parent_height: How many parent posts to fetch (default 80, max 1000)
-        transcribe: 'haiku' | 'opus' | None — applied to every post in the
-            thread (target, parents, replies). See get_user_posts for policy.
 
     Returns:
         Dict with 'post' (the target), 'parent' chain, and 'replies' tree
@@ -464,21 +434,18 @@ def get_thread(
         "parentHeight": min(parent_height, 1000)
     })
     r.raise_for_status()
-    parsed = _parse_thread(r.json().get("thread", {}))
-    return _maybe_transcribe_thread(parsed, transcribe)
+    return _parse_thread(r.json().get("thread", {}))
 
 
 def get_quotes(
     post_uri_or_url: str,
     limit: int = 25,
-    transcribe: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Get posts that quote a specific post.
 
     Args:
         post_uri_or_url: AT-URI or bsky.app URL to the quoted post
         limit: Max results (default 25, max 100)
-        transcribe: 'haiku' | 'opus' | None — see get_user_posts.
 
     Returns:
         List of quote post dicts
@@ -489,8 +456,7 @@ def get_quotes(
         "limit": min(limit, 100)
     })
     r.raise_for_status()
-    posts = [_parse_post(p) for p in r.json().get("posts", [])]
-    return _maybe_transcribe_posts(posts, transcribe)
+    return [_parse_post(p) for p in r.json().get("posts", [])]
 
 
 def get_likes(post_uri_or_url: str, limit: int = 50) -> List[Dict[str, Any]]:
@@ -919,9 +885,8 @@ def _parse_post(post: Dict) -> Dict[str, Any]:
         view_img = view_images[i] if i < len(view_images) else {}
         images.append({
             "alt": rec_img.get("alt", "") or "",
-            # Prefer fullsize for transcription; thumb is a fallback only.
+            # Prefer fullsize; thumb is a fallback only.
             "url": view_img.get("fullsize") or view_img.get("thumb") or "",
-            "transcription": None,
         })
 
     return {
@@ -938,84 +903,6 @@ def _parse_post(post: Dict) -> Dict[str, Any]:
         "images": images,
         "url": f"https://bsky.app/profile/{author.get('handle')}/post/{uri_parts[-1]}" if uri_parts else None,
     }
-
-
-def _maybe_transcribe_posts(
-    posts: List[Dict[str, Any]],
-    transcribe: Optional[str],
-) -> List[Dict[str, Any]]:
-    """Fill in `transcription` for images that have no alt text.
-
-    Policy (matches the documented contract on every public function that
-    accepts the `transcribe` parameter):
-      - transcribe is None: no-op. Returns posts unchanged.
-      - transcribe is 'haiku' or 'opus': for each post, for each image whose
-        alt is empty AND whose url is non-empty, fetch + transcribe via
-        image_transcribe.transcribe_image(url, model_alias=transcribe).
-        Images that already have alt text are left untouched (the alt IS the
-        signal; transcribing again would just spend tokens to maybe disagree).
-
-    Mutates the post dicts in place and also returns the list for chaining.
-    Failures (network, API errors) leave `transcription` as None — callers
-    that need to distinguish "no alt, never tried" from "tried, failed" can
-    use `image['url']` truthiness combined with `transcription is None`.
-    """
-    if transcribe is None:
-        return posts
-    if transcribe not in _TRANSCRIBE_ALIASES:
-        raise ValueError(
-            f"transcribe must be one of {sorted(_TRANSCRIBE_ALIASES)!r} or None; "
-            f"got {transcribe!r}"
-        )
-
-    # Local import to keep `bsky.py` usable in environments where Anthropic
-    # credentials or the anthropic library aren't available. The import only
-    # fires when transcription is actually requested.
-    try:
-        from image_transcribe import transcribe_image
-    except ImportError:
-        import sys
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from image_transcribe import transcribe_image
-
-    for post in posts:
-        for img in post.get("images", []):
-            if img.get("alt"):
-                continue  # Alt present — author told us; trust it.
-            url = img.get("url")
-            if not url:
-                continue  # No URL (e.g. quote-only embed); nothing to transcribe.
-            img["transcription"] = transcribe_image(url, model_alias=transcribe)
-
-    return posts
-
-
-def _maybe_transcribe_thread(
-    thread_result: Dict[str, Any],
-    transcribe: Optional[str],
-) -> Dict[str, Any]:
-    """Walk a parsed thread and transcribe images on every post within it.
-
-    Threads recurse through `post`, `parent`, and `replies[]`. We flatten the
-    posts into a list, run _maybe_transcribe_posts once (mutates in place),
-    and return the original thread dict.
-    """
-    if transcribe is None:
-        return thread_result
-
-    flat: List[Dict[str, Any]] = []
-
-    def _collect(node: Dict[str, Any]) -> None:
-        if "post" in node:
-            flat.append(node["post"])
-        if "parent" in node:
-            _collect(node["parent"])
-        for reply in node.get("replies", []) or []:
-            _collect(reply)
-
-    _collect(thread_result)
-    _maybe_transcribe_posts(flat, transcribe)
-    return thread_result
 
 
 def _url_to_aturi(url: str) -> str:
