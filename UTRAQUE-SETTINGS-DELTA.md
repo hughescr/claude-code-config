@@ -61,16 +61,14 @@ function hf(){ if (te._CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL) return true;
 ```
 
 `hf()` feeds the predicate that returns the 1M window. The client's built-in model table
-does record the truth — `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` and
-`claude-fable-5-1` all carry `context:{window:1e6, native_1m:true}` (as do the 5.0 and
-Mythos entries), while the 4.x Haiku, Sonnet and early Opus entries stay at 200000 — but
-with a non-Anthropic host in `ANTHROPIC_BASE_URL` that predicate returns false and every
-Claude model falls through to the 200000 default.
+marks every current Claude model (haiku, sonnet, opus, fable) as native 1M, but with a
+non-Anthropic host in `ANTHROPIC_BASE_URL` that predicate returns false and all of them
+fall through to the 200000 default unless the variable described below is set.
 
 The failure mode is worse than a smaller window. Once a session's live context is already
 past the clamp, auto-compact has to summarise a history larger than the limit it is
 compacting to. That request fails, the context never shrinks, and compaction re-fires
-immediately — forever. Observed in practice on Opus 5.
+immediately — forever. Observed in practice on Opus.
 
 Setting this variable restores native window detection from the model table. It is safe
 because it only tells the client to treat the configured base URL as first-party, which
