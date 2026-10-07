@@ -20,8 +20,9 @@ PDS_BASE = "https://bsky.social/xrpc"  # PDS for authenticated requests
 #   'gemini-lite'      — cheapest, fastest, ~95% accuracy. Best Pareto for routines.
 #   'gemini-flash'     — token-perfect, ~3x cost of lite.
 #   'gemini-3.5-flash' — frontier capability, ~19x cost of lite.
-#   'haiku'            — Anthropic single-vendor option, weak prompt-following.
-#   'opus'             — Anthropic, for interactive use where conversation context matters.
+#   'haiku'            — Anthropic single-vendor option (Haiku 5.5, not yet measured).
+#   'opus'             — Anthropic (Opus 5.5, not yet measured), for interactive use where
+#                        conversation context matters.
 _TRANSCRIBE_ALIASES = {
     "haiku", "opus",
     "gemini-lite", "gemini-flash", "gemini-3.5-flash",

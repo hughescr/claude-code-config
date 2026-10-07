@@ -207,9 +207,8 @@ posts = get_user_posts(..., transcribe="gemini-flash")
 # content needs reasoning, not just transcription:
 posts = get_user_posts(..., transcribe="gemini-3.5-flash")
 
-# Anthropic single-vendor option (note: empirically weaker prompt-following
-# than Gemini on dense transcription — Haiku tends to summarize rather
-# than transcribe):
+# Anthropic single-vendor option (Haiku 5.5; transcription quality not yet
+# measured against Gemini):
 posts = get_user_posts(..., transcribe="haiku")
 
 # Interactive sessions where image is part of the active task and you want
@@ -233,8 +232,8 @@ run each — sample size is small, treat as directional):
 | `gemini-lite` | ~8s | ~$0.001 | 95% |
 | `gemini-flash` | ~10s | ~$0.003 | 100% |
 | `gemini-3.5-flash` | ~10s | ~$0.014 | 100% |
-| `haiku` | ~7s | ~$0.008 | 18% (summarizes) |
-| `opus` | ~20s | ~$0.12 | 91% |
+
+The `haiku` (Haiku 5.5) and `opus` (Opus 5.5) aliases are not yet measured.
 
 Requires either `ANTHROPIC_API_KEY` (or `API_KEY` in `/mnt/project/claude.env`)
 for the `haiku` / `opus` aliases, or CF AI Gateway credentials in

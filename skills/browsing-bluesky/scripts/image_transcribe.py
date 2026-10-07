@@ -13,8 +13,8 @@ dense terminal screenshots (May 2026, n=3 images, single run each):
     'gemini-lite'         ~8s   ~$0.001   95%                  best Pareto for routine
     'gemini-flash'       ~10s   ~$0.003   100%                 token-perfect, still cheap
     'gemini-3.5-flash'   ~10s   ~$0.014   100%                 frontier, premium cost
-    'haiku'               ~7s   ~$0.008   18%                  weak prompt-following: summarizes
-    'opus'               ~20s   ~$0.12    91%                  use for interactive only
+
+'haiku' (Haiku 5.5) and 'opus' (Opus 5.5) are not yet measured.
 
 Pick `'gemini-lite'` for routine work, `'gemini-flash'` if you need
 token-perfect transcription cheaply, `'gemini-3.5-flash'` if you need
@@ -40,8 +40,8 @@ _GEMINI_CLIENT_PATH = "/mnt/skills/user/invoking-gemini/scripts"
 # routing path (Anthropic Messages API vs. Gemini via Cloudflare AI Gateway).
 _MODEL_REGISTRY = {
     # Anthropic
-    "haiku": ("anthropic", "claude-haiku-4-5-20251001"),
-    "opus":  ("anthropic", "claude-opus-5"),
+    "haiku": ("anthropic", "claude-haiku-5-5"),
+    "opus":  ("anthropic", "claude-opus-5-5"),
     # Gemini — recommended order: lite for routine, flash for token-perfect,
     # 3.5-flash for premium reasoning alongside transcription.
     "gemini-lite":       ("gemini", "gemini-2.5-flash-lite"),

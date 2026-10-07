@@ -61,8 +61,9 @@ function hf(){ if (te._CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL) return true;
 ```
 
 `hf()` feeds the predicate that returns the 1M window. The client's built-in model table
-does record the truth — `claude-opus-5`, `claude-fable-5` and `claude-sonnet-5` all carry
-`context:{window:1e6, native_1m:true}`, and `claude-haiku-4-5` correctly does not — but
+does record the truth — `claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5` and
+`claude-fable-5-1` all carry `context:{window:1e6, native_1m:true}` (as do the 5.0 and
+Mythos entries), while the 4.x Haiku, Sonnet and early Opus entries stay at 200000 — but
 with a non-Anthropic host in `ANTHROPIC_BASE_URL` that predicate returns false and every
 Claude model falls through to the 200000 default.
 
