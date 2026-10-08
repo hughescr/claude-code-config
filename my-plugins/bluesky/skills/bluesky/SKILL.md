@@ -1,7 +1,7 @@
 ---
 name: bluesky
 description: Read Bluesky posts, threads, profiles, feeds, and search results, and post, reply, quote, thread, or delete as Craig (@craig.rungie.com) with a preview and Craig's explicit approval. Use when Craig shares a bsky.app URL, an at:// URI, a Bluesky handle or DID, or asks to read, summarise, search, post, reply, quote, skeet, or thread on Bluesky. Covers per-surface credential setup, image alt text, and posting etiquette.
-compatibility: Reading works on any surface with a shell (node or bun) or web fetch. Posting needs node or bun plus a Bluesky app password, so claude.ai chat is read-only.
+compatibility: Reading works on any surface with a shell (node or bun) or web fetch. Posting needs node or bun plus a Bluesky app password, so the Claude app is read-only.
 ---
 
 # Bluesky: read, and post as Craig
@@ -18,8 +18,7 @@ Check what exists first: `command -v node bun`.
 |---|---|---|
 | CLI, Desktop Code tab (local Mac) | tool | tool; the password comes from `op` automatically |
 | Cloud session (claude.ai/code) | tool | tool, after `BSKY_APP_PASSWORD` is set on the environment |
-| Cowork | tool if node or bun exists, else web fetch | not supported yet; see [credentials](references/credentials.md) for fallbacks |
-| claude.ai chat, phone | web fetch | none. Draft the text and alt text, and Craig posts it in the app |
+| Claude app (desktop, web, phone) | tool if node or bun exists, else web fetch | none. Draft the text and alt text, and Craig posts it from Claude Code or the Bluesky app |
 
 Credential setup for each surface is in [references/credentials.md](references/credentials.md). Read it when a write command fails on credentials, or when Craig asks how to set up posting somewhere.
 
@@ -57,7 +56,7 @@ Images the author alt-texted are trusted as-is. For images with empty alt text w
 3. Spawn one `craig-core:haiku-xhigh` agent with the list of file paths. Ask it to Read each image and return, per path, any text in the image verbatim plus a one-line description.
 4. Map the results back to the posts by path.
 
-Where the Agent tool or that agent type doesn't exist, Read the images yourself, still in one batch. Where you can't view images at all (chat), tell Craig which images have no alt text.
+Where the Agent tool or that agent type doesn't exist, Read the images yourself, still in one batch. Where you can't view images at all (Claude app), tell Craig which images have no alt text.
 
 For a video that matters, ffmpeg can pull a few frames from the playlist URL. Treat the frames as images.
 

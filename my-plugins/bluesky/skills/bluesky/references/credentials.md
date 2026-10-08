@@ -33,21 +33,11 @@ There is no `op` here, so use an environment variable. Node 22 and bun are alrea
 4. Don't use a network secret. Those are attached to request headers, but Bluesky login sends the password in the JSON body.
 5. If the environment restricts network access, allow `bsky.social`, `*.host.bsky.network` (Craig's PDS), `public.api.bsky.app`, `api.bsky.app`, and `cdn.bsky.app`.
 
-Repo `settings.json` plugins are not installed in cloud sessions. To get this plugin there, the environment's setup script (Bash, runs as root before Claude starts, must exit 0) can try the commands below. Both steps are untested on cloud sessions: whether `claude` is on PATH during setup, whether github.com is reachable, and whether the installed plugin then loads.
+This plugin reaches cloud sessions through Craig's claude.ai account (marketplace `hughescr/claude-code-config`, synced), so no setup script is needed.
 
-```sh
-claude plugin marketplace add hughescr/claude-code-config || true
-claude plugin install bluesky@craigs-claude-plugins || true
-```
+## Claude app (desktop, web, phone)
 
-## Cowork
+Chat and Cowork are one Claude app, running in an Anthropic cloud workspace. It loads this plugin's skills, but there is no supported way to give it `BSKY_APP_PASSWORD`: it has no environment variables, and plugin settings are not prompted. It also cannot reach the Mac's `op`. So the skill is read-only here.
 
-No documented way exists to give Cowork sessions an environment variable or secret. Cowork also doesn't prompt for plugin settings. Its sandbox can't reach the Mac's `op`. Whether node or bun exists there is unknown, so check with `command -v node bun`.
-
-Posting from Cowork is unsupported for now. Fallbacks, best first:
-1. Draft the post and its alt text, and Craig posts it from the app, or from a local CLI session.
-2. Craig pastes an app password into the session for one use. It then sits in the transcript, so he should revoke that app password afterwards.
-
-## claude.ai chat and phone
-
-There is no shell, so there is no posting. Read with web fetch (see [public-xrpc.md](public-xrpc.md)). Give Craig the final text and alt text to paste into the app.
+- **Read:** use the tool if `node` or `bun` is available (`command -v node bun`). Otherwise, use public XRPC web fetches (see [public-xrpc.md](public-xrpc.md)).
+- **Post:** don't try. Draft the post and its alt text, and hand them to Craig to post from Claude Code or the Bluesky app.

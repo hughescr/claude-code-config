@@ -83,12 +83,13 @@ are never logged or stored; no credential file or session cache is used.
   Use a private environment: others using the environment can read its values.
   Network secrets inject headers, not the JSON password required by createSession.
   Allow public.api.bsky.app and api.bsky.app for reads and bsky.social plus the account's PDS for
-  authentication/writes. Verify installed plugin delivery in the chosen environment.
-- **Cowork:** arbitrary env vars and Node/Bun/op availability are unverified;
-  do not assume the host's op is accessible. Use a supported connector or a
-  documented secret mechanism in a runtime you have verified. Never rely on
-  plugin userConfig prompting or untested plugin hooks for credentials.
-- **Chat/phone without a runtime:** read-only via public endpoints; no CLI writes.
+  authentication/writes. The plugin arrives via Craig's claude.ai account sync.
+- **Claude app (desktop, web, phone):** chat and Cowork are one app, running in an
+  Anthropic cloud workspace. It cannot be given `BSKY_APP_PASSWORD` (no environment
+  variables; plugin settings are not prompted) and cannot reach the Mac's `op`, so it
+  is read-only. Read with the tool if `node` or `bun` is available
+  (`command -v node bun`), else with public endpoints. Posting means drafting the text
+  and alt text for Craig to post from Claude Code or the Bluesky app.
 
 Restricted runtimes may require proxy configuration. Here direct Node fetch
 was blocked by the sandbox; `NODE_USE_ENV_PROXY=1 node ...` worked on Node 26.10.

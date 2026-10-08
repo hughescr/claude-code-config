@@ -1,6 +1,6 @@
 # Reading Bluesky without the tool
 
-Use these endpoints when there is no node or bun, for example in claude.ai chat. They are plain HTTPS GETs that return JSON and need no login.
+Use these endpoints when there is no node or bun, for example in the Claude app. They are plain HTTPS GETs that return JSON and need no login.
 
 ## Turn a URL into an at:// URI
 
@@ -37,6 +37,6 @@ For search, `public.api.bsky.app` returned 403 on 2026-10-07, while `https://api
   - `app.bsky.embed.video#view`: `playlist` (an HLS URL), `thumbnail`, and `alt`
 - **Facets.** `post.record.facets` hold the full link URLs. The text shows a shortened form such as `github.com/hughescr/utr...`, so read the real link from the facet.
 
-## Chat limits
+## Claude app limits
 
-In chat, the fetch tool may refuse a URL you built yourself and allow only URLs Craig gave or that came from search results. If it refuses, fetch the bsky.app URL Craig gave. Its preview metadata carries the post text and the first image. Otherwise ask Craig to paste the post.
+In the Claude app, the fetch tool may refuse a URL you built yourself and allow only URLs Craig gave or that came from search results. If it refuses, fetch the bsky.app URL Craig gave. Its preview metadata carries the post text and the first image. Otherwise ask Craig to paste the post.
