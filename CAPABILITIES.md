@@ -16,9 +16,9 @@ On the Mac, an installed plugin shadows the same-named `@synced` copy from claud
 | Feature | CLI | Desktop Code | Claude app | Cloud |
 |---|---|---|---|---|
 | Global instructions (common part) | yes, natively via the `CLAUDE.md` symlink | yes, natively | yes, via craig-core SessionStart hook | plugin hook, if the plugin is installed |
-| Main and sub-agent instructions | plugin hooks | plugin hooks | main: yes (SessionStart); sub-agent: untested (SubagentStart) | plugin hooks, if installed |
+| Main and sub-agent instructions | plugin hooks | plugin hooks; main and sub-agent verified | main: yes (SessionStart); sub-agent: untested (SubagentStart) | plugin hooks, if installed; sub-agent untested |
 | `craig-core:*` route agents | yes | yes | yes, all 11 | if installed |
-| `gpt-*` and `deepseek-*` routes | only with the utraque proxy (`claude-smart.sh` sets `ANTHROPIC_BASE_URL`) | only if `ANTHROPIC_BASE_URL` points at the proxy | no: Claude-only pairings | no: Claude-only pairings |
+| `gpt-*` and `deepseek-*` routes | only with the utraque proxy (`claude-smart.sh` sets `ANTHROPIC_BASE_URL`) | no: `ANTHROPIC_BASE_URL` is `https://api.anthropic.com`, no `gpt-*`/`deepseek-*` agent types | no: Claude-only pairings | no: Claude-only pairings |
 | my-writing-style | yes | yes | yes | if installed |
 | model-selection (facts and route evidence) | yes | yes | yes | if installed |
 | model-selection live Artificial Analysis queries | env var or `op` | env var or `op` | unverified (no documented secret mechanism) | `ARTIFICIAL_ANALYSIS_API_KEY` on the environment |
@@ -67,4 +67,5 @@ Tested 2026-10-07, with the marketplace `hughescr/claude-code-config` added on c
 
   Untested: whether `claude` is on PATH during setup, whether github.com is reachable, and whether the installed plugins then load.
 - [x] **Verify the CLI.** A fresh session shows the Orchestration and Route availability text, all 11 `craig-core:*` agents, and no duplicated instructions.
-- [ ] **Verify Desktop Code and cloud.** `/skills` lists `craig-core:*`, `model-selection:model-selection`, `bluesky:bluesky` and `bluesky:bluesky-voice`, with no `browsing-bluesky` and no unprefixed duplicates. Where agents exist, the agent list shows `craig-core:*`. In cloud, check that the session context contains the `<!-- craig-core: MAIN-CLAUDE.md -->` block, which shows the plugin hooks fired. The Claude app is checked (see above).
+- [x] **Verify Desktop Code.** Instructions load once (Orchestration, Route availability), with no duplicated blocks. All 11 `craig-core:*` agents are available, with no `gpt-*` or `deepseek-*` agent types; cross-family routes are unavailable there, so routing uses `craig-core:*` only. `craig-core:my-writing-style`, `bluesky:bluesky`, `bluesky:bluesky-voice` and `model-selection:model-selection` each load once, with no `anthropic-skills:` duplicates. SubagentStart is verified: a spawned `craig-core:haiku-low` ran on `claude-haiku-5-5` and received the sub-agent instructions.
+- [ ] **Verify cloud.** `/skills` lists `craig-core:*`, `model-selection:model-selection`, `bluesky:bluesky` and `bluesky:bluesky-voice`, with no `browsing-bluesky` and no unprefixed duplicates. Where agents exist, the agent list shows `craig-core:*`. Check that the session context contains the `<!-- craig-core: MAIN-CLAUDE.md -->` block, which shows the plugin hooks fired. Sub-agent injection is untested.
