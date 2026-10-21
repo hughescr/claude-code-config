@@ -14,6 +14,7 @@ ide
 migration_v2_complete
 history.jsonl
 /debug/
+/feedback/
 /file-history/
 .claude/
 /plans/
