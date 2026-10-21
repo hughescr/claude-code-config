@@ -53,7 +53,7 @@ Images the author alt-texted are trusted as-is. For images with empty alt text w
 
 1. Collect every such image URL across all the posts you fetched.
 2. Download them in one step into the scratchpad, named by index so you can map them back. One `curl --parallel` or one loop works.
-3. Spawn one `craig-core:haiku-xhigh` agent with the list of file paths. Ask it to Read each image and return, per path, any text in the image verbatim plus a one-line description.
+3. Spawn one `craig-core:haiku` agent with `effort: "xhigh"` and the list of file paths. Ask it to Read each image and return, per path, any text in the image verbatim plus a one-line description.
 4. Map the results back to the posts by path.
 
 Where the Agent tool or that agent type doesn't exist, Read the images yourself, still in one batch. Where you can't view images at all (Claude app), tell Craig which images have no alt text.
@@ -112,7 +112,7 @@ Never retry a write blindly. A blind retry can post twice.
 ## Images and alt text
 
 - Every image needs alt text, and the tool enforces it. Craig almost never writes alt text himself, so you write it.
-- Write the alt text from the image itself: Read the file, or use the `craig-core:haiku-xhigh` batch above. Never write it from the filename or the post text.
+- Write the alt text from the image itself: Read the file, or use the `craig-core:haiku` batch above. Never write it from the filename or the post text.
 - Describe what a sighted reader gets from the image that matters to the post. Transcribe the text in screenshots verbatim. For a chart, give the axes, the trend, and the key numbers. Skip "image of".
 - Bluesky allows at most 4 images per post, and each image blob is capped at about 1 MB. Shrink larger files first, for example `magick in.png -resize '2000x2000>' -quality 85 out.jpg`.
 

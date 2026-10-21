@@ -1,6 +1,18 @@
 {
-  "description": "Inject Craig's instructions: CLAUDE.md (unless already loaded natively) plus MAIN-CLAUDE.md at session start, CLAUDE.md plus SUBAGENT-CLAUDE.md at sub-agent start. One command per part keeps each under the 10,000-character context cap.",
+  "description": "Inject Craig's instructions: CLAUDE.md (unless already loaded natively) plus MAIN-CLAUDE.md at session start, CLAUDE.md plus SUBAGENT-CLAUDE.md at sub-agent start. One command per part keeps each under the 10,000-character context cap. Before every Agent call, deny a route agent called without effort or with model.",
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/require-route-effort.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [

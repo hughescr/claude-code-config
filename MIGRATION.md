@@ -45,7 +45,7 @@
    - `claude plugin list` shows `craig-core`, `model-selection` and `bluesky` (`@craigs-claude-plugins`) enabled.
    - The session context has a `<!-- craig-core: MAIN-CLAUDE.md -->` block ending in a "Cross-family routes:" line,
      and no `<!-- craig-core: CLAUDE.md` block (the symlink loads it natively).
-   - An agent spawned as `craig-core:haiku-xhigh` receives the `<!-- craig-core: SUBAGENT-CLAUDE.md -->` block.
+   - An agent spawned as `craig-core:haiku` with `effort: "xhigh"` receives the `<!-- craig-core: SUBAGENT-CLAUDE.md -->` block.
    - `/skills` lists `craig-core:my-writing-style` and
      `model-selection:model-selection`, `bluesky:bluesky` and `bluesky:bluesky-voice`, and no unprefixed
      `model-selection` or `browsing-bluesky`.

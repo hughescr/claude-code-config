@@ -17,7 +17,8 @@ On the Mac, an installed plugin shadows the same-named `@synced` copy from claud
 |---|---|---|---|---|
 | Global instructions (common part) | yes, natively via the `CLAUDE.md` symlink | yes, natively | yes, via craig-core SessionStart hook | yes, via account sync (plugin hook) |
 | Main and sub-agent instructions | plugin hooks | plugin hooks; main and sub-agent verified | main: yes (SessionStart); sub-agent: untested (SubagentStart) | plugin hooks via account sync; main and sub-agent verified |
-| `craig-core:*` route agents | yes | yes | yes, all 11 | yes, via account sync |
+| `craig-core:*` route agents | yes | yes | yes, all | yes, via account sync |
+| Route effort hook (craig-core PreToolUse on Agent; needs `jq`) | untested | untested | untested | untested |
 | `gpt-*` and `deepseek-*` routes | only with the utraque proxy (`claude-smart.sh` sets `ANTHROPIC_BASE_URL`) | no: `ANTHROPIC_BASE_URL` is `https://api.anthropic.com`, no `gpt-*`/`deepseek-*` agent types | no: Claude-only pairings | no: proxy is on the Mac's `127.0.0.1`; Claude-only pairings |
 | my-writing-style | yes | yes | yes | yes |
 | model-selection (facts and route evidence) | yes | yes | yes | yes |
@@ -35,7 +36,7 @@ Where cross-family routes are unavailable, the Route availability rule in `CLAUD
 Tested 2026-10-07, with the marketplace `hughescr/claude-code-config` added on claude.ai with sync on:
 
 - Skills load: `craig-core:my-writing-style`, `bluesky:bluesky`, `bluesky:bluesky-voice`, `model-selection:model-selection`.
-- All 11 `craig-core:*` agents load.
+- All `craig-core:*` agents load.
 - The craig-core SessionStart hook fires and injects the instructions (Route availability, Orchestration).
 - Routing falls back to `craig-core:*` routes only.
 - Agents and hook context can arrive a moment after the session starts. If they are missing at first, check again.
@@ -50,9 +51,9 @@ Tested 2026-10-07, with the marketplace `hughescr/claude-code-config` added on c
 Tested 2026-10-07, with the marketplace synced to the account:
 
 - Account-synced plugins load. Instructions load once (Orchestration, Route availability).
-- All 11 `craig-core:*` agents are available.
+- All `craig-core:*` agents are available.
 - Skills load once each: `craig-core:my-writing-style`, `bluesky:bluesky`, `bluesky:bluesky-voice`, `model-selection:model-selection`.
-- SubagentStart verified: a spawned `craig-core:haiku-low` ran on `claude-haiku-5-5` and received `## Sub-agent house rules`.
+- SubagentStart verified: a spawned Haiku route agent ran on `claude-haiku-5-5` and received `## Sub-agent house rules`.
 - `ANTHROPIC_BASE_URL` is `https://api.anthropic.com` and no `gpt-*` or `deepseek-*` agent types exist, so routing is Claude-only (same-family checks).
 - GPT and DeepSeek routes cannot work in cloud sessions. The utraque proxy listens on the Mac's `127.0.0.1`, which a cloud VM cannot reach, and `ANTHROPIC_BASE_URL` must be set before Claude Code starts.
 
@@ -67,6 +68,6 @@ Tested 2026-10-07, with the marketplace synced to the account:
   - Mac: nothing to set; `op` reads the default item.
   - Cloud: the environment's **Environment variables** (not a network secret). Use a private environment. If network access is restricted, allow `bsky.social`, `*.host.bsky.network`, `public.api.bsky.app`, `api.bsky.app` and `cdn.bsky.app`.
   - Claude app: no supported mechanism yet. Read-only; posting stays manual.
-- [x] **Verify the CLI.** A fresh session shows the Orchestration and Route availability text, all 11 `craig-core:*` agents, and no duplicated instructions.
-- [x] **Verify Desktop Code.** Instructions load once (Orchestration, Route availability), with no duplicated blocks. All 11 `craig-core:*` agents are available, with no `gpt-*` or `deepseek-*` agent types; cross-family routes are unavailable there, so routing uses `craig-core:*` only. `craig-core:my-writing-style`, `bluesky:bluesky`, `bluesky:bluesky-voice` and `model-selection:model-selection` each load once, with no `anthropic-skills:` duplicates. SubagentStart is verified: a spawned `craig-core:haiku-low` ran on `claude-haiku-5-5` and received the sub-agent instructions.
+- [x] **Verify the CLI.** A fresh session shows the Orchestration and Route availability text, all `craig-core:*` agents, and no duplicated instructions.
+- [x] **Verify Desktop Code.** Instructions load once (Orchestration, Route availability), with no duplicated blocks. All `craig-core:*` agents are available, with no `gpt-*` or `deepseek-*` agent types; cross-family routes are unavailable there, so routing uses `craig-core:*` only. `craig-core:my-writing-style`, `bluesky:bluesky`, `bluesky:bluesky-voice` and `model-selection:model-selection` each load once, with no `anthropic-skills:` duplicates. SubagentStart is verified: a spawned Haiku route agent ran on `claude-haiku-5-5` and received the sub-agent instructions.
 - [x] **Verify cloud.** Results in the Cloud sessions section.

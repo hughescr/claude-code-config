@@ -46,7 +46,7 @@ printf '# somebody else\n' >"$FIX/home_other/.claude/CLAUDE.md"
 mkdir -p "$FIX/home_dangling/.claude"
 ln -s /nonexistent/COMMON-CLAUDE.md "$FIX/home_dangling/.claude/CLAUDE.md"
 mkdir -p "$FIX/home_proxy/.claude/agents"
-printf -- '---\nname: gpt-sol-high\n---\n' >"$FIX/home_proxy/.claude/agents/gpt-sol-high.md"
+printf -- '---\nname: gpt-sol\n---\n' >"$FIX/home_proxy/.claude/agents/gpt-sol.md"
 
 REPO_ROOT="$FIX/home_repo/.claude/my-plugins/craig-core"
 CACHE_ROOT="$FIX/home_cache/.claude/plugins/cache/craigs-claude-plugins/craig-core/0e5846f"
@@ -109,7 +109,7 @@ for s in /bin/sh dash ksh bash; do
 done
 
 IN_SESSION='{"session_id":"t","hook_event_name":"SessionStart","source":"startup","cwd":"/nowhere"}'
-IN_SUB='{"session_id":"t","hook_event_name":"SubagentStart","agent_type":"craig-core:haiku-xhigh","cwd":"/nowhere"}'
+IN_SUB='{"session_id":"t","hook_event_name":"SubagentStart","agent_type":"craig-core:haiku","cwd":"/nowhere"}'
 
 EXP_COMMON=$(printf '%s\n' "$COMMON_HDR"; cat "$INSTR/COMMON-CLAUDE.md")
 EXP_MAIN_NO=$(printf '%s\n' "<!-- craig-core: MAIN-CLAUDE.md -->"; cat "$INSTR/MAIN-CLAUDE.md"; printf '\n'; avail_no "ANTHROPIC_BASE_URL is not http://127.0.0.1:8317 and no gpt-*/deepseek-* agents are installed")
