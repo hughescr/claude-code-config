@@ -40,7 +40,7 @@ The script is POSIX `sh` with no `jq`, so it runs on macOS and the Linux cloud V
 
 ## Route effort enforcement
 
-Each route agent (`craig-core:opus|sonnet|haiku|fable` here; `gpt-sol`, `gpt-astra`, `gpt-luna`, `deepseek-flash`,
+Each route agent (`craig-core:opus|sonnet|haiku|fable` here; `gpt-sol`, `gpt-astra`, `gpt-luna`, `gpt-terra`, `deepseek-flash`,
 `deepseek-v4-pro` in `~/.claude/agents/`) pins its model and no effort, so the caller picks the effort from the
 CLAUDE.md routing table. An Agent call without `effort` would silently inherit the parent session's effort.
 `hooks/require-route-effort.sh` (PreToolUse, matcher `Agent`) denies a route-agent call that has no `effort` or that

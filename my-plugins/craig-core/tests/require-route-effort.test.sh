@@ -22,7 +22,7 @@ trap 'rm -rf "$FIX"' EXIT
 mkdir -p "$FIX/nojq"
 ln -s "$(command -v cat)" "$FIX/nojq/cat"
 
-ROUTES=(craig-core:opus craig-core:sonnet craig-core:haiku craig-core:fable gpt-sol gpt-astra gpt-luna deepseek-flash deepseek-v4-pro)
+ROUTES=(craig-core:opus craig-core:sonnet craig-core:haiku craig-core:fable gpt-sol gpt-astra gpt-luna gpt-terra deepseek-flash deepseek-v4-pro)
 
 # --- helpers -------------------------------------------------------------------
 # run SHELL STDIN [VAR=VAL ...]; sets OUT, ERR, RC

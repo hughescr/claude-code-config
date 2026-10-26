@@ -9,7 +9,7 @@ check the session's environment, not `settings.json`.
 
 | Variable | Value | Effect |
 |---|---|---|
-| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8317` | The on/off switch. Claude requests pass through untouched; Codex names (`gpt-*` and the bare aliases the route agents pin: `sol`, `astra`, `luna`) and `deepseek-*` names route to the Codex and DeepSeek legs. The route agents set no effort; the Agent call's `effort` reaches the proxy as `output_config.effort`. |
+| `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8317` | The on/off switch. Claude requests pass through untouched; Codex names (`gpt-*` and the bare aliases the route agents pin: `sol`, `astra`, `luna`, `terra`) and `deepseek-*` names route to the Codex and DeepSeek legs. The route agents set no effort; the Agent call's `effort` reaches the proxy as `output_config.effort`. |
 | `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` | `1` | Queries the gateway's `/v1/models` for the `/model` picker. Only tried when an API key or auth token is present; agent frontmatter routes work without it. |
 | `_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL` | `1` | Required; see below. |
 | `CLAUDE_CODE_MAX_CONTEXT_TOKENS` | `272000` | Context window for models whose name does not start with `claude-` (the Codex leg's real cap). Never affects Claude models. |

@@ -36,6 +36,7 @@ Every `Agent` call sets `subagent_type` to a named route agent and passes `effor
 | `craig-core:opus` @ `xhigh` | Escalation above `craig-core:opus` @ `high`, and the hardest Claude-side work. Never `max`. |
 | `craig-core:fable` @ `high`/`xhigh` | A second Claude view on hard judgment calls. Not an escalation step: when `craig-core:opus` @ `high` stalls, use `craig-core:opus` @ `xhigh`. |
 | `gpt-luna` @ `low`/`medium` | Cross-family cost peers of the Haiku routes; capability is below `craig-core:haiku` @ `xhigh`. Short inputs only. Never above `medium`. |
+| `gpt-terra` @ `medium`/`high` | Provisional cross-family peers of `craig-core:haiku` @ `xhigh` (at `medium`) and @ `max` (at `high`), for the same small bounded work. Keep prompts under 100k tokens until its long-context recall is measured. Never above `high`: `gpt-sol` @ `medium` is the better buy. |
 | `gpt-sol` @ `medium` | Normal substantive leaf work, co-default with `craig-core:sonnet` @ `high`. Also routine verification. |
 | `gpt-sol` @ `high`/`xhigh` | Multi-file leaf work, co-default with `craig-core:sonnet` @ `high`; the fallback when astra is unavailable. `gpt-sol` @ `high` is the routine cross-family challenger (pairing table below). Prefer `high` over `xhigh`. |
 | `gpt-astra` @ `medium`/`high`/`xhigh` | Consequential cross-family challenge (`craig-core:opus` @ `high` and above, design calls, security) and complex debugging; peers `craig-core:opus` @ `high` and `craig-core:fable`. For routine checks sol is the go-to; pull in astra when a problem is among the hardest, needs tenacity, or sol stalled on it. |
@@ -71,6 +72,7 @@ Cross-family proposers exist only where those routes are available:
 | `gpt-sol` @ `high`/`xhigh` | `craig-core:opus` @ `high` | `craig-core:opus` @ `xhigh` |
 | `gpt-sol` @ `medium` | `craig-core:opus` @ `medium` | `craig-core:opus` @ `high` |
 | `gpt-luna` | `craig-core:haiku` @ `xhigh` | `craig-core:sonnet` @ `high` |
+| `gpt-terra` | `craig-core:sonnet` @ `high` | `craig-core:opus` @ `medium` |
 | `deepseek-v4-pro` @ `high`, `deepseek-flash` @ `high` | `craig-core:opus` @ `high` | `gpt-sol` @ `high` |
 | `deepseek-*` @ `medium` | `craig-core:sonnet` @ `high` | `craig-core:opus` @ `medium` |
 | `deepseek-*` @ `low` | `craig-core:haiku` @ `xhigh` | `craig-core:sonnet` @ `high` |

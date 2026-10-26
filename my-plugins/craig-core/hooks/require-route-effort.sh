@@ -21,7 +21,7 @@ set -u
 LC_ALL=C
 export LC_ALL
 
-ROUTES='["craig-core:opus","craig-core:sonnet","craig-core:haiku","craig-core:fable","gpt-sol","gpt-astra","gpt-luna","deepseek-flash","deepseek-v4-pro"]'
+ROUTES='["craig-core:opus","craig-core:sonnet","craig-core:haiku","craig-core:fable","gpt-sol","gpt-astra","gpt-luna","gpt-terra","deepseek-flash","deepseek-v4-pro"]'
 
 input=$(cat 2>/dev/null || true)
 
