@@ -77,7 +77,7 @@ Cross-family proposers exist only where those routes are available:
 | `deepseek-*` @ `medium` | `craig-core:sonnet` @ `high` | `craig-core:opus` @ `medium` |
 | `deepseek-*` @ `low` | `craig-core:haiku` @ `xhigh` | `craig-core:sonnet` @ `high` |
 
-Security work (doing it or reviewing it) overrides these pairings: use `gpt-astra` (any listed effort). Claude-only, use `craig-core:opus` @ `high` (`xhigh` for the hardest), never Fable or Haiku, and report the check as same-family and possibly run on an older Opus. The model-selection skill's Security routing section gives the reasons.
+Security work (doing it or reviewing it) overrides these pairings: use `gpt-astra` (any listed effort). Claude-only, use `craig-core:opus` @ `high` (`xhigh` for the hardest), never Fable or Haiku, and report the check as same-family and possibly run on an older Opus. The model-selection skill's Security routing section gives the reasons. When both families refuse authorized security or sysadmin work, such as CA certificate work or scanning Craig's own network for insecure devices, fall back to `deepseek-flash` @ `high`, whose content filtering is less sensitive. Send it only what the task needs, never private keys or credentials, and report the work as unverified if every challenger also refuses.
 
 A cross-family disagreement is a finding to resolve, not a tie to split: escalate one rung and report both positions. If that rung is the same family as the proposer or challenger, break the tie on the third family instead (`deepseek-flash` @ `high` for Sonnet-tier work, `deepseek-v4-pro` @ `high` for Opus-tier) and report all three positions. Claude-only, escalate one rung in the Claude-only columns and report both positions.
 
