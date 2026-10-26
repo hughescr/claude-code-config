@@ -40,7 +40,7 @@ Every `Agent` call sets `subagent_type` to a named route agent and passes `effor
 | `gpt-sol` @ `medium` | Normal substantive leaf work, co-default with `craig-core:sonnet` @ `high`. Also routine verification. |
 | `gpt-sol` @ `high`/`xhigh` | Multi-file leaf work, co-default with `craig-core:sonnet` @ `high`; the fallback when astra is unavailable. `gpt-sol` @ `high` is the routine cross-family challenger (pairing table below). Prefer `high` over `xhigh`. |
 | `gpt-astra` @ `medium`/`high`/`xhigh` | Consequential cross-family challenge (`craig-core:opus` @ `high` and above, design calls, security) and complex debugging; peers `craig-core:opus` @ `high` and `craig-core:fable`. For routine checks sol is the go-to; pull in astra when a problem is among the hardest, needs tenacity, or sol stalled on it. |
-| `deepseek-flash` @ `low`/`medium`/`high` | The default DeepSeek route: third-family cost peers of the Haiku, `craig-core:sonnet` @ `medium`, and `craig-core:sonnet` @ `high` rows; capability is below `craig-core:haiku` @ `xhigh`. Never above `high`. |
+| `deepseek-flash` @ `low`/`medium`/`high` | The default DeepSeek route: third-family cost peers of the Haiku, `craig-core:sonnet` @ `medium`, and `craig-core:sonnet` @ `high` rows; capability at these efforts is unmeasured (AA measured only `max`). Never above `high`. |
 | `deepseek-v4-pro` @ `low`/`medium`/`high` | Third-family peers of `craig-core:sonnet` @ `medium`, `craig-core:opus` @ `medium`, and `craig-core:opus` @ `high`; only for a need the intelligence index does not measure. Never above `high`. |
 
 The `craig-core:haiku`/`craig-core:sonnet` @ `medium` split is by per-request prompt length: count the files the agent will read, not only the spawn prompt.
