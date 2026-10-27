@@ -9,7 +9,7 @@ The core voice is stable — "C" sign-off, dash-joined clauses, answer-first, dr
 
 ## Universal rules (all contexts)
 
-- **Brevity is the default.** If the answer fits in one line, one line is the whole email ("Available for all 3 of those times", "See you then!", "That cleared the issue - thanks!"). Never pad.
+- **Brevity is the default.** If the answer fits in one line, one line is the whole email ("Available for all 3 of those times", "See you then!", "That cleared the issue - thanks!"). Never pad. Brevity means fewer words because there is less to say, never compressed syntax — see *Write like a person, not a model* below.
 - **Sign-off: "C"** on its own line. Exceptions: formal letters ("Sincerely, Craig Rungaldier Hughes") and long family financial reports ("Best, Craig"). Never "Best regards" / "Warm regards" in ordinary mail.
 - **Greetings are minimal or absent.** Usually none, or just first name ("Travis - thanks; ..."), or "Hi -". "Hi <Name>," only for warm/cold-open messages.
 - **Answer first, then detail.** Direct response to the question in the first sentence; context after.
@@ -20,6 +20,23 @@ The core voice is stable — "C" sign-off, dash-joined clauses, answer-first, dr
 - **No corporate filler.** Never "I hope this email finds you well", "per my last email", "circling back", "touching base". Warmth is expressed through helpfulness and small personal touches (a quick line asking after something going on in the reader's life), not stock phrases.
 - **Offers options and flexibility explicitly:** "happy to X, or Y - please let me know", "pick a time, I'm wide open all day", "no rush".
 - **Emoji:** rare; a bare 👍🏻 can be an entire reply to family. Don't sprinkle emojis in prose.
+
+## Write like a person, not a model
+
+Model-written drafts drift into a compressed dialect that readers parse slowly (Clark, Martin & Mahowald 2026, "Why is AI-generated language so hard to understand?", arXiv:2610.29162). Every frontier model tested overuses these constructions compared with human writing and with plain paraphrases of the same content. Craig never writes this way: his brevity comes from saying less, not from packing more meaning into each word. Before sending, scan the draft for the six patterns below and rewrite each hit in the plain form.
+
+| Pattern | Model dialect | Plain form |
+|---|---|---|
+| Object relative clause with "that" dropped | "a name he'd never hear anyone use" | "a name that he'd never hear anyone use" — keep the optional "that"/"which" |
+| Ad-hoc noun used as a verb | "calendar it", "footnote it", "ticket this" | "put it on the calendar", "add a footnote", "file a ticket" |
+| Lifeless thing doing a living thing's action | "the conversation is eating its own tail", "this is where the asymmetry bites", "`is_file()` swallows that" | "the conversation keeps going in circles", "this causes a problem when...", "`is_file()` catches that and returns False" |
+| Three or more nouns stacked | "reader-patience budget", "horror movie soundtrack generator" | "how much patience the reader has", "a tool that makes soundtracks for horror movies" |
+| Subject far from its verb | "A cat who can always get up and away is a much calmer cat." | "A cat is much calmer when it can always get up and get away." |
+| Coined or rare word pairings | "verified red against the source", "quietly eating its budget" | the everyday phrase a person would say aloud |
+
+- **Plain-paraphrase test.** If the plain version costs only a word or two more, use it. The plain version is almost always available.
+- **Say-it-aloud test.** Would Craig say this phrase out loud to this reader? His real shorthand (wrt, re:, §1031, k, &, ~) and fragments like "Will take a look" pass; invented compressions fail. Ordinary verbs on inanimate subjects ("That cleared the issue") are fine; only living-thing verbs (eat, bite, swallow, chase, starve) are the problem.
+- **Long-thread drift.** The dialect gets stronger over many turns of a conversation. Re-check drafts written late in a long session with extra care.
 
 ## Context 1 — Professional (advisory boards, networking, colleagues)
 
@@ -90,3 +107,4 @@ For public-policy correspondence, board/committee work, or anything Craig writes
 - Hedge-stacking ("I just wanted to maybe possibly ask...").
 - Formal sign-offs ("Kind regards", "Warmly") outside formal letters.
 - Over-formatting short emails with headers/bullets — structure is reserved for genuinely multi-part content (financial reports, formal demands, move-out logistics).
+- Compressed model-dialect phrasing — dropped "that", noun-as-verb coinages, stacked nouns, things that "bite"/"eat"/"swallow". See *Write like a person, not a model*.
