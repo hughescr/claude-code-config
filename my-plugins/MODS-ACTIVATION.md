@@ -63,7 +63,7 @@ means mods are off in that session.
        `{"matcher": "Bash", "hooks": [{"type": "command", "command": "${HOME}/.claude/hooks/git-guard.sh", "timeout": 5}]}`
        (Edit tool with approval.) Open a new session; repeat the step 2 probe (the mod is now the only guard).
 4. [ ] Delete the script: `git rm hooks/git-guard.sh`. Then update the remaining references:
-       `tests/hooks-test.sh` (its `git-guard.sh` section, from about line 44), `MIGRATION.md` line 8, and the
+       `tests/hooks-test.sh` (its `git-guard.sh` section, from about line 44), and the
        "Status: staged only" paragraph of `my-plugins/git-guard/README.md`. Commit.
 5. [ ] Note on `my-plugins/git-guard/tests/gen-git-guard-wordchars.ts`: it probes `/usr/bin/grep` directly and
        writes `hooks/wordchars.ts`; `git-guard.sh` is its parity reference (named in its header and in the corpus

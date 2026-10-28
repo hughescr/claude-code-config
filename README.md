@@ -88,4 +88,3 @@ no plugin sources live there anymore.)
 - `tests/` - Hook test runner (`tests/hooks-test.sh`); craig-core's hook tests are in `my-plugins/craig-core/tests/`
 - `UTRAQUE-SETTINGS-DELTA.md` - How the utraque proxy is wired in at launch
 - `CAPABILITIES.md` - What each plugin feature does on each surface, and the manual setup steps
-- `MIGRATION.md` - Runbook for landing the plugin migration on the live machine

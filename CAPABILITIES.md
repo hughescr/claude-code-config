@@ -58,7 +58,6 @@ Tested 2026-10-07, with the marketplace synced to the account:
 
 ## Craig's manual setup
 
-- [x] **Land the migration locally** with the steps in `MIGRATION.md`. Publish model-selection's `plugin` branch first.
 - [x] **Add the marketplace** on claude.ai, Customize, Plugins, Add marketplace: `hughescr/claude-code-config`, with **Sync automatically** on.
 - [x] **Enable `craig-core`, `model-selection` and `bluesky`** on the account. Do not enable `mods-probe` in the Claude app: it is a Mac-only Claude Code diagnostic.
 - [x] **Delete the uploaded skills** on claude.ai: `browsing-bluesky`, `model-selection` and `my-writing-style`. `syncClaudeAiSkills: false` stops the sync.
