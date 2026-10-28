@@ -1,6 +1,6 @@
 ---
 name: routing-refresh
-description: Update Craig's model-routing rules when Anthropic, OpenAI, or DeepSeek ship or reprice models. Gathers benchmark, price, and effort evidence, then proposes edits to the routing and pairing tables in COMMON-CLAUDE.md, the route agent files, the hook's route list, and EVIDENCE.md, and applies them after approval.
+description: Update Craig's model-routing rules when Anthropic, OpenAI, or DeepSeek ship or reprice models. Gathers benchmark, price, and effort evidence, then proposes edits to the routing and pairing tables in COMMON-CLAUDE.md and ~/.codex/AGENTS.md, the route agent files, the hook's route list, and EVIDENCE.md, and applies them after approval.
 disable-model-invocation: true
 argument-hint: "[model names and/or URLs describing them]"
 ---
@@ -48,6 +48,7 @@ Keep probes tiny; they spend subscription quota.
 Show Craig the planned diffs for:
 
 - `instructions/COMMON-CLAUDE.md`: the routing table and both pairing tables.
+- `~/.codex/AGENTS.md`: OpenAI routing/pairing tables and the single catalog-slug mapping line (no Claude or DeepSeek models). `~/.codex` is not under git: back up before editing and show its diff in the proposal.
 - The route agent file(s): `~/.claude/agents/` for `gpt-*` and `deepseek-*`, `agents/` here for Claude routes. The description lists the allowed efforts.
 - The `ROUTES` list in `hooks/require-route-effort.sh` and in `tests/require-route-effort.test.sh`, when a route is added or removed.
 - `README.md`, if it lists routes.
