@@ -21,8 +21,7 @@ On the Mac, an installed plugin shadows the same-named `@synced` copy from claud
 | Route effort hook (craig-core PreToolUse on Agent; needs `jq`) | untested | untested | untested | untested |
 | `gpt-*` and `deepseek-*` routes | only with the utraque proxy (`claude-smart.sh` sets `ANTHROPIC_BASE_URL`) | no: `ANTHROPIC_BASE_URL` is `https://api.anthropic.com`, no `gpt-*`/`deepseek-*` agent types | no: Claude-only pairings | no: proxy is on the Mac's `127.0.0.1`; Claude-only pairings |
 | my-writing-style | yes | yes | yes | yes |
-| model-selection (facts and route evidence) | yes | yes | yes | yes |
-| model-selection live Artificial Analysis queries | env var or `op` | env var or `op` | unverified (no documented secret mechanism) | `ARTIFICIAL_ANALYSIS_API_KEY` on the environment |
+| routing-refresh (`/routing-refresh`; proxy probes need the Mac) | yes | yes | untested | untested |
 | Bluesky reading | tool | tool | read-only; runtime not guaranteed | tool |
 | Bluesky posting and deleting | tool, password from `op` | tool, password from `op` | no: draft, Craig posts | tool, `BSKY_APP_PASSWORD` on the environment |
 | bluesky-voice drafting | yes | yes | yes | yes |
@@ -35,7 +34,7 @@ Where cross-family routes are unavailable, the Route availability rule in `CLAUD
 
 Tested 2026-10-07, with the marketplace `hughescr/claude-code-config` added on claude.ai with sync on:
 
-- Skills load: `craig-core:my-writing-style`, `bluesky:bluesky`, `bluesky:bluesky-voice`, `model-selection:model-selection`.
+- Skills load: `craig-core:my-writing-style`, `bluesky:bluesky`, `bluesky:bluesky-voice`.
 - All `craig-core:*` agents load.
 - The craig-core SessionStart hook fires and injects the instructions (Route availability, Orchestration).
 - Routing falls back to `craig-core:*` routes only.
@@ -52,7 +51,7 @@ Tested 2026-10-07, with the marketplace synced to the account:
 
 - Account-synced plugins load. Instructions load once (Orchestration, Route availability).
 - All `craig-core:*` agents are available.
-- Skills load once each: `craig-core:my-writing-style`, `bluesky:bluesky`, `bluesky:bluesky-voice`, `model-selection:model-selection`.
+- Skills load once each: `craig-core:my-writing-style`, `bluesky:bluesky`, `bluesky:bluesky-voice`.
 - SubagentStart verified: a spawned Haiku route agent ran on `claude-haiku-5-5` and received `## Sub-agent house rules`.
 - `ANTHROPIC_BASE_URL` is `https://api.anthropic.com` and no `gpt-*` or `deepseek-*` agent types exist, so routing is Claude-only (same-family checks).
 - GPT and DeepSeek routes cannot work in cloud sessions. The utraque proxy listens on the Mac's `127.0.0.1`, which a cloud VM cannot reach, and `ANTHROPIC_BASE_URL` must be set before Claude Code starts.
@@ -63,7 +62,7 @@ Tested 2026-10-07, with the marketplace synced to the account:
 - [x] **Add the marketplace** on claude.ai, Customize, Plugins, Add marketplace: `hughescr/claude-code-config`, with **Sync automatically** on.
 - [x] **Enable `craig-core`, `model-selection` and `bluesky`** on the account. Do not enable `mods-probe` in the Claude app: it is a Mac-only Claude Code diagnostic.
 - [x] **Delete the uploaded skills** on claude.ai: `browsing-bluesky`, `model-selection` and `my-writing-style`. `syncClaudeAiSkills: false` stops the sync.
-- [x] **Rotate the Artificial Analysis key.** The new key is in 1Password at `op://Private/Artificial Analysis/credential` (the default ref). The old key is invalidated and `creds.json` is deleted. Cloud sessions need `ARTIFICIAL_ANALYSIS_API_KEY` on the environment if model-selection queries are wanted there.
+- [x] **Rotate the Artificial Analysis key.** The new key is in 1Password at `op://Private/Artificial Analysis/credential` (the default ref). The old key is invalidated and `creds.json` is deleted.
 - [ ] **Set `BSKY_APP_PASSWORD` per surface,** with a separate Bluesky app password for each so one can be revoked alone:
   - Mac: nothing to set; `op` reads the default item.
   - Cloud: the environment's **Environment variables** (not a network secret). Use a private environment. If network access is restricted, allow `bsky.social`, `*.host.bsky.network`, `public.api.bsky.app`, `api.bsky.app` and `cdn.bsky.app`.

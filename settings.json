@@ -85,7 +85,6 @@
     "typesafe@typesafe-ai": true,
     "mods-probe@craigs-claude-plugins": true,
     "craig-core@craigs-claude-plugins": true,
-    "model-selection@craigs-claude-plugins": true,
     "bluesky@craigs-claude-plugins": true
   },
   "extraKnownMarketplaces": {

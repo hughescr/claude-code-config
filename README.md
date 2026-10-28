@@ -9,27 +9,25 @@ Personal Claude Code configuration with plugin-based architecture, custom hooks,
 - **Orchestrator Mode**: the instructions configure Claude as a delegating orchestrator that spawns sub-agents for all implementation work — launched **async** (in the background, so you stay interactive while they work), with a **Workflow engine** for large, opted-in, programmatically-enforced fan-out
 - **Environment-adaptive routing**: cross-family (GPT, DeepSeek) agent routes are used only where the local utraque proxy serves them; everywhere else the routing falls back to Claude-only pairings
 - **Custom Hooks**: PreToolUse and SessionStart hooks for workflow automation
-- **Marketplace Integration**: This repo doubles as a plugin marketplace; plugins are *available* everywhere, *enabled* per project (craig-core, model-selection and bluesky globally)
+- **Marketplace Integration**: This repo doubles as a plugin marketplace; plugins are *available* everywhere, *enabled* per project (craig-core and bluesky globally)
 
 ## Installing via marketplace
 
 ```
 /plugin marketplace add hughescr/claude-code-config
 /plugin install craig-core@craigs-claude-plugins
-/plugin install model-selection@craigs-claude-plugins
 /plugin install bluesky@craigs-claude-plugins
 ```
 
 `CAPABILITIES.md` says which plugin features work on each surface (CLI, Desktop Code, Cowork, cloud, chat and
 phone) and lists the manual setup steps.
 
-The marketplace manifest lives at `.claude-plugin/marketplace.json`. It lists every plugin in `my-plugins/`, plus
-`model-selection`, which it installs from its own repo (hughescr/model-selection) with a `github` source. On claude.ai,
+The marketplace manifest lives at `.claude-plugin/marketplace.json` and lists every plugin in `my-plugins/`. On claude.ai,
 add the marketplace (`hughescr/claude-code-config`) with automatic sync to reach chat and Cowork.
 
 Locally, `settings.json` registers this directory itself as the `craigs-claude-plugins`
 marketplace (a `directory` source in `extraKnownMarketplaces`). That makes every plugin
-**available but not enabled**; `settings.json` enables only `craig-core`, `model-selection`, `bluesky` and
+**available but not enabled**; `settings.json` enables only `craig-core`, `bluesky` and
 `mods-probe` globally. A project opts in to others with a per-project `enabledPlugins` entry (e.g.
 `"hugo@craigs-claude-plugins": true` in the project's `.claude/settings.json`), which replaces the `.claude-mixins`
 mechanism — though `.claude-mixins` files are still honored by the `claude-smart.sh` shim. Plugin manifests carry no
@@ -50,8 +48,7 @@ my-plugins/<plugin-name>/
 ```
 
 Current plugins:
-- **craig-core** - Global instructions (CLAUDE.md, MAIN-CLAUDE.md, SUBAGENT-CLAUDE.md) injected at session and sub-agent start, the Claude route agents (`craig-core:<route>`), and the my-writing-style skill; see `my-plugins/craig-core/README.md`
-- **model-selection** (from hughescr/model-selection) - Model comparison on Artificial Analysis data, and the facts behind the agent routes
+- **craig-core** - Global instructions (CLAUDE.md, MAIN-CLAUDE.md, SUBAGENT-CLAUDE.md) injected at session and sub-agent start, the Claude route agents (`craig-core:<route>`), and the my-writing-style and routing-refresh skills; see `my-plugins/craig-core/README.md`
 - **bluesky** - Read Bluesky posts, threads, profiles and search; draft in Craig's voice and post as @craig.rungie.com after a preview and explicit confirmation (a Node CLI plus the `bluesky` and `bluesky-voice` skills); see `my-plugins/bluesky/README.md`
 - **generic-dev** - General development agents and skills
 - **hugo** - Hugo static site generator support (agents, commands, hooks, skills)
@@ -79,14 +76,6 @@ no plugin sources live there anymore.)
 3. Runs `claude update` best-effort (60s timeout; offline or failed update never
    blocks launch)
 4. `exec`s the native binary with the assembled flags
-
-## model-selection
-
-The model-selection plugin lives in its own repo, hughescr/model-selection, and this repo keeps no copy of it (no
-submodule). Edit it in a separate clone (e.g. `~/code/hughescr/model-selection`), try changes with
-`claude --plugin-dir ~/code/hughescr/model-selection`, then push and run
-`claude plugin marketplace update craigs-claude-plugins` and `claude plugin update model-selection@craigs-claude-plugins`.
-Never clone it into `~/.claude/skills/`: a plugin there auto-loads a second time as `model-selection@skills-dir`.
 
 ## Contents
 

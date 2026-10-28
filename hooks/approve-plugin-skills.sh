@@ -55,7 +55,7 @@ fi
 #    (direct subdirectories only, excluding infrastructure dirs)
 # 3. A plugin listed by name in Craig's own marketplace manifest
 #    (~/.claude/.claude-plugin/marketplace.json), for plugins it installs from
-#    another repo, such as model-selection from hughescr/model-selection.
+#    another repo (a github or git source in the manifest).
 # Marketplace/cache dirs (~/.claude/plugins/cache, ~/.claude/plugins/
 # marketplaces) are NOT approval evidence — a skill whose plugin exists
 # only there falls through to a normal permission prompt.

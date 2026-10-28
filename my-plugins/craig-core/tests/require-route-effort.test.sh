@@ -104,6 +104,8 @@ for SH in "${SHELLS[@]}"; do
   expect "route with empty effort -> deny" deny "no effort"
   call "$SH" '{"subagent_type":"craig-core:sonnet","effort":"medium","model":"","prompt":"p"}'
   expect "route with effort and empty model -> allow" allow
+  call "$SH" '{"subagent_type":"gpt-sol","effort":"medium","isolation":"worktree","description":"d","prompt":"p"}'
+  expect "route with effort and extra optional fields, no model -> allow" allow
   call "$SH" '{"subagent_type":"craig-core:opus","prompt":"p"}' Task
   expect "route without effort via tool name Task -> deny" deny "no effort"
 

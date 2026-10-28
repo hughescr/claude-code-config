@@ -8,7 +8,7 @@ Code tab, Cowork, cloud sessions, and (skills only) claude.ai chat.
 | `instructions/` | `COMMON-CLAUDE.md` (the global CLAUDE.md), `MAIN-CLAUDE.md` (main session), `SUBAGENT-CLAUDE.md` (sub-agents). The only copy of each. |
 | `hooks/` | `inject-instructions.sh`, run by `hooks.json` at SessionStart and SubagentStart; `require-route-effort.sh`, run before every Agent call. |
 | `agents/` | The Claude route agents (`opus`, `sonnet`, `haiku`, `fable`: one per model, pinning the model and no effort) and `craig-core:project-steward` (pins both). Plugin agents are namespaced: `subagent_type: "craig-core:sonnet", effort: "high"`. |
-| `skills/` | `my-writing-style` (invoked as `craig-core:my-writing-style`). |
+| `skills/` | `my-writing-style` (invoked as `craig-core:my-writing-style`) and `routing-refresh` (Craig runs `/routing-refresh`; its `EVIDENCE.md` holds the facts behind the routes). |
 | `tests/` | `inject-instructions.test.sh`, `require-route-effort.test.sh`. |
 
 The cross-family route agents (`gpt-*`, `deepseek-*`) are not here: they live in `~/.claude/agents/` on Craig's Mac,
@@ -54,8 +54,8 @@ loads the installed copy of this plugin, so run `/reload-plugins` or restart aft
 picks up changes at the next session start.
 
 When a route changes, update the agent file here (or in `~/.claude/agents/` for a cross-family route), both tables in
-`COMMON-CLAUDE.md`, the `ROUTES` list in `hooks/require-route-effort.sh` (and in its test), and the model-selection
-plugin (hughescr/model-selection).
+`COMMON-CLAUDE.md`, the `ROUTES` list in `hooks/require-route-effort.sh` (and in its test), and
+`skills/routing-refresh/EVIDENCE.md`, the facts behind the routes. `/routing-refresh` runs the update.
 
 ## Tests
 
