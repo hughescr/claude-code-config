@@ -9,7 +9,8 @@
 #            sub-agent (Craig's Mac, where it is a symlink into this plugin).
 #   role     instructions/MAIN-CLAUDE.md for SessionStart or
 #            instructions/SUBAGENT-CLAUDE.md for SubagentStart, followed by one
-#            line saying whether the cross-family routes are usable here.
+#            line saying whether the cross-family routes are usable here, plus
+#            effort guidance on entrypoints other than cli and sdk-cli.
 #   project  <project>/.claude/MAIN-CLAUDE.md or SUBAGENT-CLAUDE.md, when the
 #            project has one.
 #
@@ -155,6 +156,10 @@ case $part in
       cat "$instructions/$role_file"
       printf '\n'
       availability
+      case ${CLAUDE_CODE_ENTRYPOINT:-} in
+        ''|cli|sdk-cli) ;;
+        *) printf '%s\n' "If the Agent tool here has no effort parameter, omit effort: route agents then run at the session effort; pick the route by the table and ignore its effort." ;;
+      esac
     } | emit
     ;;
   project)

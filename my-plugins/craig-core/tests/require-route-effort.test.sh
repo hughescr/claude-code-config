@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Tests for hooks/require-route-effort.sh, the craig-core PreToolUse hook that
-# denies a route-agent Agent call without effort or with model. Every case runs
+# denies a route-agent Agent call without effort on verified entrypoints, or with
+# model on every surface. Every case runs
 # under each POSIX shell found (sh, dash, ksh, bash), because the hook must work
 # on macOS and on the Linux cloud VMs. Also checks that hooks.json wires the
 # hook and that its route list agrees with the agent files and CLAUDE.md.
@@ -9,6 +10,9 @@ set -u
 
 PLUGIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOOK="$PLUGIN/hooks/require-route-effort.sh"
+
+# Existing cases exercise the unset/local default regardless of the runner.
+unset CLAUDE_CODE_ENTRYPOINT
 
 PASS=0
 FAIL=0
@@ -108,6 +112,23 @@ for SH in "${SHELLS[@]}"; do
   expect "route with effort and extra optional fields, no model -> allow" allow
   call "$SH" '{"subagent_type":"craig-core:opus","prompt":"p"}' Task
   expect "route without effort via tool name Task -> deny" deny "no effort"
+
+  # Missing effort enforces only on verified surfaces; model always denies.
+  call "$SH" '{"subagent_type":"craig-core:opus","prompt":"p"}' Agent CLAUDE_CODE_ENTRYPOINT=remote_cowork
+  expect "remote_cowork without effort -> allow" allow
+  call "$SH" '{"subagent_type":"craig-core:opus","model":"opus","prompt":"p"}' Agent CLAUDE_CODE_ENTRYPOINT=remote_cowork
+  expect "remote_cowork with model -> deny" deny "model passed" 'no "model"' "omit effort if"
+  if [[ $(reason) == *"no effort:"* ]]; then bad "remote_cowork model denial must not flag missing effort"; else ok "remote_cowork model denial does not flag missing effort"; fi
+  call "$SH" '{"subagent_type":"craig-core:opus","prompt":"p"}' Agent CLAUDE_CODE_ENTRYPOINT=cli
+  expect "cli without effort -> deny" deny "no effort"
+  call "$SH" '{"subagent_type":"craig-core:opus","prompt":"p"}' Agent CLAUDE_CODE_ENTRYPOINT=sdk-cli
+  expect "sdk-cli without effort -> deny" deny "no effort"
+  call "$SH" '{"subagent_type":"craig-core:opus","prompt":"p"}'
+  expect "unset entrypoint without effort -> deny" deny "no effort"
+  call "$SH" '{"subagent_type":"craig-core:opus","prompt":"p"}' Agent CLAUDE_CODE_ENTRYPOINT=
+  expect "empty entrypoint without effort -> deny" deny "no effort"
+  call "$SH" '{"subagent_type":"craig-core:opus","prompt":"p"}' Agent CLAUDE_CODE_ENTRYPOINT=claude-desktop
+  expect "claude-desktop without effort -> allow (unverified surface fails open)" allow
 
   # Not route agents: allowed whatever they pass.
   call "$SH" '{"subagent_type":"craig-core:project-steward","prompt":"p"}'

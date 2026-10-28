@@ -5,8 +5,10 @@
 # Route agents pin only their model; they set no effort, so an Agent call
 # without "effort" silently inherits the parent session's effort. This hook
 # denies, for any route agent:
-#   - a call with no "effort" (absent, null or empty), and
-#   - a call that passes "model" (the agent file pins it).
+#   - a call with no "effort" (absent, null or empty) on known-effort entrypoints
+#     (cli or sdk-cli, or unset/empty for local edge cases); other surfaces fail open because
+#     their Agent tool may not expose effort, and
+#   - a call that passes "model" on every surface (the agent file pins it).
 # Every other Agent call (capability-specific agents such as
 # craig-core:project-steward, built-in agents, fork) is allowed untouched.
 #
@@ -22,6 +24,10 @@ LC_ALL=C
 export LC_ALL
 
 ROUTES='["craig-core:opus","craig-core:sonnet","craig-core:haiku","craig-core:fable","gpt-sol","gpt-astra","gpt-luna","gpt-terra","deepseek-flash","deepseek-v4-pro"]'
+# Space-separated entrypoints verified to expose Agent.effort. Empty also enforces.
+# sdk-cli is the Mac CLI run non-interactively (claude -p); same Agent tool as cli.
+EFFORT_ENTRYPOINTS='cli sdk-cli'
+entrypoint=${CLAUDE_CODE_ENTRYPOINT:-}
 
 input=$(cat 2>/dev/null || true)
 
@@ -31,14 +37,16 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 # jq prints the deny JSON, or nothing to allow. A parse failure allows.
-printf '%s' "$input" | jq -c --argjson routes "$ROUTES" '
+printf '%s' "$input" | jq -c --argjson routes "$ROUTES" \
+  --arg entrypoint "$entrypoint" --arg effort_entrypoints "$EFFORT_ENTRYPOINTS" '
   def present: . != null and . != "";
-  select((.tool_name // "Agent") == "Agent" or .tool_name == "Task")
+  ($entrypoint == "" or ($effort_entrypoints | split(" ") | index($entrypoint)) != null) as $enforce_effort
+  | select((.tool_name // "Agent") == "Agent" or .tool_name == "Task")
   | (.tool_input // {}) as $in
   | ($in.subagent_type // "") as $type
   | select(($type | type) == "string" and ($routes | index([$type])) != null)
   | [
-      (if ($in.effort | present) then empty else
+      (if ($enforce_effort | not) or ($in.effort | present) then empty else
         "no effort: route agents pin only the model, so a call without effort inherits the parent session effort" end),
       (if ($in.model | present) then
         "model passed: route agents pin their model in the agent file" else empty end)
@@ -50,7 +58,9 @@ printf '%s' "$input" | jq -c --argjson routes "$ROUTES" '
         permissionDecision: "deny",
         permissionDecisionReason: (
           "Agent call to route agent \"" + $type + "\" denied (" + ($problems | join("; ")) + "). "
-          + "Fix: call it as {\"subagent_type\": \"" + $type + "\", \"effort\": \"<effort>\", ...} with the effort from the CLAUDE.md routing table row for this route, and no \"model\"."
+          + (if $enforce_effort then
+              "Fix: call it as {\"subagent_type\": \"" + $type + "\", \"effort\": \"<effort>\", ...} with the effort from the CLAUDE.md routing table row for this route, and no \"model\"."
+            else "Fix: call the route agent with no \"model\"; omit effort if the Agent tool has no effort parameter." end)
         )
       }
     }

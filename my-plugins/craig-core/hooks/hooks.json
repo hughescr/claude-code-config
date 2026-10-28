@@ -1,5 +1,5 @@
 {
-  "description": "Inject Craig's instructions: CLAUDE.md (unless already loaded natively) plus MAIN-CLAUDE.md at session start, CLAUDE.md plus SUBAGENT-CLAUDE.md at sub-agent start. One command per part keeps each under the 10,000-character context cap. Before every Agent call, deny a route agent called without effort or with model.",
+  "description": "Inject Craig's instructions: CLAUDE.md (unless already loaded natively) plus MAIN-CLAUDE.md at session start, CLAUDE.md plus SUBAGENT-CLAUDE.md at sub-agent start. One command per part keeps each under the 10,000-character context cap. Before every Agent call, deny a route agent called with model, or without effort on the CLI (cli/sdk-cli).",
   "hooks": {
     "PreToolUse": [
       {

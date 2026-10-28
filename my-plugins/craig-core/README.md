@@ -43,8 +43,12 @@ The script is POSIX `sh` with no `jq`, so it runs on macOS and the Linux cloud V
 Each route agent (`craig-core:opus|sonnet|haiku|fable` here; `gpt-sol`, `gpt-astra`, `gpt-luna`, `gpt-terra`, `deepseek-flash`,
 `deepseek-v4-pro` in `~/.claude/agents/`) pins its model and no effort, so the caller picks the effort from the
 CLAUDE.md routing table. An Agent call without `effort` would silently inherit the parent session's effort.
-`hooks/require-route-effort.sh` (PreToolUse, matcher `Agent`) denies a route-agent call that has no `effort` or that
-passes `model`, and allows every other Agent call. It is POSIX `sh` plus `jq`; without `jq` it reports the problem on
+`hooks/require-route-effort.sh` (PreToolUse, matcher `Agent`) denies missing `effort` only when
+`CLAUDE_CODE_ENTRYPOINT` is `cli` or `sdk-cli`, or unset/empty. Other entrypoints fail open: claude.ai's app/website Agent tool
+has no effort parameter, while Desktop Code and other cloud surfaces are unverified. Without the parameter,
+route agents inherit the session effort; the role injection explains that fallback on non-CLI entrypoints.
+The hook denies passing `model` on every surface and allows every other Agent call. Add newly verified
+entrypoints to its `EFFORT_ENTRYPOINTS` list. It is POSIX `sh` plus `jq`; without `jq` it reports the problem on
 stderr and allows the call.
 
 ## Editing

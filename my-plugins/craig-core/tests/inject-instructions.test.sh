@@ -16,7 +16,7 @@ FAIL=0
 ok() { PASS=$((PASS + 1)); echo "ok   $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "FAIL $1"; }
 
-unset ANTHROPIC_BASE_URL CLAUDE_PROJECT_DIR CLAUDE_PLUGIN_ROOT
+unset ANTHROPIC_BASE_URL CLAUDE_PROJECT_DIR CLAUDE_PLUGIN_ROOT CLAUDE_CODE_ENTRYPOINT
 
 FIX=$(mktemp -d "${TMPDIR:-/tmp}/craig-core-hook-test.XXXXXX")
 trap 'rm -rf "$FIX"' EXIT
@@ -59,6 +59,8 @@ printf 'Project subagent rules\n' >"$PROJ/.claude/SUBAGENT-CLAUDE.md"
 
 AVAIL_YES="Cross-family routes: available in this session (ANTHROPIC_BASE_URL is the utraque proxy and gpt-*/deepseek-* agents are installed). Use one only if its agent type is in the available-agents list."
 avail_no() { printf 'Cross-family routes: unavailable in this session (%s). Use only craig-core:* routes and the Claude-only columns of the CLAUDE.md pairing table, and report every check as same-family.' "$1"; }
+
+EFFORT_GUIDANCE="If the Agent tool here has no effort parameter, omit effort: route agents then run at the session effort; pick the route by the table and ignore its effort."
 
 COMMON_HDR="<!-- craig-core: CLAUDE.md, Craig's global instructions (injected because ~/.claude/CLAUDE.md does not load them here) -->"
 
@@ -113,6 +115,7 @@ IN_SUB='{"session_id":"t","hook_event_name":"SubagentStart","agent_type":"craig-
 
 EXP_COMMON=$(printf '%s\n' "$COMMON_HDR"; cat "$INSTR/COMMON-CLAUDE.md")
 EXP_MAIN_NO=$(printf '%s\n' "<!-- craig-core: MAIN-CLAUDE.md -->"; cat "$INSTR/MAIN-CLAUDE.md"; printf '\n'; avail_no "ANTHROPIC_BASE_URL is not http://127.0.0.1:8317 and no gpt-*/deepseek-* agents are installed")
+EXP_MAIN_NOAGENTS=$(printf '%s\n' "<!-- craig-core: MAIN-CLAUDE.md -->"; cat "$INSTR/MAIN-CLAUDE.md"; printf '\n'; avail_no "no gpt-*/deepseek-* agents are installed")
 EXP_SUB_NO=$(printf '%s\n' "<!-- craig-core: SUBAGENT-CLAUDE.md -->"; cat "$INSTR/SUBAGENT-CLAUDE.md"; printf '\n'; avail_no "ANTHROPIC_BASE_URL is not http://127.0.0.1:8317 and no gpt-*/deepseek-* agents are installed")
 EXP_SUB_YES=$(printf '%s\n' "<!-- craig-core: SUBAGENT-CLAUDE.md -->"; cat "$INSTR/SUBAGENT-CLAUDE.md"; printf '\n%s' "$AVAIL_YES")
 EXP_SUB_NOPROXY=$(printf '%s\n' "<!-- craig-core: SUBAGENT-CLAUDE.md -->"; cat "$INSTR/SUBAGENT-CLAUDE.md"; printf '\n'; avail_no "ANTHROPIC_BASE_URL is not http://127.0.0.1:8317")
@@ -155,6 +158,22 @@ for SH in "${SHELLS[@]}"; do
   check_ctx "role, other base URL -> unavailable" SubagentStart "$EXP_SUB_NOPROXY"
   run "$SH" "$IN_SUB" SubagentStart role -- "$P" HOME="$FIX/home_none" ANTHROPIC_BASE_URL=http://127.0.0.1:8317
   check_ctx "role, proxy env but no agents (Cowork/cloud) -> unavailable" SubagentStart "$EXP_SUB_NOAGENTS"
+
+  # Non-CLI role parts explain the fallback when Agent has no effort parameter.
+  run "$SH" "$IN_SESSION" SessionStart role -- "$P" HOME="$FIX/home_none" CLAUDE_CODE_ENTRYPOINT=remote_cowork
+  check_ctx "remote_cowork MAIN includes effort fallback" SessionStart "$(printf '%s\n%s' "$EXP_MAIN_NO" "$EFFORT_GUIDANCE")"
+  run "$SH" "$IN_SESSION" SessionStart role -- "$P" HOME="$FIX/home_none" ANTHROPIC_BASE_URL=http://127.0.0.1:8317 CLAUDE_CODE_ENTRYPOINT=remote_cowork
+  check_ctx "remote_cowork MAIN with proxy env but no agents includes effort fallback" SessionStart "$(printf '%s\n%s' "$EXP_MAIN_NOAGENTS" "$EFFORT_GUIDANCE")"
+  run "$SH" "$IN_SUB" SubagentStart role -- "$P" HOME="$FIX/home_none" CLAUDE_CODE_ENTRYPOINT=remote_cowork
+  check_ctx "remote_cowork SUBAGENT includes effort fallback" SubagentStart "$(printf '%s\n%s' "$EXP_SUB_NO" "$EFFORT_GUIDANCE")"
+  run "$SH" "$IN_SUB" SubagentStart role -- "$P" HOME="$FIX/home_proxy" ANTHROPIC_BASE_URL=http://127.0.0.1:8317 CLAUDE_CODE_ENTRYPOINT=remote_cowork
+  check_ctx "non-CLI with available routes includes effort fallback" SubagentStart "$(printf '%s\n%s' "$EXP_SUB_YES" "$EFFORT_GUIDANCE")"
+  run "$SH" "$IN_SESSION" SessionStart role -- "$P" HOME="$FIX/home_none" CLAUDE_CODE_ENTRYPOINT=cli
+  check_ctx "cli MAIN omits effort fallback" SessionStart "$EXP_MAIN_NO"
+  run "$SH" "$IN_SESSION" SessionStart role -- "$P" HOME="$FIX/home_none" CLAUDE_CODE_ENTRYPOINT=sdk-cli
+  check_ctx "sdk-cli MAIN omits effort fallback" SessionStart "$EXP_MAIN_NO"
+  run "$SH" "$IN_SUB" SubagentStart role -- "$P" HOME="$FIX/home_none" CLAUDE_CODE_ENTRYPOINT=cli
+  check_ctx "cli SUBAGENT omits effort fallback" SubagentStart "$EXP_SUB_NO"
 
   # Project layer, from CLAUDE_PROJECT_DIR or the input's cwd.
   run "$SH" "$IN_SESSION" SessionStart project -- "$P" HOME="$FIX/home_none" CLAUDE_PROJECT_DIR="$PROJ"
