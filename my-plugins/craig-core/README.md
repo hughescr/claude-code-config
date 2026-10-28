@@ -1,7 +1,7 @@
 # craig-core
 
 Craig's core Claude setup, packaged so it reaches every surface that loads plugins: the Claude Code CLI and Desktop
-Code tab, Cowork, cloud sessions, and (skills only) claude.ai chat.
+Code tab, the Claude app (chat and Cowork), and cloud sessions.
 
 | Part | Contents |
 |---|---|
@@ -20,8 +20,7 @@ used; everywhere else the pairing table's Claude-only columns apply.
 | Surface | CLAUDE.md (common) | MAIN / SUBAGENT |
 |---|---|---|
 | Craig's Mac (CLI, Desktop Code tab) | Natively: `~/.claude/CLAUDE.md` is a tracked symlink to `instructions/COMMON-CLAUDE.md`, which Claude Code loads for the session, sub-agents and Workflow agents. The hook sees this and skips it. | Hook |
-| Cowork, cloud sessions | Hook | Hook |
-| claude.ai chat | Not loaded (chat runs no hooks); only the skills arrive | Not loaded |
+| Claude app (chat and Cowork), cloud sessions | Hook | Hook |
 
 At each event the hook runs once per part (`common`, `role`, `project`), because Claude Code caps every
 `additionalContext` string at 10,000 characters and replaces a longer one with a 2,000-character preview. Keep
@@ -44,9 +43,10 @@ Each route agent (`craig-core:opus|sonnet|haiku|fable` here; `gpt-sol`, `gpt-ast
 `deepseek-v4-pro` in `~/.claude/agents/`) pins its model and no effort, so the caller picks the effort from the
 CLAUDE.md routing table. An Agent call without `effort` would silently inherit the parent session's effort.
 `hooks/require-route-effort.sh` (PreToolUse, matcher `Agent`) denies missing `effort` only when
-`CLAUDE_CODE_ENTRYPOINT` is `cli` or `sdk-cli`, or unset/empty. Other entrypoints fail open: claude.ai's app/website Agent tool
-has no effort parameter, while Desktop Code and other cloud surfaces are unverified. Without the parameter,
-route agents inherit the session effort; the role injection explains that fallback on non-CLI entrypoints.
+`CLAUDE_CODE_ENTRYPOINT` is `cli` or `sdk-cli`, or unset/empty. Other entrypoints fail open. The Claude app
+(`remote_cowork`, chat and Cowork) is verified: its Agent tool has no effort parameter, and the hook allows the call.
+Desktop Code and other cloud surfaces are unverified. Without the parameter, route agents inherit the session effort;
+the role injection explains that fallback on non-CLI entrypoints.
 The hook denies passing `model` on every surface and allows every other Agent call. Add newly verified
 entrypoints to its `EFFORT_ENTRYPOINTS` list. It is POSIX `sh` plus `jq`; without `jq` it reports the problem on
 stderr and allows the call.
