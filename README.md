@@ -19,9 +19,6 @@ Personal Claude Code configuration with plugin-based architecture, custom hooks,
 /plugin install bluesky@craigs-claude-plugins
 ```
 
-`CAPABILITIES.md` says which plugin features work on each surface (CLI, Desktop Code, Cowork, cloud, chat and
-phone) and lists the manual setup steps.
-
 The marketplace manifest lives at `.claude-plugin/marketplace.json` and lists every plugin in `my-plugins/`. On claude.ai,
 add the marketplace (`hughescr/claude-code-config`) with automatic sync to reach chat and Cowork.
 
@@ -32,6 +29,14 @@ marketplace (a `directory` source in `extraKnownMarketplaces`). That makes every
 `"hugo@craigs-claude-plugins": true` in the project's `.claude/settings.json`), which replaces the `.claude-mixins`
 mechanism — though `.claude-mixins` files are still honored by the `claude-smart.sh` shim. Plugin manifests carry no
 `version`: the commit SHA is the version.
+
+## Surfaces
+
+- **Mac CLI and Desktop Code** load `~/.claude` directly. The CLI gets the utraque proxy only through `claude-smart.sh`, so cross-family routes work only in sessions it launches. Desktop Code never goes through the launcher: `ANTHROPIC_BASE_URL` is `https://api.anthropic.com` there, and its verified session listed no `gpt-*` or `deepseek-*` agent types. `settings.json` hooks (git guard, plugin-skill approval) run only on these two. On the Mac, an installed plugin shadows its `@synced` copy from claude.ai, so nothing loads twice.
+- **Claude app** (chat and Cowork) gets only plugins synced to the claude.ai account, and the craig-core SessionStart hook injects the instructions. Agents and hook context can arrive a moment after the session starts, so check again before assuming they are missing. Skills arrive through the sync, not uploads (`syncClaudeAiSkills: false` stops the upload sync). The app has no shell on the Mac, and its Mac-side tools (local MCP servers, granted folders, browser, computer use) work only while the Claude Desktop app is open. Make Mac changes in Claude Code (CLI, Desktop Code, or Remote Control from the phone). Do not enable `mods-probe` in the Claude app; it is a Mac-only diagnostic.
+- **Cloud sessions** (claude.ai/code) get the cloned repo's committed `.claude/`, the environment's variables and setup script, and the account's synced plugins. They cannot reach the proxy, which listens on the Mac's `127.0.0.1`, and `ANTHROPIC_BASE_URL` must be set before Claude Code starts, so routing there is Claude-only.
+- **Untested:** the route-effort hook on every surface, and `routing-refresh` on the Claude app and cloud. SubagentStart is verified only on Desktop Code and cloud.
+- **After changing instructions, hooks or plugins,** check a fresh session on each surface: instructions appear once, every `craig-core:*` agent is listed, and each skill loads once. The Claude app and cloud need Craig to check.
 
 ## Plugin Structure
 
@@ -87,4 +92,3 @@ no plugin sources live there anymore.)
 - `hooks/` - Global hook scripts (git guard, plugin-skill approval, mods flag reconcile)
 - `tests/` - Hook test runner (`tests/hooks-test.sh`); craig-core's hook tests are in `my-plugins/craig-core/tests/`
 - `UTRAQUE-SETTINGS-DELTA.md` - How the utraque proxy is wired in at launch
-- `CAPABILITIES.md` - What each plugin feature does on each surface, and the manual setup steps

@@ -73,23 +73,30 @@ Handle: `BSKY_HANDLE`, default `craig.rungie.com`. Password resolution: non-empt
 `BSKY_APP_PASSWORD`, else executable `op` on PATH and `op read "$BSKY_OP_REF"`,
 else an actionable error. The default reference is
 `op://Private/ev3yijxphjzfz6lm5ziuqaj5c4/App Passwords/claude-posting-key`.
-Use an **app password**, never the main account password. Passwords and op stderr
-are never logged or stored; no credential file or session cache is used.
+Use a separate **app password** for each surface, never the main account password, so
+one can be revoked without the others. Passwords and op stderr are never logged or
+stored; no credential file or session cache is used.
 
-- **Local CLI / Desktop Code:** export the env var in the shell/runtime, or use
-  a signed-in 1Password CLI. Don't put a secret in command arguments or the repo.
+- **Local CLI / Desktop Code:** on the Mac, nothing to set: `op` reads the default
+  reference through a signed-in 1Password CLI. Elsewhere, export the env var in the
+  shell/runtime. Don't put a secret in command arguments or the repo.
 - **Cloud Code:** claude.ai/code → environment settings → **Environment variables**;
   enter `BSKY_APP_PASSWORD=...` in `.env` format (quote values containing `#`).
   Use a private environment: others using the environment can read its values.
   Network secrets inject headers, not the JSON password required by createSession.
-  Allow public.api.bsky.app and api.bsky.app for reads and bsky.social plus the account's PDS for
-  authentication/writes. The plugin arrives via Craig's claude.ai account sync.
+  If the environment restricts network access, allow `bsky.social`,
+  `*.host.bsky.network` (the account's PDS), `public.api.bsky.app`, `api.bsky.app` and
+  `cdn.bsky.app`. The plugin arrives via Craig's claude.ai account sync.
 - **Claude app (desktop, web, phone):** chat and Cowork are one app, running in an
   Anthropic cloud workspace. It cannot be given `BSKY_APP_PASSWORD` (no environment
   variables; plugin settings are not prompted) and cannot reach the Mac's `op`, so it
   is read-only. Read with the tool if `node` or `bun` is available
   (`command -v node bun`), else with public endpoints. Posting means drafting the text
-  and alt text for Craig to post from Claude Code or the Bluesky app.
+  and alt text for Craig to post from Claude Code or the Bluesky app. A possible future
+  route is a local Bluesky MCP server on the Mac, reached through the Desktop bridge; none
+  is built.
+
+Per-surface setup steps are in `skills/bluesky/references/credentials.md`.
 
 Restricted runtimes may require proxy configuration. Here direct Node fetch
 was blocked by the sandbox; `NODE_USE_ENV_PROXY=1 node ...` worked on Node 26.10.
