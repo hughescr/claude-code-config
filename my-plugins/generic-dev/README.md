@@ -14,6 +14,10 @@ Generic development tools for any coding project using Claude Code.
 
 - **development-workflow**: Generic development patterns and symbol-based editing
 
+## Injected Coding Instructions
+
+`hooks/inject-coding.sh` injects `instructions/CODING.md` (code search guidance: `ast-grep` for code shape, LSP for definitions and references) into the main session at `SessionStart` and into every sub-agent at `SubagentStart`. Edit that file to change what coding sessions are told. Tests: `bash tests/inject-coding.test.sh`.
+
 ## Built-in LSP Tools
 
 Code navigation is handled via Claude Code's built-in LSP integration:

@@ -1,0 +1,27 @@
+{
+  "description": "Inject the coding instructions (instructions/CODING.md) into the session and every sub-agent.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/inject-coding.sh\" SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/inject-coding.sh\" SubagentStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

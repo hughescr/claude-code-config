@@ -8,35 +8,49 @@
 #
 # Priority: env var > marker file
 # Priority for mixin plugins: ./.claude/plugins/ > ~/.claude/my-plugins/
-# Auto-detected: javascript (via package.json), typescript (via tsconfig.json or package.json),
-#                hugo (via hugo.toml or config.toml with Hugo directories)
+# Auto-detected from the current directory only (no subdirectory scan):
+#   generic-dev: any code-project marker: package.json, tsconfig.json, Cargo.toml, go.mod,
+#                Package.swift, *.xcodeproj, CMakeLists.txt, compile_commands.json,
+#                pyproject.toml, deno.json, bunfig.toml (not Makefile: prose projects have them)
+#   javascript:  ./package.json
+#   typescript:  ./tsconfig.json, or a typescript dependency in ./package.json (needs jq)
+#   hugo:        ./hugo.toml, ./hugo/hugo.toml, ./config/_default/hugo.toml or
+#                ./config/_default/config.toml
+# When claude is started in a parent directory of the real project, put a .claude-mixins file
+# there (one plugin name per line, for example generic-dev) to load the plugins.
+# Duplicate plugin directories (for example a generic-dev mixin) are loaded once.
+#
+# CLAUDE_SMART_DRY_RUN=1 prints the plugin directories, one per line, and exits without
+# running claude (the binary need not exist).
 #
 # Launches the natively installed claude binary.
 
 set -euo pipefail
 
-# Native claude binary (native installer)
-CLAUDE_BIN="$HOME/.local/bin/claude"
-if [[ ! -x "$CLAUDE_BIN" ]]; then
-    echo "claude-smart: claude binary not found at $CLAUDE_BIN" >&2
-    echo "claude-smart: install with: curl -fsSL https://claude.ai/install.sh | bash" >&2
-    exit 1
-fi
-
-# Build up a set of plugin directories to load
+# Plugin directories to load, without duplicates (first occurrence wins)
+typeset -U PLUGIN_DIRS
 PLUGIN_DIRS=()
 
-# Detect project type
 has_package_json=false
-[[ -f "package.json" ]] && has_package_json=true
+[[ -f package.json ]] && has_package_json=true
 
 is_typescript=false
-if [[ -f "tsconfig.json" ]]; then
+if [[ -f tsconfig.json ]]; then
     is_typescript=true
 elif [[ "$has_package_json" == "true" ]] && command -v jq &>/dev/null; then
-    if jq -e '.devDependencies.typescript // .dependencies.typescript' package.json &>/dev/null 2>&1; then
+    # Unparsable JSON just means "not detected"
+    if jq -e '.devDependencies.typescript // .dependencies.typescript // empty' package.json &>/dev/null; then
         is_typescript=true
     fi
+fi
+
+# Any code-project marker; the *.xcodeproj glob matches directories only and is empty (not an error) with no match
+xcodeprojs=(*.xcodeproj(N/))
+is_code_project=false
+if [[ "$has_package_json" == "true" || -f tsconfig.json || -f Cargo.toml || -f go.mod \
+    || -f Package.swift || -f CMakeLists.txt || -f compile_commands.json \
+    || -f pyproject.toml || -f deno.json || -f bunfig.toml ]] || (( ${#xcodeprojs} )); then
+    is_code_project=true
 fi
 
 # Check for Hugo project
@@ -46,7 +60,7 @@ if [[ -f "hugo.toml" ]] || [[ -f "hugo/hugo.toml" ]] || [[ -f "config/_default/h
 fi
 
 # Load plugins based on detection (order matters: generic → hugo → js → ts)
-if [[ "$has_package_json" == "true" ]]; then
+if [[ "$is_code_project" == "true" ]]; then
     [[ -d ~/.claude/my-plugins/generic-dev ]] && PLUGIN_DIRS+=(~/.claude/my-plugins/generic-dev)
 fi
 
@@ -57,10 +71,10 @@ fi
 
 if [[ "$has_package_json" == "true" ]]; then
     [[ -d ~/.claude/my-plugins/javascript ]] && PLUGIN_DIRS+=(~/.claude/my-plugins/javascript)
+fi
 
-    if [[ "$is_typescript" == "true" ]]; then
-        [[ -d ~/.claude/my-plugins/typescript ]] && PLUGIN_DIRS+=(~/.claude/my-plugins/typescript)
-    fi
+if [[ "$is_typescript" == "true" ]]; then
+    [[ -d ~/.claude/my-plugins/typescript ]] && PLUGIN_DIRS+=(~/.claude/my-plugins/typescript)
 fi
 
 # Detect and apply mixins (env var takes priority over marker file)
@@ -95,6 +109,20 @@ CLAUDE_FLAGS=()
 for dir in "${PLUGIN_DIRS[@]}"; do
     [[ -d "$dir" ]] && CLAUDE_FLAGS+=(--plugin-dir "$dir")
 done
+
+# Dry run for tests: print the plugin directories that would be loaded and stop
+if [[ "${CLAUDE_SMART_DRY_RUN:-}" == "1" ]]; then
+    (( ${#CLAUDE_FLAGS} )) && printf '%s\n' "${(@)CLAUDE_FLAGS:#--plugin-dir}"
+    exit 0
+fi
+
+# Native claude binary (native installer)
+CLAUDE_BIN="$HOME/.local/bin/claude"
+if [[ ! -x "$CLAUDE_BIN" ]]; then
+    echo "claude-smart: claude binary not found at $CLAUDE_BIN" >&2
+    echo "claude-smart: install with: curl -fsSL https://claude.ai/install.sh | bash" >&2
+    exit 1
+fi
 
 # Route through the local utraque proxy when it is healthy, so Claude models bill
 # the Max subscription and gpt-* routes reach OpenAI on the Codex subscription.

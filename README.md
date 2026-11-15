@@ -74,10 +74,19 @@ no plugin sources live there anymore.)
 `claude-smart.sh` is a thin zsh shim around the natively installed binary
 (`~/.local/bin/claude`, native installer). On each launch it:
 
-1. Detects project shape (package.json / tsconfig.json / Hugo configs) and assembles
-   `--plugin-dir` flags for matching plugins in `~/.claude/my-plugins/`
+1. Detects project shape and assembles `--plugin-dir` flags for matching plugins in
+   `~/.claude/my-plugins/`. Detection looks at the current directory only, never at
+   subdirectories. `generic-dev` loads for any code marker (`package.json`, `tsconfig.json`,
+   `Cargo.toml`, `go.mod`, `Package.swift`, `*.xcodeproj`, `CMakeLists.txt`,
+   `compile_commands.json`, `pyproject.toml`, `deno.json`, `bunfig.toml`; not `Makefile`),
+   `javascript` for `./package.json`, `typescript` for `./tsconfig.json` or a typescript
+   dependency in `./package.json`, and `hugo` for Hugo configs. Duplicate directories
+   load once. `CLAUDE_SMART_DRY_RUN=1` prints the plugin directories and exits (tested by
+   `claude-smart.test.sh`)
 2. Applies mixins from `CLAUDE_MIXINS` env var or a `.claude-mixins` file
-   (local `./.claude/plugins/<name>` overrides `~/.claude/my-plugins/<name>`)
+   (local `./.claude/plugins/<name>` overrides `~/.claude/my-plugins/<name>`). When claude
+   is started in a parent directory of the real project, a `.claude-mixins` file there (one
+   plugin name per line, for example `generic-dev`) loads the plugins
 3. Runs `claude update` best-effort (60s timeout; offline or failed update never
    blocks launch)
 4. `exec`s the native binary with the assembled flags

@@ -10,7 +10,7 @@ Python is a last resort, and its instincts (scalar loops, unbatched hot paths) m
 
 ## Installed CLI Tools (beyond defaults)
 
-jq, httpie, gh, bat, diff-so-fancy, hyperfine, tree, watch, ag, parallel, awscli, csvkit (csvcut/csvjoin/csvstat), imagemagick, optipng, webp, ffmpeg
+jq, httpie, gh, bat, diff-so-fancy, hyperfine, tree, watch, ag, ast-grep, parallel, awscli, csvkit (csvcut/csvjoin/csvstat), imagemagick, optipng, webp, ffmpeg
 
 ## Agent routing
 
