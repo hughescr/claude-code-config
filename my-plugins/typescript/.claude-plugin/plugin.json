@@ -1,4 +1,20 @@
 {
   "name": "typescript",
-  "description": "TypeScript-specific development tools - type checking, strict mode, and TSDoc"
+  "description": "TypeScript-specific development tools - type checking, strict mode, TSDoc, and a language server that follows the project's own TypeScript version",
+  "lspServers": {
+    "typescript": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/ts-lsp",
+      "extensionToLanguage": {
+        ".ts": "typescript",
+        ".tsx": "typescriptreact",
+        ".js": "javascript",
+        ".jsx": "javascriptreact",
+        ".mts": "typescript",
+        ".cts": "typescript",
+        ".mjs": "javascript",
+        ".cjs": "javascript"
+      },
+      "maxRestarts": 3
+    }
+  }
 }

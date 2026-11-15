@@ -58,7 +58,7 @@ Current plugins:
 - **generic-dev** - General development agents and skills
 - **hugo** - Hugo static site generator support (agents, commands, hooks, skills)
 - **javascript** - JavaScript development agents and skills
-- **typescript** - TypeScript hooks and skills
+- **typescript** - TypeScript hooks and skills, plus a language-server launcher that runs the server the project's package.json declares (`tsc --lsp` including an npm alias of TypeScript 7, `tsgo`, `tsrs` or `typescript-language-server`; undeclared binaries in node_modules are ignored) and a SessionStart notice when only a fallback is available; see `my-plugins/typescript/README.md`
 - **duckdb** - DuckDB integration
 - **tmux** - Tmux session management
 - **resin-print-prep** - Prep 3D meshes for resin printing in Blender (via Blender MCP)

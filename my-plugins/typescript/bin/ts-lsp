@@ -1,0 +1,469 @@
+#!/bin/sh
+# ts-lsp: launch the TypeScript language server that matches the project.
+#
+# Usage: ts-lsp [--workspace DIR] [--explain]
+#
+#   (no flags)  resolve the server for the workspace and exec it over stdio.
+#               Exits 3 with a one-line stderr message when no server works.
+#   --explain   print the resolution as key=value lines and exit 0 without
+#               exec. The SessionStart hook (hooks/ts-lsp-check.sh) calls this,
+#               so what it reports is exactly what the launcher would run.
+#
+# The workspace is --workspace DIR, else $CLAUDE_PROJECT_DIR, else $PWD.
+#
+# What the project DECLARES decides; node_modules only supplies the binary for
+# what is declared. The nearest ancestor package.json that declares a relevant
+# dependency (typescript, an npm alias of typescript, @typescript/native-preview
+# or tsrs, in dependencies, devDependencies, peerDependencies or
+# optionalDependencies) decides, so a monorepo root that declares TypeScript
+# decides for its sub-packages. Binaries in node_modules that no package.json
+# declares (a stale tsgo build, say) are never used. The declared package is
+# found Node-style: the nearest node_modules, from the declaring package.json's
+# directory upward, that has it.
+#
+# Order of choice (the first that applies):
+#   1. tsrs declared                  -> node_modules/.bin/tsrs --lsp --stdio
+#   2. TypeScript 7+ declared         -> its tsc --lsp --stdio (TS 7 is the Go-native compiler).
+#        "Declared" is `typescript` with a range whose major is >= 7 (dist-tags
+#        such as latest and next count as 7), or ANY dependency whose value is
+#        an npm alias of typescript 7+ (NAME: "npm:typescript@7.0.2", "^7",
+#        "latest"). The binary is <node_modules>/NAME/bin/tsc (NAME may be
+#        scoped, e.g. @typescript/native; for plain typescript it falls back to
+#        .bin/tsc), and the installed package.json must report major >= 7.
+#        This wins over a co-declared typescript < 7, which a project keeps for
+#        tools that import the JS API. A range with no readable major
+#        (catalog:, workspace:*) takes the installed version's major instead.
+#   3. @typescript/native-preview declared -> node_modules/.bin/tsgo --lsp --stdio
+#   4. only typescript < 7 declared (directly or via alias)
+#                                     -> typescript-language-server --stdio, from
+#                                        node_modules/.bin if present, else from PATH
+#                                        (it uses the workspace's tsserver). This helper
+#                                        is the one thing that need not be declared: it is
+#                                        tooling, not the compiler. Needs the declared
+#                                        typescript installed.
+#   A declared choice that is not installed (no node_modules, binary absent,
+#   wrong version) is matched=no with a hint to install the project's
+#   dependencies; it does not fall through to a lower rule.
+#   Nothing relevant declared: want=unknown.
+#   Fallback (matched=no): tsrs on PATH, then tsc >= 7 on PATH, then tsgo on PATH.
+#   Otherwise kind=none.
+#
+# Verified command (run against typescript 7.0.2, @typescript/native-preview
+# 7.0.0-dev.20260707.2 and tsrs 0.25.0-ts7.1.0-beta): `<bin> --lsp --stdio`.
+#
+# POSIX sh. jq is used when present. Without jq, package.json is read with sed
+# and tr: the file is split at commas and braces and every line of the exact
+# form "key": "string" counts as a dependency entry. That reads one entry per
+# line and minified files, and sees an entry anywhere in the file (a typescript
+# pin under "overrides" counts as a declaration). It misreads values that
+# contain a comma, brace or escaped quote, and it does not notice an
+# unparsable package.json.
+
+set -u
+LC_ALL=C
+export LC_ALL
+
+explain=0
+ws=
+
+while [ $# -gt 0 ]; do
+  case $1 in
+    --explain) explain=1 ;;
+    --workspace)
+      shift
+      if [ $# -eq 0 ]; then
+        echo "ts-lsp: --workspace needs a directory" >&2
+        exit 2
+      fi
+      ws=$1
+      ;;
+    *)
+      echo "ts-lsp: unknown argument '$1' (usage: ts-lsp [--workspace DIR] [--explain])" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+[ -n "$ws" ] || ws=${CLAUDE_PROJECT_DIR:-${PWD:-.}}
+ws=$(cd "$ws" 2>/dev/null && pwd) || {
+  echo "ts-lsp: workspace '$ws' is not a directory" >&2
+  exit 2
+}
+
+have_jq=0
+command -v jq >/dev/null 2>&1 && have_jq=1
+
+nl='
+'
+old_ifs=$IFS
+
+# ---- package.json readers ---------------------------------------------------
+
+# Print the "version" of a package.json (nothing when unreadable or unparsable).
+read_version() {
+  [ -f "$1" ] || return 0
+  if [ "$have_jq" = 1 ]; then
+    jq -r 'if (.version | type) == "string" then .version else empty end' "$1" 2>/dev/null
+  else
+    sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1
+  fi
+}
+
+# Print every string-valued dependency entry of package.json $1 as "name value"
+# lines, across dependencies, devDependencies, peerDependencies and
+# optionalDependencies (see the header comment for the no-jq limits).
+list_decls() {
+  [ -f "$1" ] || return 0
+  if [ "$have_jq" = 1 ]; then
+    jq -r '[.dependencies, .devDependencies, .peerDependencies, .optionalDependencies]
+      | map(select(type == "object") | to_entries[] | select(.value | type == "string"))
+      | .[] | "\(.key) \(.value)"' "$1" 2>/dev/null
+  else
+    # Four characters map to newline on purpose.
+    # shellcheck disable=SC2020
+    tr ',{}\r' '\n\n\n\n' <"$1" 2>/dev/null |
+      sed -n 's/^[[:space:]]*"\([^"]*\)"[[:space:]]*:[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1 \2/p'
+  fi
+}
+
+# True for a dependency entry that matters here: typescript, an npm alias of it
+# ("npm:typescript" or "npm:typescript@RANGE"), @typescript/native-preview, tsrs.
+is_relevant() { # name value
+  case $1 in typescript | @typescript/native-preview | tsrs) return 0 ;; esac
+  case $2 in npm:typescript | npm:typescript@*) return 0 ;; esac
+  return 1
+}
+
+# Leading integer of a version or range ("^5.4" -> 5, "npm:typescript@6" -> 6).
+major_of() {
+  printf '%s\n' "$1" | sed -n 's/^[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -1
+}
+
+# Like major_of, with dist-tags mapped to the current major (7).
+range_major() {
+  case $1 in
+    latest | next | beta | rc | dev | insiders | '*' | x | X) echo 7 ;;
+    *) major_of "$1" ;;
+  esac
+}
+
+# ---- find the deciding package.json -----------------------------------------
+
+decl_pkg=
+decl_dir=$ws
+decl_tsrs=
+decl_native=
+ts_decls=
+notes=
+
+d=$ws
+while :; do
+  if [ -f "$d/package.json" ]; then
+    rel=
+    all=$(list_decls "$d/package.json")
+    # Lines are walked with IFS=newline, not a here-document (ksh writes those to a temp file).
+    set -f
+    IFS=$nl
+    for line in $all; do
+      dn=${line%% *}
+      dv=${line#* }
+      [ -n "$dn" ] && [ -n "$dv" ] && [ "$dn" != "$line" ] || continue
+      is_relevant "$dn" "$dv" || continue
+      rel="$rel$dn $dv$nl"
+    done
+    IFS=$old_ifs
+    set +f
+    if [ -n "$rel" ]; then
+      decl_pkg=$d/package.json
+      decl_dir=$d
+      set -f
+      IFS=$nl
+      for line in $rel; do
+        dn=${line%% *}
+        dv=${line#* }
+        case $dn in
+          tsrs) [ -n "$decl_tsrs" ] || decl_tsrs=$dv ;;
+          @typescript/native-preview) [ -n "$decl_native" ] || decl_native=$dv ;;
+        esac
+        case $dn:$dv in
+          tsrs:* | @typescript/native-preview:*) ;;
+          *) ts_decls="$ts_decls$dn $dv$nl" ;;
+        esac
+      done
+      IFS=$old_ifs
+      set +f
+      break
+    elif [ "$have_jq" = 1 ] && ! jq -e . "$d/package.json" >/dev/null 2>&1; then
+      [ -n "$notes" ] || notes="ignored unparsable $d/package.json"
+    fi
+  fi
+  [ "$d" = / ] && break
+  parent=${d%/*}
+  [ -n "$parent" ] || parent=/
+  d=$parent
+done
+
+# ---- node_modules lookups, Node-style, from the declaring package.json's dir --
+
+# Print the nearest node_modules directory that holds package $1.
+nearest_nm() {
+  _d=$decl_dir
+  while :; do
+    if [ -f "$_d/node_modules/$1/package.json" ]; then
+      printf '%s' "$_d/node_modules"
+      return 0
+    fi
+    [ "$_d" = / ] && return 1
+    _p=${_d%/*}
+    [ -n "$_p" ] || _p=/
+    _d=$_p
+  done
+}
+
+# Print the nearest executable node_modules/.bin/$1.
+nearest_bin() {
+  _d=$decl_dir
+  while :; do
+    if [ -f "$_d/node_modules/.bin/$1" ] && [ -x "$_d/node_modules/.bin/$1" ]; then
+      printf '%s' "$_d/node_modules/.bin/$1"
+      return 0
+    fi
+    [ "$_d" = / ] && return 1
+    _p=${_d%/*}
+    [ -n "$_p" ] || _p=/
+    _d=$_p
+  done
+}
+
+is_exec() { [ -f "$1" ] && [ -x "$1" ]; }
+
+# ---- decide -----------------------------------------------------------------
+
+kind=none
+matched=no
+want=unknown
+cmd=
+reason=
+hint=
+
+install_hint="install the project's dependencies (npm install, bun install or pnpm install)"
+
+pick_project() {
+  if [ -z "$decl_pkg" ]; then
+    want=unknown
+    reason="no package.json at or above $ws declares typescript, @typescript/native-preview or tsrs"
+    hint="npm install -D typescript@7 (TypeScript 7 has a built-in language server), or tsrs"
+    return 1
+  fi
+
+  # 1. tsrs
+  if [ -n "$decl_tsrs" ]; then
+    want=tsrs
+    if b=$(nearest_bin tsrs); then
+      kind=tsrs-project matched=yes cmd=$b
+      reason="$decl_pkg declares tsrs = $decl_tsrs; using $b"
+      return 0
+    fi
+    reason="$decl_pkg declares tsrs = $decl_tsrs but node_modules/.bin/tsrs is not installed"
+    hint=$install_hint
+    return 1
+  fi
+
+  # Classify the typescript declarations (plain and aliased) by effective major.
+  t7_label=
+  t7_why=
+  t7_bin=
+  t7_ok=
+  old_label=
+  old_inst=
+  old_iv=
+  set -f
+  IFS=$nl
+  for line in $ts_decls; do
+    dn=${line%% *}
+    dv=${line#* }
+    spec=$dv
+    case $dv in
+      npm:typescript@*) spec=${dv#npm:typescript@} ;;
+      npm:typescript) spec=latest ;;
+    esac
+    rmaj=$(range_major "$spec")
+    nm=
+    iv=
+    im=
+    if nm=$(nearest_nm "$dn"); then
+      iv=$(read_version "$nm/$dn/package.json")
+      im=$(major_of "$iv")
+      [ -n "$iv" ] || [ -n "$notes" ] || notes="ignored unreadable $nm/$dn/package.json"
+    fi
+    em=${rmaj:-$im}
+    em=${em:-0}
+    if [ "$em" -ge 7 ]; then
+      [ -n "$t7_label" ] || t7_label="$dn = $dv"
+      [ -z "$t7_bin" ] || continue
+      if [ -z "$nm" ]; then
+        [ -n "$t7_why" ] || t7_why="$dn is not installed"
+      elif [ -z "$im" ] || [ "$im" -lt 7 ]; then
+        [ -n "$t7_why" ] || t7_why="installed $dn in $nm is ${iv:-of unknown version}, not TypeScript 7"
+      elif is_exec "$nm/$dn/bin/tsc"; then
+        t7_bin=$nm/$dn/bin/tsc t7_ok="$dn = $dv"
+      elif [ "$dn" = typescript ] && is_exec "$nm/.bin/tsc"; then
+        t7_bin=$nm/.bin/tsc t7_ok="$dn = $dv"
+      else
+        [ -n "$t7_why" ] || t7_why="installed $dn $iv has no tsc binary"
+      fi
+    else
+      [ -n "$old_label" ] || old_label="$dn = $dv"
+      if [ -n "$nm" ] && [ -z "$old_inst" ]; then
+        old_inst="$dn = $dv"
+        old_iv=$iv
+      fi
+    fi
+  done
+  IFS=$old_ifs
+  set +f
+
+  # 2. TypeScript 7+
+  if [ -n "$t7_label" ]; then
+    want=ts7
+    if [ -n "$t7_bin" ]; then
+      kind=tsc7-project matched=yes cmd=$t7_bin
+      reason="$decl_pkg declares $t7_ok; using $t7_bin"
+      return 0
+    fi
+    reason="$decl_pkg declares $t7_label (TypeScript 7) but $t7_why"
+    hint=$install_hint
+    return 1
+  fi
+
+  # 3. @typescript/native-preview
+  if [ -n "$decl_native" ]; then
+    want=ts7
+    if b=$(nearest_bin tsgo); then
+      kind=tsgo-project matched=yes cmd=$b
+      reason="$decl_pkg declares @typescript/native-preview = $decl_native; using $b"
+      return 0
+    fi
+    reason="$decl_pkg declares @typescript/native-preview = $decl_native but node_modules/.bin/tsgo is not installed"
+    hint=$install_hint
+    return 1
+  fi
+
+  # 4. only typescript < 7: typescript-language-server (the one undeclared helper)
+  want=classic
+  if [ -z "$old_inst" ]; then
+    reason="$decl_pkg declares $old_label but it is not installed"
+    hint="$install_hint, plus typescript-language-server (npm install -D typescript-language-server)"
+    return 1
+  fi
+  if b=$(nearest_bin typescript-language-server); then
+    kind=tsls-project matched=yes cmd=$b
+    reason="$decl_pkg declares $old_inst (installed ${old_iv:-version unknown}); using project typescript-language-server at $b"
+    return 0
+  fi
+  if p=$(command -v typescript-language-server 2>/dev/null) && case $p in /*) true ;; *) false ;; esac; then
+    kind=tsls-path matched=yes cmd=$p
+    reason="$decl_pkg declares $old_inst (installed ${old_iv:-version unknown}); using typescript-language-server on PATH at $p (it uses the workspace's tsserver)"
+    return 0
+  fi
+  reason="$decl_pkg declares $old_inst (installed ${old_iv:-version unknown}) but there is no typescript-language-server in the project or on PATH"
+  hint="npm install -D typescript-language-server (or install it globally); to move to the Go-native server instead: npm install -D typescript@7"
+  return 1
+}
+
+# A global (PATH) server: tsrs, then tsc >= 7, then tsgo.
+pick_fallback() {
+  p=$(command -v tsrs 2>/dev/null) || p=
+  case $p in
+    /*)
+      if "$p" --version >/dev/null 2>&1 </dev/null; then
+        kind=tsrs-path cmd=$p
+        fb="tsrs on PATH at $p"
+        return 0
+      fi
+      ;;
+  esac
+  p=$(command -v tsc 2>/dev/null) || p=
+  case $p in
+    /*)
+      v=$("$p" --version 2>/dev/null </dev/null | head -1)
+      m=$(major_of "$v")
+      if [ -n "$m" ] && [ "$m" -ge 7 ]; then
+        kind=tsc7-path cmd=$p
+        fb="tsc $m on PATH at $p"
+        return 0
+      fi
+      ;;
+  esac
+  p=$(command -v tsgo 2>/dev/null) || p=
+  case $p in
+    /*)
+      if "$p" --version >/dev/null 2>&1 </dev/null; then
+        kind=tsgo-path cmd=$p
+        fb="tsgo on PATH at $p"
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+if ! pick_project; then
+  fb=
+  if pick_fallback; then
+    reason="$reason; falling back to $fb"
+  else
+    kind=none
+    cmd=
+    reason="$reason; no tsrs, tsc >= 7 or tsgo on PATH either"
+  fi
+fi
+
+# Binaries in node_modules that no package.json declares are never used; say so.
+stray=
+if [ -z "$decl_tsrs" ] && b=$(nearest_bin tsrs); then
+  stray="ignored undeclared tsrs at $b"
+fi
+if [ -z "$decl_native" ] && b=$(nearest_bin tsgo); then
+  stray="${stray:+$stray, }ignored undeclared tsgo at $b"
+fi
+[ -z "$stray" ] || notes="${notes:+$notes; }$stray"
+[ -z "$notes" ] || reason="$reason ($notes)"
+
+# typescript-language-server takes --stdio; the Go and Rust servers take --lsp --stdio.
+case $kind in
+  tsls-project | tsls-path) args=--stdio ;;
+  *) args="--lsp --stdio" ;;
+esac
+
+# Values stay on one line.
+oneline() { printf '%s' "$1" | tr '\n\r' '  '; }
+
+if [ "$explain" = 1 ]; then
+  printf 'kind=%s\n' "$kind"
+  printf 'matched=%s\n' "$matched"
+  printf 'want=%s\n' "$want"
+  printf 'workspace=%s\n' "$(oneline "$ws")"
+  if [ -n "$cmd" ]; then
+    printf 'command=%s %s\n' "$(oneline "$cmd")" "$args"
+  else
+    printf 'command=\n'
+  fi
+  printf 'reason=%s\n' "$(oneline "$reason")"
+  printf 'hint=%s\n' "$(oneline "$hint")"
+  exit 0
+fi
+
+if [ "$kind" = none ]; then
+  echo "ts-lsp: no TypeScript language server for $(oneline "$ws"): $(oneline "$reason"). Install: $(oneline "$hint")" >&2
+  exit 3
+fi
+
+if [ "$matched" = no ]; then
+  echo "ts-lsp: fallback $kind ($(oneline "$reason"))" >&2
+fi
+
+# $args is deliberately unquoted: it is a fixed, space-separated flag list.
+# shellcheck disable=SC2086
+exec "$cmd" $args

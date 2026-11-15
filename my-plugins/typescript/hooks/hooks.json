@@ -1,5 +1,17 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/ts-lsp-check.sh\"",
+            "timeout": 5,
+            "statusMessage": "Checking the TypeScript language server"
+          }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",
@@ -7,7 +19,7 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/hooks/block-tsc-with-files.sh",
-            "timeout": 5000
+            "timeout": 5
           }
         ]
       }
