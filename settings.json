@@ -132,6 +132,7 @@
       }
     }
   },
+  "outputStyle": "Concise",
   "sandbox": {
     "enabled": true,
     "autoAllowBashIfSandboxed": true,
