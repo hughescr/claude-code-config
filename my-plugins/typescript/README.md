@@ -49,11 +49,11 @@ sh ~/.claude/my-plugins/typescript/bin/ts-lsp --explain [--workspace DIR]
 
 `matched=yes` means the server the project's `package.json` declares; `want` is what the project declares (`tsrs`, `ts7`, `classic` or `unknown`); `hint` says what to install in the project to get the matched server.
 
-jq is used to read `package.json` when present. Without it the launcher splits the file at commas and braces and reads every `"key": "string"` line with sed, which handles one-dependency-per-line and minified files, but sees an entry anywhere in the file (a `typescript` pin under `overrides` counts), misreads values containing a comma, brace or escaped quote, and does not notice an unparsable file.
+jq is used to read `package.json` when present. Without it the launcher splits the file at commas and braces and reads every `"key": "string"` line in plain shell, which handles one-dependency-per-line and minified files, but sees an entry anywhere in the file (a `typescript` pin under `overrides` counts), misreads values containing a comma, brace or escaped quote, and does not notice an unparsable file.
 
 ### Startup notice
 
-`hooks/ts-lsp-check.sh` runs the same resolution at `SessionStart` (about 55 ms). It prints nothing when the server the project declares was found. On a fallback, or when no server works, it prints a `systemMessage` (shown to you in the terminal) and the same text as `additionalContext` (so Claude can explain diagnostics that disagree with the project's TypeScript). It always exits 0.
+`hooks/ts-lsp-check.sh` runs the same resolution at `SessionStart` (about 25 ms). It prints nothing when the server the project declares was found. On a fallback, or when no server works, it prints a `systemMessage` (shown to you in the terminal) and the same text as `additionalContext` (so Claude can explain diagnostics that disagree with the project's TypeScript). It always exits 0.
 
 ### One server per extension
 
@@ -65,7 +65,7 @@ Claude Code gives each file extension one server: when two enabled plugins claim
 
 ### Tests
 
-`sh tests/ts-lsp.test.sh` (or `bash`): temp workspaces with a `package.json` and fake `node_modules` with stub binaries, under a controlled PATH; covers every branch, aliases, undeclared binaries being ignored, declared-but-not-installed for each kind, the fallbacks, monorepo walk-up, broken or missing `package.json`, with and without jq, under each shell found (sh, dash, ksh, bash), and the hook and manifest wiring.
+`sh tests/ts-lsp.test.sh` (or `bash`): temp workspaces with a `package.json` and fake `node_modules` with stub binaries, under a controlled PATH; covers every branch, aliases, undeclared binaries being ignored, declared-but-not-installed for each kind, the fallbacks, monorepo walk-up, broken or missing `package.json`, with and without jq (the two parsers), and the hook and manifest wiring. The whole table runs under `sh` and `bash`; a core subset (every rule, every fallback, every declared-but-not-installed kind, the monorepo walk, broken and minified files, both parsers) runs under `dash` and `ksh`, whichever of the four are installed. It takes a few seconds: the workspaces are built once, the launcher runs once per case, and the assertions spawn no processes. `TS_LSP_LAUNCHER=/path/to/ts-lsp` runs the suite against another copy of the launcher, which is how to check that the suite catches a deliberately broken one.
 
 ## Usage
 

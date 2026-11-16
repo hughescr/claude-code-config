@@ -51,9 +51,9 @@
 # Verified command (run against typescript 7.0.2, @typescript/native-preview
 # 7.0.0-dev.20260707.2 and tsrs 0.25.0-ts7.1.0-beta): `<bin> --lsp --stdio`.
 #
-# POSIX sh. jq is used when present. Without jq, package.json is read with sed
-# and tr: the file is split at commas and braces and every line of the exact
-# form "key": "string" counts as a dependency entry. That reads one entry per
+# POSIX sh. jq is used when present. Without jq, package.json is read by the
+# shell itself (no process is spawned): the file is split at commas and braces
+# and every piece of the exact form "key": "string" counts as a dependency entry. That reads one entry per
 # line and minified files, and sees an entry anywhere in the file (a typescript
 # pin under "overrides" counts as a declaration). It misreads values that
 # contain a comma, brace or escaped quote, and it does not notice an
@@ -86,10 +86,28 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$ws" ] || ws=${CLAUDE_PROJECT_DIR:-${PWD:-.}}
-ws=$(cd "$ws" 2>/dev/null && pwd) || {
-  echo "ts-lsp: workspace '$ws' is not a directory" >&2
-  exit 2
-}
+# Performance: this launcher runs at every session start, and every process it
+# spawns costs a fork, so everything below that can be done by the shell itself
+# (parameter expansion, case, [ ]) is. An absolute path with no ".", ".." or
+# "//" part is already what `cd DIR && pwd` would print; anything else, or a
+# directory that is missing or not searchable, goes through cd so the answer
+# and the error stay the same.
+ws_plain=0
+case $ws in
+  /*)
+    case $ws in
+      *//* | */./* | */../* | */. | */.. | */) ;;
+      *) [ -d "$ws" ] && [ -x "$ws" ] && ws_plain=1 ;;
+    esac
+    ;;
+esac
+if [ "$ws_plain" = 0 ]; then
+  ws_arg=$ws
+  ws=$(cd "$ws" 2>/dev/null && pwd) || {
+    echo "ts-lsp: workspace '$ws_arg' is not a directory" >&2
+    exit 2
+  }
+fi
 
 have_jq=0
 command -v jq >/dev/null 2>&1 && have_jq=1
@@ -100,31 +118,104 @@ old_ifs=$IFS
 
 # ---- package.json readers ---------------------------------------------------
 
-# Print the "version" of a package.json (nothing when unreadable or unparsable).
+# The readers set a variable instead of printing, so the no-jq path (which is
+# pure shell) needs no process at all and the jq path needs exactly one.
+
+# Set RV to the "version" of a package.json (empty when unreadable or unparsable).
 read_version() {
+  RV=
   [ -f "$1" ] || return 0
   if [ "$have_jq" = 1 ]; then
-    jq -r 'if (.version | type) == "string" then .version else empty end' "$1" 2>/dev/null
+    RV=$(jq -r 'if (.version | type) == "string" then .version else empty end' "$1" 2>/dev/null)
   else
-    sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1
+    nojq_version "$1"
   fi
 }
 
-# Print every string-valued dependency entry of package.json $1 as "name value"
-# lines, across dependencies, devDependencies, peerDependencies and
+# Set ALL to every string-valued dependency entry of package.json $1 as "name
+# value" lines, across dependencies, devDependencies, peerDependencies and
 # optionalDependencies (see the header comment for the no-jq limits).
 list_decls() {
+  ALL=
   [ -f "$1" ] || return 0
   if [ "$have_jq" = 1 ]; then
-    jq -r '[.dependencies, .devDependencies, .peerDependencies, .optionalDependencies]
+    ALL=$(jq -r '[.dependencies, .devDependencies, .peerDependencies, .optionalDependencies]
       | map(select(type == "object") | to_entries[] | select(.value | type == "string"))
-      | .[] | "\(.key) \(.value)"' "$1" 2>/dev/null
+      | .[] | "\(.key) \(.value)"' "$1" 2>/dev/null)
   else
-    # Four characters map to newline on purpose.
-    # shellcheck disable=SC2020
-    tr ',{}\r' '\n\n\n\n' <"$1" 2>/dev/null |
-      sed -n 's/^[[:space:]]*"\([^"]*\)"[[:space:]]*:[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1 \2/p'
+    nojq_decls "$1"
   fi
+}
+
+# ---- the no-jq readers: what the sed/tr pipeline did, in the shell itself -----
+
+# Set RV to the "version" of the first line that has a `"version": "STRING"`
+# pair (the last such pair on that line, as a greedy `.*"version"` finds it).
+nojq_version() {
+  [ -r "$1" ] || return 0
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    _rest=$_line
+    _found=0
+    while :; do
+      case $_rest in *'"version"'*) ;; *) break ;; esac
+      _after=${_rest#*'"version"'}
+      _rest=\"$_after # an occurrence may start at the quote that just closed this one
+      _t=${_after#"${_after%%[![:space:]]*}"}
+      case $_t in :*) ;; *) continue ;; esac
+      _t=${_t#:}
+      _t=${_t#"${_t%%[![:space:]]*}"}
+      case $_t in \"*) ;; *) continue ;; esac
+      _t=${_t#\"}
+      case $_t in *\"*) ;; *) continue ;; esac
+      RV=${_t%%\"*}
+      _found=1
+    done
+    [ "$_found" = 0 ] || break
+  done 2>/dev/null <"$1"
+}
+
+# Set ALL from package.json $1 without jq. The file is split at commas, braces
+# and carriage returns (and so at newlines), and every piece of exactly the
+# form  "key": "string"  (blanks allowed around the parts) is an entry.
+nojq_decls() {
+  [ -r "$1" ] || return 0
+  [ -n "${cr:-}" ] || cr=$(printf '\r')
+  _sep="[,{}$cr]"
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    _rest=$_line
+    _more=1
+    while [ "$_more" = 1 ]; do
+      # $_sep is a glob pattern on purpose.
+      # shellcheck disable=SC2295
+      case $_rest in
+        *$_sep*)
+          _piece=${_rest%%$_sep*}
+          _rest=${_rest#*$_sep}
+          ;;
+        *)
+          _piece=$_rest
+          _more=0
+          ;;
+      esac
+      _t=${_piece#"${_piece%%[![:space:]]*}"}
+      case $_t in \"*) ;; *) continue ;; esac
+      _t=${_t#\"}
+      case $_t in *\"*) ;; *) continue ;; esac
+      _k=${_t%%\"*}
+      _t=${_t#*\"}
+      _t=${_t#"${_t%%[![:space:]]*}"}
+      case $_t in :*) ;; *) continue ;; esac
+      _t=${_t#:}
+      _t=${_t#"${_t%%[![:space:]]*}"}
+      case $_t in \"*) ;; *) continue ;; esac
+      _t=${_t#\"}
+      case $_t in *\"*) ;; *) continue ;; esac
+      _v=${_t%%\"*}
+      _t=${_t#*\"}
+      case $_t in *[![:space:]]*) continue ;; esac
+      ALL=$ALL$_k\ $_v$nl
+    done
+  done 2>/dev/null <"$1"
 }
 
 # True for a dependency entry that matters here: typescript, an npm alias of it
@@ -135,16 +226,23 @@ is_relevant() { # name value
   return 1
 }
 
-# Leading integer of a version or range ("^5.4" -> 5, "npm:typescript@6" -> 6).
+# Set MAJOR to the leading integer of a version or range ("^5.4" -> 5,
+# "npm:typescript@6" -> 6; empty when there is none). Pure parameter expansion:
+# no subshell, so callers read $MAJOR instead of capturing output.
 major_of() {
-  printf '%s\n' "$1" | sed -n 's/^[^0-9]*\([0-9][0-9]*\).*/\1/p' | head -1
+  _pre=${1%%[0-9]*}
+  _rest=${1#"$_pre"}
+  MAJOR=${_rest%%[!0-9]*}
 }
 
-# Like major_of, with dist-tags mapped to the current major (7).
+# Like major_of, with dist-tags mapped to the current major (7); sets RMAJOR.
 range_major() {
   case $1 in
-    latest | next | beta | rc | dev | insiders | '*' | x | X) echo 7 ;;
-    *) major_of "$1" ;;
+    latest | next | beta | rc | dev | insiders | '*' | x | X) RMAJOR=7 ;;
+    *)
+      major_of "$1"
+      RMAJOR=$MAJOR
+      ;;
   esac
 }
 
@@ -161,7 +259,8 @@ d=$ws
 while :; do
   if [ -f "$d/package.json" ]; then
     rel=
-    all=$(list_decls "$d/package.json")
+    list_decls "$d/package.json"
+    all=$ALL
     # Lines are walked with IFS=newline, not a here-document (ksh writes those to a temp file).
     set -f
     IFS=$nl
@@ -206,12 +305,14 @@ done
 
 # ---- node_modules lookups, Node-style, from the declaring package.json's dir --
 
-# Print the nearest node_modules directory that holds package $1.
+# Set NM to the nearest node_modules directory that holds package $1 (status 1
+# when none does). These helpers set a variable instead of printing, so callers
+# need no command substitution (a subshell each).
 nearest_nm() {
   _d=$decl_dir
   while :; do
     if [ -f "$_d/node_modules/$1/package.json" ]; then
-      printf '%s' "$_d/node_modules"
+      NM=$_d/node_modules
       return 0
     fi
     [ "$_d" = / ] && return 1
@@ -221,12 +322,12 @@ nearest_nm() {
   done
 }
 
-# Print the nearest executable node_modules/.bin/$1.
+# Set NB to the nearest executable node_modules/.bin/$1 (status 1 when none).
 nearest_bin() {
   _d=$decl_dir
   while :; do
     if [ -f "$_d/node_modules/.bin/$1" ] && [ -x "$_d/node_modules/.bin/$1" ]; then
-      printf '%s' "$_d/node_modules/.bin/$1"
+      NB=$_d/node_modules/.bin/$1
       return 0
     fi
     [ "$_d" = / ] && return 1
@@ -234,6 +335,37 @@ nearest_bin() {
     [ -n "$_p" ] || _p=/
     _d=$_p
   done
+}
+
+# Set FP to the first regular executable file named $1 on PATH, as
+# `command -v` would find it ("" when none). A relative result (an empty or
+# relative PATH entry) is returned as such; callers only accept absolute ones.
+find_in_path() {
+  FP=
+  if [ -z "${PATH:-}" ]; then
+    FP=$(command -v "$1" 2>/dev/null) || FP=
+    return 0
+  fi
+  _rest=$PATH
+  _more=1
+  while [ "$_more" = 1 ]; do
+    case $_rest in
+      *:*)
+        _dir=${_rest%%:*}
+        _rest=${_rest#*:}
+        ;;
+      *)
+        _dir=$_rest
+        _more=0
+        ;;
+    esac
+    [ -n "$_dir" ] || _dir=.
+    if [ -x "$_dir/$1" ] && [ ! -d "$_dir/$1" ]; then
+      FP=$_dir/$1
+      return 0
+    fi
+  done
+  return 0
 }
 
 is_exec() { [ -f "$1" ] && [ -x "$1" ]; }
@@ -260,7 +392,8 @@ pick_project() {
   # 1. tsrs
   if [ -n "$decl_tsrs" ]; then
     want=tsrs
-    if b=$(nearest_bin tsrs); then
+    if nearest_bin tsrs; then
+      b=$NB
       kind=tsrs-project matched=yes cmd=$b
       reason="$decl_pkg declares tsrs = $decl_tsrs; using $b"
       return 0
@@ -288,13 +421,17 @@ pick_project() {
       npm:typescript@*) spec=${dv#npm:typescript@} ;;
       npm:typescript) spec=latest ;;
     esac
-    rmaj=$(range_major "$spec")
+    range_major "$spec"
+    rmaj=$RMAJOR
     nm=
     iv=
     im=
-    if nm=$(nearest_nm "$dn"); then
-      iv=$(read_version "$nm/$dn/package.json")
-      im=$(major_of "$iv")
+    if nearest_nm "$dn"; then
+      nm=$NM
+      read_version "$nm/$dn/package.json"
+      iv=$RV
+      major_of "$iv"
+      im=$MAJOR
       [ -n "$iv" ] || [ -n "$notes" ] || notes="ignored unreadable $nm/$dn/package.json"
     fi
     em=${rmaj:-$im}
@@ -340,7 +477,8 @@ pick_project() {
   # 3. @typescript/native-preview
   if [ -n "$decl_native" ]; then
     want=ts7
-    if b=$(nearest_bin tsgo); then
+    if nearest_bin tsgo; then
+      b=$NB
       kind=tsgo-project matched=yes cmd=$b
       reason="$decl_pkg declares @typescript/native-preview = $decl_native; using $b"
       return 0
@@ -357,16 +495,21 @@ pick_project() {
     hint="$install_hint, plus typescript-language-server (npm install -D typescript-language-server)"
     return 1
   fi
-  if b=$(nearest_bin typescript-language-server); then
+  if nearest_bin typescript-language-server; then
+    b=$NB
     kind=tsls-project matched=yes cmd=$b
     reason="$decl_pkg declares $old_inst (installed ${old_iv:-version unknown}); using project typescript-language-server at $b"
     return 0
   fi
-  if p=$(command -v typescript-language-server 2>/dev/null) && case $p in /*) true ;; *) false ;; esac; then
-    kind=tsls-path matched=yes cmd=$p
-    reason="$decl_pkg declares $old_inst (installed ${old_iv:-version unknown}); using typescript-language-server on PATH at $p (it uses the workspace's tsserver)"
-    return 0
-  fi
+  find_in_path typescript-language-server
+  case $FP in
+    /*)
+      p=$FP
+      kind=tsls-path matched=yes cmd=$p
+      reason="$decl_pkg declares $old_inst (installed ${old_iv:-version unknown}); using typescript-language-server on PATH at $p (it uses the workspace's tsserver)"
+      return 0
+      ;;
+  esac
   reason="$decl_pkg declares $old_inst (installed ${old_iv:-version unknown}) but there is no typescript-language-server in the project or on PATH"
   hint="npm install -D typescript-language-server (or install it globally); to move to the Go-native server instead: npm install -D typescript@7"
   return 1
@@ -374,7 +517,8 @@ pick_project() {
 
 # A global (PATH) server: tsrs, then tsc >= 7, then tsgo.
 pick_fallback() {
-  p=$(command -v tsrs 2>/dev/null) || p=
+  find_in_path tsrs
+  p=$FP
   case $p in
     /*)
       if "$p" --version >/dev/null 2>&1 </dev/null; then
@@ -384,11 +528,14 @@ pick_fallback() {
       fi
       ;;
   esac
-  p=$(command -v tsc 2>/dev/null) || p=
+  find_in_path tsc
+  p=$FP
   case $p in
     /*)
-      v=$("$p" --version 2>/dev/null </dev/null | head -1)
-      m=$(major_of "$v")
+      v=$("$p" --version 2>/dev/null </dev/null)
+      v=${v%%"$nl"*} # the first line only
+      major_of "$v"
+      m=$MAJOR
       if [ -n "$m" ] && [ "$m" -ge 7 ]; then
         kind=tsc7-path cmd=$p
         fb="tsc $m on PATH at $p"
@@ -396,7 +543,8 @@ pick_fallback() {
       fi
       ;;
   esac
-  p=$(command -v tsgo 2>/dev/null) || p=
+  find_in_path tsgo
+  p=$FP
   case $p in
     /*)
       if "$p" --version >/dev/null 2>&1 </dev/null; then
@@ -422,11 +570,11 @@ fi
 
 # Binaries in node_modules that no package.json declares are never used; say so.
 stray=
-if [ -z "$decl_tsrs" ] && b=$(nearest_bin tsrs); then
-  stray="ignored undeclared tsrs at $b"
+if [ -z "$decl_tsrs" ] && nearest_bin tsrs; then
+  stray="ignored undeclared tsrs at $NB"
 fi
-if [ -z "$decl_native" ] && b=$(nearest_bin tsgo); then
-  stray="${stray:+$stray, }ignored undeclared tsgo at $b"
+if [ -z "$decl_native" ] && nearest_bin tsgo; then
+  stray="${stray:+$stray, }ignored undeclared tsgo at $NB"
 fi
 [ -z "$stray" ] || notes="${notes:+$notes; }$stray"
 [ -z "$notes" ] || reason="$reason ($notes)"
@@ -437,31 +585,42 @@ case $kind in
   *) args="--lsp --stdio" ;;
 esac
 
-# Values stay on one line.
-oneline() { printf '%s' "$1" | tr '\n\r' '  '; }
+# Values stay on one line: newline and carriage return become spaces. Values
+# with no control character (all of them in practice) pass through untouched;
+# only a value that has one pays for tr. Sets OL.
+oneline() {
+  case $1 in
+    *[[:cntrl:]]*) OL=$(printf '%s' "$1" | tr '\n\r' '  ') ;;
+    *) OL=$1 ;;
+  esac
+}
+
+oneline "$ws"
+ws_line=$OL
+oneline "$reason"
+reason_line=$OL
+oneline "$hint"
+hint_line=$OL
 
 if [ "$explain" = 1 ]; then
-  printf 'kind=%s\n' "$kind"
-  printf 'matched=%s\n' "$matched"
-  printf 'want=%s\n' "$want"
-  printf 'workspace=%s\n' "$(oneline "$ws")"
   if [ -n "$cmd" ]; then
-    printf 'command=%s %s\n' "$(oneline "$cmd")" "$args"
+    oneline "$cmd"
+    cmd_line="$OL $args"
   else
-    printf 'command=\n'
+    cmd_line=
   fi
-  printf 'reason=%s\n' "$(oneline "$reason")"
-  printf 'hint=%s\n' "$(oneline "$hint")"
+  printf 'kind=%s\nmatched=%s\nwant=%s\nworkspace=%s\ncommand=%s\nreason=%s\nhint=%s\n' \
+    "$kind" "$matched" "$want" "$ws_line" "$cmd_line" "$reason_line" "$hint_line"
   exit 0
 fi
 
 if [ "$kind" = none ]; then
-  echo "ts-lsp: no TypeScript language server for $(oneline "$ws"): $(oneline "$reason"). Install: $(oneline "$hint")" >&2
+  echo "ts-lsp: no TypeScript language server for $ws_line: $reason_line. Install: $hint_line" >&2
   exit 3
 fi
 
 if [ "$matched" = no ]; then
-  echo "ts-lsp: fallback $kind ($(oneline "$reason"))" >&2
+  echo "ts-lsp: fallback $kind ($reason_line)" >&2
 fi
 
 # $args is deliberately unquoted: it is a fixed, space-separated flag list.
