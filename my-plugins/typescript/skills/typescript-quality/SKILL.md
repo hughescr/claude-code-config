@@ -16,7 +16,7 @@ bun run typecheck     # Preferred - uses project tsconfig.json
 
 Fallback when no typecheck script exists: run the compiler the project declares in package.json. Use `bunx tsrs --noEmit` for a tsrs project and `bunx tsc --noEmit` otherwise. tsrs is a Rust port of the TypeScript compiler with tsc's CLI flags.
 
-Run the compiler against the full project, not individual files, because it needs full project context for correct type-checking. This applies to tsrs as well as tsc. The `block-tsc-with-files` hook blocks per-file invocations of both `tsc` and `tsrs`.
+Run the compiler against the full project, not individual files, because it needs full project context for correct type-checking. This applies to tsrs as well as tsc. A plugin guard blocks per-file invocations of both `tsc` and `tsrs`.
 
 ## Strict Mode Compliance
 

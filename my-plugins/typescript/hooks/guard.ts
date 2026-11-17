@@ -1,8 +1,7 @@
-// Pure decision logic for the block-tsc-with-files guard. No claude-code
-// imports: the module is exercised by the plugin's tests and by an external
-// parity harness against the original shell hook.
+// Pure decision logic for the per-file compiler guard. No claude-code
+// imports: the module is exercised by the plugin's tests.
 //
-// Mirrors the former hooks/block-tsc-with-files.sh. Two compilers share one
+// Mirrors the logic of the shell hook it replaced. Two compilers share one
 // rule: tsc, and tsrs (the Rust port with tsc's CLI), which like tsc ignores
 // the project's tsconfig.json when given file arguments.
 //   1. gate: is tsc or tsrs invoked at all (bash [[ =~ ]] on the whole command)?

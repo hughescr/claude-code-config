@@ -1,4 +1,5 @@
 {
+  "modules": ["./register.ts"],
   "hooks": {
     "SessionStart": [
       {
@@ -8,18 +9,6 @@
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/ts-lsp-check.sh\"",
             "timeout": 5,
             "statusMessage": "Checking the TypeScript language server"
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/block-tsc-with-files.sh",
-            "timeout": 5
           }
         ]
       }

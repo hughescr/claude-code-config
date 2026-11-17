@@ -930,8 +930,8 @@ if [ "$HAVE_JQ" = 1 ]; then
     "$(jq -r '.lspServers.typescript | keys - ["command","args","extensionToLanguage","transport","env","initializationOptions","settings","workspaceFolder","startupTimeout","shutdownTimeout","requestTimeout","restartOnCrash","maxRestarts","diagnostics"] | length' "$PLUGIN/.claude-plugin/plugin.json")" 0
   eq "hooks.json: SessionStart runs the check" \
     "$(jq -r '[.hooks.SessionStart[].hooks[].command] | map(test("ts-lsp-check.sh")) | all' "$PLUGIN/hooks/hooks.json")" true
-  eq "hooks.json: the existing PreToolUse hook is kept" \
-    "$(jq -r '.hooks.PreToolUse[0].hooks[0].command | test("block-tsc-with-files.sh")' "$PLUGIN/hooks/hooks.json")" true
+  eq "hooks.json: the per-file compiler guard is the module, not a PreToolUse hook" \
+    "$(jq -r '(.modules == ["./register.ts"]) and ((.hooks.PreToolUse // []) | length == 0)' "$PLUGIN/hooks/hooks.json")" true
 else
   skip "manifest checks (jq not installed)"
 fi

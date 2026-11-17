@@ -8,10 +8,8 @@ TypeScript-specific development tools for Claude Code.
 
 ## Hooks
 
-- **block-tsc-with-files**: Prevents running `tsc` or `tsrs` with individual file arguments (both ignore the project's `tsconfig.json` when given files, so they need full project context). `tsrs-lint` and path-qualified invocations such as `./node_modules/.bin/tsc` are not matched.
+- **Per-file compiler guard** (mod): prevents running `tsc` or `tsrs` with individual file arguments (both ignore the project's `tsconfig.json` when given files, so they need full project context). `tsrs-lint` and path-qualified invocations such as `./node_modules/.bin/tsc` are not matched. It is a hooks module (`hooks/register.ts`, with the logic in `hooks/guard.ts`), declared under `modules` in `hooks/hooks.json`. A mod loads only while Claude Code's hooks-modules feature flag is on, so the guard is absent in a process where the flag is off. This plugin loads only in sessions started through `claude-smart.sh`. See `my-plugins/MODS-ACTIVATION.md`.
 - **ts-lsp-check** (SessionStart): reports the language-server choice, only when it is not the project's own server (see below)
-
-A staged in-process mod form of the tsc/tsrs guard (`hooks/register.ts`, `hooks/guard.ts`) is not wired yet; activation steps: `my-plugins/MODS-ACTIVATION.md`.
 
 ## Language server that follows the project
 
@@ -91,4 +89,4 @@ The server starts the first time Claude edits a matching file. Check `/plugin` (
 For TypeScript projects, plugins are loaded in order:
 1. `generic-dev` - DevTools MCP (symbol editing, docs, security)
 2. `javascript` - nodejs-packages MCP, Bun runtime skill
-3. `typescript` - TypeScript quality skill, tsc hooks, language-server launcher
+3. `typescript` - TypeScript quality skill, per-file compiler guard, language-server launcher

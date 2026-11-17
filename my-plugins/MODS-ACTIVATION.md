@@ -1,7 +1,8 @@
 # Mods activation runbook
 
-Status: the guard mods (`git-guard`, and the `guard.ts`/`register.ts` files in `typescript` and `hugo`) are staged
-on `develop` and **not wired**. The `.sh` command hooks stay the enforcement of record until you run this.
+Status: the `typescript` per-file compiler guard is activated (its `.sh` is removed; the mod is the only guard). The
+`git-guard` and `hugo` guard mods (`guard.ts`/`register.ts`) are staged on `develop` and **not wired**. Their `.sh`
+command hooks stay the enforcement of record until you run this.
 
 Why the wait: hooks modules load only while the server-side GrowthBook flag `tengu_plugin_hooks_modules` is ON for
 the process. While it is off, every module is silently skipped, so a guard whose `.sh` was removed is **absent**.
@@ -76,9 +77,12 @@ means mods are off in that session.
        `claude plugin update git-guard@craigs-claude-plugins` (it runs from
        `~/.claude/plugins/cache/craigs-claude-plugins/git-guard/<version>`).
 
-### typescript and hugo
+### hugo
 
-How they load: they are NOT marketplace-installed on this machine (`installed_plugins.json` has no
+typescript is done: its `hooks/hooks.json` keeps the `SessionStart` hook (`ts-lsp-check.sh`) beside the `modules`
+key.
+
+How the plugins load: they are NOT marketplace-installed on this machine (`installed_plugins.json` has no
 `typescript@`/`hugo@craigs-claude-plugins`). `claude-smart.sh` adds
 `--plugin-dir ~/.claude/my-plugins/typescript` (project has `tsconfig.json`, or typescript in `package.json`) and
 `--plugin-dir ~/.claude/my-plugins/hugo` (project has a Hugo config) straight from this working tree. Two
@@ -89,30 +93,27 @@ consequences:
 - The desktop app and a plain `claude` do not go through `claude-smart.sh`, so these guards (shell or mod) are not
   loaded there at all. Nothing changes for them.
 
-Per plugin (`typescript`: `block-tsc-with-files.sh`; `hugo`: `block-serverless-deploy.sh`):
+For hugo (`block-serverless-deploy.sh`):
 
 1. [ ] Overlap. Edit `hooks/hooks.json` to carry BOTH keys: add `"modules": ["./register.ts"]` and keep the
-       existing `"hooks": {...}` block. `claude plugin validate` accepts both together (checked on a scratch copy of
-       typescript). The mod runs first; the `.sh` still guards when the flag is off.
-2. [ ] Verify in a NEW `claude-smart.sh --debug-file $TMPDIR/x.txt` session in a matching project, asking it to run
-       typescript: `false && tsc a.ts` and `false && tsrs a.ts` (each denied: file argument, reason names that compiler); and `cd src && false && tsc *` in a directory with
-       `.ts` files (denied) and in one without (allowed), which proves `$.session.cwd()` equals the old hook's cwd;
-       hugo: `false && sls deploy` (denied). Expect the new plain-text reasons. `grep -E '(typescript|hugo).*(loaded|answered)' $TMPDIR/x.txt`
-       shows the mod answered.
-3. [ ] Remove the `.sh`: set `hooks/hooks.json` to exactly `{"modules": ["./register.ts"]}` (the shape the
-       plugin-authoring docs require: one path under `modules`, relative to that file). Repeat the step 2 probes.
-       Then `git rm my-plugins/typescript/hooks/block-tsc-with-files.sh` (or the hugo `.sh`).
-4. [ ] Bump `.claude-plugin/plugin.json` `version` `1.0.0` to `1.1.0`.
-5. [ ] Update docs that name the shell hook: `my-plugins/typescript/README.md` (Hooks section),
-       `my-plugins/typescript/skills/typescript-quality/SKILL.md` (line 19), `my-plugins/hugo/README.md` (hooks
-       table, line 66, and the file tree, line 132), `my-plugins/hugo/agents/hugo-deployment.md` (line 56).
-6. [ ] Refresh:
+       existing `"hooks": {...}` block. `claude plugin validate` accepts both together. The mod runs first; the
+       `.sh` still guards when the flag is off.
+2. [ ] Verify in a NEW `claude-smart.sh --debug-file $TMPDIR/x.txt` session in a Hugo project, asking it to run
+       `false && sls deploy` (denied). Expect the new plain-text reason.
+       `grep -E 'hugo.*(loaded|answered)' $TMPDIR/x.txt` shows the mod answered.
+3. [ ] Remove the `.sh`: remove the `PreToolUse` entry that runs it from `hooks/hooks.json`, keeping the `modules`
+       key and any other hooks (the plugin-authoring docs require one path under `modules`, relative to that file;
+       if the file has no other hooks, it becomes exactly `{"modules": ["./register.ts"]}`). Repeat the step 2
+       probe. Then `git rm my-plugins/hugo/hooks/block-serverless-deploy.sh`.
+4. [ ] Update docs that name the shell hook: `my-plugins/hugo/README.md` (hooks table, line 66, and the file tree,
+       line 132), `my-plugins/hugo/agents/hugo-deployment.md` (line 56).
+5. [ ] Refresh:
        - `claude-smart.sh` sessions: nothing to install; they read the tree. Restart long-lived sessions.
        - Marketplace copies: `misc.rungie.com` and `erica-s-hughes` enable `hugo@craigs-claude-plugins` from GitHub
          (`hughescr/claude-code-config`, per the cutover plan). Pushing the activation commit to that repo's default
          branch is what activates it there. Then, in each, `claude plugin marketplace update craigs-claude-plugins`
-         and `claude plugin update hugo@craigs-claude-plugins` (the version bump in step 4 is what makes the update
-         take).
+         and `claude plugin update hugo@craigs-claude-plugins`. The hugo `plugin.json` has no `version` field, so
+         check that the update picks up the new commit.
        - If `claude plugin list` ever shows `typescript@` or `hugo@craigs-claude-plugins` installed locally, run
          `claude plugin update <name>@craigs-claude-plugins` the same way.
 
@@ -123,8 +124,10 @@ Per plugin (`typescript`: `block-tsc-with-files.sh`; `hugo`: `block-serverless-d
   Edit tool. The script is still on disk if step 4 was not done.
 - git-guard step 1 (install): `claude plugin disable git-guard@craigs-claude-plugins`, or
   `claude plugin uninstall git-guard@craigs-claude-plugins`; restart sessions.
-- typescript/hugo step 3 (`.sh` removed): `git revert <sha>` restores the `.sh` and the old `hooks.json`.
-- typescript/hugo step 1 (overlap): remove the `"modules"` key from `hooks/hooks.json` by editing it.
+- typescript (cutover done): `git revert <sha>` of the cutover commit restores `block-tsc-with-files.sh` and the
+  `PreToolUse` entry in `hooks/hooks.json`.
+- hugo step 3 (`.sh` removed): `git revert <sha>` restores the `.sh` and the old `hooks.json`.
+- hugo step 1 (overlap): remove the `"modules"` key from `hooks/hooks.json` by editing it.
 - Roll back at once if a session shows no mods-probe notice while a guard depends on the mod, a probe is not
   denied, or the flag log shows gaps.
 
@@ -136,8 +139,8 @@ Deliberate changes:
 - A non-string command passes through (no opinion).
 - tsc and hugo deny reasons are plain text, not a raw JSON blob.
 - The `jq`/`sed` failure paths are gone.
-- tsc: if the bash glob-expansion fallback cannot run, literal words are used (never weaker than the old hook in
-  that situation).
+- tsc: if the bash glob-expansion fallback cannot run, literal words are used (never weaker than the former shell
+  hook in that situation).
 - Plugin `tool.call` hooks run before settings `PreToolUse` hooks. When one command trips several guards, the model
   sees only the first plugin's reason. Allow/deny parity holds.
 - Word boundaries are an exact generated 706-range table of what BSD grep treats as word characters, pinned to this
@@ -151,8 +154,8 @@ Fail-open paths that remain:
 - A hook that throws or exceeds its budget is skipped.
 - `--bare`, safe mode and untrusted workspaces load no installed-plugin modules (`--bare` also skips settings
   hooks, so parity holds there).
-- tsc glob fallback: `$.session.cwd()` is assumed equal to the old hook's cwd; a subagent in its own
-  cwd/worktree may differ (probe in step 2).
+- tsc glob fallback: `$.session.cwd()` is assumed equal to the former shell hook's cwd; a subagent in its own
+  cwd/worktree may differ.
 
 Known gaps preserved on purpose, for parity (fix in a separate, flagged change with its own tests):
 
