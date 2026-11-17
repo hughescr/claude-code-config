@@ -80,4 +80,4 @@ A disagreement is a finding to resolve, not a tie to split: escalate one rung an
 
 ---
 
-Destructive git commands are blocked by a PreToolUse hook: `git checkout -- <path>`, `git restore` (except the pure `--staged` unstage form), `git reset --hard`, and `git clean` with a force flag (dry runs allowed); undo your own edits by editing.
+Destructive git commands are blocked by the git-guard plugin: `git checkout -- <path>`, `git restore` (except the pure `--staged` unstage form), `git reset --hard`, and `git clean` with a force flag (dry runs allowed); undo your own edits by editing.
