@@ -8,3 +8,4 @@
 - Nested Agent calls use a CLAUDE.md route agent (`craig-core:*`; cross-family routes only where available) with an explicit `effort` from its table row and no `model`. Sub-agents never launch Workflows.
 - If spawned to review or verify, do the check yourself; never spawn your own reviewer. Review does not recurse.
 - Report concise evidence, checks run, and unresolved issues.
+- State every blocker you hit in your report (a missing file, a failed command, an unavailable tool, a denied permission), and what you did not do because of it. Never report work as done when a blocker stopped part of it.
