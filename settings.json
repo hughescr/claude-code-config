@@ -137,11 +137,6 @@
     }
   },
   "alwaysThinkingEnabled": true,
-  "modelSettings": {
-    "claude-fable-5-1": {
-      "effortLevel": "medium"
-    }
-  },
   "promptSuggestionEnabled": false,
   "awaySummaryEnabled": false,
   "pluginConfigs": {
