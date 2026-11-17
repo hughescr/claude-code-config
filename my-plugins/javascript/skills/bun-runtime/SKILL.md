@@ -44,13 +44,14 @@ npm run script-name
 
 ```bash
 # CORRECT - Use the project's configured scripts
-bun run lint          # Instead of bunx eslint
-bun run typecheck     # Instead of bunx tsc
+bun run lint          # Instead of bunx oxlint
+bun run typecheck     # Instead of bunx tsrs or bunx tsc
 bun run format        # Instead of bunx prettier
 bun run test          # Instead of bunx jest
 
 # INCORRECT - Running tools directly bypasses project configuration
-bunx eslint src/
+bunx oxlint src/
+bunx tsrs --noEmit
 bunx tsc --noEmit
 bunx prettier --write .
 ```
@@ -78,12 +79,18 @@ Common bun verbs to watch out for: `test`, `run`, `install`, `add`, `remove`, `u
 ```bash
 # CORRECT - Use bunx
 bunx <command>
-bunx eslint
 bunx prettier
+bunx ast-grep scan
 
 # INCORRECT - Do NOT use npx
 npx <command>
 ```
+
+**Oxlint is the exception:** run it under Node from the repo root, never through bun or bunx:
+```bash
+node node_modules/oxlint/bin/oxlint --deny-warnings <paths>
+```
+Bun truncates piped output at 64 KiB, and some rules resolve globs against the working directory.
 
 #### Direct Execution
 ```bash
@@ -180,5 +187,6 @@ The ONLY time to use Node.js/npm is when:
 - Explicitly debugging Node.js-specific compatibility issues
 - Working with tools that have hard Node.js version dependencies
 - User explicitly requests npm/node for a specific reason
+- Running Oxlint directly from the repo root under Node (see Executable Tools)
 
 **In all other cases, default to Bun.**

@@ -1,6 +1,6 @@
 ---
 name: typescript-quality
-description: Use for TypeScript type-safety work - fixing type/tsc errors, adding types or TSDoc, enabling strict mode, or sourcing @types packages. Provides guidance on strict mode compliance, TSDoc documentation, and DefinitelyTyped packages.
+description: Use for TypeScript type-safety work - fixing type errors from tsc or tsrs, adding types or TSDoc, enabling strict mode, sourcing @types packages, or Oxlint/ast-grep lint errors and disable directives. Provides guidance on strict mode compliance, TSDoc documentation, and DefinitelyTyped packages.
 ---
 
 # TypeScript Quality Standards
@@ -12,10 +12,11 @@ This skill covers TypeScript-specific quality requirements including strict mode
 Run type checking through package.json scripts:
 ```bash
 bun run typecheck     # Preferred - uses project tsconfig.json
-bunx tsc --noEmit     # Only if no typecheck script exists
 ```
 
-Run tsc against the full project, not individual files — TypeScript needs full project context for correct type-checking. A `block-tsc-with-files` hook blocks per-file invocations, so use `bun run typecheck` (preferred) or `bunx tsc --noEmit`.
+Fallback when no typecheck script exists: run the compiler the project declares in package.json. Use `bunx tsrs --noEmit` for a tsrs project and `bunx tsc --noEmit` otherwise. tsrs is a Rust port of the TypeScript compiler with tsc's CLI flags.
+
+Run the compiler against the full project, not individual files, because it needs full project context for correct type-checking. This applies to tsrs as well as tsc. The `block-tsc-with-files` hook covers only `tsc`; for tsrs, follow the rule yourself.
 
 ## Strict Mode Compliance
 
@@ -76,13 +77,30 @@ Before completing TypeScript work:
 4. TSDoc comments on exported functions, classes, and types
 5. Strict mode compliance (null safety, no @ts-ignore abuse)
 6. @types packages added for dependencies without bundled types
+7. Zero lint errors and warnings (`bun run lint`; see Linting below)
 
-## ESLint Auto-Fix
+## Linting
 
-For formatting and stylistic issues, use auto-fix to save time:
-```bash
-bun lint --fix     # If project uses bun scripts
-eslint --fix .     # Direct eslint command
-```
+Which linter runs is decided by the project's package.json scripts and config files (`oxlint.config.ts` vs `eslint.config.*`). Some projects still run ESLint.
 
-Auto-fix handles: trailing commas, semicolons, quotes, spacing, import order, and many other formatting rules. Always review changes after running auto-fix.
+- **Gate:** `bun run lint`. For auto-fix, run `bun run lint:fix` if the script exists, then review the diff.
+- **Direct Oxlint runs** go under Node from the repo root, never through bun or bunx:
+  ```bash
+  node node_modules/oxlint/bin/oxlint --deny-warnings <paths>
+  ```
+  Bun truncates piped output at 64 KiB, and some rules resolve globs against the working directory. This is a deliberate exception to the bun-first rule.
+- **Always pass `--deny-warnings`.** Warnings alone exit 0, and unused disable directives are reported as warnings.
+- **Type-aware rules** run through tsrs, using each file's nearest `tsconfig.json`. Lint does not report compiler diagnostics, so the typecheck gate stays separate.
+- **ast-grep** holds the syntax bans and lint-directive policy. Run it through the project's script (commonly `bun run check:ast-grep`, which runs `ast-grep scan`) where one exists.
+- **Suppress an Oxlint rule** on the line above the code:
+  ```ts
+  // eslint-disable-next-line <rule-id> -- <specific reason>
+  ```
+  Oxlint honours ESLint directive syntax. The rule list and the reason are both required. Use the id Oxlint reports: ESLint-plugin rules loaded under an alias carry the alias prefix (`eslint-core/`, `unicorn-js/`, `import-x-js/`, `n-js/`, `jest-js/`).
+- **Directive policy:** use only `disable-next-line` or `disable-line`, for local exceptions. Whole-file disables go in the file header before any code. Never use `eslint-enable` or `oxlint-enable`, or inline `eslint`, `global`, `globals`, `exported`, or `eslint-env` config comments. Delete a directive once it is no longer needed, since it fails the gate as unused.
+- **Suppress an ast-grep rule** on the line above the code:
+  ```ts
+  // ast-grep-ignore: <rule-id> -- <reason>
+  ```
+  In `.js`/`.jsx` files the shared rule ids end in `-javascript`; in `.tsx` they end in `-tsx`.
+- `package.json` is still linted by ESLint, since Oxlint does not lint JSON. The project's lint script already runs it.

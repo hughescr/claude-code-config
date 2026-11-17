@@ -137,7 +137,7 @@ Verify vulnerability resolved
 
 **Before merging:**
 - All tests passing
-- No new ESLint errors
+- No new lint errors or warnings (`bun run lint`)
 - No security vulnerabilities
 - License compliance verified
 - If the project has a `mutate` script in package.json, run `bun run mutate` after all tests pass
