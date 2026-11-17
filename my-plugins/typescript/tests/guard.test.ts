@@ -8,10 +8,14 @@ import {
   tscArgs,
   tscDecide,
   tscGuard,
+  compilerName,
   TSC_REASON,
+  TSRS_REASON,
 } from '../hooks/guard'
 
-type Row = { command: string; expect: 'allow' | 'deny' }
+// `reason` names the compiler a deny should mention; tsc when omitted.
+type Row = { command: string; expect: 'allow' | 'deny'; reason?: string }
+const reasonOf = (row: Row): string => row.reason ?? TSC_REASON
 
 // Golden corpus: decisions recorded from the original shell hook (parity-checked).
 const CORPUS: Row[] = [
@@ -45,20 +49,43 @@ const CORPUS: Row[] = [
   { command: 'tsc nomatch*', expect: 'allow' },
   { command: 'tsc "src/*"', expect: 'allow' },
   { command: `${' '.repeat(40)}echo ok\ntsc a.ts`, expect: 'deny' },
+  // tsrs shares tsc's rule; `tsrs-lint` is a different binary and never matches.
+  { command: 'tsrs a.ts', expect: 'deny', reason: TSRS_REASON },
+  { command: 'tsrs --noEmit src/a.tsx', expect: 'deny', reason: TSRS_REASON },
+  { command: 'bunx tsrs a.ts', expect: 'deny', reason: TSRS_REASON },
+  { command: 'npx tsrs a.ts', expect: 'deny', reason: TSRS_REASON },
+  { command: 'false && tsrs a.ts', expect: 'deny', reason: TSRS_REASON },
+  { command: 'tsrs --noEmit', expect: 'allow' },
+  { command: 'tsrs -p tsconfig.json', expect: 'allow' },
+  { command: 'tsrs -p tsconfig.types.json', expect: 'allow' },
+  { command: 'tsrs --fast --noEmit', expect: 'allow' },
+  { command: 'tsrs --lsp --stdio', expect: 'allow' },
+  { command: 'tsrs-lint a.ts', expect: 'allow' },
+  { command: 'node node_modules/tsrs/bin/tsrs a.ts', expect: 'allow' },
+  { command: 'tsrs nomatch*.ts', expect: 'deny', reason: TSRS_REASON },
+  // Both names: the compiler named last is the one in the message.
+  { command: 'tsc --noEmit && tsrs a.ts', expect: 'deny', reason: TSRS_REASON },
+  { command: 'tsrs --noEmit && tsc a.ts', expect: 'deny', reason: TSC_REASON },
   { command: '', expect: 'allow' },
 ]
 
 // Rows with a glob word: in a session the answer comes from bash's pathname
 // expansion in the session cwd. The corpus was recorded where nothing matches,
 // so the glob stays literal; the tool.call path below stubs bash that way.
-const NEEDS_EXPANSION = new Set(['tsc src/*', 'tsc nomatch*', 'tsc nomatch*.ts', 'tsc "src/*"'])
+const NEEDS_EXPANSION = new Set([
+  'tsc src/*',
+  'tsc nomatch*',
+  'tsc nomatch*.ts',
+  'tsc "src/*"',
+  'tsrs nomatch*.ts',
+])
 
 describe('literal-words path (tscGuard)', () => {
   for (const row of CORPUS) {
     test(`${row.expect}: ${JSON.stringify(row.command.slice(0, 60))}`, () => {
       const got = tscGuard(row.command)
       expect(got === undefined ? 'allow' : 'deny').toBe(row.expect)
-      if (row.expect === 'deny') expect(got).toBe(TSC_REASON)
+      if (row.expect === 'deny') expect(got).toBe(reasonOf(row))
     })
   }
 })
@@ -88,6 +115,23 @@ describe('helpers', () => {
   })
   test('EXPAND_SCRIPT is an unquoted split+glob NUL emitter', () => {
     expect(EXPAND_SCRIPT).toBe(`for w in $1; do printf '%s\\0' "$w"; done`)
+  })
+  test('reasons name the compiler', () => {
+    expect(TSRS_REASON).toBe(TSC_REASON.replaceAll('tsc', 'tsrs'))
+    expect(tscDecide(['a.ts'], 'tsrs')).toBe(TSRS_REASON)
+    expect(tscDecide(['a.ts'])).toBe(TSC_REASON)
+  })
+  test('compilerName picks the last compiler named', () => {
+    expect(compilerName('tsc a.ts')).toBe('tsc')
+    expect(compilerName('bunx tsrs a.ts')).toBe('tsrs')
+    expect(compilerName('tsc tsrs a.ts')).toBe('tsrs')
+    expect(compilerName('tsrs a\ntsc b')).toBe('tsc')
+    expect(compilerName('tsrs-lint a.ts')).toBe('tsc')
+  })
+  test('tscArgs strips through the last tsrs too', () => {
+    expect(tscArgs('tsrs --noEmit')).toBe('--noEmit')
+    expect(tscArgs('pnpm dlx tsrs a.ts')).toBe('a.ts')
+    expect(tscArgs('tsrs-lint a.ts')).toBeUndefined()
   })
   test('tscArgs strips through the last tsc per line', () => {
     expect(tscArgs('npx tsc a.ts')).toBe('a.ts')
@@ -169,7 +213,7 @@ describe('tool.call path', () => {
       expect(state.runs.length).toBe(NEEDS_EXPANSION.has(row.command) ? 1 : 0)
       if (row.expect === 'deny') {
         expect(state.reached).toBe(0)
-        expect(denyOf(r)).toBe(TSC_REASON)
+        expect(denyOf(r)).toBe(reasonOf(row))
       } else {
         expect(state.reached).toBe(1)
         expect(denyOf(r)).toBeUndefined()

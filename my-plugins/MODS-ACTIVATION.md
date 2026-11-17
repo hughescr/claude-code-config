@@ -95,7 +95,7 @@ Per plugin (`typescript`: `block-tsc-with-files.sh`; `hugo`: `block-serverless-d
        existing `"hooks": {...}` block. `claude plugin validate` accepts both together (checked on a scratch copy of
        typescript). The mod runs first; the `.sh` still guards when the flag is off.
 2. [ ] Verify in a NEW `claude-smart.sh --debug-file $TMPDIR/x.txt` session in a matching project, asking it to run
-       typescript: `false && tsc a.ts` (denied: file argument); and `cd src && false && tsc *` in a directory with
+       typescript: `false && tsc a.ts` and `false && tsrs a.ts` (each denied: file argument, reason names that compiler); and `cd src && false && tsc *` in a directory with
        `.ts` files (denied) and in one without (allowed), which proves `$.session.cwd()` equals the old hook's cwd;
        hugo: `false && sls deploy` (denied). Expect the new plain-text reasons. `grep -E '(typescript|hugo).*(loaded|answered)' $TMPDIR/x.txt`
        shows the mod answered.
@@ -104,7 +104,7 @@ Per plugin (`typescript`: `block-tsc-with-files.sh`; `hugo`: `block-serverless-d
        Then `git rm my-plugins/typescript/hooks/block-tsc-with-files.sh` (or the hugo `.sh`).
 4. [ ] Bump `.claude-plugin/plugin.json` `version` `1.0.0` to `1.1.0`.
 5. [ ] Update docs that name the shell hook: `my-plugins/typescript/README.md` (Hooks section),
-       `my-plugins/typescript/skills/typescript-quality/SKILL.md` (line 18), `my-plugins/hugo/README.md` (hooks
+       `my-plugins/typescript/skills/typescript-quality/SKILL.md` (line 19), `my-plugins/hugo/README.md` (hooks
        table, line 66, and the file tree, line 132), `my-plugins/hugo/agents/hugo-deployment.md` (line 56).
 6. [ ] Refresh:
        - `claude-smart.sh` sessions: nothing to install; they read the tree. Restart long-lived sessions.
@@ -162,3 +162,8 @@ Known gaps preserved on purpose, for parity (fix in a separate, flagged change w
 - `git -c clean.requireForce=false clean` is allowed.
 - Shell obfuscation is not handled.
 - Over-denies: `--hard` or `-f` in unrelated commands next to a reset or clean.
+- tsc/tsrs: a path-qualified invocation (`./node_modules/.bin/tsc a.ts`, `node node_modules/tsrs/bin/tsrs a.ts`)
+  is allowed, because the gate needs whitespace, `|`, `;`, `&` or the start before the name, not `/`. `tsrs-lint`
+  is a different binary and is not matched.
+- tsc/tsrs: the deny reason names the compiler last invoked in the command. On a multi-line command naming both,
+  an earlier line can be the one that denied, so the name can be the other compiler.

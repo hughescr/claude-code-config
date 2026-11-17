@@ -26,21 +26,38 @@ command=$(echo "$input" | jq -r '.tool_input.command // empty')
 
 [ -z "$command" ] && exit 0
 
+# The deny message names the compiler invoked ($1: tsc or tsrs).
 deny_tsc_files() {
-  cat << 'ERRMSG' >&2
-{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny"}, "systemMessage": "BLOCKED: tsc should not be run with individual file arguments. TypeScript needs to process the entire project for proper type-checking. Remove the file arguments and run 'tsc --noEmit' instead."}
+  local name="${1:-tsc}"
+  cat << ERRMSG >&2
+{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny"}, "systemMessage": "BLOCKED: ${name} should not be run with individual file arguments. TypeScript needs to process the entire project for proper type-checking. Remove the file arguments and run '${name} --noEmit' instead."}
 ERRMSG
   exit 2
 }
 
-# Extract the tsc command portion (handles direct tsc, npx tsc, pnpm tsc, yarn tsc)
-# First check if tsc is invoked at all
-if ! [[ "$command" =~ (^|[[:space:]|;&])(npx|pnpm|yarn)?[[:space:]]*(dlx[[:space:]]+)?tsc([[:space:]]|$) ]]; then
+# The compiler named last in the command (greedy .* finds the last match under
+# POSIX leftmost-longest), used only to word the deny message. Exact for a
+# single-line command, since only the text after the last compiler on a line is
+# examined; on a multi-line command naming both, an earlier line may have denied.
+# Same rule as compilerName in guard.ts.
+compiler_name() {
+  local re='^(.*[[:space:]|;&])?(npx|pnpm|yarn)?(tsc|tsrs)([[:space:]]|$)'
+  if [[ "$command" =~ $re ]]; then
+    echo "${BASH_REMATCH[3]}"
+  else
+    echo tsc
+  fi
+}
+
+# Extract the compiler command portion (handles direct tsc/tsrs, npx, pnpm, yarn, bunx)
+# First check if tsc or tsrs is invoked at all (tsrs-lint does not match: the
+# name must be followed by whitespace or the end)
+if ! [[ "$command" =~ (^|[[:space:]|;&])(npx|pnpm|yarn)?[[:space:]]*(dlx[[:space:]]+)?(tsc|tsrs)([[:space:]]|$) ]]; then
   exit 0
 fi
 
-# Get everything after 'tsc' (including any flags and arguments)
-tsc_args=$(echo "$command" | sed -E 's/^.*(^|[[:space:]])(npx[[:space:]]+|pnpm[[:space:]]+(dlx[[:space:]]+)?|yarn[[:space:]]+)?tsc([[:space:]]|$)//')
+# Get everything after 'tsc' or 'tsrs' (including any flags and arguments)
+tsc_args=$(echo "$command" | sed -E 's/^.*(^|[[:space:]])(npx[[:space:]]+|pnpm[[:space:]]+(dlx[[:space:]]+)?|yarn[[:space:]]+)?(tsc|tsrs)([[:space:]]|$)//')
 
 # Skip flags that take a file argument (these are config files, not source files)
 # -p/--project, --build/-b can have config arguments
@@ -68,7 +85,7 @@ for word in $tsc_args; do
 
   # Check if this non-flag argument is a .ts or .tsx file
   if [[ "$word" =~ \.(ts|tsx)$ ]]; then
-    deny_tsc_files
+    deny_tsc_files "$(compiler_name)"
   fi
 done
 

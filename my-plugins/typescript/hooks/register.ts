@@ -1,5 +1,5 @@
 import type { Register } from 'claude-code'
-import { EXPAND_SCRIPT, hasGlob, splitWords, tscArgs, tscDecide } from './guard'
+import { compilerName, EXPAND_SCRIPT, hasGlob, splitWords, tscArgs, tscDecide } from './guard'
 
 export const register: Register = on => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
@@ -25,7 +25,7 @@ export const register: Register = on => {
       }
     }
 
-    const reason = tscDecide(words)
+    const reason = tscDecide(words, compilerName(cmd))
     return reason === undefined ? next(e) : { deny: reason }
   })
 }

@@ -8,10 +8,10 @@ TypeScript-specific development tools for Claude Code.
 
 ## Hooks
 
-- **block-tsc-with-files**: Prevents running `tsc` with individual file arguments (TypeScript needs full project context)
+- **block-tsc-with-files**: Prevents running `tsc` or `tsrs` with individual file arguments (both ignore the project's `tsconfig.json` when given files, so they need full project context). `tsrs-lint` and path-qualified invocations such as `./node_modules/.bin/tsc` are not matched.
 - **ts-lsp-check** (SessionStart): reports the language-server choice, only when it is not the project's own server (see below)
 
-A staged in-process mod form of the tsc guard (`hooks/register.ts`, `hooks/guard.ts`) is not wired yet; activation steps: `my-plugins/MODS-ACTIVATION.md`.
+A staged in-process mod form of the tsc/tsrs guard (`hooks/register.ts`, `hooks/guard.ts`) is not wired yet; activation steps: `my-plugins/MODS-ACTIVATION.md`.
 
 ## Language server that follows the project
 
