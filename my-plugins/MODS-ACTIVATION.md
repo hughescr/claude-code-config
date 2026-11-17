@@ -28,14 +28,12 @@ sandboxed run falsely says "turned off".
 ## How each guard loads
 
 **git-guard** is installed as `git-guard@craigs-claude-plugins` (user scope; `enabledPlugins` in
-`~/.claude/settings.json`) and runs from the plugin cache, `~/.claude/plugins/cache/craigs-claude-plugins/git-guard/`.
-An edit to the plugin takes effect only after
-
-    claude plugin marketplace update craigs-claude-plugins
-    claude plugin update git-guard@craigs-claude-plugins
-
-`plugin.json` has no version field and the cache folder is named `unknown`, so verify after an update that the new
-code is the one loaded (the probe and debug-file grep below, or a changed behaviour). Restart long-lived sessions.
+`~/.claude/settings.json`). The marketplace `craigs-claude-plugins` is a directory source pointing at `~/.claude`,
+so sessions load the plugin from its source folder, `~/.claude/my-plugins/git-guard/`, not from the plugin cache.
+A new session reads `hooks/hooks.json` there; a running session re-reads the folder with `/reload-plugins`, or after
+a restart. No `claude plugin update` is needed on this machine. The cache folder
+`~/.claude/plugins/cache/craigs-claude-plugins/git-guard/unknown` from the install is not what sessions load. After
+an edit, verify that the new behaviour is active with the probe and debug-file grep below.
 
 **typescript and hugo** are NOT marketplace-installed on this machine (`installed_plugins.json` has no
 `typescript@`/`hugo@craigs-claude-plugins`). `claude-smart.sh` adds

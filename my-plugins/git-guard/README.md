@@ -4,12 +4,13 @@ An in-process `tool.call` mod that denies Bash git commands which silently disca
 replaced a shell hook that cost about 34 ms of forks per Bash call; the mod costs under a microsecond.
 
 **Status:** this mod is the enforcement. It is installed and enabled as `git-guard@craigs-claude-plugins` (user
-scope) and runs from the plugin cache, so an edit to the plugin takes effect only after
-`claude plugin marketplace update craigs-claude-plugins` and
-`claude plugin update git-guard@craigs-claude-plugins`. `plugin.json` has no version field and the cache folder is
-named `unknown`, so verify after an update that the new code is the one loaded. A mod loads only while Claude Code's
-hooks-modules feature flag is on: in a process where it is off, and under `--bare`, safe mode or an untrusted
-workspace, the guard is absent. Operation, verification and rollback: `my-plugins/MODS-ACTIVATION.md`.
+scope), so it loads in every session, CLI and desktop app. The marketplace `craigs-claude-plugins` is a directory
+source pointing at `~/.claude`, and sessions load the plugin from its source folder, `my-plugins/git-guard`, not from
+the plugin cache. A new session reads it from there; a running session re-reads it with `/reload-plugins`, or after a
+restart. No `claude plugin update` is needed on this machine. A mod loads only while Claude Code's hooks-modules
+feature flag is on: in a process where it is off, and under `--bare`, safe mode or an untrusted workspace, the guard
+is absent. After an edit, verify with the live probe that the new behaviour is active. Operation, verification and
+rollback: `my-plugins/MODS-ACTIVATION.md`.
 
 ## What it denies
 
