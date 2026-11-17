@@ -89,7 +89,7 @@ After reporting results, always remind the user:
 > git add . && git commit -m "Build site" && git push origin develop
 > ```
 >
-> CI/CD handles the actual deployment automatically; a manual `serverless deploy` is blocked by a PreToolUse hook, so push to `develop` instead.
+> CI/CD handles the actual deployment automatically; a manual `serverless deploy` is blocked by the plugin's deploy guard, so push to `develop` instead.
 
 ## Error Handling
 
