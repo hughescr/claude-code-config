@@ -1,12 +1,15 @@
 # git-guard
 
-An in-process `tool.call` mod that denies Bash git commands which silently discard uncommitted work. It is
-the mod form of `hooks/git-guard.sh` and replaces it once cut over, saving the shell forks that script cost on
-every Bash call (about 34 ms per call, against under a microsecond here).
+An in-process `tool.call` mod that denies Bash git commands which silently discard uncommitted work. It
+replaced a shell hook that cost about 34 ms of forks per Bash call; the mod costs under a microsecond.
 
-**Status:** staged only. Until Craig decides otherwise, the `PreToolUse` Bash entry in `settings.json` that runs
-`hooks/git-guard.sh` stays the enforcement of record. This plugin is inert until it is installed
-(`marketplace update`, then `install`). Activation, verification and rollback: `my-plugins/MODS-ACTIVATION.md`.
+**Status:** this mod is the enforcement. It is installed and enabled as `git-guard@craigs-claude-plugins` (user
+scope) and runs from the plugin cache, so an edit to the plugin takes effect only after
+`claude plugin marketplace update craigs-claude-plugins` and
+`claude plugin update git-guard@craigs-claude-plugins`. `plugin.json` has no version field and the cache folder is
+named `unknown`, so verify after an update that the new code is the one loaded. A mod loads only while Claude Code's
+hooks-modules feature flag is on: in a process where it is off, and under `--bare`, safe mode or an untrusted
+workspace, the guard is absent. Operation, verification and rollback: `my-plugins/MODS-ACTIVATION.md`.
 
 ## What it denies
 
@@ -35,7 +38,8 @@ are BSD grep and libc semantics, not Unicode properties, so the character classe
 - `\b` after a keyword uses `hooks/wordchars.ts`, a generated table of the characters BSD grep treats as word
   characters on this machine (706 ranges). `tests/gen-git-guard-wordchars.ts` regenerates it
   (`bun my-plugins/git-guard/tests/gen-git-guard-wordchars.ts` from `~/.claude`); rerun it only after
-  a macOS upgrade, while `hooks/git-guard.sh` still exists as the reference.
+  a macOS upgrade. The reference script is recovered from git history with the two commands in the "Regenerating
+  the word-character table" section of `my-plugins/MODS-ACTIVATION.md`.
 - The `git ... <subcommand>` prefix is scanned token by token in linear time. The shell's regexes backtracked
   quadratically (`git -C ` repeated 5,700 times, about 40 KB, took 5 s), which would have crossed the hook timeout
   and failed open. Every 1 MB adversarial input now finishes in well under 100 ms.

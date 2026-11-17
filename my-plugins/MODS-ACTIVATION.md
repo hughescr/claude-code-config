@@ -1,88 +1,43 @@
-# Mods activation runbook
+# Guard mods: operation and rollback
 
-Status: the `typescript` and `hugo` guards are activated (their `.sh` hooks are removed; the mods are the only
-guards). The `git-guard` mod (`guard.ts`/`register.ts`) is staged on `develop` and **not wired**. Its `.sh` command
-hook stays the enforcement of record until you run this.
+Status: the `git-guard`, `typescript` and `hugo` guards all run as hooks modules (`guard.ts`/`register.ts`). No shell
+guard remains: their `.sh` hooks are removed, and the `settings.json` `PreToolUse` Bash entry for git-guard is gone.
 
-Why the wait: hooks modules load only while the server-side GrowthBook flag `tengu_plugin_hooks_modules` is ON for
-the process. While it is off, every module is silently skipped, so a guard whose `.sh` was removed is **absent**.
-The flag has flapped. `mods-probe` (installed and enabled) exists to measure that.
+## Why a guard can be absent
 
-Rules for every step below:
+Hooks modules load only while the server-side GrowthBook flag `tengu_plugin_hooks_modules` is ON for the process.
+While it is off, every module is silently skipped, so the guard is **absent** in that process. The flag has flapped.
+`mods-probe` (installed and enabled) exists to measure that. Installed-plugin modules also do not load under
+`--bare`, safe mode or an untrusted workspace.
 
-- Never set `DISABLE_GROWTHBOOK=1` in a launcher or in settings. Use it only as a one-off prefix on
-  `claude plugin test` (or `validate`).
-- Overlap before you remove: the new guard is verified live while the old one still guards.
-- `claude plugin test`/`validate` need network and may need the sandbox off. A sandboxed run falsely says
-  "turned off".
-- The live git-guard denies Bash commands containing destructive git strings. Write files that contain them with
-  the Write/Edit tool, not shell redirection.
+To check:
 
-## (a) Is the flag stable? (all three, over several days)
+- `bun ~/.claude/hooks/mods-flag-reconcile.ts --report` prints starts, on and off per day plus the last transition.
+  The hook writes a `start` line to `~/.claude/mods-flag.log` for every session and, 2 minutes later, an
+  `inferred off` for any start that never got an `on` (see `my-plugins/mods-probe/README.md`). `tail -n 30
+  ~/.claude/mods-flag.log` shows the raw lines.
+- `jq '.cachedGrowthBookFeatures.tengu_plugin_hooks_modules' ~/.claude.json` prints the cached flag. It is written
+  by whichever process last refreshed it: a hint, not proof.
+- Every new session shows `mods-probe: hooks modules are ON in this process` at launch. No notice means mods are
+  off in that session.
 
-- [ ] `~/.claude/mods-flag.log` has an `on` line for every `start` line (every session you started, CLI and
-      desktop). The hook `hooks/mods-flag-reconcile.ts` writes the `start` and, 2 minutes later, an
-      `inferred off` for any start that never got an `on` (see `my-plugins/mods-probe/README.md`). Run
-      `bun ~/.claude/hooks/mods-flag-reconcile.ts --report`: it prints starts, on and off per day plus the last
-      transition. Stable means `off` is 0 on every day of the window. `tail -n 30 ~/.claude/mods-flag.log` shows
-      the raw lines.
-- [ ] `jq '.cachedGrowthBookFeatures.tengu_plugin_hooks_modules' ~/.claude.json` prints `true` on each check, and
-      did not print `false` between checks. It is a cache written by whichever process last refreshed it: a hint,
-      not proof.
-- [ ] `claude plugin test my-plugins/git-guard`, in a fresh process **without** `DISABLE_GROWTHBOOK`, ends
-      `104 pass / 0 fail`. A "turned off" message means the flag is off right now.
-- [ ] Your bar (suggested): every session for 7 days logged, `jq` never `false`, and the `plugin test` passed on at
-      least 3 different days. Any miss restarts the count. If it fails, stop: change no wiring.
+Never set `DISABLE_GROWTHBOOK=1` in a launcher or in settings; use it only as a one-off prefix on
+`claude plugin test` (or `validate`). `claude plugin test`/`validate` need network and may need the sandbox off; a
+sandboxed run falsely says "turned off".
 
-Also: every new session shows `mods-probe: hooks modules are ON in this process` at launch. No notice in a session
-means mods are off in that session.
+## How each guard loads
 
-## (b) Activation, one guard at a time
+**git-guard** is installed as `git-guard@craigs-claude-plugins` (user scope; `enabledPlugins` in
+`~/.claude/settings.json`) and runs from the plugin cache, `~/.claude/plugins/cache/craigs-claude-plugins/git-guard/`.
+An edit to the plugin takes effect only after
 
-### git-guard
+    claude plugin marketplace update craigs-claude-plugins
+    claude plugin update git-guard@craigs-claude-plugins
 
-1. [ ] Install and enable (this repo is the marketplace, a directory source):
-       `claude plugin marketplace update craigs-claude-plugins`
-       `claude plugin install git-guard@craigs-claude-plugins`
-       The install adds `"git-guard@craigs-claude-plugins": true` to `enabledPlugins` in `~/.claude/settings.json`
-       by itself (it did for `mods-probe`). Confirm with
-       `jq '.enabledPlugins["git-guard@craigs-claude-plugins"]' ~/.claude/settings.json` (`true`). If absent, add
-       that line to `enabledPlugins` by hand (settings.json is sandbox-protected; use the Edit tool with approval).
-2. [ ] Verify the mod blocks, in a NEW session, while `hooks/git-guard.sh` is still wired:
-       `claude-smart.sh --debug-file $TMPDIR/gg.txt` (or `claude --debug-file ...`), then ask it to run exactly
-       `false && git clean -f --dry-run-NOT`
-       Why this probe: `--dry-run-NOT` is not the token `--dry-run` and not a short `-...n...` flag, so the clean
-       rule sees `-f` with no dry run and denies. Checked against `hooks/guard.ts`: it returns the clean reason.
-       It is safe even if the guard failed open: `false &&` stops the shell, and git rejects the unknown option
-       before it deletes anything. Do not use `--dry-run` (that is the allowed form).
-       Expect the deny reason "git clean with a force flag permanently deletes untracked files. ..."
-       Then, to prove the MOD answered (the old hook gives the same reason text):
-       `grep -E 'git-guard.*(loaded|answered tool.call without next)' $TMPDIR/gg.txt`
-       Also check `git status` runs (allowed), and repeat the probe from a subagent.
-3. [ ] Only after step 2 passes in a session that showed the mods-probe notice: remove from
-       `~/.claude/settings.json` ONLY this element of `hooks.PreToolUse`, keeping the `Skill` element:
-       `{"matcher": "Bash", "hooks": [{"type": "command", "command": "${HOME}/.claude/hooks/git-guard.sh", "timeout": 5}]}`
-       (Edit tool with approval.) Open a new session; repeat the step 2 probe (the mod is now the only guard).
-4. [ ] Delete the script: `git rm hooks/git-guard.sh`. Then update the remaining references:
-       `tests/hooks-test.sh` (its `git-guard.sh` section, from about line 44), and the
-       "Status: staged only" paragraph of `my-plugins/git-guard/README.md`. Commit.
-5. [ ] Note on `my-plugins/git-guard/tests/gen-git-guard-wordchars.ts`: it probes `/usr/bin/grep` directly and
-       writes `hooks/wordchars.ts`; `git-guard.sh` is its parity reference (named in its header and in the corpus
-       and test comments), not something it executes. After the deletion, restore the reference from history when
-       you need it: `git log --diff-filter=D --format=%h -1 -- hooks/git-guard.sh`, then
-       `git show <that-sha>^:hooks/git-guard.sh`. Rerun the generator only after a macOS upgrade:
-       `bun my-plugins/git-guard/tests/gen-git-guard-wordchars.ts` (from `~/.claude`).
-6. [ ] Later edits to an installed plugin take effect only after a version bump in its
-       `.claude-plugin/plugin.json`, `claude plugin marketplace update craigs-claude-plugins`, and
-       `claude plugin update git-guard@craigs-claude-plugins` (it runs from
-       `~/.claude/plugins/cache/craigs-claude-plugins/git-guard/<version>`).
+`plugin.json` has no version field and the cache folder is named `unknown`, so verify after an update that the new
+code is the one loaded (the probe and debug-file grep below, or a changed behaviour). Restart long-lived sessions.
 
-### typescript and hugo (done)
-
-typescript's `hooks/hooks.json` keeps the `SessionStart` hook (`ts-lsp-check.sh`) beside the `modules` key; hugo's is
-exactly `{"modules": ["./register.ts"]}`.
-
-How the plugins load: they are NOT marketplace-installed on this machine (`installed_plugins.json` has no
+**typescript and hugo** are NOT marketplace-installed on this machine (`installed_plugins.json` has no
 `typescript@`/`hugo@craigs-claude-plugins`). `claude-smart.sh` adds
 `--plugin-dir ~/.claude/my-plugins/typescript` (project has `tsconfig.json`, or typescript in `package.json`) and
 `--plugin-dir ~/.claude/my-plugins/hugo` (project has a Hugo config) straight from this working tree. Two
@@ -91,9 +46,12 @@ consequences:
 - A `--plugin-dir` folder is watched and hot-reloaded: **saving `hooks/hooks.json` takes effect in every running
   `claude-smart.sh` session.**
 - The desktop app and a plain `claude` do not go through `claude-smart.sh`, so these guards are not loaded there at
-  all. Nothing changes for them.
+  all.
 
-Remaining refresh:
+typescript's `hooks/hooks.json` keeps the `SessionStart` hook (`ts-lsp-check.sh`) beside the `modules` key; hugo's is
+exactly `{"modules": ["./register.ts"]}`.
+
+Refreshing hugo elsewhere:
 
 - `claude-smart.sh` sessions: nothing to install; they read the tree. Restart long-lived sessions.
 - hugo marketplace copies: `misc.rungie.com` and `erica-s-hughes` enable `hugo@craigs-claude-plugins` from GitHub
@@ -104,21 +62,57 @@ Remaining refresh:
 - If `claude plugin list` ever shows `typescript@` or `hugo@craigs-claude-plugins` installed locally, run
   `claude plugin update <name>@craigs-claude-plugins` the same way.
 
-## (c) Rollback (never `git checkout --` or `git restore`; the guards deny them)
+## Verifying a guard live
 
-- git-guard step 4 (script deleted): `git revert <sha>` restores `hooks/git-guard.sh` and its test section.
-- git-guard step 3 (settings entry removed): re-add the exact `PreToolUse` Bash element from step 3, using the
-  Edit tool. The script is still on disk if step 4 was not done.
-- git-guard step 1 (install): `claude plugin disable git-guard@craigs-claude-plugins`, or
-  `claude plugin uninstall git-guard@craigs-claude-plugins`; restart sessions.
-- typescript (cutover done): `git revert <sha>` of the cutover commit restores `block-tsc-with-files.sh` and the
-  `PreToolUse` entry in `hooks/hooks.json`.
-- hugo (cutover done): `git revert <sha>` of its cutover commit restores `block-serverless-deploy.sh` and the old
+Start a NEW session with a debug file (`claude-smart.sh --debug-file $TMPDIR/gg.txt`, or
+`claude --debug-file ...`), confirm it shows the mods-probe notice, and ask it to run exactly:
+
+- git-guard: `false && git clean -f --dry-run-NOT`. `--dry-run-NOT` is not the token `--dry-run` and not a short
+  `-...n...` flag, so the clean rule sees `-f` with no dry run and denies; the expected reason is "git clean with a
+  force flag permanently deletes untracked files. ...". It is safe even if the guard failed open: `false &&` stops
+  the shell, and git rejects the unknown option before it deletes anything. Do not use `--dry-run` (that is the
+  allowed form). Also check that `git status` runs (allowed), and repeat the probe from a subagent.
+- typescript: `false && tsc a.ts` and `false && tsrs a.ts` (both denied).
+- hugo (in a Hugo project): `false && sls deploy` (denied).
+
+Then prove the MOD answered, not something else:
+
+    grep -E 'git-guard.*(loaded|answered tool.call without next)' $TMPDIR/gg.txt
+    grep -E 'typescript.*(loaded|answered)' $TMPDIR/gg.txt
+    grep -E 'hugo.*(loaded|answered)' $TMPDIR/gg.txt
+
+The guard denies Bash commands containing destructive git strings, even inside quotes. Write files that contain them
+with the Write/Edit tool, never shell redirection.
+
+## Rollback (never the destructive git forms the guard denies; use `git revert`)
+
+- git-guard: `git revert` the cutover commit (the one that deleted `hooks/git-guard.sh`; find it with
+  `git log --diff-filter=D --format=%h -1 -- hooks/git-guard.sh`). It restores `hooks/git-guard.sh`, its section of
+  `tests/hooks-test.sh` and the `settings.json` `PreToolUse` Bash element. Or re-add that element to
+  `hooks.PreToolUse` in `~/.claude/settings.json` by hand with the Edit tool, keeping the `Skill` element, with this
+  exact JSON (the script is then back from the revert, or from git history):
+  `{"matcher": "Bash", "hooks": [{"type": "command", "command": "${HOME}/.claude/hooks/git-guard.sh", "timeout": 5}]}`
+  To switch the mod off as well: `claude plugin disable git-guard@craigs-claude-plugins` (or `uninstall`), then
+  restart sessions.
+- typescript: `git revert 62480c5` restores `block-tsc-with-files.sh` and the `PreToolUse` entry in
   `hooks/hooks.json`.
-- Roll back at once if a session shows no mods-probe notice while a guard depends on the mod, a probe is not
-  denied, or the flag log shows gaps.
+- hugo: `git revert 454225c` restores `block-serverless-deploy.sh` and the old `hooks/hooks.json`.
+- Roll back at once if a session shows no mods-probe notice while a guard depends on the mod, a probe is not denied,
+  or the flag log shows gaps.
 
-## (d) Deliberate behaviour changes and preserved gaps
+## Regenerating the word-character table
+
+`my-plugins/git-guard/tests/gen-git-guard-wordchars.ts` probes `/usr/bin/grep` directly and writes
+`hooks/wordchars.ts`. `hooks/git-guard.sh` is its parity reference (named in the generator's header and in the corpus
+and test comments), not something it executes. The script is deleted; recover it from history when you need it:
+
+    git log --diff-filter=D --format=%h -1 -- hooks/git-guard.sh
+    git show <that-sha>^:hooks/git-guard.sh
+
+Rerun the generator only after a macOS upgrade: `bun my-plugins/git-guard/tests/gen-git-guard-wordchars.ts` (from
+`~/.claude`).
+
+## Deliberate behaviour changes and preserved gaps
 
 Deliberate changes:
 
@@ -129,22 +123,24 @@ Deliberate changes:
 - tsc: if the bash glob-expansion fallback cannot run, literal words are used (never weaker than the former shell
   hook in that situation).
 - Plugin `tool.call` hooks run before settings `PreToolUse` hooks. When one command trips several guards, the model
-  sees only the first plugin's reason. Allow/deny parity holds.
+  sees only the first plugin's reason. Allow/deny parity with the former shell hooks holds.
 - Word boundaries are an exact generated 706-range table of what BSD grep treats as word characters, pinned to this
-  macOS. A macOS upgrade can drift the shell script but not the mod: regenerate (step 5 above).
+  macOS. A macOS upgrade can change what grep treats as word characters but not the mod's table: regenerate (see
+  "Regenerating the word-character table").
 - Quadratic regex blowups are gone: a linear token scanner (1 MB worst case about 38 ms; the shell took 5 s on
   about 40 KB of repeated `git -C `).
 
 Fail-open paths that remain:
 
-- Flag off in a process: all mods are skipped (the reason for this runbook).
+- Flag off in a process: all mods are skipped.
 - A hook that throws or exceeds its budget is skipped.
 - `--bare`, safe mode and untrusted workspaces load no installed-plugin modules (`--bare` also skips settings
-  hooks, so parity holds there).
+  hooks, so the removal of the shell hooks changed nothing there).
 - tsc glob fallback: `$.session.cwd()` is assumed equal to the former shell hook's cwd; a subagent in its own
   cwd/worktree may differ.
 
-Known gaps preserved on purpose, for parity (fix in a separate, flagged change with its own tests):
+Known gaps preserved on purpose, for parity with the former shell hooks (fix in a separate, flagged change with its
+own tests):
 
 - `--staged` anywhere in the command allows `git restore`; `git restore -S f` is denied.
 - A dry-run-like token anywhere (even `-name`) allows `git clean`.

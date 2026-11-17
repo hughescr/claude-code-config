@@ -6,7 +6,8 @@
 // NOT match (no word boundary after "restore" => the code point is a word character).
 // Every code point except NUL, \n and surrogates is probed (surrogates cannot be encoded as UTF-8).
 //
-// Rerun only after a macOS upgrade, while hooks/git-guard.sh still exists as the reference:
+// Rerun only after a macOS upgrade. The reference script, the retired hooks/git-guard.sh, is recovered from git
+// history with the two commands in my-plugins/MODS-ACTIVATION.md ("Regenerating the word-character table"):
 //   bun my-plugins/git-guard/tests/gen-git-guard-wordchars.ts   (from ~/.claude)
 import { join } from 'node:path'
 
