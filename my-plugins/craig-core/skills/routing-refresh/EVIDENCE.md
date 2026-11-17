@@ -8,8 +8,8 @@ The `gpt-*` routes reach OpenAI models over the `utraque` proxy on `127.0.0.1:83
 
 | Route | Model name sent | Peer Claude route | Allowed efforts |
 |---|---|---|---|
-| `gpt-astra` | `astra` (GPT-6 Astra) | `craig-core:opus` @ `high`/`xhigh` | `medium`, `high`, `max` |
-| `gpt-sol` | `sol` (GPT-6.1 Sol) | `craig-core:sonnet` @ `high` | `medium`, `high`, `xhigh` |
+| `gpt-astra` | `astra` (GPT-6.2 Astra) | `craig-core:opus` @ `xhigh` (at `medium`), `craig-core:fable` @ `high` (at `high`/`xhigh`) | `medium`, `high`, `xhigh` |
+| `gpt-sol` | `sol` (GPT-6.2 Sol) | `craig-core:opus` @ `high` (at `medium`), `craig-core:opus` @ `xhigh` (at `high`/`xhigh`) by score; alternative to `craig-core:sonnet` @ `high` for leaf work | `medium`, `high`, `xhigh` |
 | `gpt-luna` | `luna` (GPT-6 Luna) | `craig-core:haiku` @ `low` | `low`, `medium` |
 | `gpt-terra` | `terra` (GPT-6.1 Terra) | `craig-core:haiku` @ `low`/`xhigh`/`max` (at `low`/`medium`/`high`) | `low`, `medium`, `high`, `xhigh`, `max` |
 | `deepseek-flash` | `deepseek-flash` (V4.1 Flash 1017) | `craig-core:haiku` (at `low`), `craig-core:sonnet` @ `medium` (at `medium`), `craig-core:sonnet` @ `high` (at `high`) | `low`, `medium`, `high` |
@@ -25,18 +25,18 @@ Measured on Claude Code 2.1.306, 2026-10-21, except where dated otherwise.
 - **`utraque` resolves effort as model-name suffix > body `output_config.effort` > default**, and logs `effort_source` (`suffix|body|default`) beside `effort_requested` and `effort_applied`. Use bare aliases (`sol`, `astra`, `luna`, `terra`) so the Agent parameter decides; a suffixed alias (`sol-high`) would override it.
 - **The Codex leg clamps effort to the model's live catalog levels**, and sends it unclamped when the catalog is unavailable. `utraque` has no per-model effort override. Check `effort_applied` in the log line, not the request.
 - **Terra's catalog lists `low` through `ultra`** (checked 2026-10-27), so `xhigh` and `max` pass the clamp. The proxy log of 2026-10-27 showed Terra running only at `medium` and `high`; `xhigh` and `max` are catalog-supported but not yet observed.
-- **GPT-6 Astra `max` passes the clamp:** the proxy log of 2026-11-09 shows `effort_requested` max and `effort_applied` max.
+- **GPT-6.2 Astra and Sol pass the `xhigh` clamp:** probes of 2026-11-17 show `effort_requested` xhigh and `effort_applied` xhigh on both, and the Codex catalog lists `low` through `ultra` for both.
 - **The DeepSeek leg maps** `low`→`low`, `medium`→`high`, `high`→`high`, `xhigh`→`high`, `max`→`max`, because DeepSeek accepts only `low`, `high`, and `max` ([thinking mode](https://api-docs.deepseek.com/guides/thinking_mode)). So `medium` and `high` run identically there, and `xhigh` buys nothing. DeepSeek model names take no suffix.
 - **`utraque` translates Claude Code's mid-conversation `tool_addition` and `tool_removal` blocks** for both the GPT and DeepSeek legs: it hoists added tools into the tools list and honors removals.
 
 ### Facts that constrain these routes
 
-- **Context windows.** The live Codex catalog (`utraque` cache `~/Library/Caches/utraque/models_cache.json`, checked 2026-10-27) lists 500,000-token windows for GPT-6.1 Sol and GPT-6.1 Terra and 272,000 for GPT-6 Astra and GPT-6 Luna. AA lists 1M for Sol and Terra, but the subscription leg does not offer it. Never plan a task larger than a route's window onto it. DeepSeek windows are unverified.
+- **Context windows.** The live Codex catalog (`utraque` cache `~/Library/Caches/utraque/models_cache.json`, checked 2026-11-17) lists 500,000-token windows for GPT-6.2 Sol and GPT-6.1 Terra and 272,000 for GPT-6.2 Astra and GPT-6 Luna. AA lists 1M for Sol, Astra, and Terra, but the subscription leg does not offer it. Never plan a task larger than a route's window onto it. DeepSeek windows are unverified.
 - **Keep luna off long context.** Its long-context recall is poor, so it degrades quietly rather than failing.
 - **Route agent files carry the bare model name and no `effort` key.** The Agent `effort` parameter is the only effort setting; confirm what a request ran with from the proxy's per-request log line (`client_model`, `upstream_model`, `effort_source`, `effort_requested`, `effort_applied`).
 - **On the DeepSeek leg the model name must be exact** (`deepseek-flash`, `deepseek-v4-pro`; a suffix is rejected).
-- **No `ultra` route.** The Agent `effort` enum stops at `max`. Reaching `ultra`, if ever, needs a dedicated agent file whose `model:` is the suffixed name `sol-ultra` (unverified for GPT-6.1 Sol).
-- **Bare aliases float to the newest model with that codename**; pinned names (`sol-6`) keep older ones. The backend withholds new models from older Codex CLI clients, so check `/v1/models` before assuming which model a route runs.
+- **No `ultra` route.** The Agent `effort` enum stops at `max`. Reaching `ultra`, if ever, needs a dedicated agent file whose `model:` is the suffixed name `sol-ultra` (unverified for GPT-6.2 Sol).
+- **Bare aliases float to the newest model with that codename:** `astra` → `gpt-6.2-astra` and `sol` → `gpt-6.2-sol` (proxy log 2026-11-17); pinned names such as `astra-6` and `sol-6.1` still route to the older models. The backend withholds new models from older Codex CLI clients, so check `/v1/models` before assuming which model a route runs.
 - Do not route to `gpt-5.3-codex-spark` or `codex-auto-review`.
 
 ### Proxy availability
@@ -47,11 +47,11 @@ For availability prefer the proxy's own state: `GET /healthz` reports Codex auth
 
 ### Tool schemas
 
-`utraque` sends `"strict": false` on every Responses function tool (since utraque 1.1.1+25507e7). Without it the API treats tools as strict and forces GPT models to fill every optional field, so GPT route agents passed `model` and `isolation` on Agent calls and the craig-core hook denied them. If GPT agents start passing optional Agent fields again, check this first.
+`utraque` sends `"strict": false` on every Responses function tool (since utraque 1.1.1+25507e7). Without it the API treats tools as strict and forces GPT models to fill every optional field, so GPT route agents passed `model` and `isolation` on Agent calls and the craig-core hook denied them. If GPT agents start passing optional Agent fields again, check this first. On 2026-11-17, forced tool calls with one required and two optional fields left the optional fields out in 3 of 3 runs on both GPT-6.2 Astra and GPT-6.2 Sol.
 
 ## Intelligence-cost snapshot
 
-Artificial Analysis Intelligence Index v5.0.1 @ cost per index task, as of 2026-11-09. `~` marks a chart reading; `—` is unpublished. AA's effort names are its own settings. Cost is metered only on the DeepSeek leg; on the subscription legs these are API-cost comparisons, and their equivalence to subscription quota is unverified.
+Artificial Analysis Intelligence Index v5.0.1 @ cost per index task, as of 2026-11-17 for the GPT-6.2 rows and 2026-11-09 for the rest (Claude rows and Terra `max` re-confirmed 2026-11-17). `~` marks a chart reading; `—` is unpublished. AA's effort names are its own settings. Cost is metered only on the DeepSeek leg; on the subscription legs these are API-cost comparisons, and their equivalence to subscription quota is unverified.
 
 | Model | low | medium | high | xhigh | max |
 |---|---|---|---|---|---|
@@ -59,8 +59,8 @@ Artificial Analysis Intelligence Index v5.0.1 @ cost per index task, as of 2026-
 | Claude Opus 5.5 | 35 @ $0.98 | 48 @ $2.45 | 52 @ $3.46 | 57 @ $6.05 | 59 @ $10.04 |
 | Claude Sonnet 5.5 | 26 @ $0.51 | 31 @ $0.78 | 42 @ $1.64 | 50 @ $4.09 | 55 @ $10.02 |
 | Claude Haiku 5.5 | 19 @ $0.04 | 25 @ $0.09 | 30 @ $0.16 | 35 @ $0.25 | 36 @ $0.41 |
-| GPT-6.1 Sol | 35 @ $0.16 | 46 @ $0.36 | 50 @ $0.59 | 52 @ $0.76 | 55 @ $1.27 |
-| GPT-6 Astra | 43 @ $1.42 | 52 @ $2.73 | 55 @ $3.24 | 55 @ $3.66 | 57 @ $6.24 |
+| GPT-6.2 Sol | 41 @ $0.18 | 53 @ $0.41 | 55 @ $0.56 | 56 @ $0.65 | 57 @ $1.01 |
+| GPT-6.2 Astra | 46 @ $0.66 | 57 @ $1.62 | 60 @ $2.07 | 62 @ $2.52 | 62 @ $4.00 |
 | GPT-6.1 Terra | 29 @ $0.07 | 38 @ $0.17 | 42 @ $0.26 | 45 @ $0.40 | 51 @ $0.96 |
 | GPT-6 Luna | 10 @ $0.01 | 18 @ $0.04 | 21 @ $0.07 | 23 @ $0.10 | 28 @ $0.15 |
 | DeepSeek V4.1 Flash 1017 | — | — | — | — | 45 @ $0.26 |
@@ -86,35 +86,54 @@ Sources: [AA Fable 5.2](https://artificialanalysis.ai/models/releases/claude-fab
 - **Craig's experience:** Fable reasons more doggedly ("tenacity of thought"), a subjective judgment and the basis for the `low`/`medium` situational row.
 - **Craig's experience:** Fable burns subscription quota fast, especially at `high` and above (it uses 85M–275M output tokens on the index at $40 per 1M output).
 
+### GPT-6.2 Astra and Sol
+
+Sources: [AA Astra](https://artificialanalysis.ai/models/gpt-6-2-astra), [AA Sol](https://artificialanalysis.ai/models/gpt-6-2-sol), checked 2026-11-17. The [OpenAI announcement](https://openai.com/index/introducing-gpt-6-2-astra-sol/) was read in a browser on 2026-11-17. Both released 2026-11-17.
+
+- **Index (AA Intelligence Index v5.0.1):** Astra low 46, medium 57, high 60, xhigh 62 (61.6 unrounded), max 62 (62.1 unrounded). Sol low 41, medium 53, high 55, xhigh 56, max 57.
+- **Price:** Astra $8 in / $40 out per 1M tokens; Sol $2 / $10; 95% cache discount on both. Text and image in; AA lists 1M context for both (the Codex catalog windows are under Facts that constrain these routes).
+- **Output tokens on the index:** Astra low 6.31M, medium 12.4M, high 20M, xhigh 27.1M, max 65.8M; Sol low 7.21M, medium 14.6M, high 22.7M, xhigh 33.3M, max 60.9M.
+- **Time per index task:** Astra 1.4 / 3.7 / 4.8 / 5.9 / 10.4 minutes at low / medium / high / xhigh / max; Sol 1.4 / 3.1 / 4.3 / 5.1 / 7.9.
+- **Placement:** Astra @ `medium` ties Opus @ `xhigh` (57) at 27% of the API cost. Astra @ `high` (60) passes Opus @ `max` (59). Astra @ `xhigh` ties Fable @ `high` (62) at 28% of the API cost. Sol @ `medium` (53) edges Opus @ `high` (52) at 12% of the API cost. Sol @ `max` ties Opus @ `xhigh` (57).
+- **Placement in the routes:** API cost does not predict subscription quota use, so these scores did not change Claude effort assignments; see Subscription quota for the resulting defaults.
+- **Price:** cached input is $0.40 per 1M for Astra and $0.10 for Sol; Astra's token prices are 20% below GPT-6 Astra's; Sol keeps GPT-6.1 Sol's.
+- **OpenAI's claims:** both models "deliver better results on demanding tasks with fewer output tokens"; FrontierCode 2.0: Sol "comes within 0.5 points of GPT‑6.2 Astra at about one-fifth the cost (both at max)"; Agents' Last Exam: Astra scores 5.2 points above GPT-6 Astra "at less than a third of the cost" and 5.5 points above Claude Fable 5.2 "at just 5% of the cost" (efforts not stated; the Fable result excludes nine tasks that used a fallback model); GDPval v2: Astra up 6.2 points on GPT-6 Astra with 22% fewer output tokens, Sol up 5.3 on GPT-6.1 Sol; AA-3D Elo: Astra 1,318, Claude Fable 5.2 1,271, Sol 1,259.
+- **Availability:** Plus, Pro, Enterprise, and Edu plans in ChatGPT Work and Codex from 2026-11-17.
+- **Blocker reporting:** OpenAI reports that in two tests both models "were more likely to omit mentioning obstacles that blocked their work, such as a missing file or unavailable search tool", and that it added Codex instructions that reduce this. Those instructions are not in our harness, so check GPT route reports for unstated blockers.
+
 ### GPT-6.1 Terra
 
-Sources: [AA Terra](https://artificialanalysis.ai/models/releases/gpt-6-1-terra), [AA Sol](https://artificialanalysis.ai/models/releases/gpt-6-1-sol), [OpenAI announcement](https://openai.com/index/introducing-gpt-6-1-terra/).
+Sources: [AA Terra](https://artificialanalysis.ai/models/releases/gpt-6-1-terra), [AA Sol](https://artificialanalysis.ai/models/gpt-6-2-sol), [OpenAI announcement](https://openai.com/index/introducing-gpt-6-1-terra/).
 
 - **Index (AA Intelligence Index v5.0.1):** max 51, xhigh 45, high 42, medium 38, low 29, non-reasoning 31. Non-reasoning is not reachable through the Agent `effort` parameter.
 - **Price:** $1 in / $5 out per 1M tokens against Sol's $2 / $10, with a 95% cache discount on both.
-- **Token use:** Terra max uses 99.4M output tokens on the index against Sol max's 63.7M; Terra xhigh uses 34.7M against Sol medium's 15.1M. Terra uses more tokens per task despite its faster token speed (about 91 against about 77 output tokens per second).
+- **Token use:** Terra max uses 99.4M output tokens on the index against Sol max's 60.9M; Terra xhigh uses 34.7M against Sol medium's 14.6M. Terra uses more tokens per task despite its faster token speed (about 91 output tokens per second against GPT-6.2 Sol's 71 to 85 from low to max, Artificial Analysis 2026-11-17).
 - **Long context:** no published recall (AA-LCR per-model subscores are not shown), so prefer Sol or a Claude route for prompts well over 100k tokens.
-- **OpenAI's claims:** "a fast, efficient model" at an API price 50% below Sol that completes tasks more than 3x faster than Sol and Astra. Strongest at visual reasoning, computer use, and technical drawings to 3D; close to Sol and Astra on MMMU-Pro and Agents' Last Exam (on par with Astra there at medium); Terminal-Bench 4.0 50.3% at max. "For the most complex coding tasks, GPT-6.1 Sol and GPT-6 Astra remain the better choice."
+- **OpenAI's claims at Terra's launch, against GPT-6.1 Sol and GPT-6 Astra, the models then current:** "a fast, efficient model" at an API price 50% below Sol that completes tasks more than 3x faster than Sol and Astra. Strongest at visual reasoning, computer use, and technical drawings to 3D; close to Sol and Astra on MMMU-Pro and Agents' Last Exam (on par with Astra there at medium); Terminal-Bench 4.0 50.3% at max. "For the most complex coding tasks, GPT-6.1 Sol and GPT-6 Astra remain the better choice."
 - **Craig's experience:** Sol and Terra are notably good at 3D conceptual and geometry work; Terra is very smart for its cost.
 
 ### Terra, Sol, or Astra
 
-- **Sol @ `medium` (46 @ $0.36) dominates Terra @ `xhigh` (45 @ $0.40),** and Sol @ `high` (50 @ $0.59) beats Terra @ `max` (51 @ $0.96) on cost per point, so Terra's `xhigh`/`max` are kept only for visual, 3D, and geometry work.
-- **Astra @ `xhigh` (55 @ $3.66) adds nothing over Astra @ `high` (55 @ $3.24),** so the route uses `max` (57 @ $6.24, the top GPT score) for the hardest.
-- **Sol @ `medium`/`high`** for normal and multi-file work; Sol @ `high` is the routine challenger.
-- **Astra** for the hardest, consequential, and security work.
-- **Observation, no rule change:** Sol @ `xhigh` (52 @ $0.76) ties Astra @ `medium` (52 @ $2.73) at about 28% of the cost; a candidate for the next refresh.
+- **Sol @ `medium` (53 @ $0.41) outscores Terra @ `xhigh` (45 @ $0.40) at about the same cost and Terra @ `max` (51 @ $0.96) at under half the cost,** so Terra's `xhigh`/`max` are kept only for visual, 3D, and geometry work.
+- **Astra @ `xhigh` and `max` have the same rounded score (62; 61.6 against 62.1 unrounded), and `xhigh` ($2.52) costs 63% of `max` ($4.00),** so the route tops out at `xhigh` and drops `max`.
+- **Sol @ `medium`/`high`** is the alternative leaf route (normal and multi-file work); at `high` it challenges `craig-core:sonnet` @ `high` and `craig-core:opus` work (the CLAUDE.md pairing table is authoritative).
+- **Astra** for Fable work, design calls, security, escalation, and the hardest work.
+- **Observation, no rule change:** Sol @ `max` (57 @ $1.01) ties Astra @ `medium` (57 @ $1.62) at 62% of the cost but takes 7.9 against 3.7 minutes per task.
+- **Observation, no rule change:** Sol @ `low` (41 @ $0.18) trails Terra @ `high` (42 @ $0.26) and Sonnet @ `high` (42 @ $1.64) by one point at lower cost; a candidate `gpt-sol` @ `low` row for the next refresh.
+
+### Subscription quota
+
+Craig's observation (2026-11-17): the Codex subscription runs out much faster than the Claude one. API cost per task does not predict subscription quota use, and the conversion is unmeasured. The benchmarks did not change any Claude effort assignment; the quota observation changed the defaults: for execution the Claude route wins when both fit, `gpt-sol` is an alternative for leaf work, and `craig-core:opus` @ `high`/`xhigh` work is challenged by `gpt-sol` @ `high` (55 @ $0.56) with `gpt-astra` @ `high` (60 @ $2.07) as escalation; `gpt-astra` stays for Fable work, design calls, defensive security, and escalation.
 
 ## Cross-family verification
 
 The pairing tables with their Claude-only columns, the tiebreak, and the security override live in CLAUDE.md. In addition, when cross-family routes are available:
 
-- If `gpt-sol` @ `high` fails as the challenger for `craig-core:sonnet` @ `high` or `craig-core:opus` @ `medium`, use `gpt-astra` @ `medium`, escalating to `gpt-astra` @ `high`.
 - `craig-core:sonnet` @ `high` is also an acceptable routine challenger for `gpt-sol` @ `medium`.
 - `deepseek-flash` is a fit challenger when metered-cheap is the right price for a second opinion.
 
-### Security routing
+### Security routing and refusals
 
-Why CLAUDE.md sends security work — doing it and reviewing it — to `gpt-astra` and, Claude-only, to `craig-core:opus` @ `high` or @ `xhigh` but never `craig-core:fable` or `craig-core:haiku`: Anthropic re-routes most cybersecurity tasks on Opus and Fable to an older Opus, and higher-risk ones on Sonnet visibly fall back to an older Sonnet, so no Claude route is full-strength for security and a Claude route reviewing GPT's security work may be running the older model. Routine bug finding and fixing in normal development is unaffected. Fable 5.2 still blocks most cybersecurity tasks and answers them from Opus 4.8 (and biology from Opus 5), with about 55% fewer false-positive blocks than Fable 5.1, and it hands a small set of AI-R&D topics (such as kernel development on some nonstandard accelerators) to Opus 5 transparently. Haiku has no fallback: a cyber-classifier decline returns `stop_reason: "refusal"` and stays declined, so `craig-core:haiku` never runs security work. A Claude-only security check is reported as same-family and as possibly run on an older Opus.
+Why CLAUDE.md routes security work — doing it and reviewing it — to the route least likely to refuse, and, Claude-only, to `craig-core:opus` @ `high` or @ `xhigh` but never `craig-core:fable` or `craig-core:haiku`. Anthropic re-routes most cybersecurity tasks on Opus and Fable to an older Opus, and higher-risk ones on Sonnet visibly fall back to an older Sonnet, so no Claude route is full-strength for security and a Claude route reviewing GPT's security work may be running the older model. Routine bug finding and fixing in normal development is unaffected. Fable 5.2 still blocks most cybersecurity tasks and answers them from Opus 4.8 (and biology from Opus 5), with about 55% fewer false-positive blocks than Fable 5.1, and it hands a small set of AI-R&D topics (such as kernel development on some nonstandard accelerators) to Opus 5 transparently. Haiku has no fallback: a cyber-classifier decline returns `stop_reason: "refusal"` and stays declined, so `craig-core:haiku` never runs security work. A Claude-only security check is reported as same-family and as possibly run on an older Opus.
 
-Anthropic's and OpenAI's classifiers also over-refuse defensive work on Craig's own systems: sysadmin tasks such as CA certificate repair, and network scans for insecure devices, have drawn refusals from both families. DeepSeek filters less, so CLAUDE.md falls back to `deepseek-flash` @ `high` when both refuse. Flash rather than `deepseek-v4-pro`, because Flash 1017 is the stronger DeepSeek model (AA index 45 vs 36 at `max`). The leg is a metered third-party API: send only what the task needs, never private keys or credentials.
+Anthropic's and OpenAI's classifiers also over-refuse defensive work on Craig's own systems: sysadmin tasks such as CA certificate repair, and network scans for insecure devices, have drawn refusals from both families. GPT-6.2 Astra and Sol launched (2026-11-17) with tighter cybersecurity safeguards that OpenAI says "also restrict some legitimate vulnerability research and security testing workflows", plus increased restrictions on dual-use biological requests; OpenAI's reduced-refusal access (its Daybreak program) covers only GPT-6 Astra and is not part of the subscription. DeepSeek filters least; Craig expects it to refuse far less. Hence the CLAUDE.md rule: choose the route least likely to refuse; defensive review and secure coding go to `gpt-astra`; work that classifiers often block goes straight to `deepseek-flash` @ `high`; after a refusal, move that task to another family, DeepSeek last; the refusing family stays in use for other work. Flash rather than `deepseek-v4-pro`, because Flash 1017 is the stronger DeepSeek model (AA index 45 vs 36, both `max`-effort scores, which the route never runs). The leg is a metered third-party API: send only what the task needs, never private keys or credentials.

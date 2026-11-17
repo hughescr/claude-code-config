@@ -24,7 +24,7 @@ Every `Agent` call sets `subagent_type` to a named route agent and passes `effor
 | `craig-core:haiku` @ `low` | Latency-sensitive mechanical work and summaries on small prompts. Verify consequential output with a stronger route. |
 | `craig-core:haiku` @ `max` | A small task that needs a bit more than `xhigh`. |
 | `craig-core:sonnet` @ `medium` | Bounded work with objective checks on prompts above 100k tokens. |
-| `craig-core:sonnet` @ `high` | Normal substantive execution: the default leaf route, co-default with `gpt-sol` @ `medium`/`high` where available. Routine verifier for sol work. Never above `high`. |
+| `craig-core:sonnet` @ `high` | Normal substantive execution: the default leaf route. Routine verifier for sol work. Never above `high`. |
 | `craig-core:opus` @ `medium` | Routine verification or challenge. |
 | `craig-core:opus` @ `high` | Heavy work, consequential verification or challenge, and complex debugging. |
 | `craig-core:opus` @ `xhigh` | Above `high` when Fable's cost and latency are not justified. Never `max`. |
@@ -34,16 +34,18 @@ Every `Agent` call sets `subagent_type` to a named route agent and passes `effor
 | `gpt-luna` @ `low`/`medium` | Cross-family cost peers of the Haiku routes; capability is below `craig-core:haiku` @ `xhigh`. Short inputs only. Never above `medium`. |
 | `gpt-terra` @ `low` | Cross-family peer of `craig-core:haiku` @ `low`; stronger, at about twice the cost. Verify consequential output with a stronger route. |
 | `gpt-terra` @ `medium`/`high` | Cross-family peers of `craig-core:haiku` @ `xhigh` (at `medium`) and @ `max` (at `high`) for the same small bounded work. At `high`, also the cheap challenger for Haiku work. |
-| `gpt-terra` @ `xhigh`/`max` | Visual, 3D, and geometry work; prefer `xhigh`. For other bounded or middle-weight work use `gpt-sol` @ `medium`; for complex multi-file coding and consequential challenges, `gpt-sol` @ `high`/`xhigh` or `gpt-astra`. |
-| `gpt-sol` @ `medium` | Normal substantive leaf work, co-default with `craig-core:sonnet` @ `high`. Also routine verification. |
-| `gpt-sol` @ `high`/`xhigh` | Multi-file leaf work, co-default with `craig-core:sonnet` @ `high`; the fallback when astra is unavailable. At `high`, the routine cross-family challenger. Prefer `high` over `xhigh`. |
-| `gpt-astra` @ `medium`/`high`/`max` | Consequential cross-family challenge (`craig-core:opus` @ `high` and above, design calls, security), complex debugging, and work that needs tenacity or that sol stalled on; peers `craig-core:opus` @ `high`/`xhigh`. Prefer `high`; `max` for the hardest. Use `gpt-sol` for routine checks. |
+| `gpt-terra` @ `xhigh`/`max` | Visual, 3D, and geometry work; prefer `xhigh`. For other work use the Sol, Astra, or Claude rows. |
+| `gpt-sol` @ `medium` | Alternative to `craig-core:sonnet` @ `high` for normal leaf work. Also routine verification. |
+| `gpt-sol` @ `high`/`xhigh` | Alternative for multi-file leaf work; the fallback when astra is unavailable. At `high`, the cross-family challenger for Opus and Sonnet work. Prefer `high` over `xhigh`. |
+| `gpt-astra` @ `medium`/`high`/`xhigh` | Cross-family challenge of Fable work, design calls, and security; escalation from sol; complex debugging; peers `craig-core:opus` @ `xhigh` (at `medium`) and `craig-core:fable` @ `high` (at `high`/`xhigh`). Prefer `high`; `xhigh` for the hardest. |
 | `deepseek-flash` @ `low`/`medium`/`high` | The default DeepSeek route: third-family cost peers of Haiku, `craig-core:sonnet` @ `medium`, and @ `high`, respectively; capability at these efforts is unmeasured. Never above `high`. |
 | `deepseek-v4-pro` @ `low`/`medium`/`high` | Third-family peers of `craig-core:sonnet` @ `medium`, `craig-core:opus` @ `medium`, and `craig-core:opus` @ `high`; only for a need the intelligence index does not measure. Never above `high`. |
 
 The `craig-core:haiku`/`craig-core:sonnet` @ `medium` split is by per-request prompt length: count the files the agent will read, not only the spawn prompt. Keep `gpt-terra` off prompts well over 100k tokens; its long-context recall is unmeasured.
 
 `/routing-refresh` updates routes; its `EVIDENCE.md` holds their evidence.
+
+For execution, when a Claude and a GPT route both fit, use Claude: Codex quota runs out faster. Verification follows the pairing tables.
 
 Fan out independent necessary work; do not duplicate work merely to create parallelism.
 
@@ -55,8 +57,8 @@ Claude work is challenged by a GPT route and GPT work by a Claude route; no mode
 
 | Proposer | Challenger | Escalate to | Claude-only challenger | Claude-only escalation |
 |---|---|---|---|---|
-| `craig-core:opus` @ `high`/`xhigh` | `gpt-astra` @ `high` | `gpt-astra` @ `max` | `craig-core:opus` @ `high` | `craig-core:fable` @ `high` |
-| `craig-core:fable` | `gpt-astra` @ `high` | `gpt-astra` @ `max` | `craig-core:opus` @ `high` | `craig-core:opus` @ `xhigh` |
+| `craig-core:opus` @ `high`/`xhigh` | `gpt-sol` @ `high` | `gpt-astra` @ `high` | `craig-core:opus` @ `high` | `craig-core:fable` @ `high` |
+| `craig-core:fable` | `gpt-astra` @ `high` | `gpt-astra` @ `xhigh` | `craig-core:opus` @ `high` | `craig-core:opus` @ `xhigh` |
 | `craig-core:opus` @ `medium` | `gpt-sol` @ `high` | `gpt-astra` @ `medium` | `craig-core:opus` @ `high` | `craig-core:opus` @ `xhigh` |
 | `craig-core:sonnet` @ `high` | `gpt-sol` @ `high` | `gpt-astra` @ `high` | `craig-core:opus` @ `medium` | `craig-core:opus` @ `high` |
 | `craig-core:sonnet` @ `medium` | `gpt-sol` @ `medium` | `gpt-sol` @ `high` | `craig-core:opus` @ `medium` | `craig-core:opus` @ `high` |
@@ -74,7 +76,7 @@ Cross-family proposers exist only where those routes are available:
 | `deepseek-v4-pro` @ `high`, `deepseek-flash` @ `high` | `craig-core:opus` @ `high` | `gpt-astra` @ `high` |
 | `deepseek-*` @ `medium` | `craig-core:sonnet` @ `high` | `craig-core:opus` @ `medium` |
 
-Security work (doing it or reviewing it) overrides these pairings: use `gpt-astra` (any listed effort). Claude-only, use `craig-core:opus` @ `high` (`xhigh` for the hardest), never Fable or Haiku, and report the check as same-family and possibly run on an older Opus. When both families refuse authorized security or sysadmin work (CA certificates, scanning Craig's own network), fall back to `deepseek-flash` @ `high`, whose content filtering is less sensitive. Send it only what the task needs, never private keys or credentials, and report the work as unverified if every challenger also refuses.
+Security work (doing it or reviewing it) overrides these pairings: use the route least likely to refuse. Defensive review and secure coding go to `gpt-astra` (any listed effort). Work that classifiers often block (vulnerability research, exploit testing, scanning Craig's own network, CA certificates) goes straight to `deepseek-flash` @ `high`. Claude-only, use `craig-core:opus` @ `high` (`xhigh` for the hardest), never Fable or Haiku, and report the check as same-family and possibly run on an older Opus. After a refusal, move that task (not other work) to another family, DeepSeek last. Send DeepSeek only what the task needs, never private keys or credentials, and report the work as unverified if every challenger also refuses.
 
 A disagreement is a finding to resolve, not a tie to split: escalate one rung and report both positions. Claude-only, use the Claude-only columns. Otherwise, if that rung shares the proposer's or challenger's family, use the third family instead (`deepseek-flash` @ `high` for Sonnet-tier work, `deepseek-v4-pro` @ `high` for Opus-tier) and report all three positions.
 
