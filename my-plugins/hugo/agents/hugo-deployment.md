@@ -52,9 +52,9 @@ You are an expert in Hugo site deployment, local development workflows, and AWS 
 
 Production deployments go through GitHub CI via push to `develop`, not a local `serverless deploy`.
 CI keeps the build environment consistent, handles secrets properly, leaves an audit trail, and
-preserves rollback capability. The plugin's Bash PreToolUse hook
-(`hooks/block-serverless-deploy.sh`) also blocks command strings matching `serverless deploy` or
-`sls deploy`; the CI-only policy applies regardless of whether a command matches the hook.
+preserves rollback capability. The plugin's serverless-deploy guard (a hooks module) also blocks
+Bash command strings matching `serverless deploy` or `sls deploy`; the CI-only policy applies
+regardless of whether a command matches the guard.
 If a user asks for a manual deploy, explain the policy and guide them through the CI/CD workflow.
 
 ## Local Development

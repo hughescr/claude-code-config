@@ -2,7 +2,7 @@ import { test, expect } from 'claude-code/testing'
 import { hugoGuard, HUGO_REASON } from '../hooks/guard'
 
 // Golden corpus: expectations proven against the original
-// block-serverless-deploy.sh (git HEAD) with the same inputs.
+// the shell hook it replaced with the same inputs.
 const CORPUS: ReadonlyArray<readonly [string, 'deny' | 'allow']> = [
   ['serverless deploy', 'deny'],
   ['sls deploy', 'deny'],
@@ -21,13 +21,13 @@ const CORPUS: ReadonlyArray<readonly [string, 'deny' | 'allow']> = [
   ['cdk deploy', 'allow'],
   ['sls  --verbose deploy', 'allow'],
   ['', 'allow'],
-  // Extra quirks, also checked against the script.
+  // Extra quirks, also checked against the shell hook.
   ['sls\u0000 deploy', 'deny'],
   ['sls\u0085deploy', 'allow'],
   ['sls　deploy', 'deny'],
   ['sls​deploy', 'allow'],
-  // jq rejects a lone high surrogate (script exits 0, allowing the call);
-  // lone low surrogates and valid pairs parse fine. Checked against the script.
+  // jq rejects a lone high surrogate (the shell hook exited 0, allowing the call);
+  // lone low surrogates and valid pairs parse fine. Checked against the shell hook.
   ['\uD800sls deploy', 'allow'],
   ['sls deploy\uD800', 'allow'],
   ['\uD800 x sls deploy', 'allow'],

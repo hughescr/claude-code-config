@@ -11,14 +11,14 @@ export const HUGO_REASON =
 // U+FEFF, which bash does not treat as space.
 const SP = '[\\t\\n\\v\\f\\r \\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]';
 
-// The script ran bash [[ =~ ]] on the whole command: no word boundaries, no
+// The shell hook it replaced ran bash [[ =~ ]] on the whole command: no word boundaries, no
 // line split, case-sensitive, "deploy" may be a prefix of a longer word.
 const RE_SERVERLESS = new RegExp(`serverless${SP}+deploy`, 'u');
 const RE_SLS = new RegExp(`sls${SP}+deploy`, 'u');
 
 // A high surrogate not followed by a low one. No u flag: this scans UTF-16
 // code units. jq rejects such a command ("Invalid \uXXXX\uXXXX surrogate pair
-// escape"), the script exits 0, and the call goes through. A lone LOW
+// escape"), the shell hook exited 0, and the call goes through. A lone LOW
 // surrogate is accepted by jq, so it is deliberately not matched here.
 const RE_LONE_HIGH = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])/;
 
@@ -31,7 +31,7 @@ export function shellNormalize(raw: unknown): string {
   return raw.replace(/\u0000/g, '');
 }
 
-/** The deny reason for a command the script blocked, else undefined. */
+/** The deny reason for a command the shell hook blocked, else undefined. */
 export function hugoGuard(raw: unknown): string | undefined {
   const cmd = shellNormalize(raw);
   return RE_SERVERLESS.test(cmd) || RE_SLS.test(cmd) ? HUGO_REASON : undefined;

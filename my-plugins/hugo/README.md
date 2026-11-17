@@ -63,9 +63,11 @@ When both Hugo and JavaScript plugins load (common for Hugo projects with `packa
 
 | Hook | Event | Purpose |
 |------|-------|---------|
-| `block-serverless-deploy` | PreToolUse | Prevents manual `serverless deploy` - all deployments must go through GitHub CI |
+| Serverless deploy guard (mod) | `tool.call` on Bash | Prevents manual `serverless deploy` / `sls deploy` - all deployments must go through GitHub CI |
 
-A staged in-process mod form of this guard (`hooks/register.ts`, `hooks/guard.ts`) is not wired yet; activation steps: `my-plugins/MODS-ACTIVATION.md`.
+The guard is a hooks module (`hooks/register.ts`, with the logic in `hooks/guard.ts`), declared under `modules` in `hooks/hooks.json`. A mod loads only while Claude Code's hooks-modules feature flag is on, so the guard is absent in a process where the flag is off.
+
+How the plugin loads: `claude-smart.sh` adds it from the working tree (`--plugin-dir ~/.claude/my-plugins/hugo`) for Hugo projects. Two other repos (`misc.rungie.com`, `erica-s-hughes`) enable `hugo@craigs-claude-plugins` from the GitHub marketplace copy, which gets a change only after it is pushed and `claude plugin update hugo@craigs-claude-plugins` is run there. See `my-plugins/MODS-ACTIVATION.md`.
 
 ---
 
@@ -130,8 +132,9 @@ Manages local development and deployment workflows:
 │   ├── hugo-preview.md
 │   └── hugo-build.md
 ├── hooks/
+│   ├── guard.ts
 │   ├── hooks.json
-│   └── block-serverless-deploy.sh
+│   └── register.ts
 └── skills/
     ├── hugo-fundamentals/
     │   └── SKILL.md
