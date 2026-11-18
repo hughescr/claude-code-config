@@ -6,7 +6,7 @@ When updating docs, skills, or config, replace superseded facts, estimates, and 
 
 ## Language Choice
 
-Python is a last resort, and its instincts (scalar loops, unbatched hot paths) must not leak into any language. Design data flow batch-first — a per-item call in a hot path is a defect. Prefer ecosystems whose norms pull toward quality: Rust for performance-critical or parallel work; TypeScript on bun (Craig's usual) or Go for services and tooling. If Python is unavoidable, write it like a systems language and surface it as debt to retire.
+Python is a last resort, and its instincts (scalar loops, unbatched hot paths) must not leak into any language. Design data flow batch-first — a per-item call in a hot path is a defect. Prefer ecosystems whose norms pull toward quality: Rust for performance-critical or parallel work; TypeScript on bun or Go for services and tooling. If Python is unavoidable, write it like a systems language and surface it as debt to retire.
 
 ## Installed CLI Tools (beyond defaults)
 
@@ -14,9 +14,9 @@ jq, httpie, gh, bat, diff-so-fancy, hyperfine, tree, watch, ag, ast-grep, parall
 
 ## Agent routing
 
-Every `Agent` call sets `subagent_type` to a named route agent and passes `effort` from the table below: `route` @ `effort` means `subagent_type: "route", effort: "effort"`. Never pass `model` to a route agent; its file pins the model and no effort. Omitting `effort` inherits the parent's, which is never acceptable; a craig-core PreToolUse hook denies both mistakes. Use only the efforts a route's rows list. A capability-specific agent (such as `craig-core:project-steward`) pins `model` and `effort` in its frontmatter; call it without `effort` unless you deliberately override it.
+Every `Agent` call sets `subagent_type` to a named route agent and passes `effort` from the table below: `route` @ `effort` means `subagent_type: "route", effort: "effort"`. Never pass `model` to a route agent; its file pins the model and no effort. Omitting `effort` inherits the parent's, which is never acceptable. Use only the efforts a route's rows list. A capability-specific agent (such as `craig-core:project-steward`) pins `model` and `effort` in its frontmatter; call it without `effort` unless you deliberately override it.
 
-**Route availability.** Claude route `subagent_type`s always use the `craig-core:` prefix. The cross-family routes (`gpt-*`, `deepseek-*`) are local agents on Craig's Mac that reach their models through the `utraque` proxy. Use one only when its agent type is in this session's available agents and `ANTHROPIC_BASE_URL` is `http://127.0.0.1:8317` (check that environment variable, not `settings.json`). Otherwise (always in Cowork, cloud sessions, and claude.ai chat) use only `craig-core:*` routes and the Claude-only pairing columns, and report every check as same-family.
+**Route availability.** Claude route `subagent_type`s always use the `craig-core:` prefix. The cross-family routes (`gpt-*`, `deepseek-*`) are local agents on Craig's Mac that reach their models through the `utraque` proxy. Use one only when its agent type is in this session's available agents and `ANTHROPIC_BASE_URL` is `http://127.0.0.1:8317` (check that environment variable, not `settings.json`). Otherwise use only `craig-core:*` routes and the Claude-only pairing columns, and report every check as same-family.
 
 | Route @ effort | Use |
 |---|---|
@@ -30,7 +30,7 @@ Every `Agent` call sets `subagent_type` to a named route agent and passes `effor
 | `craig-core:opus` @ `xhigh` | Above `high` when Fable's cost and latency are not justified. Never `max`. |
 | `craig-core:fable` @ `high` | Escalation when Opus @ `high` or @ `xhigh` stalls, the hardest Claude-side work, and a second Claude view on hard judgment calls. Use it where it earns its cost; at `high` and above, track quota use. |
 | `craig-core:fable` @ `max` | Only where `craig-core:fable` @ `high` fell short on the hardest problems. Never `xhigh`. |
-| `craig-core:fable` @ `low`/`medium` | Slower, more tenacious alternative to `craig-core:opus` @ `medium`/`high` (Craig's judgment, not a benchmark). |
+| `craig-core:fable` @ `low`/`medium` | Slower, more tenacious alternative to `craig-core:opus` @ `medium`/`high`. |
 | `gpt-luna` @ `low`/`medium` | Cross-family cost peers of the Haiku routes; capability is below `craig-core:haiku` @ `xhigh`. Exact lookup holds on long inputs; reasoning across them is unmeasured. Never above `medium`. |
 | `gpt-terra` @ `low` | Cross-family peer of `craig-core:haiku` @ `low`; stronger, at about twice the cost. Verify consequential output with a stronger route. |
 | `gpt-terra` @ `medium`/`high` | Cross-family peers of `craig-core:haiku` @ `xhigh` (at `medium`) and @ `max` (at `high`) for the same small bounded work. At `high`, also the cheap challenger for Haiku work. |
@@ -42,8 +42,6 @@ Every `Agent` call sets `subagent_type` to a named route agent and passes `effor
 | `deepseek-v4-pro` @ `low`/`medium`/`high` | Third-family peers of `craig-core:sonnet` @ `medium`, `craig-core:opus` @ `medium`, and `craig-core:opus` @ `high`; only for a need the intelligence index does not measure. Never above `high`. |
 
 The `craig-core:haiku`/`craig-core:sonnet` @ `medium` split is by per-request prompt length: count the files the agent will read, not only the spawn prompt. GPT routes accept prompts up to about 828k tokens, but above 272k input the API prices the whole request at 2x, so assume the Codex allowance drains faster there; keep `gpt-astra` prompts under 272k unless the task needs more.
-
-`/routing-refresh` updates routes; its `EVIDENCE.md` holds their evidence.
 
 For execution, when a Claude and a GPT route both fit, use Claude: Codex quota runs out faster. Verification follows the pairing tables.
 
