@@ -31,7 +31,7 @@ Every `Agent` call sets `subagent_type` to a named route agent and passes `effor
 | `craig-core:fable` @ `high` | Escalation when Opus @ `high` or @ `xhigh` stalls, the hardest Claude-side work, and a second Claude view on hard judgment calls. Use it where it earns its cost; at `high` and above, track quota use. |
 | `craig-core:fable` @ `max` | Only where `craig-core:fable` @ `high` fell short on the hardest problems. Never `xhigh`. |
 | `craig-core:fable` @ `low`/`medium` | Slower, more tenacious alternative to `craig-core:opus` @ `medium`/`high` (Craig's judgment, not a benchmark). |
-| `gpt-luna` @ `low`/`medium` | Cross-family cost peers of the Haiku routes; capability is below `craig-core:haiku` @ `xhigh`. Short inputs only. Never above `medium`. |
+| `gpt-luna` @ `low`/`medium` | Cross-family cost peers of the Haiku routes; capability is below `craig-core:haiku` @ `xhigh`. Exact lookup holds on long inputs; reasoning across them is unmeasured. Never above `medium`. |
 | `gpt-terra` @ `low` | Cross-family peer of `craig-core:haiku` @ `low`; stronger, at about twice the cost. Verify consequential output with a stronger route. |
 | `gpt-terra` @ `medium`/`high` | Cross-family peers of `craig-core:haiku` @ `xhigh` (at `medium`) and @ `max` (at `high`) for the same small bounded work. At `high`, also the cheap challenger for Haiku work. |
 | `gpt-terra` @ `xhigh`/`max` | Visual, 3D, and geometry work; prefer `xhigh`. For other work use the Sol, Astra, or Claude rows. |
@@ -41,7 +41,7 @@ Every `Agent` call sets `subagent_type` to a named route agent and passes `effor
 | `deepseek-flash` @ `low`/`medium`/`high` | The default DeepSeek route: third-family cost peers of Haiku, `craig-core:sonnet` @ `medium`, and @ `high`, respectively; capability at these efforts is unmeasured. Never above `high`. |
 | `deepseek-v4-pro` @ `low`/`medium`/`high` | Third-family peers of `craig-core:sonnet` @ `medium`, `craig-core:opus` @ `medium`, and `craig-core:opus` @ `high`; only for a need the intelligence index does not measure. Never above `high`. |
 
-The `craig-core:haiku`/`craig-core:sonnet` @ `medium` split is by per-request prompt length: count the files the agent will read, not only the spawn prompt. Keep `gpt-terra` off prompts well over 100k tokens; its long-context recall is unmeasured.
+The `craig-core:haiku`/`craig-core:sonnet` @ `medium` split is by per-request prompt length: count the files the agent will read, not only the spawn prompt. GPT routes accept prompts up to about 828k tokens, but above 272k input the API prices the whole request at 2x, so assume the Codex allowance drains faster there; keep `gpt-astra` prompts under 272k unless the task needs more.
 
 `/routing-refresh` updates routes; its `EVIDENCE.md` holds their evidence.
 

@@ -137,8 +137,12 @@ if curl -sf --max-time 1 http://127.0.0.1:8317/healthz >/dev/null 2>&1; then
     # variable restores native window detection from the built-in model table.
     export _CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL=1
     # Only applies to models whose name does not start with "claude-", so this
-    # sizes the gpt-* routes and never touches the Claude models above.
-    export CLAUDE_CODE_MAX_CONTEXT_TOKENS=272000
+    # sizes the gpt-* routes and never touches the Claude models above. 828000
+    # is the Codex catalog's max_context_window (872000) less the 5% margin the
+    # Codex CLI keeps; the backend accepted 800k-token prompts on gpt-6-luna.
+    # Above 272k input the API prices a request at 2x, so long GPT sessions
+    # probably drain the Codex allowance faster, most of all on astra.
+    export CLAUDE_CODE_MAX_CONTEXT_TOKENS=828000
 fi
 
 # Launch the native binary
