@@ -69,3 +69,4 @@ skills/.trash
 /plugins/store
 /mods-flag.log
 plugins/plugin-directory-cache-v2.json*
+/session-env
