@@ -6,10 +6,10 @@ Code tab, the Claude app (chat and Cowork), and cloud sessions.
 | Part | Contents |
 |---|---|
 | `instructions/` | `COMMON-CLAUDE.md` (the global CLAUDE.md), `MAIN-CLAUDE.md` (main session), `SUBAGENT-CLAUDE.md` (sub-agents). The only copy of each. |
-| `hooks/` | `inject-instructions.sh`, run by `hooks.json` at SessionStart and SubagentStart; `require-route-effort.sh`, run before every Agent call. |
+| `hooks/` | `inject-instructions.sh`, run by `hooks.json` at SessionStart and SubagentStart; `require-route-effort.sh`, run before every Agent call; `clean-session-env.sh`, run at SessionEnd. |
 | `agents/` | The Claude route agents (`opus`, `sonnet`, `haiku`, `fable`: one per model, pinning the model and no effort) and `craig-core:project-steward` (pins both). Plugin agents are namespaced: `subagent_type: "craig-core:sonnet", effort: "high"`. |
 | `skills/` | `my-writing-style` (invoked as `craig-core:my-writing-style`) and `routing-refresh` (Craig runs `/routing-refresh`; its `EVIDENCE.md` holds the facts behind the routes). |
-| `tests/` | `inject-instructions.test.sh`, `require-route-effort.test.sh`. |
+| `tests/` | `inject-instructions.test.sh`, `require-route-effort.test.sh`, `clean-session-env.test.sh`. |
 
 The cross-family route agents (`gpt-*`, `deepseek-*`) are not here: they live in `~/.claude/agents/` on Craig's Mac,
 because they only work through the local utraque proxy. CLAUDE.md's Route availability rule says when they may be
@@ -51,6 +51,22 @@ The hook denies passing `model` on every surface and allows every other Agent ca
 entrypoints to its `EFFORT_ENTRYPOINTS` list. It is POSIX `sh` plus `jq`; without `jq` it reports the problem on
 stderr and allows the call.
 
+## Session-env cleanup
+
+Claude Code makes one directory per session under `${CLAUDE_CONFIG_DIR:-~/.claude}/session-env` and never removes them.
+`hooks/clean-session-env.sh` runs at SessionEnd (timeout 5 seconds) and removes empty directories only, each with `rmdir`:
+
+1. The ending session's own directory, when its `session_id` is a strict UUID (8-4-4-4-12 hex digits, nothing else).
+2. Every other direct child whose name is a strict UUID, is empty, is not the `sessionId` of any `sessions/*.json` record
+   (a running session; compared case-insensitively), and was not modified in the last 60 minutes.
+
+A directory that holds a file survives. Symlinks are never followed or removed, and `sessions/*.key` files are never read.
+A malformed or unreadable record protects nothing.
+
+Step 2 is skipped when `jq` is absent, the sessions directory is missing, it holds no `*.json` records, or none of them
+yields a `sessionId`. Step 1 still runs without `jq`, reading `session_id` with `sed`. The script never fails the session:
+it prints nothing and exits 0.
+
 ## Editing
 
 Edit the files in `instructions/`, never `~/.claude/CLAUDE.md` directly (it is the symlink). Locally, Claude Code
@@ -66,5 +82,6 @@ When a route changes, update the agent file here (or in `~/.claude/agents/` for 
 ```bash
 bash my-plugins/craig-core/tests/inject-instructions.test.sh   # injector, under sh, dash, ksh and bash
 bash my-plugins/craig-core/tests/require-route-effort.test.sh  # Agent effort hook, same shells
+bash my-plugins/craig-core/tests/clean-session-env.test.sh     # SessionEnd cleanup, same shells, with and without jq
 bash tests/hooks-test.sh                                       # repo-level PreToolUse hooks
 ```

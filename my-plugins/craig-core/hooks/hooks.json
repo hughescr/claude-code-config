@@ -1,5 +1,5 @@
 {
-  "description": "Inject Craig's instructions: CLAUDE.md (unless already loaded natively) plus MAIN-CLAUDE.md at session start, CLAUDE.md plus SUBAGENT-CLAUDE.md at sub-agent start. One command per part keeps each under the 10,000-character context cap. Before every Agent call, deny a route agent called with model, or without effort on the CLI (cli/sdk-cli).",
+  "description": "Craig's hooks. Inject Craig's instructions: CLAUDE.md (unless already loaded natively) plus MAIN-CLAUDE.md at session start, CLAUDE.md plus SUBAGENT-CLAUDE.md at sub-agent start, one command per part to stay under the 10,000-character context cap. Before every Agent call, deny a route agent called with model, or without effort on the CLI (cli/sdk-cli). At session end, remove this session's session-env directory if it is empty, then sweep the empty session-env directories of sessions that are no longer running: strict-UUID names with no sessions/*.json record, not modified in the last 60 minutes. A directory that holds a file survives. The sweep is skipped when jq is absent, the sessions directory is missing, it holds no *.json records, or none of them yields a sessionId.",
   "hooks": {
     "PreToolUse": [
       {
@@ -50,6 +50,17 @@
           {
             "type": "command",
             "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/inject-instructions.sh\" SubagentStart project",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hooks/clean-session-env.sh\"",
             "timeout": 5
           }
         ]
