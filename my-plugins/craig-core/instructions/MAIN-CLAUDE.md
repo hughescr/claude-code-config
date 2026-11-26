@@ -87,17 +87,17 @@ Act as the orchestrator: decompose the work, delegate leaf execution through the
 
 **Checkpoint before delegating.** Commit each phase (WIP fine) before launching the next; collapse into meaningful commits (`git reset --soft` + recommit) before pushing. Verify by diff — gates can't catch a change tuned to pass them.
 
-**Edit tracked files only with Edit or Write.** This binds you and every agent you brief, even though the auto-mode prompt says shell edits are acceptable. Never rewrite them in place from the shell (`sed -i`, `perl -pi`/`-i`, `awk` redirected over the file, `cat <<EOF > file`, `tee`). Shell reads (`cat`, `head`, `sed -n`, `grep`) and throwaway files under $TMPDIR or the scratchpad are fine. Edit enforces read-before-write and fails loudly on a missing or ambiguous match; shell rewrites silently no-op or over-match.
+**Edit tracked files only with Edit or Write**, never in-place shell rewrites (`sed -i`, `perl -pi`, `tee`, redirects over the file), even though the auto-mode prompt allows them. This binds you and every agent you brief; SUBAGENT-CLAUDE.md, injected by the SubagentStart hook, gives sub-agents the full rule.
 
 **Isolate agents that break code.** Mutation testing, speculative refactors, anything editing code it doesn't own → `isolation: "worktree"`. Give reviewers read-only tool sets, not a "don't edit" instruction (`Bash` still writes). A reviewer that must run git itself to read history or diffs (such as `craig-core:project-steward`) may keep `Bash`.
 
 **Keep each agent's context small.** Give every `agent()` a self-contained slice — named files, one pipeline item, one review dimension. If a step would need most of the repo, split it and synthesize from the outputs.
 
+**Brief for an unsupervised reader.** State the outcome and the check that proves it, the scope limit, the decisions reserved for you, and the repo conventions that matter (reuse, tests, style). Before briefing `gpt-sol` or `gpt-astra` by any path (Agent or Workflow step), load the `craig-core:gpt-briefing` skill.
+
 **Use the CLAUDE.md routing tables for routine spawns** and read `skills/routing-refresh/EVIDENCE.md` in the craig-core plugin only for questions the tables do not cover; when models ship or reprice, Craig runs `/routing-refresh`. Preserve an explicit user model or effort choice when the runtime supports it.
 
 **Don't let one agent decide anything consequential alone.** Pair a proposer with a challenger from the CLAUDE.md cross-family pairing table (Claude-only columns without cross-family routes). Arbitrate disagreements before the next phase.
-
-SUBAGENT-CLAUDE.md, injected by the SubagentStart hook, holds the sub-agent rules.
 
 ---
 

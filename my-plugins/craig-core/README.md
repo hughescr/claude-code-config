@@ -8,7 +8,7 @@ Code tab, the Claude app (chat and Cowork), and cloud sessions.
 | `instructions/` | `COMMON-CLAUDE.md` (the global CLAUDE.md), `MAIN-CLAUDE.md` (main session), `SUBAGENT-CLAUDE.md` (sub-agents). The only copy of each. |
 | `hooks/` | `inject-instructions.sh`, run by `hooks.json` at SessionStart and SubagentStart; `require-route-effort.sh`, run before every Agent call; `clean-session-env.sh`, run at SessionEnd. |
 | `agents/` | The Claude route agents (`opus`, `sonnet`, `haiku`, `fable`: one per model, pinning the model and no effort) and `craig-core:project-steward` (pins both). Plugin agents are namespaced: `subagent_type: "craig-core:sonnet", effort: "high"`. |
-| `skills/` | `my-writing-style` (invoked as `craig-core:my-writing-style`) and `routing-refresh` (Craig runs `/routing-refresh`; its `EVIDENCE.md` holds the facts behind the routes). |
+| `skills/` | `my-writing-style` (invoked as `craig-core:my-writing-style`), `routing-refresh` (Craig runs `/routing-refresh`; its `EVIDENCE.md` holds the facts behind the routes), and `gpt-briefing` (how to brief `gpt-sol` and `gpt-astra`; MAIN-CLAUDE.md tells the orchestrator to load it before the first brief to either model). |
 | `tests/` | `inject-instructions.test.sh`, `require-route-effort.test.sh`, `clean-session-env.test.sh`. |
 
 The cross-family route agents (`gpt-*`, `deepseek-*`) are not here: they live in `~/.claude/agents/` on Craig's Mac,
@@ -75,7 +75,7 @@ picks up changes at the next session start.
 
 When a route changes, update the agent file here (or in `~/.claude/agents/` for a cross-family route), both tables in
 `COMMON-CLAUDE.md`, the `ROUTES` list in `hooks/require-route-effort.sh` (and in its test), and
-`skills/routing-refresh/EVIDENCE.md`, the facts behind the routes. `/routing-refresh` runs the update.
+`skills/routing-refresh/EVIDENCE.md`, the facts behind the routes. `/routing-refresh` runs the update. When OpenAI revises its prompting guidance for Sol or Astra, update `skills/gpt-briefing/SKILL.md`, the only copy of that guidance.
 
 ## Tests
 
